@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -59,6 +60,7 @@ type Watch struct {
 	lastImport   time.Time
 	lastNote     string
 	lastNoteKind noteKind
+	pendingApply bool // JSON mutated; Apply has not yet succeeded
 	running      bool
 }
 
@@ -105,6 +107,14 @@ func (w *Watch) Tick(ctx context.Context) {
 		return
 	}
 	if cfg.Xray.Failover != nil {
+		if w.pendingApply {
+			if err := w.apply(); err == nil {
+				w.pendingApply = false
+				if id := failoverTunnel(cfg); id != "" {
+					w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
+				}
+			}
+		}
 		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
@@ -149,11 +159,11 @@ func (w *Watch) Tick(ctx context.Context) {
 	}); err != nil {
 		return
 	}
-	if w.Apply != nil {
-		if err := w.Apply(); err != nil {
-			return
-		}
+	if err := w.apply(); err != nil {
+		w.pendingApply = true
+		return
 	}
+	w.pendingApply = false
 	w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 	if reloaded, err := w.LoadVPN(); err == nil {
 		cfg = reloaded
@@ -210,6 +220,12 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			return
 		}
 	}
+	if w.UpdateVPN != nil {
+		_ = w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+			current.Xray.Servers = uniqueServerIPs(servers)
+			return nil
+		})
+	}
 	if w.Generate == nil {
 		return
 	}
@@ -236,24 +252,72 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if err := w.Probe(ctx, socks); err != nil {
 			continue
 		}
-		w.failSince = time.Time{}
-		if w.UpdateVPN != nil {
-			if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-				vpnconfig.RestoreXrayClientsFromFailover(current)
-				return nil
-			}); err != nil {
-				return
-			}
-		}
-		if w.Apply != nil {
-			if err := w.Apply(); err != nil {
-				return
-			}
+		if !w.commitRestore(cfg) {
+			return
 		}
 		w.notify(noteRestored, fmt.Sprintf(msgRestored, s.Name))
 		return
 	}
 	w.notifyNoLive(cfg)
+}
+
+// uniqueServerIPs is the same de-dupe as handler/import.go and webapi.collectServerIPs:
+// xray.servers feeds TPROXY_BYPASS, so every imported endpoint must be present.
+func uniqueServerIPs(servers []vpnconfig.Server) []string {
+	seen := make(map[string]bool)
+	ips := make([]string, 0)
+	for _, s := range servers {
+		for _, ip := range s.IPs {
+			if ip != "" && !seen[ip] {
+				seen[ip] = true
+				ips = append(ips, ip)
+			}
+		}
+	}
+	sort.Strings(ips)
+	return ips
+}
+
+func (w *Watch) apply() error {
+	if w.Apply == nil {
+		return nil
+	}
+	return w.Apply()
+}
+
+func (w *Watch) writeBackFailover(tunnel string) {
+	if tunnel == "" || w.UpdateVPN == nil {
+		return
+	}
+	_ = w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+		vpnconfig.MoveXrayClientsToTunnel(current, tunnel)
+		return nil
+	})
+}
+
+// commitRestore persists Restore+Apply as one transaction. On Apply error the
+// failover record is written back so a later Tick can retry instead of
+// guessing that clients are already on Xray. failSince and lastImport clear
+// only after Apply succeeds.
+func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
+	tunnel := failoverTunnel(cfg)
+	if w.UpdateVPN != nil {
+		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+			vpnconfig.RestoreXrayClientsFromFailover(current)
+			return nil
+		}); err != nil {
+			return false
+		}
+	}
+	if err := w.apply(); err != nil {
+		w.writeBackFailover(tunnel)
+		w.lastImport = time.Time{}
+		return false
+	}
+	w.pendingApply = false
+	w.failSince = time.Time{}
+	w.lastImport = time.Time{}
+	return true
 }
 
 func (w *Watch) notifyRefreshFailed(cfg *vpnconfig.VPNDirectorConfig) {

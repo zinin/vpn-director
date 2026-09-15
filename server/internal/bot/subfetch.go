@@ -16,6 +16,12 @@ import (
 const maxSubscriptionBody = 1 << 20
 
 func fetchSubscription(ctx context.Context, rawURL string, wan *http.Client, tunnel *http.Client) ([]byte, error) {
+	return fetchWANThenOptionalTunnel(ctx, rawURL, wan, func() *http.Client { return tunnel })
+}
+
+// fetchWANThenOptionalTunnel GETs via wan; on failure it builds the tunnel
+// client once and GETs through that only — it does not retry WAN.
+func fetchWANThenOptionalTunnel(ctx context.Context, rawURL string, wan *http.Client, tunnel func() *http.Client) ([]byte, error) {
 	body, err := getSubscription(ctx, wan, rawURL)
 	if err == nil {
 		return body, nil
@@ -23,7 +29,11 @@ func fetchSubscription(ctx context.Context, rawURL string, wan *http.Client, tun
 	if tunnel == nil {
 		return nil, err
 	}
-	return getSubscription(ctx, tunnel, rawURL)
+	c := tunnel()
+	if c == nil {
+		return nil, err
+	}
+	return getSubscription(ctx, c, rawURL)
 }
 
 func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
@@ -47,15 +57,9 @@ func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([
 
 func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) ([]byte, error) {
 	wan := ssrf.NewClient(10 * time.Second)
-	body, err := fetchSubscription(ctx, rawURL, wan, nil)
-	if err == nil {
-		return body, nil
-	}
-	tunnel := subscriptionTunnelClient(cfgSvc, vpnSvc)
-	if tunnel == nil {
-		return nil, err
-	}
-	return fetchSubscription(ctx, rawURL, wan, tunnel)
+	return fetchWANThenOptionalTunnel(ctx, rawURL, wan, func() *http.Client {
+		return subscriptionTunnelClient(cfgSvc, vpnSvc)
+	})
 }
 
 func subscriptionTunnelClient(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) *http.Client {

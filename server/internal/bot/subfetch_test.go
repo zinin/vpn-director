@@ -80,11 +80,14 @@ func TestFetchSubscription_WANErrorNilTunnel(t *testing.T) {
 }
 
 func TestFetchSubscription_WANErrorTunnelSuccess(t *testing.T) {
+	var wanHits, tunHits int
 	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wanHits++
 		http.Error(w, "wan-down", http.StatusBadGateway)
 	}))
 	t.Cleanup(wan.Close)
 	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tunHits++
 		_, _ = io.WriteString(w, "tun-body")
 	}))
 	t.Cleanup(tun.Close)
@@ -95,6 +98,69 @@ func TestFetchSubscription_WANErrorTunnelSuccess(t *testing.T) {
 	}
 	if string(body) != "tun-body" {
 		t.Fatalf("body %q, want tun-body", body)
+	}
+	if wanHits != 1 {
+		t.Fatalf("WAN hits %d, want 1", wanHits)
+	}
+	if tunHits != 1 {
+		t.Fatalf("tunnel hits %d, want 1", tunHits)
+	}
+}
+
+func TestFetchWANThenOptionalTunnel_DoesNotRetryWAN(t *testing.T) {
+	var wanHits, tunHits, factoryCalls int
+	wanErr := errors.New("wan down")
+	wan := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		wanHits++
+		return nil, wanErr
+	})}
+	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tunHits++
+		_, _ = io.WriteString(w, "tun-body")
+	}))
+	t.Cleanup(tun.Close)
+
+	body, err := fetchWANThenOptionalTunnel(context.Background(), "http://subscription.example/list", wan, func() *http.Client {
+		factoryCalls++
+		return hostClient(tun)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "tun-body" {
+		t.Fatalf("body %q, want tun-body", body)
+	}
+	if wanHits != 1 {
+		t.Fatalf("WAN hits %d; after WAN fails must not retry WAN", wanHits)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("tunnel factory %d, want 1", factoryCalls)
+	}
+	if tunHits != 1 {
+		t.Fatalf("tunnel hits %d, want 1", tunHits)
+	}
+}
+
+func TestFetchWANThenOptionalTunnel_SuccessSkipsTunnelFactory(t *testing.T) {
+	var factoryCalls int
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "wan-body")
+	}))
+	t.Cleanup(wan.Close)
+
+	body, err := fetchWANThenOptionalTunnel(context.Background(), wan.URL, hostClient(wan), func() *http.Client {
+		factoryCalls++
+		t.Error("tunnel factory must not run after a WAN success")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "wan-body" {
+		t.Fatalf("body %q", body)
+	}
+	if factoryCalls != 0 {
+		t.Fatalf("factory calls %d", factoryCalls)
 	}
 }
 

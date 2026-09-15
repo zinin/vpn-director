@@ -3,6 +3,7 @@ package subwatch
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 )
 
 var errProbe = errors.New("probe failed")
+var errApply = errors.New("apply failed")
 
 func contains(list []string, s string) bool {
 	for _, v := range list {
@@ -26,6 +28,7 @@ type fake struct {
 	cfg      *vpnconfig.VPNDirectorConfig
 	plat     vpnconfig.PlatformInfo
 	probeErr error
+	applyErr error
 	applies  int
 	notes    []string
 	now      time.Time
@@ -38,7 +41,10 @@ func (f *fake) watch() *Watch {
 		UpdateVPN: func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 			return fn(f.cfg)
 		},
-		Apply:  func() error { f.applies++; return nil },
+		Apply: func() error {
+			f.applies++
+			return f.applyErr
+		},
 		Probe:  func(context.Context, int) error { return f.probeErr },
 		Notify: func(msg string) { f.notes = append(f.notes, msg) },
 		Now:    func() time.Time { return f.now },
@@ -254,6 +260,9 @@ func TestTick_ImportAndRestoreOnLiveServer(t *testing.T) {
 	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
 		t.Fatal("foreign client")
 	}
+	if !w.lastImport.IsZero() {
+		t.Fatal("lastImport must reset on successful restore so a new death does not wait 5m")
+	}
 }
 
 func TestTick_SameNameDeadWalksList(t *testing.T) {
@@ -369,5 +378,168 @@ func TestTick_ImportRetryWaitsFiveMinutes(t *testing.T) {
 	w.Tick(context.Background())
 	if fetches != 2 {
 		t.Fatalf("after 5m fetches %d", fetches)
+	}
+}
+
+func failedOverCfg() *vpnconfig.VPNDirectorConfig {
+	cfg := baseCfg()
+	cfg.Xray.Failover = &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}}
+	cfg.Xray.Clients = []string{"192.168.1.9"}
+	cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	tun := cfg.TunnelDirector.Tunnels["ovpnc2"]
+	tun.Clients = []string{"192.168.1.3", "192.168.1.8"}
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = tun
+	return cfg
+}
+
+func liveImportWatch(f *fake) *Watch {
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10", "203.0.113.11"}},
+			{Name: "Backup", Address: "b.example", Port: 443, IPs: []string{"203.0.113.11", "198.51.100.8", ""}},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server) (bool, error) { return true, nil }
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error { return nil }
+	return w
+}
+
+func assertStillOnTunnel(t *testing.T, cfg *vpnconfig.VPNDirectorConfig) {
+	t.Helper()
+	if cfg.Xray.Failover == nil || cfg.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Fatalf("failover %+v", cfg.Xray.Failover)
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("client must stay on the tunnel")
+	}
+	if contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("JSON must not look restored")
+	}
+}
+
+func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:      time.Unix(1_700_000_000, 0),
+		applyErr: errApply,
+	}
+	w := liveImportWatch(f)
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want 1", f.applies)
+	}
+	for _, n := range f.notes {
+		if n == "LAN clients back on Xray; server Oslo" {
+			t.Fatalf("must not notify restore before Apply succeeds: %v", f.notes)
+		}
+	}
+
+	f.applyErr = nil
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("later Tick with Apply succeeding must restore")
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("client not restored")
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("added client still on tunnel")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("foreign client")
+	}
+	found := false
+	for _, n := range f.notes {
+		if n == "LAN clients back on Xray; server Oslo" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("notes %v", f.notes)
+	}
+	if !w.lastImport.IsZero() {
+		t.Fatal("lastImport must reset on successful restore")
+	}
+}
+
+func TestTick_MoveApplyFailureRetriesApply(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		applyErr: errApply,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	tickUntilDead(w, f)
+	assertStillOnTunnel(t, f.cfg)
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want 1", f.applies)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("must not notify moved until Apply succeeds: %v", f.notes)
+	}
+
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+	if f.applies != 2 {
+		t.Fatalf("later Tick must retry Apply, got %d", f.applies)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("still failing Apply: %v", f.notes)
+	}
+
+	f.applyErr = nil
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+	if f.applies != 3 {
+		t.Fatalf("applies %d, want 3", f.applies)
+	}
+	if len(f.notes) != 1 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+func TestTick_ImportSyncsXrayServers(t *testing.T) {
+	f := &fake{
+		cfg: failedOverCfg(),
+		now: time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10", "203.0.113.11"}},
+			{Name: "Backup", Address: "b.example", Port: 443, IPs: []string{"203.0.113.11", "198.51.100.8", ""}},
+		}, nil
+	}
+	w.Tick(context.Background())
+	want := []string{"198.51.100.8", "203.0.113.10", "203.0.113.11"}
+	if !reflect.DeepEqual(f.cfg.Xray.Servers, want) {
+		t.Fatalf("Xray.Servers %v, want %v", f.cfg.Xray.Servers, want)
+	}
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("Generate is nil; must stay failed over")
+	}
+}
+
+func TestUniqueServerIPs(t *testing.T) {
+	got := uniqueServerIPs([]vpnconfig.Server{
+		{IPs: []string{"2.2.2.2", "", "1.1.1.1"}},
+		{IPs: []string{"1.1.1.1", "3.3.3.3"}},
+	})
+	want := []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("%v, want %v", got, want)
+	}
+	if uniqueServerIPs(nil) == nil {
+		t.Fatal("empty result must be non-nil so JSON is []")
 	}
 }
