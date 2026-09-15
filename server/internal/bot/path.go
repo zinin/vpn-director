@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -131,27 +130,12 @@ func candidates(cfg *vpnconfig.VPNDirectorConfig, plat vpnconfig.PlatformInfo, s
 		idxByID = map[string]int{}
 	}
 	shift := markShift(cfg)
-	ids := make([]string, 0, len(cfg.TunnelDirector.Tunnels))
-	for id := range cfg.TunnelDirector.Tunnels {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
 	byID := make(map[string]vpnconfig.PlatformTunnel, len(plat.Tunnels))
 	for _, t := range plat.Tunnels {
 		byID[t.ID] = t
 	}
-	for _, id := range ids {
-		if id == "main" {
-			continue
-		}
-		tun := cfg.TunnelDirector.Tunnels[id]
-		if len(tun.Clients) == 0 {
-			continue
-		}
-		pt, ok := byID[id]
-		if !ok || !pt.Connected || pt.Iface == "" {
-			continue
-		}
+	for _, id := range vpnconfig.TDExits(cfg, plat) {
+		pt := byID[id]
 		var mark uint32
 		if idx, ok := idxByID[id]; ok {
 			mark = tunnelMark(idx, shift)

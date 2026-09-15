@@ -57,11 +57,13 @@ type TunnelDirectorConfig struct {
 }
 
 type XrayConfig struct {
-	Clients      []string      `json:"clients"`
-	Servers      []string      `json:"servers"`
-	ExcludeIPs   []string      `json:"exclude_ips"`
-	ExcludeSets  []string      `json:"exclude_sets"`
-	ActiveServer *ActiveServer `json:"active_server,omitempty"`
+	Clients         []string      `json:"clients"`
+	Servers         []string      `json:"servers"`
+	ExcludeIPs      []string      `json:"exclude_ips"`
+	ExcludeSets     []string      `json:"exclude_sets"`
+	ActiveServer    *ActiveServer `json:"active_server,omitempty"`
+	SubscriptionURL string        `json:"subscription_url,omitempty"`
+	Failover        *XrayFailover `json:"failover,omitempty"`
 }
 
 // ActiveServer records which server the generated Xray config was built from.

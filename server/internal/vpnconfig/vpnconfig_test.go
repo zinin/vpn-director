@@ -666,6 +666,39 @@ func TestXrayConfig_OmitsTheActiveServerUntilOneIsSelected(t *testing.T) {
 	}
 }
 
+func TestXrayConfig_PersistsSubscriptionURLAndFailover(t *testing.T) {
+	cfg := VPNDirectorConfig{
+		Xray: XrayConfig{
+			SubscriptionURL: "https://cdn.example/s/token",
+			Failover:        &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}},
+		},
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `"subscription_url":"https://cdn.example/s/token"`) {
+		t.Errorf("missing subscription_url: %s", s)
+	}
+	if !strings.Contains(s, `"failover"`) || !strings.Contains(s, `"ovpnc2"`) {
+		t.Errorf("missing failover: %s", s)
+	}
+	var got VPNDirectorConfig
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Xray.SubscriptionURL != cfg.Xray.SubscriptionURL {
+		t.Errorf("url %q", got.Xray.SubscriptionURL)
+	}
+	if got.Xray.Failover == nil || got.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Errorf("failover %+v", got.Xray.Failover)
+	}
+	if !reflect.DeepEqual(got.Xray.Failover.Clients, []string{"192.168.1.8"}) {
+		t.Errorf("failover clients %v", got.Xray.Failover.Clients)
+	}
+}
+
 // /api/config hands the whole file to the browser. The record identifies the
 // server to a reader and stops there: the UUID is the subscription credential
 // and has no business travelling with a display name.
