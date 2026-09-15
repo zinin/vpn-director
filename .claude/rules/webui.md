@@ -47,14 +47,14 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET | `/api/ip` | External IP |
 | GET | `/api/version` | Build version and commit |
 | GET | `/api/platform` | `vpn-director.sh platform`: firmware, password file, LAN/WAN interfaces, tunnels; 503 when the script cannot answer |
-| GET | `/api/servers` | Xray server list plus `active`, the recorded server |
-| POST | `/api/servers/active`, `/api/servers/import` | Select the active server, import a subscription |
+| GET | `/api/servers` | Xray server list plus `active`, the recorded server, and `subscription_saved` |
+| POST | `/api/servers/active`, `/api/servers/import` | Select the active server; import a subscription (`url` empty reuses the saved URL) |
 | GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config |
 | POST | `/api/clients/pause`, `/api/clients/resume` | Pause and resume a client |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |
 | GET/POST/DELETE | `/api/excludes/ips` | Excluded IPs and CIDRs |
 | GET | `/api/logs` | One source (`?source=`) or every source at once |
-| GET | `/api/config` | `vpn-director.json` with `jwt_secret` blanked |
+| GET | `/api/config` | `vpn-director.json` with `jwt_secret` and `subscription_url` blanked |
 | GET | `/api/update/check` | Latest release; `?force=1` pierces the 30-minute cache |
 | POST | `/api/update` | Starts the unified update, answers 202 |
 | GET | `/api/update/status` | Whether an update is running |
@@ -111,7 +111,8 @@ writes `servers.json` and `xray.servers`. All of them serialize on
   lockout.
 - `jwt_secret` is generated on first start when empty and written back under
   the config lock. It is never rewritten, which is what lets a login session
-  survive an update.
+  survive an update. `GET /api/config` blanks `jwt_secret` and `subscription_url`
+  (the latter is a secret: the subscription token sits in the path).
 - The file paths in `vpn-director.json` — `data_dir`, `webui.cert_file`,
   `webui.key_file` — are read against **the config file's own directory** when
   they are relative (`paths.Resolve`). They cannot be read against the working

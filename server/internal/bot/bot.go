@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"strconv"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/chatstore"
@@ -15,9 +17,12 @@ import (
 	"github.com/zinin/vpn-director/server/internal/paths"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/startup"
+	"github.com/zinin/vpn-director/server/internal/subwatch"
 	"github.com/zinin/vpn-director/server/internal/telegram"
 	"github.com/zinin/vpn-director/server/internal/updateflow"
 	"github.com/zinin/vpn-director/server/internal/updater"
+	"github.com/zinin/vpn-director/server/internal/vless"
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/wizard"
 )
 
@@ -32,6 +37,7 @@ type Bot struct {
 	updater     updater.Updater
 	chatStore   *chatstore.Store
 	pathManager *PathManager
+	subWatch    *subwatch.Watch
 	// apiBase is empty in production and set only by tests, where one local
 	// server answers both the path probe and the Telegram API, as one host
 	// does in production.
@@ -90,6 +96,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 
 	var httpClient *http.Client
 	var stopMonitor context.CancelFunc
+	var monitorCtx context.Context
 	if b.devMode {
 		httpClient = &http.Client{}
 	} else {
@@ -102,7 +109,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		pm.SelectOnce(ctx)
 		b.pathManager = pm
 		httpClient = NewPathClient(pm)
-		monitorCtx, stop := context.WithCancel(ctx)
+		var stop context.CancelFunc
+		monitorCtx, stop = context.WithCancel(ctx)
 		stopMonitor = stop
 		go pm.Start(monitorCtx)
 	}
@@ -129,6 +137,64 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	b.api = api
 	b.auth = NewAuth(cfg.AllowedUsers)
 	b.sender = sender
+
+	if !b.devMode {
+		sw := &subwatch.Watch{
+			LoadVPN:      configSvc.LoadVPNConfig,
+			LoadPlatform: vpnSvc.Platform,
+			UpdateVPN:    configSvc.UpdateVPNConfig,
+			Apply:        vpnSvc.Apply,
+			RestartXray:  vpnSvc.RestartXray,
+			SaveServers:  configSvc.SaveServers,
+			Generate: func(s vpnconfig.Server) (bool, error) {
+				cfg, err := configSvc.LoadVPNConfig()
+				if err != nil {
+					return false, err
+				}
+				ports := service.InboundPorts{}
+				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
+				return service.GenerateAndRecordActiveServer(configSvc, xraySvc, s, ports)
+			},
+			Probe: func(ctx context.Context, port int) error {
+				return subwatch.ProbeSOCKS(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), subwatch.ProbeURL)
+			},
+			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
+				body, err := b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
+				if err != nil {
+					return nil, err
+				}
+				parsed, _ := vless.DecodeSubscription(string(body))
+				if len(parsed) == 0 {
+					return nil, errors.New("no VLESS servers")
+				}
+				var resolved []vpnconfig.Server
+				for _, s := range parsed {
+					if err := s.ResolveIPs(); err != nil {
+						continue
+					}
+					resolved = append(resolved, s.ToVPNConfig())
+				}
+				if len(resolved) == 0 {
+					return nil, errors.New("could not resolve IP for any server")
+				}
+				return resolved, nil
+			},
+			Notify: func(msg string) {
+				if b.chatStore == nil || b.sender == nil {
+					return
+				}
+				users, err := b.chatStore.GetActiveUsers()
+				if err != nil {
+					return
+				}
+				for _, u := range users {
+					b.sender.SendPlain(u.ChatID, msg)
+				}
+			},
+		}
+		b.subWatch = sw
+		go sw.Start(monitorCtx)
+	}
 
 	// Create handler dependencies
 	deps := &handler.Deps{
@@ -201,6 +267,9 @@ func (b *Bot) RegisterCommands() error {
 func (b *Bot) Run(ctx context.Context) {
 	if b.pathManager != nil {
 		go b.pathManager.Start(ctx)
+	}
+	if b.subWatch != nil {
+		go b.subWatch.Start(ctx)
 	}
 	// b.chatStore is a typed nil in dev mode; assigning it straight into the
 	// interface would hand CheckAndSendNotify a non-nil interface over a nil

@@ -23,7 +23,8 @@ server/
 │   │   ├── probe.go          # One getMe over a given path; any HTTP status counts as live
 │   │   ├── transport.go      # DialPath, NewPathClient, SO_BINDTODEVICE
 │   │   ├── transport_linux.go # SO_BINDTODEVICE + SO_MARK socket control
-│   │   └── transport_other.go # Non-Linux stub that fails the dial
+│   │   ├── transport_other.go # Non-Linux stub that fails the dial
+│   │   └── subfetch.go       # Subscription fetch: WAN then DialPath tunnel
 │   ├── chatstore/            # Chat ID persistence
 │   │   └── store.go          # Thread-safe chat storage for notifications
 │   ├── config/               # Configuration
@@ -51,6 +52,9 @@ server/
 │   ├── ssrf/                 # Dial guard: refuse private and reserved addresses
 │   ├── startup/              # Startup notifications
 │   │   └── notify.go         # Post-update notification
+│   ├── subwatch/             # Xray outbound watch (SOCKS probe, failover, restore)
+│   │   ├── probe.go          # HTTPS 204 through Xray SOCKS
+│   │   └── watch.go          # Tick: arming, failover, import, restore
 │   ├── telegram/             # Telegram API helpers
 │   │   └── sender.go         # Message sending, escaping
 │   ├── updatechecker/        # Automatic update notifications
@@ -87,7 +91,7 @@ server/
 | `/status` | `StatusHandler.HandleStatus` | VPN Director status |
 | `/xray` | `XrayHandler.HandleXray` | Quick server switch |
 | `/servers` | `ServersHandler.HandleServers` | Server list (paginated) |
-| `/import <url>` | `ImportHandler.HandleImport` | Import VLESS subscription |
+| `/import [url]` | `ImportHandler.HandleImport` | Import VLESS subscription (saved URL if omitted) |
 | `/configure` | `WizardHandler.HandleConfigure` | Configuration wizard |
 | `/restart` | `StatusHandler.HandleRestart` | Restart VPN Director |
 | `/stop` | `StatusHandler.HandleStop` | Stop VPN Director |
@@ -163,6 +167,12 @@ Setup: `./setup_telegram_bot.sh`
 ## Telegram API transport
 
 The bot reaches `api.telegram.org` without a `proxy` setting. A selection cycle runs at startup, every 30s, and after a path failure. Every cycle probes **direct**, and probes the current path as well when that is not `direct`; the backups — Xray SOCKS on `advanced.xray.socks_port` (default 12346) when that port listens, then each `tunnel_director.tunnels` key except `main` that has clients and a connected platform iface, sorted by id — are probed only when a replacement is needed (direct dead and the current path dead or unset), stopping at the first live one. A tunnel socket gets `SO_BINDTODEVICE` **plus** the Tunnel Director `SO_MARK` derived from `/tmp/tunnel_director/tun_dir_tables`, so a tunnel path needs an applied Tunnel Director config; tunnel DNS queries `8.8.8.8` then `1.1.1.1` over the bound device instead of `resolv.conf`. When no path answers, a WARN lists every candidate with its reason. `--dev` is direct only. Leftover `proxy` / `proxy_fallback_direct` keys in old JSON are ignored.
+
+## Subscription watch
+
+Armed when `xray.subscription_url` is saved and there are effective Xray clients (after subtracting `paused_clients`) or a `xray.failover` record. `--dev` does not start it.
+
+Every 30s the bot probes `https://www.gstatic.com/generate_204` through Xray SOCKS (`127.0.0.1:<socks_port>`, default 12346). Success is HTTP 204. After 3 minutes of consecutive failures it moves those clients onto the first Tunnel Director exit (same filter as PathManager: not `main`, has clients, platform lists it connected with an iface; no Telegram probe), refreshes the saved subscription (SSRF WAN first, then `DialPath` through that tunnel), and tries the same `active_server.name` then the rest. A live SOCKS probe restores only the addresses that were moved. Telegram gets one message per state change (moved, no tunnel, refresh failed, no live server, restored). A failed import keeps `servers.json`.
 
 ## Automatic Update Notifications
 

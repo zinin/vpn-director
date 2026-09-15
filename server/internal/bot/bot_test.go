@@ -74,6 +74,21 @@ func TestNew_DevModeUsesPlainClientAndNoPathManager(t *testing.T) {
 	}
 }
 
+func TestNew_DevModeDoesNotStartWatch(t *testing.T) {
+	srv := newAPIServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, err := New(ctx, testConfig(), testPaths(t), "v0.0.0", "v0.0.0-test", "deadbee", "2026-01-01",
+		WithDevMode(devmode.NewExecutor()), withAPIBase(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.subWatch != nil {
+		t.Fatal("dev mode must not start the subscription watch")
+	}
+}
+
 func TestNew_ProductionUsesPathClientAndManager(t *testing.T) {
 	srv := newAPIServer(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -103,5 +118,8 @@ func TestNew_ProductionUsesPathClientAndManager(t *testing.T) {
 			t.Fatal("path monitor must start before getMe so a blackhole can fail over")
 		}
 		time.Sleep(time.Millisecond)
+	}
+	if b.subWatch == nil {
+		t.Fatal("production must start the subscription watch")
 	}
 }
