@@ -32,7 +32,7 @@ Commands:
 /status \- VPN Director status
 /xray \- quick server switch
 /servers \- server list
-/import \<url\> \- import servers
+/import \[url\] \- import servers
 /configure \- configuration
 /restart \- restart VPN Director
 /stop \- stop VPN Director

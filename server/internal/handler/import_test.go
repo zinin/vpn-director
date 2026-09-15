@@ -18,6 +18,7 @@ type mockConfigStoreForImport struct {
 	mockConfigStore
 	savedServers []vpnconfig.Server
 	dataDirVal   string
+	cfg          *vpnconfig.VPNDirectorConfig
 }
 
 func (m *mockConfigStoreForImport) SaveServers(servers []vpnconfig.Server) error {
@@ -30,6 +31,23 @@ func (m *mockConfigStoreForImport) DataDirOrDefault() string {
 		return m.dataDirVal
 	}
 	return "/data"
+}
+
+func (m *mockConfigStoreForImport) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) {
+	if m.cfg != nil {
+		return m.cfg, nil
+	}
+	return m.mockConfigStore.LoadVPNConfig()
+}
+
+func (m *mockConfigStoreForImport) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	if m.cfg == nil {
+		return m.mockConfigStore.UpdateVPNConfig(fn)
+	}
+	if err := fn(m.cfg); err != nil {
+		return err
+	}
+	return nil
 }
 
 func TestImportHandler_HandleImport_NoURL(t *testing.T) {
@@ -52,6 +70,69 @@ func TestImportHandler_HandleImport_NoURL(t *testing.T) {
 	}
 	if !strings.Contains(sender.lastText, "Usage") {
 		t.Errorf("expected usage message, got %q", sender.lastText)
+	}
+}
+
+func TestImportHandler_HandleImport_NoArgsUsesSavedURL(t *testing.T) {
+	vlessURL := "vless://test-uuid-1234@example.com:443?type=tcp#TestServer"
+	encoded := base64.StdEncoding.EncodeToString([]byte(vlessURL))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(encoded))
+	}))
+	defer server.Close()
+
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{dataDirVal: t.TempDir()}
+	config.cfg = &vpnconfig.VPNDirectorConfig{
+		Xray: vpnconfig.XrayConfig{SubscriptionURL: server.URL},
+	}
+	deps := &Deps{Sender: sender, Config: config}
+	h := NewImportHandler(deps)
+	h.httpClient = &http.Client{}
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 123},
+		Text: "/import",
+		Entities: []tgbotapi.MessageEntity{
+			{Type: "bot_command", Offset: 0, Length: 7},
+		},
+	}
+	h.HandleImport(msg)
+	if len(config.savedServers) == 0 {
+		t.Fatalf("expected import from saved URL, last message %q", sender.lastText)
+	}
+}
+
+func TestImportHandler_HandleImport_SavesPostedURL(t *testing.T) {
+	vlessURL := "vless://test-uuid-1234@example.com:443?type=tcp#TestServer"
+	encoded := base64.StdEncoding.EncodeToString([]byte(vlessURL))
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(encoded))
+	}))
+	defer server.Close()
+
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{
+		dataDirVal: t.TempDir(),
+		cfg:        &vpnconfig.VPNDirectorConfig{},
+	}
+	deps := &Deps{Sender: sender, Config: config}
+	h := NewImportHandler(deps)
+	h.httpClient = &http.Client{} // bypass SSRF guard to reach the loopback test server
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 789},
+		Text: "/import " + server.URL,
+		Entities: []tgbotapi.MessageEntity{
+			{Type: "bot_command", Offset: 0, Length: 7},
+		},
+	}
+	h.HandleImport(msg)
+
+	if config.cfg.Xray.SubscriptionURL != server.URL {
+		t.Fatalf("expected SubscriptionURL %q, got %q, last message %q",
+			server.URL, config.cfg.Xray.SubscriptionURL, sender.lastText)
 	}
 }
 

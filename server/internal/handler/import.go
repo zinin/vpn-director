@@ -38,13 +38,19 @@ func NewImportHandler(deps *Deps) *ImportHandler {
 // HandleImport handles /import command - downloads and imports VLESS subscription
 func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	args := msg.CommandArguments()
-	if args == "" {
-		h.deps.Sender.Send(msg.Chat.ID, "Usage: `/import <url>`")
+	fetchURL := args
+	if fetchURL == "" {
+		if cfg, err := h.deps.Config.LoadVPNConfig(); err == nil && cfg != nil {
+			fetchURL = cfg.Xray.SubscriptionURL
+		}
+	}
+	if fetchURL == "" {
+		h.deps.Sender.Send(msg.Chat.ID, "Usage: `/import [url]`")
 		return
 	}
 
 	// Validate URL scheme
-	parsedURL, err := url.Parse(args)
+	parsedURL, err := url.Parse(fetchURL)
 	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
 		h.deps.Sender.Send(msg.Chat.ID, "Invalid URL\\. Use http:// or https://")
 		return
@@ -53,7 +59,7 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	h.deps.Sender.Send(msg.Chat.ID, "Loading server list\\.\\.\\.")
 
 	// Download subscription
-	resp, err := h.httpClient.Get(args)
+	resp, err := h.httpClient.Get(fetchURL)
 	if err != nil {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Download error: %v", err)))
 		return
@@ -129,6 +135,9 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	// configure, and the wizard writes xray.servers itself.
 	err = h.deps.Config.UpdateVPNConfig(func(vpnCfg *vpnconfig.VPNDirectorConfig) error {
 		vpnCfg.Xray.Servers = serverIPs
+		if args != "" {
+			vpnCfg.Xray.SubscriptionURL = args
+		}
 		return nil
 	})
 	if err != nil && !errors.Is(err, service.ErrConfigLoad) {
