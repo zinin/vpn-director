@@ -38,7 +38,11 @@ func handleListServers(deps *Deps) http.HandlerFunc {
 		if cfg != nil {
 			active = cfg.Xray.ActiveServer
 		}
-		jsonOK(w, map[string]interface{}{"servers": servers, "active": active})
+		jsonOK(w, map[string]interface{}{
+			"servers":            servers,
+			"active":             active,
+			"subscription_saved": cfg != nil && cfg.Xray.SubscriptionURL != "",
+		})
 	}
 }
 
@@ -150,12 +154,14 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 			return
 		}
 
-		if req.URL == "" {
+		cfg, _ := deps.Config.LoadVPNConfig()
+		fetchURL, err := resolveSubscriptionURL(req.URL, cfg)
+		if err != nil {
 			jsonError(w, http.StatusBadRequest, "url is required")
 			return
 		}
 
-		parsed, err := url.Parse(req.URL)
+		parsed, err := url.Parse(fetchURL)
 		if err != nil {
 			jsonError(w, http.StatusBadRequest, "invalid URL")
 			return
@@ -178,7 +184,7 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		// Fetch the subscription with the SSRF-hardened client.
 		client := ssrf.NewClient(10 * time.Second)
 
-		resp, err := client.Get(req.URL)
+		resp, err := client.Get(fetchURL)
 		if err != nil {
 			jsonError(w, http.StatusBadGateway, downloadErrMessage(err))
 			return
@@ -235,7 +241,7 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		// servers.json is already saved here, so the message says so explicitly:
 		// the import partially persisted (servers stored, xray.servers stale) and
 		// the client must not read the 500 as "nothing changed".
-		if err := syncXrayServers(deps.Config, resolved); err != nil {
+		if err := syncXrayServers(deps.Config, resolved, req.URL); err != nil {
 			jsonError(w, http.StatusInternalServerError,
 				fmt.Sprintf("servers saved, but xray.servers sync failed: %s", err))
 			return
@@ -276,14 +282,32 @@ func collectServerIPs(servers []vpnconfig.Server) []string {
 	return ips
 }
 
+// resolveSubscriptionURL returns the posted URL, or the saved one when the
+// client re-imports with an empty url. An empty post and nothing saved is an
+// error: the import handler maps it to "url is required".
+func resolveSubscriptionURL(reqURL string, cfg *vpnconfig.VPNDirectorConfig) (string, error) {
+	if reqURL != "" {
+		return reqURL, nil
+	}
+	if cfg != nil && cfg.Xray.SubscriptionURL != "" {
+		return cfg.Xray.SubscriptionURL, nil
+	}
+	return "", errors.New("url is required")
+}
+
 // syncXrayServers updates xray.servers with the IPs of all given servers under
-// the config lock. The error is returned unwrapped: the only caller already
-// prefixes it with "xray.servers sync failed", and wrapping here produced
+// the config lock. A non-empty subscriptionURL is written in the same update;
+// an empty one leaves a previously saved link in place so a re-import does not
+// clear it. The error is returned unwrapped: the only caller already prefixes
+// it with "xray.servers sync failed", and wrapping here produced
 // "servers saved, but xray.servers sync failed: sync xray.servers: ..." in the
 // user's face.
-func syncXrayServers(config service.ConfigStore, servers []vpnconfig.Server) error {
+func syncXrayServers(config service.ConfigStore, servers []vpnconfig.Server, subscriptionURL string) error {
 	return config.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
 		cfg.Xray.Servers = collectServerIPs(servers)
+		if subscriptionURL != "" {
+			cfg.Xray.SubscriptionURL = subscriptionURL
+		}
 		return nil
 	})
 }

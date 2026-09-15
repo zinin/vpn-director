@@ -330,7 +330,7 @@ func TestSyncXrayServers_SaveError(t *testing.T) {
 		saveVPNCfgErr: errors.New("disk full"),
 	}
 
-	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}})
+	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
 
 	if err == nil {
 		t.Fatal("expected error when saving config fails, got nil")
@@ -340,7 +340,7 @@ func TestSyncXrayServers_SaveError(t *testing.T) {
 func TestSyncXrayServers_LoadError(t *testing.T) {
 	mc := &mockConfig{err: errors.New("load failed")}
 
-	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}})
+	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
 
 	if err == nil {
 		t.Fatal("expected error when LoadVPNConfig fails, got nil")
@@ -357,7 +357,7 @@ func TestSyncXrayServers_Success(t *testing.T) {
 	err := syncXrayServers(mc, []vpnconfig.Server{
 		{IPs: []string{"2.2.2.2"}},
 		{IPs: []string{"1.1.1.1"}},
-	})
+	}, "")
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -378,7 +378,7 @@ func TestSyncXrayServers_MissingConfigIsSurfaced(t *testing.T) {
 	// caller must learn about rather than read as success.
 	mc := &mockConfig{cfg: nil}
 
-	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}})
+	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
 
 	if !errors.Is(err, service.ErrConfigLoad) {
 		t.Fatalf("expected a service.ErrConfigLoad failure when config is absent, got %v", err)
@@ -532,5 +532,64 @@ func TestHandleListServers_ActiveIsNullWhenNothingIsRecorded(t *testing.T) {
 	}
 	if got, ok := resp["active"]; !ok || string(got) != "null" {
 		t.Errorf("active = %s (present: %v), want null", got, ok)
+	}
+}
+
+func TestHandleListServers_SubscriptionSaved(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.Config = &mockConfig{
+		servers: []vpnconfig.Server{{Name: "S", Address: "a.example", Port: 443}},
+		cfg: &vpnconfig.VPNDirectorConfig{
+			Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://cdn.example/s/token"},
+		},
+	}
+	rec := httptest.NewRecorder()
+	handleListServers(deps).ServeHTTP(rec, httptest.NewRequest("GET", "/api/servers", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		SubscriptionSaved bool `json:"subscription_saved"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatal(err)
+	}
+	if !resp.SubscriptionSaved {
+		t.Fatal("expected subscription_saved")
+	}
+	if strings.Contains(rec.Body.String(), "cdn.example") {
+		t.Fatal("URL leaked")
+	}
+}
+
+func TestResolveSubscriptionURL(t *testing.T) {
+	cfg := &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://saved.example/s/a"}}
+	got, err := resolveSubscriptionURL("https://new.example/s/b", cfg)
+	if err != nil || got != "https://new.example/s/b" {
+		t.Fatalf("posted URL: %q %v", got, err)
+	}
+	got, err = resolveSubscriptionURL("", cfg)
+	if err != nil || got != "https://saved.example/s/a" {
+		t.Fatalf("saved: %q %v", got, err)
+	}
+	_, err = resolveSubscriptionURL("", &vpnconfig.VPNDirectorConfig{})
+	if err == nil {
+		t.Fatal("want error when nothing saved")
+	}
+}
+
+func TestSyncXrayServers_WritesSubscriptionURL(t *testing.T) {
+	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+	if err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "https://cdn.example/s/token"); err != nil {
+		t.Fatal(err)
+	}
+	if mc.savedCfg.Xray.SubscriptionURL != "https://cdn.example/s/token" {
+		t.Fatalf("got %q", mc.savedCfg.Xray.SubscriptionURL)
+	}
+	if err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if mc.savedCfg.Xray.SubscriptionURL != "https://cdn.example/s/token" {
+		t.Fatal("empty url must not clear the saved link")
 	}
 }
