@@ -5,6 +5,7 @@ import type { ActiveServer, Server } from '../types'
 
 const servers = ref<Server[]>([])
 const active = ref<ActiveServer | null>(null)
+const subscriptionSaved = ref(false)
 const loading = ref(false)
 const importLoading = ref(false)
 const selectLoading = ref(-1)
@@ -18,6 +19,7 @@ async function loadServers() {
     const resp = await api.getServers()
     servers.value = resp.data.servers ?? []
     active.value = resp.data.active ?? null
+    subscriptionSaved.value = !!resp.data.subscription_saved
   } catch (e: any) {
     error.value = e.response?.data?.error || e.message
   } finally {
@@ -51,7 +53,7 @@ async function selectServer(index: number) {
 }
 
 async function importServers() {
-  if (!importUrl.value) {
+  if (!importUrl.value && !subscriptionSaved.value) {
     alert('Please enter a subscription URL')
     return
   }
@@ -80,6 +82,13 @@ onMounted(loadServers)
       <input v-model="importUrl" type="text" placeholder="https://... subscription URL" style="flex: 1; min-width: 200px;" />
       <button class="btn btn-primary" :disabled="importLoading || !importUrl" @click="importServers">
         {{ importLoading ? '...' : '⬇ Import' }}
+      </button>
+      <button
+        class="btn btn-blue"
+        :disabled="importLoading || !subscriptionSaved"
+        @click="importUrl = ''; importServers()"
+      >
+        {{ importLoading ? '...' : '⬇ Re-import saved' }}
       </button>
     </div>
 

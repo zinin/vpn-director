@@ -72,6 +72,7 @@ export default {
     api.get<ServersResponse>('/api/servers'),
   selectServer: (index: number) =>
     api.post<OkResponse>('/api/servers/active', { index }),
+  // Empty url reuses xray.subscription_url on the server.
   importServers: (url: string) =>
     api.post<ImportResponse>('/api/servers/import', { url }),
 

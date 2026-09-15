@@ -66,6 +66,7 @@ export interface ActiveServer {
 export interface ServersResponse {
   servers: Server[] | null
   active: ActiveServer | null
+  subscription_saved?: boolean
 }
 
 export interface ClientsResponse {
