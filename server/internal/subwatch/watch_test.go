@@ -181,3 +181,193 @@ func TestTick_FailoverPresentSkipsHealthyProbeRestore(t *testing.T) {
 		t.Fatal("live SOCKS must not restore")
 	}
 }
+
+func TestPickOrder_SameNameFirst(t *testing.T) {
+	in := []vpnconfig.Server{
+		{Name: "A", Address: "1.example"},
+		{Name: "Oslo", Address: "2.example"},
+		{Name: "B", Address: "3.example"},
+	}
+	got := pickOrder(in, "Oslo")
+	if got[0].Name != "Oslo" || got[1].Name != "A" || got[2].Name != "B" {
+		t.Fatalf("%v", got)
+	}
+	got = pickOrder(in, "missing")
+	if got[0].Name != "A" {
+		t.Fatal("keep list order")
+	}
+}
+
+func TestTick_ImportAndRestoreOnLiveServer(t *testing.T) {
+	f := &fake{
+		cfg:  baseCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	f.probeErr = errProbe
+	saved := 0
+	generated := []string{}
+	liveAfter := ""
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { saved++; return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "new.example", Port: 443},
+			{Name: "Backup", Address: "b.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		generated = append(generated, s.Name)
+		liveAfter = s.Name
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if liveAfter == "Oslo" && f.cfg.Xray.Failover != nil {
+			return nil
+		}
+		return f.probeErr
+	}
+	start := f.now
+	for f.now.Sub(start) <= DeadAfter {
+		w.Tick(context.Background())
+		f.now = f.now.Add(ProbeInterval)
+	}
+	w.Tick(context.Background()) // the tick that crosses DeadAfter
+	if saved != 1 {
+		t.Fatalf("saved %d", saved)
+	}
+	if len(generated) < 1 || generated[0] != "Oslo" {
+		t.Fatalf("generate %v", generated)
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("should have restored")
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("client not restored")
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("added client still on tunnel")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("foreign client")
+	}
+}
+
+func TestTick_SameNameDeadWalksList(t *testing.T) {
+	f := &fake{
+		cfg:  baseCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	f.probeErr = errProbe
+	generated := []string{}
+	liveAfter := ""
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "new.example", Port: 443},
+			{Name: "Backup", Address: "b.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		generated = append(generated, s.Name)
+		liveAfter = s.Name
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if liveAfter == "Backup" {
+			return nil
+		}
+		return f.probeErr
+	}
+	tickUntilDead(w, f)
+	if len(generated) != 2 || generated[0] != "Oslo" || generated[1] != "Backup" {
+		t.Fatalf("generate %v", generated)
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("should have restored")
+	}
+	want := "LAN clients back on Xray; server Backup"
+	found := false
+	for _, n := range f.notes {
+		if n == want {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+func TestTick_FailedFetchDoesNotSave(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	saved := 0
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { saved++; return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return nil, errors.New("cdn down")
+	}
+	tickUntilDead(w, f)
+	if saved != 0 {
+		t.Fatalf("saved %d", saved)
+	}
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("should stay failed over")
+	}
+	want := "Subscription refresh failed; still on tunnel:ovpnc2"
+	if len(f.notes) == 0 || f.notes[len(f.notes)-1] != want {
+		t.Fatalf("notes %v", f.notes)
+	}
+	w.Tick(context.Background())
+	n := 0
+	for _, msg := range f.notes {
+		if msg == want {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("duplicate notify %v", f.notes)
+	}
+}
+
+func TestTick_ImportRetryWaitsFiveMinutes(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	fetches := 0
+	w := f.watch()
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("cdn down")
+	}
+	tickUntilDead(w, f)
+	if fetches != 1 {
+		t.Fatalf("first dead tick fetches %d", fetches)
+	}
+	f.now = f.now.Add(4 * time.Minute)
+	w.Tick(context.Background())
+	if fetches != 1 {
+		t.Fatalf("after 4m fetches %d", fetches)
+	}
+	f.now = f.now.Add(time.Minute)
+	w.Tick(context.Background())
+	if fetches != 2 {
+		t.Fatalf("after 5m fetches %d", fetches)
+	}
+}

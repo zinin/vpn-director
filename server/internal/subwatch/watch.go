@@ -20,8 +20,13 @@ const (
 )
 
 const (
-	msgMoved    = "Xray outbound is down; LAN clients moved to %s"
-	msgNoTunnel = "Xray outbound is down; no Tunnel Director fallback"
+	msgMoved           = "Xray outbound is down; LAN clients moved to %s"
+	msgNoTunnel        = "Xray outbound is down; no Tunnel Director fallback"
+	msgRefreshFailed   = "Subscription refresh failed"
+	msgRefreshFailedOn = "Subscription refresh failed; still on tunnel:%s"
+	msgNoLive          = "No live server in the subscription"
+	msgNoLiveOn        = "No live server in the subscription; still on tunnel:%s"
+	msgRestored        = "LAN clients back on Xray; server %s"
 )
 
 type noteKind int
@@ -30,6 +35,9 @@ const (
 	noteNone noteKind = iota
 	noteMoved
 	noteNoTunnel
+	noteRefreshFailed
+	noteNoLive
+	noteRestored
 )
 
 type Watch struct {
@@ -97,6 +105,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		return
 	}
 	if cfg.Xray.Failover != nil {
+		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
 
@@ -128,6 +137,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	id := vpnconfig.FirstTDExit(cfg, plat)
 	if id == "" {
 		w.notify(noteNoTunnel, msgNoTunnel)
+		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
 	if w.UpdateVPN == nil {
@@ -145,6 +155,121 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 	}
 	w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
+	if reloaded, err := w.LoadVPN(); err == nil {
+		cfg = reloaded
+	}
+	w.maybeImportAndPick(ctx, cfg)
+}
+
+func pickOrder(servers []vpnconfig.Server, activeName string) []vpnconfig.Server {
+	if activeName == "" {
+		return servers
+	}
+	var first, rest []vpnconfig.Server
+	seen := false
+	for _, s := range servers {
+		if !seen && s.Name == activeName {
+			first = append(first, s)
+			seen = true
+			continue
+		}
+		rest = append(rest, s)
+	}
+	return append(first, rest...)
+}
+
+func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
+	if cfg == nil || cfg.Xray.Failover == nil {
+		return ""
+	}
+	return cfg.Xray.Failover.Tunnel
+}
+
+func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
+	if w.Fetch == nil {
+		return
+	}
+	now := w.Now()
+	if !w.lastImport.IsZero() && now.Sub(w.lastImport) < ImportRetry {
+		return
+	}
+	w.lastImport = now
+
+	url := ""
+	if cfg != nil {
+		url = cfg.Xray.SubscriptionURL
+	}
+	servers, err := w.Fetch(ctx, url)
+	if err != nil || len(servers) == 0 {
+		w.notifyRefreshFailed(cfg)
+		return
+	}
+	if w.SaveServers != nil {
+		if err := w.SaveServers(servers); err != nil {
+			w.notifyRefreshFailed(cfg)
+			return
+		}
+	}
+	if w.Generate == nil {
+		return
+	}
+
+	activeName := ""
+	if cfg != nil && cfg.Xray.ActiveServer != nil {
+		activeName = cfg.Xray.ActiveServer.Name
+	}
+	_, socks := vpnconfig.XrayInboundPorts(cfg)
+	if socks == 0 {
+		socks = defaultSOCKSPort
+	}
+	for _, s := range pickOrder(servers, activeName) {
+		generated, _ := w.Generate(s)
+		if !generated {
+			continue
+		}
+		if w.RestartXray != nil {
+			if err := w.RestartXray(); err != nil {
+				continue
+			}
+		}
+		w.AfterRestart(SettleAfterRestart)
+		if err := w.Probe(ctx, socks); err != nil {
+			continue
+		}
+		w.failSince = time.Time{}
+		if w.UpdateVPN != nil {
+			if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+				vpnconfig.RestoreXrayClientsFromFailover(current)
+				return nil
+			}); err != nil {
+				return
+			}
+		}
+		if w.Apply != nil {
+			if err := w.Apply(); err != nil {
+				return
+			}
+		}
+		w.notify(noteRestored, fmt.Sprintf(msgRestored, s.Name))
+		return
+	}
+	w.notifyNoLive(cfg)
+}
+
+func (w *Watch) notifyRefreshFailed(cfg *vpnconfig.VPNDirectorConfig) {
+	if id := failoverTunnel(cfg); id != "" {
+		w.notify(noteRefreshFailed, fmt.Sprintf(msgRefreshFailedOn, id))
+		return
+	}
+	w.notify(noteRefreshFailed, msgRefreshFailed)
+}
+
+func (w *Watch) notifyNoLive(cfg *vpnconfig.VPNDirectorConfig) {
+	if id := failoverTunnel(cfg); id != "" {
+		w.notify(noteNoLive, fmt.Sprintf(msgNoLiveOn, id))
+		return
+	}
+	w.notify(noteNoLive, msgNoLive)
 }
 
 func (w *Watch) applyDefaults() {
