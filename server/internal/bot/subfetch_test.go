@@ -194,17 +194,13 @@ func TestFetchSubscription_CapsBody(t *testing.T) {
 		_, _ = w.Write(bytes.Repeat([]byte("A"), (1<<20)+64))
 	}))
 	t.Cleanup(wan.Close)
-	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Error("tunnel must not run when WAN returns 200")
-	}))
-	t.Cleanup(tun.Close)
 
-	body, err := fetchSubscription(context.Background(), wan.URL, hostClient(wan), hostClient(tun))
-	if err != nil {
-		t.Fatal(err)
+	body, err := fetchSubscription(context.Background(), wan.URL, hostClient(wan), nil)
+	if err == nil || !strings.Contains(err.Error(), "subscription body exceeds 1 MiB") {
+		t.Fatalf("err %v, want the 1 MiB cap", err)
 	}
-	if len(body) != 1<<20 {
-		t.Fatalf("body length %d, want %d", len(body), 1<<20)
+	if body != nil {
+		t.Fatalf("an oversized list must not come back truncated, got %d bytes", len(body))
 	}
 }
 

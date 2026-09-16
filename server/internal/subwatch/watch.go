@@ -2,8 +2,11 @@ package subwatch
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"sync"
@@ -28,6 +31,7 @@ const (
 	msgNoLive          = "No live server in the subscription"
 	msgNoLiveOn        = "No live server in the subscription; still on tunnel:%s"
 	msgRestored        = "LAN clients back on Xray; server %s"
+	msgPicked          = "Subscription refreshed; selected server %s"
 )
 
 type noteKind int
@@ -58,7 +62,6 @@ type Watch struct {
 	mu           sync.Mutex
 	failSince    time.Time // zero => last probe succeeded
 	lastImport   time.Time
-	lastNote     string
 	lastNoteKind noteKind
 	pendingApply bool // JSON mutated; Apply has not yet succeeded
 	running      bool
@@ -101,16 +104,21 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	cfg, err := w.LoadVPN()
 	if err != nil {
+		slog.Warn("Failed to load VPN Director config for the subscription watch", "error", err)
 		return
 	}
 	if !vpnconfig.Armed(cfg) {
+		w.failSince = time.Time{}
 		return
 	}
 	if cfg.Xray.Failover != nil {
 		if w.pendingApply {
-			if err := w.apply(); err == nil {
+			if err := w.apply(); err != nil {
+				slog.Warn("Apply retry after moving Xray clients failed", "error", err)
+			} else {
 				w.pendingApply = false
 				if id := failoverTunnel(cfg); id != "" {
+					slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", len(cfg.Xray.Failover.Clients))
 					w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 				}
 			}
@@ -123,9 +131,9 @@ func (w *Watch) Tick(ctx context.Context) {
 	if socks == 0 {
 		socks = defaultSOCKSPort
 	}
-	if err := w.Probe(ctx, socks); err == nil {
+	err = w.Probe(ctx, socks)
+	if err == nil {
 		w.failSince = time.Time{}
-		w.lastNote = ""
 		w.lastNoteKind = noteNone
 		return
 	}
@@ -135,17 +143,29 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.failSince = now
 	}
 	if now.Sub(w.failSince) < DeadAfter {
+		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, "error", err)
 		return
+	}
+	// With no tunnel to move to, every later tick comes back here: log the
+	// transition only until the user has been told there is no fallback.
+	announce := w.lastNoteKind != noteNoTunnel
+	if announce {
+		slog.Info("Xray outbound declared dead", "socks_port", socks, "error", err)
 	}
 
 	var plat vpnconfig.PlatformInfo
 	if w.LoadPlatform != nil {
-		if p, err := w.LoadPlatform(); err == nil {
+		if p, err := w.LoadPlatform(); err != nil {
+			slog.Warn("Failed to read platform info for the Xray failover", "error", err)
+		} else {
 			plat = p
 		}
 	}
 	id := vpnconfig.FirstTDExit(cfg, plat)
 	if id == "" {
+		if announce {
+			slog.Info("No Tunnel Director fallback for Xray clients")
+		}
 		w.notify(noteNoTunnel, msgNoTunnel)
 		w.maybeImportAndPick(ctx, cfg)
 		return
@@ -153,17 +173,25 @@ func (w *Watch) Tick(ctx context.Context) {
 	if w.UpdateVPN == nil {
 		return
 	}
+	movedClients := 0
 	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
 		vpnconfig.MoveXrayClientsToTunnel(current, id)
+		if current.Xray.Failover == nil {
+			return fmt.Errorf("tunnel %s no longer configured", id)
+		}
+		movedClients = len(current.Xray.Failover.Clients)
 		return nil
 	}); err != nil {
+		slog.Warn("Failed to move Xray clients to Tunnel Director", "tunnel", id, "error", err)
 		return
 	}
 	if err := w.apply(); err != nil {
+		slog.Warn("Apply after moving Xray clients failed", "tunnel", id, "error", err)
 		w.pendingApply = true
 		return
 	}
 	w.pendingApply = false
+	slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", movedClients)
 	w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 	if reloaded, err := w.LoadVPN(); err == nil {
 		cfg = reloaded
@@ -205,26 +233,36 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	}
 	w.lastImport = now
 
-	url := ""
+	rawURL := ""
 	if cfg != nil {
-		url = cfg.Xray.SubscriptionURL
+		rawURL = cfg.Xray.SubscriptionURL
 	}
-	servers, err := w.Fetch(ctx, url)
+	servers, err := w.Fetch(ctx, rawURL)
 	if err != nil || len(servers) == 0 {
+		// A *url.Error carries the whole subscription URL, token included.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		slog.Warn("Subscription refresh failed", "servers", len(servers), "error", err)
 		w.notifyRefreshFailed(cfg)
 		return
 	}
 	if w.SaveServers != nil {
 		if err := w.SaveServers(servers); err != nil {
+			slog.Warn("Failed to save the refreshed subscription servers", "error", err)
 			w.notifyRefreshFailed(cfg)
 			return
 		}
 	}
+	slog.Info("Subscription refreshed", "servers", len(servers))
 	if w.UpdateVPN != nil {
-		_ = w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
 			current.Xray.Servers = uniqueServerIPs(servers)
 			return nil
-		})
+		}); err != nil {
+			slog.Warn("Failed to sync xray.servers after the subscription refresh", "error", err)
+		}
 	}
 	if w.Generate == nil {
 		return
@@ -238,26 +276,42 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	if socks == 0 {
 		socks = defaultSOCKSPort
 	}
+	tried := 0
 	for _, s := range pickOrder(servers, activeName) {
-		generated, _ := w.Generate(s)
+		generated, err := w.Generate(s)
+		if err != nil || !generated {
+			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, "error", err)
+		}
 		if !generated {
 			continue
 		}
+		tried++
 		if w.RestartXray != nil {
 			if err := w.RestartXray(); err != nil {
+				slog.Debug("Xray restart failed", "server", s.Name, "error", err)
 				continue
 			}
 		}
 		w.AfterRestart(SettleAfterRestart)
 		if err := w.Probe(ctx, socks); err != nil {
+			slog.Debug("Subscription server probe failed", "server", s.Name, "error", err)
 			continue
 		}
+		slog.Info("Subscription server picked", "server", s.Name)
+		// Only a watch that moved clients has anything to bring back to Xray.
+		moved := failoverTunnel(cfg) != ""
 		if !w.commitRestore(cfg) {
 			return
 		}
-		w.notify(noteRestored, fmt.Sprintf(msgRestored, s.Name))
+		if moved {
+			slog.Info("Xray clients restored", "server", s.Name)
+			w.notify(noteRestored, fmt.Sprintf(msgRestored, s.Name))
+		} else {
+			w.notify(noteRestored, fmt.Sprintf(msgPicked, s.Name))
+		}
 		return
 	}
+	slog.Info("No live server in the subscription", "tried", tried)
 	w.notifyNoLive(cfg)
 }
 
@@ -289,10 +343,12 @@ func (w *Watch) writeBackFailover(tunnel string) {
 	if tunnel == "" || w.UpdateVPN == nil {
 		return
 	}
-	_ = w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
 		vpnconfig.MoveXrayClientsToTunnel(current, tunnel)
 		return nil
-	})
+	}); err != nil {
+		slog.Warn("Failed to write the Xray failover back", "tunnel", tunnel, "error", err)
+	}
 }
 
 // commitRestore persists Restore+Apply as one transaction. On Apply error the
@@ -306,10 +362,12 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 			vpnconfig.RestoreXrayClientsFromFailover(current)
 			return nil
 		}); err != nil {
+			slog.Warn("Failed to restore Xray clients from the failover", "error", err)
 			return false
 		}
 	}
 	if err := w.apply(); err != nil {
+		slog.Warn("Apply after restoring Xray clients failed", "error", err)
 		w.writeBackFailover(tunnel)
 		return false
 	}
@@ -354,7 +412,6 @@ func (w *Watch) notify(kind noteKind, msg string) {
 		return
 	}
 	w.lastNoteKind = kind
-	w.lastNote = msg
 	if w.Notify != nil {
 		w.Notify(msg)
 	}

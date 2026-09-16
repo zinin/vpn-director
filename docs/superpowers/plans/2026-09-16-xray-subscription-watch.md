@@ -75,6 +75,6 @@ Post-plan fix wave (final review): `3b85ab7` — keep failover until Apply succe
 
 ## Self-review
 
-**Spec coverage:** Tasks 1–8 map to spec §§4–15 as originally written. Residual after final review: `lastImport` cleared on failed restore-Apply (`watch.go:314`) — see continuation prompt.
+**Spec coverage:** Tasks 1–8 map to spec §§4–15 as originally written. The final-review residual (`lastImport` cleared on a failed restore-Apply) is fixed in `80444cd`.
 
 **Note for executors:** Spec §13 says "six consecutive failed probes"; §5 says 3 minutes. Code implements `>= DeadAfter` (3 minutes).

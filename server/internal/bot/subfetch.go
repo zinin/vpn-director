@@ -2,10 +2,13 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/service"
@@ -33,6 +36,12 @@ func fetchWANThenOptionalTunnel(ctx context.Context, rawURL string, wan *http.Cl
 	if c == nil {
 		return nil, err
 	}
+	// A *url.Error carries the whole subscription URL, token included.
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+	}
+	slog.Debug("Subscription fetch over WAN failed, trying the tunnel", "error", err)
 	return getSubscription(ctx, c, rawURL)
 }
 
@@ -40,6 +49,7 @@ func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([
 	if client == nil {
 		return nil, fmt.Errorf("no http client")
 	}
+	defer client.CloseIdleConnections()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, err
@@ -52,7 +62,15 @@ func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBody))
+	// One byte past the cap tells a truncated list from one that fits exactly.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBody+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxSubscriptionBody {
+		return nil, fmt.Errorf("subscription body exceeds 1 MiB")
+	}
+	return body, nil
 }
 
 func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) ([]byte, error) {

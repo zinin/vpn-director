@@ -3,6 +3,9 @@ package handler
 
 import (
 	"encoding/base64"
+	"errors"
+	"fmt"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -100,6 +103,70 @@ func TestImportHandler_HandleImport_NoArgsUsesSavedURL(t *testing.T) {
 	h.HandleImport(msg)
 	if len(config.savedServers) == 0 {
 		t.Fatalf("expected import from saved URL, last message %q", sender.lastText)
+	}
+	if config.cfg.Xray.SubscriptionURL != server.URL {
+		t.Fatalf("SubscriptionURL %q, want the saved %q kept", config.cfg.Xray.SubscriptionURL, server.URL)
+	}
+}
+
+// failingTransport fails every request the way an unreachable host does.
+type failingTransport struct{ err error }
+
+func (t failingTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, t.err }
+
+func TestImportHandler_HandleImport_DownloadErrorHidesSavedURL(t *testing.T) {
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{
+		cfg: &vpnconfig.VPNDirectorConfig{
+			Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://cdn.example/s/SECRET-TOKEN"},
+		},
+	}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = &http.Client{Transport: failingTransport{err: errors.New("connection refused")}}
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 123},
+		Text: "/import",
+		Entities: []tgbotapi.MessageEntity{
+			{Type: "bot_command", Offset: 0, Length: 7},
+		},
+	}
+	h.HandleImport(msg)
+
+	if !strings.Contains(sender.lastText, "Download error") {
+		t.Fatalf("expected a download error, got %q", sender.lastText)
+	}
+	// The text is MarkdownV2-escaped, so a leaked token reads SECRET\-TOKEN.
+	if strings.Contains(sender.lastText, "SECRET") {
+		t.Fatalf("download error leaked the saved URL: %q", sender.lastText)
+	}
+}
+
+func TestImportHandler_HandleImport_NoArgsConfigLoadError(t *testing.T) {
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 123},
+		Text: "/import",
+		Entities: []tgbotapi.MessageEntity{
+			{Type: "bot_command", Offset: 0, Length: 7},
+		},
+	}
+
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{mockConfigStore: mockConfigStore{
+		err: errors.New("invalid character 'x' looking for beginning of value"),
+	}}
+	NewImportHandler(&Deps{Sender: sender, Config: config}).HandleImport(msg)
+	if !strings.Contains(sender.lastText, "Config load error") {
+		t.Fatalf("expected the load error, got %q", sender.lastText)
+	}
+
+	// A missing vpn-director.json is not an error: /import works before configure.
+	sender = &mockSender{}
+	config = &mockConfigStoreForImport{mockConfigStore: mockConfigStore{
+		err: fmt.Errorf("open vpn-director.json: %w", fs.ErrNotExist),
+	}}
+	NewImportHandler(&Deps{Sender: sender, Config: config}).HandleImport(msg)
+	if !strings.Contains(sender.lastText, "Usage") {
+		t.Fatalf("expected usage message for a missing config, got %q", sender.lastText)
 	}
 }
 

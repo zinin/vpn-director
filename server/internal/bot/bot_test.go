@@ -5,10 +5,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/zinin/vpn-director/server/internal/chatstore"
 	"github.com/zinin/vpn-director/server/internal/config"
 	"github.com/zinin/vpn-director/server/internal/devmode"
 	"github.com/zinin/vpn-director/server/internal/paths"
@@ -121,5 +125,55 @@ func TestNew_ProductionUsesPathClientAndManager(t *testing.T) {
 	}
 	if b.subWatch == nil {
 		t.Fatal("production must start the subscription watch")
+	}
+}
+
+type sentPlain struct {
+	chatID int64
+	text   string
+}
+
+// recordingSender keeps every SendPlain; the rest of MessageSender is unused.
+type recordingSender struct {
+	plain []sentPlain
+}
+
+func (s *recordingSender) Send(int64, string) error { return nil }
+func (s *recordingSender) SendPlain(chatID int64, text string) error {
+	s.plain = append(s.plain, sentPlain{chatID: chatID, text: text})
+	return nil
+}
+func (s *recordingSender) SendLongPlain(int64, string) error { return nil }
+func (s *recordingSender) SendWithKeyboard(int64, string, tgbotapi.InlineKeyboardMarkup) error {
+	return nil
+}
+func (s *recordingSender) SendCodeBlock(int64, string, string) error { return nil }
+func (s *recordingSender) EditMessage(int64, int, string, tgbotapi.InlineKeyboardMarkup) error {
+	return nil
+}
+func (s *recordingSender) AckCallback(string) error { return nil }
+
+func TestNotifyActiveChats_AuthorizedOncePerChat(t *testing.T) {
+	store := chatstore.New(filepath.Join(t.TempDir(), "chats.json"))
+	for _, rec := range []struct {
+		username string
+		chatID   int64
+	}{
+		{"mallory", 200},
+		{"alice", 100},
+		{"alice_renamed", 100},
+	} {
+		if err := store.RecordInteraction(rec.username, rec.chatID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sender := &recordingSender{}
+	b := &Bot{auth: NewAuth([]string{"alice", "alice_renamed"}), sender: sender, chatStore: store}
+
+	b.notifyActiveChats("Xray outbound is down")
+
+	want := []sentPlain{{chatID: 100, text: "Xray outbound is down"}}
+	if !reflect.DeepEqual(sender.plain, want) {
+		t.Fatalf("sent %+v, want %+v", sender.plain, want)
 	}
 }

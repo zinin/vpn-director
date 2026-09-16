@@ -179,21 +179,9 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				}
 				return resolved, nil
 			},
-			Notify: func(msg string) {
-				if b.chatStore == nil || b.sender == nil {
-					return
-				}
-				users, err := b.chatStore.GetActiveUsers()
-				if err != nil {
-					return
-				}
-				for _, u := range users {
-					b.sender.SendPlain(u.ChatID, msg)
-				}
-			},
+			Notify: b.notifyActiveChats,
 		}
 		b.subWatch = sw
-		go sw.Start(monitorCtx)
 	}
 
 	// Create handler dependencies
@@ -233,6 +221,30 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	b.router = router
 
 	return b, nil
+}
+
+// notifyActiveChats sends msg to every active chat whose user is still in
+// allowed_users, once per ChatID: one person who renamed their handle is two
+// chatstore records with one ChatID.
+func (b *Bot) notifyActiveChats(msg string) {
+	if b.chatStore == nil || b.sender == nil {
+		return
+	}
+	users, err := b.chatStore.GetActiveUsers()
+	if err != nil {
+		return
+	}
+	seen := make(map[int64]struct{}, len(users))
+	for _, u := range users {
+		if b.auth == nil || !b.auth.IsAuthorized(u.Username) {
+			continue
+		}
+		if _, dup := seen[u.ChatID]; dup {
+			continue
+		}
+		seen[u.ChatID] = struct{}{}
+		b.sender.SendPlain(u.ChatID, msg)
+	}
 }
 
 // RegisterCommands registers bot commands with Telegram

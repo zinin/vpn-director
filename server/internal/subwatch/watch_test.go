@@ -2,6 +2,7 @@ package subwatch
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"reflect"
 	"sync"
@@ -34,9 +35,23 @@ type fake struct {
 	now      time.Time
 }
 
+// cloneCfg hands out what production's LoadVPN does: a fresh parse, which a
+// later UpdateVPN of f.cfg cannot change under the Tick holding it.
+func cloneCfg(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPNDirectorConfig, error) {
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	var out vpnconfig.VPNDirectorConfig
+	if err := json.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (f *fake) watch() *Watch {
 	return &Watch{
-		LoadVPN:      func() (*vpnconfig.VPNDirectorConfig, error) { return f.cfg, nil },
+		LoadVPN:      func() (*vpnconfig.VPNDirectorConfig, error) { return cloneCfg(f.cfg) },
 		LoadPlatform: func() (vpnconfig.PlatformInfo, error) { return f.plat, nil },
 		UpdateVPN: func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 			return fn(f.cfg)
@@ -174,6 +189,93 @@ func TestTick_SuccessResetsTimer(t *testing.T) {
 	}
 	if f.cfg.Xray.Failover != nil {
 		t.Fatal("timer must reset after a success")
+	}
+}
+
+func TestTick_UnarmedTickResetsTimer(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.Tick(context.Background())
+
+	f.cfg.Xray.SubscriptionURL = ""
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+
+	f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/token"
+	f.now = f.now.Add(10 * time.Minute)
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("the first failed probe after re-arming must not fail over")
+	}
+	if f.applies != 0 {
+		t.Fatalf("applies %d", f.applies)
+	}
+}
+
+func TestTick_TunnelGoneAtMoveSkipsApplyAndNotify(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	// The tick's snapshot still lists ovpnc2; the locked update no longer does.
+	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		delete(f.cfg.TunnelDirector.Tunnels, "ovpnc2")
+		return fn(f.cfg)
+	}
+	tickUntilDead(w, f)
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v", f.cfg.Xray.Failover)
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("clients must stay on Xray")
+	}
+	if f.applies != 0 {
+		t.Fatalf("applies %d, want 0", f.applies)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+func TestTick_NoTunnelPickNotifiesSelectedServer(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	generated := false
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) {
+		generated = true
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if generated {
+			return nil
+		}
+		return f.probeErr
+	}
+	tickUntilDead(w, f)
+	want := []string{
+		"Xray outbound is down; no Tunnel Director fallback",
+		"Subscription refreshed; selected server Oslo",
+	}
+	if !reflect.DeepEqual(f.notes, want) {
+		t.Fatalf("notes %v, want %v", f.notes, want)
 	}
 }
 

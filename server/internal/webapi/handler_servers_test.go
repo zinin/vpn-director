@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -275,6 +276,33 @@ func TestHandleImportServers_LoopbackIP(t *testing.T) {
 	}
 }
 
+func TestHandleImportServers_EmptyURLUsesSavedURL(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.Config = &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{
+		Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://127.0.0.1/s/token"},
+	}}
+
+	handler := handleImportServers(deps)
+
+	req := httptest.NewRequest("POST", "/api/servers/import", strings.NewReader(`{"url":""}`))
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	// The loopback refusal comes before any network access and proves the
+	// saved link was the one checked.
+	if resp["error"] != "URL must not point to private or loopback addresses" {
+		t.Errorf("error %q, want the private/loopback refusal of the saved URL", resp["error"])
+	}
+}
+
 func TestCollectServerIPs(t *testing.T) {
 	servers := []vpnconfig.Server{
 		{IPs: []string{"2.2.2.2", "1.1.1.1"}},
@@ -320,6 +348,17 @@ func TestDownloadErrMessage(t *testing.T) {
 	// Non-SSRF errors keep their detail for diagnostics.
 	other := errors.New("dial tcp: i/o timeout")
 	if got := downloadErrMessage(other); !strings.Contains(got, "i/o timeout") {
+		t.Errorf("downloadErrMessage dropped diagnostic detail: %q", got)
+	}
+}
+
+func TestDownloadErrMessage_DropsURL(t *testing.T) {
+	err := &url.Error{Op: "Get", URL: "https://cdn.example/s/SECRET-TOKEN", Err: errors.New("timeout")}
+	got := downloadErrMessage(err)
+	if strings.Contains(got, "SECRET-TOKEN") {
+		t.Errorf("downloadErrMessage leaked the subscription URL: %q", got)
+	}
+	if !strings.Contains(got, "timeout") {
 		t.Errorf("downloadErrMessage dropped diagnostic detail: %q", got)
 	}
 }

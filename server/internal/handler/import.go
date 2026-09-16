@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"sort"
@@ -40,7 +41,12 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	args := msg.CommandArguments()
 	fetchURL := args
 	if fetchURL == "" {
-		if cfg, err := h.deps.Config.LoadVPNConfig(); err == nil && cfg != nil {
+		cfg, err := h.deps.Config.LoadVPNConfig()
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("Config load error: "+err.Error()))
+			return
+		}
+		if err == nil && cfg != nil {
 			fetchURL = cfg.Xray.SubscriptionURL
 		}
 	}
@@ -61,6 +67,12 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	// Download subscription
 	resp, err := h.httpClient.Get(fetchURL)
 	if err != nil {
+		// A *url.Error carries the whole URL, and a saved link's token must
+		// not reach the chat.
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Download error: %v", err)))
 		return
 	}

@@ -105,9 +105,6 @@ func MoveXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 		}
 		// unpaused Xray clients leave xray.clients even if they already sat on the tunnel
 	}
-	if cfg.TunnelDirector.Tunnels == nil {
-		cfg.TunnelDirector.Tunnels = map[string]TunnelConfig{}
-	}
 	cfg.TunnelDirector.Tunnels[tunnel] = tun
 	cfg.Xray.Clients = keptXray
 	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: added}
@@ -118,15 +115,27 @@ func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) {
 		return
 	}
 	fo := cfg.Xray.Failover
-	for _, ip := range fo.Clients {
+	restore := fo.Clients
+	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
+	if ok {
+		// A client deleted from the tunnel, or moved to another one, during
+		// failover stays where the user put it instead of coming back on Xray.
+		restore = make([]string, 0, len(fo.Clients))
+		for _, ip := range fo.Clients {
+			if contains(tun.Clients, ip) {
+				restore = append(restore, ip)
+			}
+		}
+	}
+	for _, ip := range restore {
 		if !contains(cfg.Xray.Clients, ip) {
 			cfg.Xray.Clients = append(cfg.Xray.Clients, ip)
 		}
 	}
-	if tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]; ok {
+	if ok {
 		kept := make([]string, 0, len(tun.Clients))
-		drop := make(map[string]struct{}, len(fo.Clients))
-		for _, ip := range fo.Clients {
+		drop := make(map[string]struct{}, len(restore))
+		for _, ip := range restore {
 			drop[ip] = struct{}{}
 		}
 		for _, ip := range tun.Clients {

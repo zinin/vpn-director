@@ -254,11 +254,17 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 // downloadErrMessage builds the client-facing message for a subscription
 // download failure. It echoes the underlying error for diagnostics EXCEPT when
 // the SSRF dial guard blocked the connection: that error carries the resolved
-// internal IP, which must not leak back to the caller.
+// internal IP, which must not leak back to the caller. The *url.Error wrapper
+// is dropped too: its text is the whole URL, and a re-import from the saved
+// link must not hand its token to the browser.
 func downloadErrMessage(err error) string {
 	if errors.Is(err, ssrf.ErrBlockedAddress) {
 		// The error carries the resolved internal IP; do not echo it back.
 		return "download failed: URL resolved to a private or reserved address"
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
 	}
 	return fmt.Sprintf("download failed: %s", err)
 }

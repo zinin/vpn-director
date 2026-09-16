@@ -52,14 +52,14 @@ async function selectServer(index: number) {
   }
 }
 
-async function importServers() {
-  if (!importUrl.value && !subscriptionSaved.value) {
+async function importServers(url: string) {
+  if (!url && !subscriptionSaved.value) {
     alert('Please enter a subscription URL')
     return
   }
   importLoading.value = true
   try {
-    await api.importServers(importUrl.value)
+    await api.importServers(url)
     await loadServers()
   } catch (e: any) {
     alert('Error: ' + (e.response?.data?.error || e.message))
@@ -80,13 +80,13 @@ onMounted(loadServers)
         {{ loading ? '...' : '⟳ Refresh' }}
       </button>
       <input v-model="importUrl" type="text" placeholder="https://... subscription URL" style="flex: 1; min-width: 200px;" />
-      <button class="btn btn-primary" :disabled="importLoading || !importUrl" @click="importServers">
+      <button class="btn btn-primary" :disabled="importLoading || !importUrl" @click="importServers(importUrl)">
         {{ importLoading ? '...' : '⬇ Import' }}
       </button>
       <button
         class="btn btn-blue"
         :disabled="importLoading || !subscriptionSaved"
-        @click="importUrl = ''; importServers()"
+        @click="importServers('')"
       >
         {{ importLoading ? '...' : '⬇ Re-import saved' }}
       </button>

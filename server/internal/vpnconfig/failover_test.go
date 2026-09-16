@@ -107,6 +107,31 @@ func TestMoveAndRestore_KeepsForeignTunnelClients(t *testing.T) {
 	}
 }
 
+func TestRestore_SkipsClientsRemovedFromTunnelDuringFailover(t *testing.T) {
+	cfg := sample()
+	cfg.Xray.Clients = append(cfg.Xray.Clients, "192.168.1.7")
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	if !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.1.8", "192.168.1.7"}) {
+		t.Fatalf("added snapshot %v", cfg.Xray.Failover.Clients)
+	}
+	// DELETE /api/clients drops the address from its route and leaves
+	// xray.failover as it was.
+	tun := cfg.TunnelDirector.Tunnels["ovpnc2"]
+	tun.Clients = []string{"192.168.1.3", "192.168.1.8"}
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = tun
+
+	RestoreXrayClientsFromFailover(cfg)
+	if cfg.Xray.Failover != nil {
+		t.Fatal("failover")
+	}
+	if !reflect.DeepEqual(cfg.Xray.Clients, []string{"192.168.1.9", "192.168.1.8"}) {
+		t.Fatalf("restored xray %v, want the removed client left out", cfg.Xray.Clients)
+	}
+	if !reflect.DeepEqual(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, []string{"192.168.1.3"}) {
+		t.Fatalf("tunnel after restore %v", cfg.TunnelDirector.Tunnels["ovpnc2"].Clients)
+	}
+}
+
 func TestXrayConfig_OmitsSubscriptionURLAndFailoverWhenEmpty(t *testing.T) {
 	out, err := json.Marshal(VPNDirectorConfig{})
 	if err != nil {
