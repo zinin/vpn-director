@@ -457,6 +457,24 @@ load '../test_helper'
     assert_output --partial "ovpnc2"
 }
 
+@test "tunnel_apply: succeeds when the failover tunnel has no effective clients" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-paused.json"
+    jq '.tunnel_director.tunnels = {
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]} |
+        .paused_clients = ["192.168.1.8"]' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    run tunnel_apply
+    assert_success
+}
+
 @test "tunnel_apply: up-to-date path re-ensures every recorded route" {
     load_tunnel_module
     run tunnel_apply

@@ -171,6 +171,14 @@ _tunnel_ensure_routes() {
     return "$rc"
 }
 
+# True when the failover tunnel still has clients after pause filtering.
+_tunnel_failover_needed() {
+    [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] || return 1
+    local c
+    c=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].clients // [] | .[]')
+    [[ -n $c ]]
+}
+
 # One client's RETURN / offload / MARK in TUN_DIR. Offload sits immediately
 # before MARK with the same match so excluded destinations keep acceleration.
 # warnings and changes are tunnel_apply's locals (bash dynamic scope).
@@ -371,13 +379,17 @@ tunnel_apply() {
     fi
 
     if [[ $rebuild -eq 0 ]]; then
-        if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] && ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES"; then
-            log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
-            return 1
-        fi
-        if ! _tunnel_ensure_routes; then
-            log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
-            return 1
+        if _tunnel_failover_needed; then
+            if ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES"; then
+                log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+                return 1
+            fi
+            if ! _tunnel_ensure_routes; then
+                log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+                return 1
+            fi
+        else
+            _tunnel_ensure_routes || true
         fi
         log "Rules are applied and up-to-date"
         return 0
@@ -654,7 +666,7 @@ tunnel_apply() {
     mkdir -p "$(dirname "$TUN_DIR_HASH")"
     cp -f "$tables_tmp" "$TUN_DIR_TABLES"
 
-    if [[ -n ${XRAY_FAILOVER_TUNNEL:-} && ( $fo_applied -eq 0 || $fo_route_ok -eq 0 || $fo_rule_ok -eq 0 ) ]]; then
+    if _tunnel_failover_needed && [[ $fo_applied -eq 0 || $fo_route_ok -eq 0 || $fo_rule_ok -eq 0 ]]; then
         rm -f "$TUN_DIR_HASH"
         log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
         return 1

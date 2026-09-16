@@ -125,13 +125,11 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 	}
 	if cfg.Xray.Failover != nil {
-		wasPending := w.pendingApply || vpnconfig.FailoverStaged(cfg)
+		staged := vpnconfig.FailoverStaged(cfg)
+		wasPending := w.pendingApply || staged
 		var ok bool
 		cfg, ok = w.applyFailover(cfg)
-		if !ok {
-			return
-		}
-		if wasPending {
+		if ok && wasPending {
 			if id := failoverTunnel(cfg); id != "" {
 				n := 0
 				if cfg.Xray.Failover != nil {
@@ -140,6 +138,13 @@ func (w *Watch) Tick(ctx context.Context) {
 				slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", n)
 				w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 			}
+		}
+		if !ok && staged {
+			// Keep Xray membership until TUN_DIR exists. A committed
+			// failover already dropped TPROXY; blocking import would
+			// leave clients without a working outbound until the
+			// unrelated fallback tunnel returns.
+			return
 		}
 		w.maybeImportAndPick(ctx, cfg)
 		return

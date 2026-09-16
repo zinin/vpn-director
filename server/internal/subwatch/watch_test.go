@@ -1402,7 +1402,7 @@ func TestTick_FirstTickReappliesFailoverFromEarlierProcess(t *testing.T) {
 	}
 }
 
-func TestTick_FirstTickReapplyFailureRetriesWithoutImport(t *testing.T) {
+func TestTick_CommittedFailoverApplyFailureStillImports(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), applyErr: errApply, now: time.Unix(1_700_000_000, 0)}
 	fetches := 0
 	w := f.watch()
@@ -1415,8 +1415,11 @@ func TestTick_FirstTickReapplyFailureRetriesWithoutImport(t *testing.T) {
 	if f.applies != 1 {
 		t.Fatalf("applies %d, want the reconcile Apply", f.applies)
 	}
-	if fetches != 0 {
-		t.Fatalf("fetches %d; no import before the failover is applied", fetches)
+	if fetches != 1 {
+		t.Fatalf("fetches %d; a committed failover must still refresh the subscription", fetches)
+	}
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("must not look staged")
 	}
 
 	f.now = f.now.Add(ProbeInterval)
@@ -1424,8 +1427,8 @@ func TestTick_FirstTickReapplyFailureRetriesWithoutImport(t *testing.T) {
 	if f.applies != 2 {
 		t.Fatalf("applies %d, want the retry", f.applies)
 	}
-	if fetches != 0 {
-		t.Fatalf("fetches %d; no import while Apply keeps failing", fetches)
+	if fetches != 1 {
+		t.Fatalf("fetches %d; ImportRetry has not elapsed", fetches)
 	}
 }
 
