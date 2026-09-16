@@ -311,7 +311,6 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	if err := w.apply(); err != nil {
 		w.writeBackFailover(tunnel)
-		w.lastImport = time.Time{}
 		return false
 	}
 	w.pendingApply = false

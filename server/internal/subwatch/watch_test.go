@@ -421,6 +421,49 @@ func assertStillOnTunnel(t *testing.T, cfg *vpnconfig.VPNDirectorConfig) {
 	}
 }
 
+func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:      time.Unix(1_700_000_000, 0),
+		applyErr: errApply,
+	}
+	fetches, generates, restarts := 0, 0, 0
+	w := liveImportWatch(f)
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10"}},
+		}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) {
+		generates++
+		return true, nil
+	}
+	w.RestartXray = func() error {
+		restarts++
+		return nil
+	}
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+	if fetches != 1 || generates != 1 || restarts != 1 {
+		t.Fatalf("first tick fetches=%d generates=%d restarts=%d", fetches, generates, restarts)
+	}
+	if w.lastImport.IsZero() {
+		t.Fatal("lastImport must stay set after failed restore-Apply")
+	}
+
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+	if fetches != 1 || generates != 1 || restarts != 1 {
+		t.Fatalf("30s later must not re-import, fetches=%d generates=%d restarts=%d", fetches, generates, restarts)
+	}
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want 1 (no restore-Apply until ImportRetry)", f.applies)
+	}
+}
+
 func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
 	f := &fake{
 		cfg:      failedOverCfg(),
@@ -441,9 +484,10 @@ func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
 	}
 
 	f.applyErr = nil
+	f.now = f.now.Add(ImportRetry)
 	w.Tick(context.Background())
 	if f.cfg.Xray.Failover != nil {
-		t.Fatal("later Tick with Apply succeeding must restore")
+		t.Fatal("Tick after ImportRetry with Apply succeeding must restore")
 	}
 	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
 		t.Fatal("client not restored")
