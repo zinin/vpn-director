@@ -153,6 +153,31 @@ func TestRestore_OverlapCIDRStaysOnTunnel(t *testing.T) {
 	}
 }
 
+func TestCommit_DoesNotDropClientRemovedThenReaddedToXray(t *testing.T) {
+	cfg := sample()
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	// DELETE /api/clients strips the address from every route and leaves
+	// xray.failover as it was. Adding the same address back as xray must not
+	// look staged: Commit would drop it and Restore would not put it back.
+	tun := cfg.TunnelDirector.Tunnels["ovpnc2"]
+	kept := make([]string, 0, len(tun.Clients))
+	for _, ip := range tun.Clients {
+		if ip != "192.168.1.8" {
+			kept = append(kept, ip)
+		}
+	}
+	tun.Clients = kept
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = tun
+	cfg.Xray.Clients = []string{"192.168.1.9", "192.168.1.8"}
+	if FailoverStaged(cfg) {
+		t.Fatal("re-added xray client is not on the fallback tunnel")
+	}
+	CommitXrayFailover(cfg)
+	if !contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("re-added xray client must stay")
+	}
+}
+
 func TestStageThenCommit_DropsXrayAfterTunnelHasClients(t *testing.T) {
 	cfg := sample()
 	StageXrayClientsToTunnel(cfg, "ovpnc2")

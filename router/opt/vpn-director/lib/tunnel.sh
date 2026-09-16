@@ -171,6 +171,19 @@ _tunnel_ensure_routes() {
     return "$rc"
 }
 
+# True when the failover tunnel has an ip rule at pref TUN_DIR_PREF_BASE+idx.
+# "ip rule show pref N" is refused by iproute2 4.4 (Entware's ip-full), so this
+# greps the unfiltered listing the way tproxy.sh does.
+_tunnel_failover_rule_present() {
+    local idx pref
+    [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] || return 0
+    [[ -f $TUN_DIR_TABLES ]] || return 1
+    idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$TUN_DIR_TABLES")
+    [[ -n $idx ]] || return 1
+    pref=$((TUN_DIR_PREF_BASE + idx))
+    ip rule show 2>/dev/null | grep -q "^${pref}:"
+}
+
 # True when the failover tunnel still has clients after pause filtering.
 _tunnel_failover_needed() {
     [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] || return 1
@@ -385,6 +398,10 @@ tunnel_apply() {
                 return 1
             fi
             if ! _tunnel_ensure_routes; then
+                log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+                return 1
+            fi
+            if ! _tunnel_failover_rule_present; then
                 log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
                 return 1
             fi

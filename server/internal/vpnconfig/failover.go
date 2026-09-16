@@ -124,15 +124,15 @@ func StageXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 }
 
 // CommitXrayFailover drops staged clients from xray.clients: snapshot
-// addresses and anyone already on the failover tunnel. Paused clients stay.
+// addresses still on the failover tunnel. Paused clients stay. An address
+// the Web UI deleted and re-added as xray is not on the tunnel, so it stays.
 func CommitXrayFailover(cfg *VPNDirectorConfig) {
 	if cfg == nil || cfg.Xray.Failover == nil {
 		return
 	}
 	paused := pausedSet(cfg)
-	fo := cfg.Xray.Failover
-	drop := make(map[string]struct{}, len(fo.Clients))
-	for _, ip := range fo.Clients {
+	drop := make(map[string]struct{})
+	for _, ip := range snapshotOnTunnel(cfg) {
 		drop[ip] = struct{}{}
 	}
 	kept := make([]string, 0, len(cfg.Xray.Clients))
@@ -150,22 +150,46 @@ func CommitXrayFailover(cfg *VPNDirectorConfig) {
 }
 
 // FailoverStaged reports that failover is recorded but TPROXY still matches
-// those clients, so the drop Apply has not run.
+// those clients, so the drop Apply has not run. Only snapshot addresses that
+// are still on the fallback tunnel count: DELETE /api/clients strips the
+// tunnel and leaves xray.failover, and a later xray add of the same address
+// must not look staged.
 func FailoverStaged(cfg *VPNDirectorConfig) bool {
 	if cfg == nil || cfg.Xray.Failover == nil {
 		return false
 	}
 	paused := pausedSet(cfg)
-	fo := cfg.Xray.Failover
+	onTunnel := snapshotOnTunnel(cfg)
 	for _, ip := range cfg.Xray.Clients {
 		if _, skip := paused[ip]; skip {
 			continue
 		}
-		if contains(fo.Clients, ip) {
+		if contains(onTunnel, ip) {
 			return true
 		}
 	}
 	return false
+}
+
+// snapshotOnTunnel is the failover snapshot still assigned to the fallback
+// tunnel. Restore, Commit and FailoverStaged share this so a deleted address
+// is not treated as still in the move.
+func snapshotOnTunnel(cfg *VPNDirectorConfig) []string {
+	if cfg == nil || cfg.Xray.Failover == nil {
+		return nil
+	}
+	fo := cfg.Xray.Failover
+	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(fo.Clients))
+	for _, ip := range fo.Clients {
+		if contains(tun.Clients, ip) {
+			out = append(out, ip)
+		}
+	}
+	return out
 }
 
 func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) []string {
@@ -177,15 +201,8 @@ func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) []string {
 	// missing key is the wizard dropping that tunnel (and possibly moving
 	// the clients elsewhere); restoring the whole snapshot would put them
 	// on Xray and override the new assignment.
-	restore := make([]string, 0, len(fo.Clients))
+	restore := snapshotOnTunnel(cfg)
 	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
-	if ok {
-		for _, ip := range fo.Clients {
-			if contains(tun.Clients, ip) {
-				restore = append(restore, ip)
-			}
-		}
-	}
 	for _, ip := range restore {
 		if !contains(cfg.Xray.Clients, ip) {
 			cfg.Xray.Clients = append(cfg.Xray.Clients, ip)

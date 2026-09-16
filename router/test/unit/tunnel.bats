@@ -492,6 +492,47 @@ load '../test_helper'
     refute grep -q -- '-t mangle -X TUN_DIR' /tmp/bats_iptables_calls.log
 }
 
+# iproute2 4.4 refuses "ip rule show pref N". The up-to-date path used to
+# check only TUN_DIR_TABLES and the route, so a first apply that recorded the
+# hash after ip rule add failed then returned 0 on the next apply. The watch
+# took that as FallbackReady and dropped Xray membership onto a mark with no
+# ip rule — WAN. Keep the hash (do not tunnel_stop); still return 1 until the
+# failover pref exists.
+@test "tunnel_apply: a missing failover ip rule keeps the hash and still fails the next apply" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-rule.json"
+    jq '.tunnel_director.tunnels = {
+            "wgc1": {"clients":["192.168.50.0/24"],"exclude":[]},
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    # Route must succeed so the up-to-date path is not already failing on
+    # _tunnel_ensure_routes; this is only the missing ip rule.
+    platform_tunnel_route_ensure() { return 0; }
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+            echo "ip $*" >> /tmp/bats_ip_calls.log
+            return 1
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_failure
+    [ -f "$TUN_DIR_HASH" ]
+
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_failure
+    refute_output --partial "Stopping Tunnel Director"
+    refute grep -q -- '-t mangle -X TUN_DIR' /tmp/bats_iptables_calls.log
+}
+
 @test "tunnel_apply: succeeds when the failover tunnel has no effective clients" {
     load_common
     source "$LIB_DIR/firewall.sh"
