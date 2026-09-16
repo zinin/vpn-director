@@ -412,21 +412,28 @@ func (w *Watch) applyDefaults() {
 // notify de-duplicates two channels separately: where the clients are routed
 // (moved, no tunnel) and what the last import came to (refresh failed, no live
 // server, restored). One channel shared by both let a steady no-tunnel outage
-// alternate kinds and repeat the same messages on every import wave.
+// alternate kinds and repeat the same messages on every import wave. A routing
+// message that is sent starts a new episode and clears the import channel, so
+// that episode's import outcome is news again. A suppressed one leaves the
+// import channel alone: the no-tunnel branch notifies on every tick.
 func (w *Watch) notify(kind noteKind, msg string) {
 	if kind == noteRestored {
 		// The clients are back, or Xray works again: the next episode's moved
 		// or no-tunnel message is news even without a healthy probe between.
 		w.lastRouteKind = noteNone
 	}
+	route := kind == noteMoved || kind == noteNoTunnel
 	last := &w.lastImportKind
-	if kind == noteMoved || kind == noteNoTunnel {
+	if route {
 		last = &w.lastRouteKind
 	}
 	if *last == kind {
 		return
 	}
 	*last = kind
+	if route {
+		w.lastImportKind = noteNone
+	}
 	if w.Notify != nil {
 		w.Notify(msg)
 	}

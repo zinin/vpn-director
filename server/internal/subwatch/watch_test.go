@@ -585,6 +585,48 @@ func TestTick_NewDeathAfterRestoreNotifiesMovedAgain(t *testing.T) {
 	}
 }
 
+func TestTick_NewEpisodeAfterRestoreNotifiesRestoredAgain(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	justGenerated := false
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) {
+		justGenerated = true
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	// Every walk finds Oslo live and every health probe fails, so no healthy
+	// probe separates the two episodes.
+	w.Probe = func(context.Context, int) error {
+		if justGenerated {
+			justGenerated = false
+			return nil
+		}
+		return f.probeErr
+	}
+	// Episode 1 dies at 3m and restores; episode 2 fails from 3m30s, dies at
+	// 6m30s and restores; stopping at 7m leaves no room for a third.
+	tickFor(w, f, 7*time.Minute)
+	want := []string{
+		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
+		"LAN clients back on Xray; server Oslo",
+		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
+		"LAN clients back on Xray; server Oslo",
+	}
+	if !reflect.DeepEqual(f.notes, want) {
+		t.Fatalf("notes %v, want %v", f.notes, want)
+	}
+}
+
 func TestTick_ImportRetryWaitsFiveMinutes(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
