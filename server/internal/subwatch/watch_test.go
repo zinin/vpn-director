@@ -99,6 +99,13 @@ func tickFor(w *Watch, f *fake, d time.Duration) {
 	}
 }
 
+// runningWatch marks w as a watch that has been running in this process, so its
+// first Tick does not re-apply the failover record as one left by an earlier process.
+func runningWatch(w *Watch) *Watch {
+	w.reconciled = true
+	return w
+}
+
 func TestTick_NotArmedDoesNothing(t *testing.T) {
 	f := &fake{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{Clients: []string{"192.168.1.8"}}}, now: time.Unix(0, 0)}
 	f.watch().Tick(context.Background())
@@ -293,7 +300,7 @@ func TestTick_FailoverPresentSkipsHealthyProbeRestore(t *testing.T) {
 	cfg.Xray.Failover = &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}}
 	cfg.Xray.Clients = []string{"192.168.1.9"}
 	f := &fake{cfg: cfg, probeErr: nil, now: time.Unix(1_700_000_000, 0)}
-	f.watch().Tick(context.Background())
+	runningWatch(f.watch()).Tick(context.Background())
 	if f.cfg.Xray.Failover == nil {
 		t.Fatal("live SOCKS must not restore")
 	}
@@ -716,7 +723,7 @@ func TestTick_NoLiveWaveReturnsToPreferredServer(t *testing.T) {
 		{Name: "SaoPaulo", Address: "saopaulo.example", Port: 443},
 	}
 	var events []string
-	w := recordingWalkWatch(f, servers, allGenerate, &events)
+	w := runningWatch(recordingWalkWatch(f, servers, allGenerate, &events))
 
 	w.Tick(context.Background())
 	want := []string{"Oslo", "restart", "Paris", "restart", "SaoPaulo", "restart", "Oslo", "restart"}
@@ -749,7 +756,7 @@ func TestTick_NoLiveWaveWithoutPreferredInListGeneratesNothingExtra(t *testing.T
 		{Name: "SaoPaulo", Address: "saopaulo.example", Port: 443},
 	}
 	var events []string
-	w := recordingWalkWatch(f, servers, allGenerate, &events)
+	w := runningWatch(recordingWalkWatch(f, servers, allGenerate, &events))
 
 	w.Tick(context.Background())
 	want := []string{"Paris", "restart", "SaoPaulo", "restart"}
@@ -766,7 +773,7 @@ func TestTick_NoLiveWaveOnlyPreferredGeneratedGeneratesNothingExtra(t *testing.T
 		{Name: "SaoPaulo", Address: "saopaulo.example", Port: 443},
 	}
 	var events []string
-	w := recordingWalkWatch(f, servers, func(s vpnconfig.Server) bool { return s.Name == "Oslo" }, &events)
+	w := runningWatch(recordingWalkWatch(f, servers, func(s vpnconfig.Server) bool { return s.Name == "Oslo" }, &events))
 
 	w.Tick(context.Background())
 	want := []string{"Oslo", "restart", "Paris", "SaoPaulo"}
@@ -796,7 +803,7 @@ func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
 		applyErr: errApply,
 	}
 	fetches, generates, restarts := 0, 0, 0
-	w := liveImportWatch(f)
+	w := runningWatch(liveImportWatch(f))
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		fetches++
 		return []vpnconfig.Server{
@@ -838,7 +845,7 @@ func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
 		now:      time.Unix(1_700_000_000, 0),
 		applyErr: errApply,
 	}
-	w := liveImportWatch(f)
+	w := runningWatch(liveImportWatch(f))
 	w.Tick(context.Background())
 	assertStillOnTunnel(t, f.cfg)
 	if f.applies != 1 {
@@ -976,12 +983,66 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 	}
 }
 
+func TestTick_FirstTickReappliesFailoverFromEarlierProcess(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+	fetches := 0
+	w := f.watch()
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("cdn down")
+	}
+
+	w.Tick(context.Background())
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want the reconcile Apply", f.applies)
+	}
+	if len(f.notes) == 0 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
+		t.Fatalf("notes %v", f.notes)
+	}
+	if fetches != 1 {
+		t.Fatalf("fetches %d; the import must run in the Tick whose Apply succeeded", fetches)
+	}
+
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != 1 {
+		t.Fatalf("applies %d; reconcile must run once per process", f.applies)
+	}
+}
+
+func TestTick_FirstTickReapplyFailureRetriesWithoutImport(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), applyErr: errApply, now: time.Unix(1_700_000_000, 0)}
+	fetches := 0
+	w := f.watch()
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("cdn down")
+	}
+
+	w.Tick(context.Background())
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want the reconcile Apply", f.applies)
+	}
+	if fetches != 0 {
+		t.Fatalf("fetches %d; no import before the failover is applied", fetches)
+	}
+
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != 2 {
+		t.Fatalf("applies %d, want the retry", f.applies)
+	}
+	if fetches != 0 {
+		t.Fatalf("fetches %d; no import while Apply keeps failing", fetches)
+	}
+}
+
 func TestTick_ImportSyncsXrayServers(t *testing.T) {
 	f := &fake{
 		cfg: failedOverCfg(),
 		now: time.Unix(1_700_000_000, 0),
 	}
-	w := f.watch()
+	w := runningWatch(f.watch())
 	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{

@@ -65,6 +65,7 @@ type Watch struct {
 	lastRouteKind  noteKind // noteMoved, noteNoTunnel
 	lastImportKind noteKind // noteRefreshFailed, noteNoLive, noteRestored
 	pendingApply   bool     // JSON mutated; Apply has not yet succeeded
+	reconciled     bool     // the first armed Tick has checked for a failover left by an earlier process
 	running        bool
 }
 
@@ -111,6 +112,15 @@ func (w *Watch) Tick(ctx context.Context) {
 	if !vpnconfig.Armed(cfg) {
 		w.failSince = time.Time{}
 		return
+	}
+	if !w.reconciled {
+		w.reconciled = true
+		// The move is written before Apply, and a process that stopped in
+		// between left the kernel without the fallback routing. apply is
+		// idempotent and queues with --wait, so re-running it is safe.
+		if cfg.Xray.Failover != nil {
+			w.pendingApply = true
+		}
 	}
 	if cfg.Xray.Failover != nil {
 		if w.pendingApply {
