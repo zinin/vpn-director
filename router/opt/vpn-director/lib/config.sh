@@ -69,12 +69,20 @@ _cfg_is_ipv4() {
 # malformed (e.g. string-valued) clients through untouched so tunnel_apply can
 # validate and warn. Without the array guard, "string - $p" is a jq type error
 # that, under set -e, aborts sourcing this file.
+# xray.failover.tunnel is applied first: TUN_DIR is first-match, and an
+# earlier covering rule (often main's LAN CIDR) would send failover clients
+# out the WAN after they leave xray.clients. keys_unsorted in tunnel.sh
+# keeps this order.
 TUN_DIR_TUNNELS_JSON=$(jq --argjson p "$_PAUSED_CLIENTS_JSON" \
-    '(.tunnel_director.tunnels // {})
+    '(.xray.failover.tunnel // "") as $fo
+     | (.tunnel_director.tunnels // {})
      | to_entries
      | map(if (.value | type) == "object" and ((.value.clients // []) | type) == "array"
            then .value.clients = ((.value.clients // []) - $p)
            else . end)
+     | if $fo != "" then
+         ([.[] | select(.key == $fo)] + [.[] | select(.key != $fo)])
+       else . end
      | from_entries' "$VPD_CONFIG_FILE")
 
 # Spec 12: drop a tunnel.gateway that is not a dotted IPv4. Validate in bash

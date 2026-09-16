@@ -878,6 +878,48 @@ func TestTick_FailedFetchKeepsFiveMinuteRetry(t *testing.T) {
 	}
 }
 
+func TestTick_FailedDownloadAfterNoLiveWaveResetsToFiveMinutes(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	fetches := 0
+	fetchErr := error(nil)
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) { return true, nil }
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background()) // all-dead walk: next wave waits 10m
+	if fetches != 1 {
+		t.Fatalf("fetches %d after the dead wave", fetches)
+	}
+
+	fetchErr = errors.New("cdn down")
+	f.now = f.now.Add(10 * time.Minute)
+	w.Tick(context.Background())
+	if fetches != 2 {
+		t.Fatalf("fetches %d; the backed-off wave must run", fetches)
+	}
+
+	failedAt := f.now
+	f.now = failedAt.Add(ImportRetry - time.Second)
+	w.Tick(context.Background())
+	if fetches != 2 {
+		t.Fatalf("fetches %d at 5m-1s; a failed download must wait ImportRetry", fetches)
+	}
+	f.now = failedAt.Add(ImportRetry)
+	w.Tick(context.Background())
+	if fetches != 3 {
+		t.Fatalf("fetches %d; a failed download must retry after %v, not the 10m all-dead backoff", fetches, ImportRetry)
+	}
+}
+
 func TestTick_NoLiveWaveReturnsToPreferredServer(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	servers := []vpnconfig.Server{
@@ -1047,6 +1089,30 @@ func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
 	}
 	if !w.lastImport.IsZero() {
 		t.Fatal("lastImport must reset on successful restore")
+	}
+}
+
+func TestTick_RestoreApplyFailureDoesNotMoveUnrelatedXrayClients(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:      time.Unix(1_700_000_000, 0),
+		applyErr: errApply,
+	}
+	// Added or resumed on Xray while the snapshot was already on the tunnel.
+	f.cfg.Xray.Clients = append(f.cfg.Xray.Clients, "192.168.1.10")
+	w := runningWatch(liveImportWatch(f))
+	w.Tick(context.Background())
+
+	assertStillOnTunnel(t, f.cfg)
+	if !contains(f.cfg.Xray.Clients, "192.168.1.10") {
+		t.Fatal("a client added on Xray during failover must stay on Xray when restore-Apply fails")
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.10") {
+		t.Fatal("write-back must not move the unrelated Xray client onto the tunnel")
+	}
+	if f.cfg.Xray.Failover != nil && contains(f.cfg.Xray.Failover.Clients, "192.168.1.10") {
+		t.Fatalf("failover snapshot %v must not grow to include the unrelated client", f.cfg.Xray.Failover.Clients)
 	}
 }
 

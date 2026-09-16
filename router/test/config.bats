@@ -198,6 +198,20 @@ load 'test_helper'
     grep -q "WARN.*invalid gateway 'not-an-ip'" "$LOG_FILE"
 }
 
+@test "config.sh: failover tunnel is first in TUN_DIR_TUNNELS_JSON" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-order.json"
+    jq '.tunnel_director.tunnels = {
+            "main": {"clients":["192.168.50.0/24"],"exclude":[]},
+            "ovpnc2": {"clients":["192.168.1.3","192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ "$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[0]')" = "ovpnc2" ]
+    [ "$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[1]')" = "main" ]
+}
+
 @test "config.sh: drops a gateway whose octet is above 255" {
     local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-gateway-octet.json"
     jq '.tunnel_director.tunnels.wgc1.gateway = "10.8.0.999"' \

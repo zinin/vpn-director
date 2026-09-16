@@ -282,6 +282,9 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			err = ue.Err
 		}
 		slog.Warn("Subscription refresh failed", "servers", len(servers), "error", err)
+		// An all-dead walk may have backed this off to 10/20/30m. A failed
+		// download retries every ImportRetry; keep that, not the walk backoff.
+		w.importRetry = 0
 		w.notifyRefreshFailed(cfg)
 		return
 	}
@@ -409,27 +412,29 @@ func (w *Watch) apply() error {
 	return w.Apply()
 }
 
-func (w *Watch) writeBackFailover(tunnel string) {
-	if tunnel == "" || w.UpdateVPN == nil {
+func (w *Watch) writeBackFailover(fo *vpnconfig.XrayFailover) {
+	if fo == nil || fo.Tunnel == "" || w.UpdateVPN == nil {
 		return
 	}
 	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-		vpnconfig.MoveXrayClientsToTunnel(current, tunnel)
+		vpnconfig.ApplyFailoverSnapshot(current, fo)
 		return nil
 	}); err != nil {
-		slog.Warn("Failed to write the Xray failover back", "tunnel", tunnel, "error", err)
+		slog.Warn("Failed to write the Xray failover back", "tunnel", fo.Tunnel, "error", err)
 	}
 }
 
 // commitRestore persists Restore+Apply as one transaction. On Apply error the
 // failover record is written back so a later Tick can retry instead of
 // guessing that clients are already on Xray. failSince and lastImport clear
-// only after Apply succeeds.
+// only after Apply succeeds. The write-back is the addresses this restore
+// moved, not a fresh Move of every current Xray client.
 func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	tunnel := failoverTunnel(cfg)
+	var restored []string
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-			vpnconfig.RestoreXrayClientsFromFailover(current)
+			restored = vpnconfig.RestoreXrayClientsFromFailover(current)
 			return nil
 		}); err != nil {
 			slog.Warn("Failed to restore Xray clients from the failover", "error", err)
@@ -438,7 +443,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after restoring Xray clients failed", "error", err)
-		w.writeBackFailover(tunnel)
+		w.writeBackFailover(&vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored})
 		// Only a restored failover record changed the JSON routing; without one
 		// there is nothing to re-apply and the next Tick's health probe decides.
 		if tunnel != "" {

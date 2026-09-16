@@ -108,11 +108,13 @@ func MoveXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 	cfg.TunnelDirector.Tunnels[tunnel] = tun
 	cfg.Xray.Clients = keptXray
 	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: added}
+	// TUN_DIR is first-match: config.sh puts this tunnel first while failover is set,
+	// so a covering earlier rule (often main) does not send these clients to WAN.
 }
 
-func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) {
+func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) []string {
 	if cfg == nil || cfg.Xray.Failover == nil {
-		return
+		return nil
 	}
 	fo := cfg.Xray.Failover
 	restore := fo.Clients
@@ -147,4 +149,40 @@ func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) {
 		cfg.TunnelDirector.Tunnels[fo.Tunnel] = tun
 	}
 	cfg.Xray.Failover = nil
+	return restore
+}
+
+// ApplyFailoverSnapshot puts only fo.Clients onto fo.Tunnel and records
+// failover. Unlike MoveXrayClientsToTunnel it does not scoop up other
+// addresses that landed on xray.clients while we were failed over.
+func ApplyFailoverSnapshot(cfg *VPNDirectorConfig, fo *XrayFailover) {
+	if cfg == nil || fo == nil || fo.Tunnel == "" {
+		return
+	}
+	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
+	if !ok {
+		return
+	}
+	drop := make(map[string]struct{}, len(fo.Clients))
+	clients := make([]string, 0, len(fo.Clients))
+	for _, ip := range fo.Clients {
+		if ip == "" {
+			continue
+		}
+		drop[ip] = struct{}{}
+		clients = append(clients, ip)
+		if !contains(tun.Clients, ip) {
+			tun.Clients = append(tun.Clients, ip)
+		}
+	}
+	keptXray := make([]string, 0, len(cfg.Xray.Clients))
+	for _, ip := range cfg.Xray.Clients {
+		if _, skip := drop[ip]; skip {
+			continue
+		}
+		keptXray = append(keptXray, ip)
+	}
+	cfg.TunnelDirector.Tunnels[fo.Tunnel] = tun
+	cfg.Xray.Clients = keptXray
+	cfg.Xray.Failover = &XrayFailover{Tunnel: fo.Tunnel, Clients: clients}
 }

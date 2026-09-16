@@ -132,6 +132,30 @@ func TestRestore_SkipsClientsRemovedFromTunnelDuringFailover(t *testing.T) {
 	}
 }
 
+func TestApplyFailoverSnapshot_OnlyMovesListedClients(t *testing.T) {
+	cfg := sample()
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	RestoreXrayClientsFromFailover(cfg)
+	cfg.Xray.Clients = append(cfg.Xray.Clients, "192.168.1.10")
+
+	ApplyFailoverSnapshot(cfg, &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}})
+	if cfg.Xray.Failover == nil || !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.1.8"}) {
+		t.Fatalf("snapshot %+v", cfg.Xray.Failover)
+	}
+	if contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("listed client still on xray")
+	}
+	if !contains(cfg.Xray.Clients, "192.168.1.10") {
+		t.Fatal("unrelated Xray client")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("listed client not on tunnel")
+	}
+	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.10") {
+		t.Fatal("unrelated client on tunnel")
+	}
+}
+
 func TestXrayConfig_OmitsSubscriptionURLAndFailoverWhenEmpty(t *testing.T) {
 	out, err := json.Marshal(VPNDirectorConfig{})
 	if err != nil {

@@ -97,11 +97,21 @@ func buildOutbound(s vpnconfig.Server) xrayOutbound {
 	if s.Security == "" {
 		userFlow = ""
 	}
+	// Dial the resolved IPv4 when import populated IPs (a tunneled
+	// subscription lookup never reaches Xray's system resolver). TLS/REALITY
+	// SNI stays on s.Address / s.SNI above.
+	dial := s.Address
+	for _, ip := range s.IPs {
+		if ip != "" {
+			dial = ip
+			break
+		}
+	}
 	return xrayOutbound{
 		Protocol: "vless",
 		Settings: map[string]interface{}{
 			"vnext": []xrayVnext{{
-				Address: s.Address,
+				Address: dial,
 				Port:    s.Port,
 				Users:   []xrayUser{{ID: s.UUID, Encryption: "none", Flow: userFlow}},
 			}},
