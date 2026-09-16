@@ -90,6 +90,15 @@ func tickUntilDead(w *Watch, f *fake) {
 	w.Tick(context.Background())
 }
 
+// tickFor ticks every ProbeInterval from f.now through d later.
+func tickFor(w *Watch, f *fake, d time.Duration) {
+	end := f.now.Add(d)
+	for !f.now.After(end) {
+		w.Tick(context.Background())
+		f.now = f.now.Add(ProbeInterval)
+	}
+}
+
 func TestTick_NotArmedDoesNothing(t *testing.T) {
 	f := &fake{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{Clients: []string{"192.168.1.8"}}}, now: time.Unix(0, 0)}
 	f.watch().Tick(context.Background())
@@ -451,6 +460,128 @@ func TestTick_FailedFetchDoesNotSave(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("duplicate notify %v", f.notes)
+	}
+}
+
+func TestTick_NoTunnelNoLiveNotifiesOncePerChannel(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	fetches := 0
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) { return true, nil }
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	tickFor(w, f, 30*time.Minute)
+	if fetches < 3 {
+		t.Fatalf("fetches %d; the outage must span several import waves", fetches)
+	}
+	want := []string{msgNoTunnel, msgNoLive}
+	if !reflect.DeepEqual(f.notes, want) {
+		t.Fatalf("notes %v, want %v", f.notes, want)
+	}
+}
+
+func TestTick_NoTunnelRefreshFailedNotifiesOncePerChannel(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	fetches := 0
+	w := f.watch()
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("cdn down")
+	}
+	tickFor(w, f, 30*time.Minute)
+	if fetches < 3 {
+		t.Fatalf("fetches %d; the outage must span several import waves", fetches)
+	}
+	want := []string{msgNoTunnel, msgRefreshFailed}
+	if !reflect.DeepEqual(f.notes, want) {
+		t.Fatalf("notes %v, want %v", f.notes, want)
+	}
+}
+
+func TestTick_TunnelImportOutcomesNotifyOnceEach(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	fetches := 0
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		if fetches == 1 {
+			return nil, errors.New("cdn down")
+		}
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) { return true, nil }
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	tickFor(w, f, 30*time.Minute)
+	if fetches < 3 {
+		t.Fatalf("fetches %d; the outage must span several import waves", fetches)
+	}
+	want := []string{
+		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
+		"Subscription refresh failed; still on tunnel:ovpnc2",
+		"No live server in the subscription; still on tunnel:ovpnc2",
+	}
+	if !reflect.DeepEqual(f.notes, want) {
+		t.Fatalf("notes %v, want %v", f.notes, want)
+	}
+}
+
+func TestTick_NewDeathAfterRestoreNotifiesMovedAgain(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	generated, liveOnce := false, true
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) {
+		generated = true
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	// The first walk finds Oslo live; every probe after the restore fails, so
+	// no healthy probe separates the two episodes.
+	w.Probe = func(context.Context, int) error {
+		if generated && liveOnce {
+			liveOnce = false
+			return nil
+		}
+		return f.probeErr
+	}
+	tickFor(w, f, 30*time.Minute)
+	want := []string{
+		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
+		"LAN clients back on Xray; server Oslo",
+		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
+		"No live server in the subscription; still on tunnel:ovpnc2",
+	}
+	if !reflect.DeepEqual(f.notes, want) {
+		t.Fatalf("notes %v, want %v", f.notes, want)
 	}
 }
 

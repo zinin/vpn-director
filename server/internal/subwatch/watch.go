@@ -59,12 +59,13 @@ type Watch struct {
 	Now          func() time.Time
 	AfterRestart func(time.Duration)
 
-	mu           sync.Mutex
-	failSince    time.Time // zero => last probe succeeded
-	lastImport   time.Time
-	lastNoteKind noteKind
-	pendingApply bool // JSON mutated; Apply has not yet succeeded
-	running      bool
+	mu             sync.Mutex
+	failSince      time.Time // zero => last probe succeeded
+	lastImport     time.Time
+	lastRouteKind  noteKind // noteMoved, noteNoTunnel
+	lastImportKind noteKind // noteRefreshFailed, noteNoLive, noteRestored
+	pendingApply   bool     // JSON mutated; Apply has not yet succeeded
+	running        bool
 }
 
 func (w *Watch) Start(ctx context.Context) {
@@ -134,7 +135,8 @@ func (w *Watch) Tick(ctx context.Context) {
 	err = w.Probe(ctx, socks)
 	if err == nil {
 		w.failSince = time.Time{}
-		w.lastNoteKind = noteNone
+		w.lastRouteKind = noteNone
+		w.lastImportKind = noteNone
 		return
 	}
 
@@ -148,7 +150,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	// With no tunnel to move to, every later tick comes back here: log the
 	// transition only until the user has been told there is no fallback.
-	announce := w.lastNoteKind != noteNoTunnel
+	announce := w.lastRouteKind != noteNoTunnel
 	if announce {
 		slog.Info("Xray outbound declared dead", "socks_port", socks, "error", err)
 	}
@@ -407,11 +409,24 @@ func (w *Watch) applyDefaults() {
 	}
 }
 
+// notify de-duplicates two channels separately: where the clients are routed
+// (moved, no tunnel) and what the last import came to (refresh failed, no live
+// server, restored). One channel shared by both let a steady no-tunnel outage
+// alternate kinds and repeat the same messages on every import wave.
 func (w *Watch) notify(kind noteKind, msg string) {
-	if w.lastNoteKind == kind {
+	if kind == noteRestored {
+		// The clients are back, or Xray works again: the next episode's moved
+		// or no-tunnel message is news even without a healthy probe between.
+		w.lastRouteKind = noteNone
+	}
+	last := &w.lastImportKind
+	if kind == noteMoved || kind == noteNoTunnel {
+		last = &w.lastRouteKind
+	}
+	if *last == kind {
 		return
 	}
-	w.lastNoteKind = kind
+	*last = kind
 	if w.Notify != nil {
 		w.Notify(msg)
 	}
