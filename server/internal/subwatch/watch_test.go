@@ -683,6 +683,98 @@ func liveImportWatch(f *fake) *Watch {
 	return w
 }
 
+// recordingWalkWatch imports servers on every wave. Its Generate records the
+// server as xray.active_server, as production does, when generates allows it;
+// events lists every Generate by server name and every restart as "restart".
+func recordingWalkWatch(f *fake, servers []vpnconfig.Server, generates func(vpnconfig.Server) bool, events *[]string) *Watch {
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) { return servers, nil }
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		*events = append(*events, s.Name)
+		if !generates(s) {
+			return false, errors.New("rejected")
+		}
+		f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: s.Name}
+		return true, nil
+	}
+	w.RestartXray = func() error {
+		*events = append(*events, "restart")
+		return nil
+	}
+	w.AfterRestart = func(time.Duration) {}
+	return w
+}
+
+func allGenerate(vpnconfig.Server) bool { return true }
+
+func TestTick_NoLiveWaveReturnsToPreferredServer(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	servers := []vpnconfig.Server{
+		{Name: "Oslo", Address: "oslo.example", Port: 443},
+		{Name: "Paris", Address: "paris.example", Port: 443},
+		{Name: "SaoPaulo", Address: "saopaulo.example", Port: 443},
+	}
+	var events []string
+	w := recordingWalkWatch(f, servers, allGenerate, &events)
+
+	w.Tick(context.Background())
+	want := []string{"Oslo", "restart", "Paris", "restart", "SaoPaulo", "restart", "Oslo", "restart"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("dead wave events %v, want %v", events, want)
+	}
+	if f.cfg.Xray.ActiveServer == nil || f.cfg.Xray.ActiveServer.Name != "Oslo" {
+		t.Fatalf("active server %+v, want Oslo", f.cfg.Xray.ActiveServer)
+	}
+
+	events = nil
+	f.probeErr = nil
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+	if !reflect.DeepEqual(events, []string{"Oslo", "restart"}) {
+		t.Fatalf("live wave events %v, want Oslo tried first", events)
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("live wave must restore")
+	}
+	if n := len(f.notes); n == 0 || f.notes[n-1] != "LAN clients back on Xray; server Oslo" {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+func TestTick_NoLiveWaveWithoutPreferredInListGeneratesNothingExtra(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	servers := []vpnconfig.Server{
+		{Name: "Paris", Address: "paris.example", Port: 443},
+		{Name: "SaoPaulo", Address: "saopaulo.example", Port: 443},
+	}
+	var events []string
+	w := recordingWalkWatch(f, servers, allGenerate, &events)
+
+	w.Tick(context.Background())
+	want := []string{"Paris", "restart", "SaoPaulo", "restart"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events %v, want %v", events, want)
+	}
+}
+
+func TestTick_NoLiveWaveOnlyPreferredGeneratedGeneratesNothingExtra(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	servers := []vpnconfig.Server{
+		{Name: "Oslo", Address: "oslo.example", Port: 443},
+		{Name: "Paris", Address: "paris.example", Port: 443},
+		{Name: "SaoPaulo", Address: "saopaulo.example", Port: 443},
+	}
+	var events []string
+	w := recordingWalkWatch(f, servers, func(s vpnconfig.Server) bool { return s.Name == "Oslo" }, &events)
+
+	w.Tick(context.Background())
+	want := []string{"Oslo", "restart", "Paris", "SaoPaulo"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events %v, want %v", events, want)
+	}
+}
+
 func assertStillOnTunnel(t *testing.T, cfg *vpnconfig.VPNDirectorConfig) {
 	t.Helper()
 	if cfg.Xray.Failover == nil || cfg.Xray.Failover.Tunnel != "ovpnc2" {

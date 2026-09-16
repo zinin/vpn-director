@@ -278,8 +278,14 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	if socks == 0 {
 		socks = defaultSOCKSPort
 	}
+	order := pickOrder(servers, activeName)
+	var preferred *vpnconfig.Server
+	if activeName != "" && len(order) > 0 && order[0].Name == activeName {
+		preferred = &order[0]
+	}
 	tried := 0
-	for _, s := range pickOrder(servers, activeName) {
+	lastGenerated := ""
+	for _, s := range order {
 		generated, err := w.Generate(s)
 		if err != nil || !generated {
 			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, "error", err)
@@ -287,6 +293,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if !generated {
 			continue
 		}
+		lastGenerated = s.Name
 		tried++
 		if w.RestartXray != nil {
 			if err := w.RestartXray(); err != nil {
@@ -314,7 +321,33 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	slog.Info("No live server in the subscription", "tried", tried)
+	if preferred != nil && lastGenerated != "" && lastGenerated != activeName {
+		w.returnToPreferred(*preferred)
+	}
 	w.notifyNoLive(cfg)
+}
+
+// returnToPreferred generates the preferred server back after a walk found
+// nothing live. Generate records every server it writes as xray.active_server,
+// so without this the next wave would start from the last server tried rather
+// than the user's. No probe and no restore: the walk has just found it down.
+func (w *Watch) returnToPreferred(s vpnconfig.Server) {
+	generated, err := w.Generate(s)
+	if err != nil || !generated {
+		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
+	}
+	if !generated {
+		return
+	}
+	if w.RestartXray != nil {
+		if err := w.RestartXray(); err != nil {
+			slog.Warn("Xray restart on the preferred server failed", "server", s.Name, "error", err)
+			return
+		}
+	}
+	if err == nil {
+		slog.Info("Xray config returned to the preferred server", "server", s.Name)
+	}
 }
 
 // uniqueServerIPs is the same de-dupe as handler/import.go and webapi.collectServerIPs:
