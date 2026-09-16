@@ -390,7 +390,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	tried := 0
 	lastGenerated := ""
 	for _, s := range order {
-		generated, err := w.Generate(serverForDial(s))
+		generated, err := w.Generate(s)
 		if err != nil || !generated {
 			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, "error", err)
 		}
@@ -451,7 +451,7 @@ func (w *Watch) importInterval() time.Duration {
 // so without this the next wave would start from the last server tried rather
 // than the user's. No probe and no restore: the walk has just found it down.
 func (w *Watch) returnToPreferred(s vpnconfig.Server) {
-	generated, err := w.Generate(serverForDial(s))
+	generated, err := w.Generate(s)
 	if err != nil || !generated {
 		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
 	}
@@ -510,10 +510,10 @@ func (w *Watch) abandonStaged() {
 	}
 }
 
-// serverForDial uses a tunnel-resolved IPv4 for vnext so Xray does not go
+// ServerForDial uses a tunnel-resolved IPv4 for vnext so Xray does not go
 // back to the system resolver. SNI keeps the hostname. Web UI /xray keep
 // s.Address and let Xray resolve, so a CDN IP change still works there.
-func serverForDial(s vpnconfig.Server) vpnconfig.Server {
+func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
 	host := s.Address
 	for _, ip := range s.IPs {
 		if ip == "" {
@@ -548,8 +548,14 @@ func (w *Watch) writeBackFailover(fo *vpnconfig.XrayFailover) {
 func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	tunnel := failoverTunnel(cfg)
 	var restored []string
+	var added []string
+	addedSet := false
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+			if current.Xray.Failover != nil && current.Xray.Failover.Added != nil {
+				added = append([]string(nil), current.Xray.Failover.Added...)
+				addedSet = true
+			}
 			restored = vpnconfig.RestoreXrayClientsFromFailover(current)
 			return nil
 		}); err != nil {
@@ -559,7 +565,20 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after restoring Xray clients failed", "error", err)
-		w.writeBackFailover(&vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored})
+		wb := &vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored}
+		if addedSet {
+			kept := make([]string, 0, len(added))
+			for _, ip := range added {
+				for _, r := range restored {
+					if ip == r {
+						kept = append(kept, ip)
+						break
+					}
+				}
+			}
+			wb.Added = kept
+		}
+		w.writeBackFailover(wb)
 		// Only a restored failover record changed the JSON routing; without one
 		// there is nothing to re-apply and the next Tick's health probe decides.
 		if tunnel != "" {

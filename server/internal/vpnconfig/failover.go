@@ -5,6 +5,11 @@ import "sort"
 type XrayFailover struct {
 	Tunnel  string   `json:"tunnel"`
 	Clients []string `json:"clients"`
+	// Addresses appended to the tunnel at stage time. Restore removes only
+	// these, so an address that was already a tunnel client stays there.
+	// nil means a record from before this field existed: restore then
+	// removes every restored address, as it used to.
+	Added []string `json:"added"`
 }
 
 func pausedSet(cfg *VPNDirectorConfig) map[string]struct{} {
@@ -101,6 +106,7 @@ func StageXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 	}
 	paused := pausedSet(cfg)
 	dropped := make([]string, 0)
+	added := make([]string, 0)
 	for _, ip := range cfg.Xray.Clients {
 		if _, skip := paused[ip]; skip {
 			continue
@@ -108,10 +114,11 @@ func StageXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 		dropped = append(dropped, ip)
 		if !contains(tun.Clients, ip) {
 			tun.Clients = append(tun.Clients, ip)
+			added = append(added, ip)
 		}
 	}
 	cfg.TunnelDirector.Tunnels[tunnel] = tun
-	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: dropped}
+	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: dropped, Added: added}
 	// TUN_DIR is first-match: tunnel.sh emits these snapshot IPs first so a
 	// covering earlier rule (often main) does not send them to WAN.
 }
@@ -186,9 +193,15 @@ func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) []string {
 	}
 	if ok {
 		kept := make([]string, 0, len(tun.Clients))
-		drop := make(map[string]struct{}, len(restore))
-		for _, ip := range restore {
-			drop[ip] = struct{}{}
+		drop := make(map[string]struct{})
+		if fo.Added == nil {
+			for _, ip := range restore {
+				drop[ip] = struct{}{}
+			}
+		} else {
+			for _, ip := range fo.Added {
+				drop[ip] = struct{}{}
+			}
 		}
 		for _, ip := range tun.Clients {
 			if _, ok := drop[ip]; !ok {
@@ -234,5 +247,5 @@ func ApplyFailoverSnapshot(cfg *VPNDirectorConfig, fo *XrayFailover) {
 	}
 	cfg.TunnelDirector.Tunnels[fo.Tunnel] = tun
 	cfg.Xray.Clients = keptXray
-	cfg.Xray.Failover = &XrayFailover{Tunnel: fo.Tunnel, Clients: clients}
+	cfg.Xray.Failover = &XrayFailover{Tunnel: fo.Tunnel, Clients: clients, Added: fo.Added}
 }

@@ -31,12 +31,19 @@ import (
 // failure here leaves a new config.json against a config that already lists
 // its address in the bypass set, rather than one that does not.
 func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnconfig.Server, ports InboundPorts) (generated bool, err error) {
+	return GenerateAndRecordDialedServer(store, xray, s, s, ports)
+}
+
+// GenerateAndRecordDialedServer writes config.json from generate (the watch
+// walk may have replaced Address with a resolved IPv4) and records identity
+// as active_server so the Web UI badge still matches servers.json.
+func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts) (generated bool, err error) {
 	err = store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
-		if err := xray.GenerateConfig(s, ports); err != nil {
+		if err := xray.GenerateConfig(generate, ports); err != nil {
 			return err
 		}
 		generated = true
-		cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+		cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(identity)
 		return nil
 	})
 	return generated, err

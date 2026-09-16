@@ -61,6 +61,31 @@ func (x *stubXray) GenerateConfig(s vpnconfig.Server, ports ...InboundPorts) err
 	return x.err
 }
 
+func TestGenerateAndRecordDialedServer_RecordsHostnameNotDialIP(t *testing.T) {
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{}}
+	xray := &stubXray{store: store}
+	identity := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
+	dial := vpnconfig.Server{Name: "Oslo", Address: "203.0.113.50", Port: 443, SNI: "oslo.example"}
+
+	generated, err := GenerateAndRecordDialedServer(store, xray, dial, identity, InboundPorts{TProxy: 12345, Socks: 12346})
+	if err != nil {
+		t.Fatalf("GenerateAndRecordDialedServer error: %v", err)
+	}
+	if !generated {
+		t.Fatal("generated = false")
+	}
+	if xray.got.Address != "203.0.113.50" {
+		t.Fatalf("config.json address %q, want the dial IP", xray.got.Address)
+	}
+	got := store.cfg.Xray.ActiveServer
+	if got == nil {
+		t.Fatal("nothing was recorded")
+	}
+	if got.Name != "Oslo" || got.Address != "oslo.example" || got.Port != 443 {
+		t.Errorf("recorded %+v, want the subscription hostname", *got)
+	}
+}
+
 func TestGenerateAndRecordActiveServer_RecordsWhatIdentifiesTheServer(t *testing.T) {
 	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{}}
 	xray := &stubXray{store: store}

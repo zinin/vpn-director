@@ -457,6 +457,41 @@ load '../test_helper'
     assert_output --partial "ovpnc2"
 }
 
+# Deleting the hash on a failover route failure sent every later apply down the
+# rebuild path: tunnel_stop removes TUN_DIR, the PREROUTING jumps and every
+# ip rule, so unrelated Tunnel Director clients lose routing until the
+# fallback interface is up. The watch retries apply every 30s while
+# pendingApply is set; hooks and Web UI Apply do the same.
+@test "tunnel_apply: a failed failover route still records the hash so the next apply does not tear down" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-route-hash.json"
+    jq '.tunnel_director.tunnels = {
+            "wgc1": {"clients":["192.168.50.0/24"],"exclude":[]},
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() {
+        [[ $1 == ovpnc2 ]] && return 1
+        return 0
+    }
+    run tunnel_apply
+    assert_failure
+    [ -f "$TUN_DIR_HASH" ]
+
+    : > /tmp/bats_iptables_calls.log
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_failure
+    refute_output --partial "Stopping Tunnel Director"
+    refute grep -q -- '-t mangle -X TUN_DIR' /tmp/bats_iptables_calls.log
+}
+
 @test "tunnel_apply: succeeds when the failover tunnel has no effective clients" {
     load_common
     source "$LIB_DIR/firewall.sh"

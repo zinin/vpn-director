@@ -666,17 +666,20 @@ tunnel_apply() {
     mkdir -p "$(dirname "$TUN_DIR_HASH")"
     cp -f "$tables_tmp" "$TUN_DIR_TABLES"
 
-    if _tunnel_failover_needed && [[ $fo_applied -eq 0 || $fo_route_ok -eq 0 || $fo_rule_ok -eq 0 ]]; then
-        rm -f "$TUN_DIR_HASH"
-        log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
-        return 1
-    fi
-
     if [[ $skipped_unknown -eq 0 ]]; then
         printf '%s\n' "$new_hash" > "$TUN_DIR_HASH"
     else
         rm -f "$TUN_DIR_HASH"
         log -l WARN "Tunnel Director: a configured tunnel is unknown to the platform (RCI down, or a typo in the id); this apply is not recorded as up-to-date and the next apply retries"
+    fi
+
+    # Still return 1 so the watch does not drop Xray membership. Keep the hash
+    # when every configured tunnel was applied: deleting it forced the next
+    # apply through tunnel_stop, which takes TUN_DIR down for every client
+    # while the fallback interface is still coming up.
+    if _tunnel_failover_needed && [[ $fo_applied -eq 0 || $fo_route_ok -eq 0 || $fo_rule_ok -eq 0 ]]; then
+        log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+        return 1
     fi
 
     if [[ $changes -eq 0 ]]; then

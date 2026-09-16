@@ -232,14 +232,14 @@ func TestTick_StagedFailoverAbandonsWhenXrayRecovers(t *testing.T) {
 }
 
 func TestServerForDial_UsesResolvedIPKeepsHostnameSNI(t *testing.T) {
-	s := serverForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls"})
+	s := ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls"})
 	if s.Address != "203.0.113.50" {
 		t.Fatalf("address %q", s.Address)
 	}
 	if s.SNI != "oslo.example" {
 		t.Fatalf("sni %q", s.SNI)
 	}
-	s = serverForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls", SNI: "cdn.example"})
+	s = ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls", SNI: "cdn.example"})
 	if s.SNI != "cdn.example" {
 		t.Fatalf("explicit sni %q", s.SNI)
 	}
@@ -465,6 +465,28 @@ func TestPickOrder_SameNameFirst(t *testing.T) {
 	got = pickOrder(in, "missing")
 	if got[0].Name != "A" {
 		t.Fatal("keep list order")
+	}
+}
+
+func TestTick_GenerateKeepsSubscriptionHostname(t *testing.T) {
+	f := &fake{
+		cfg:  failedOverCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	w := runningWatch(liveImportWatch(f))
+	var got vpnconfig.Server
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		got = s
+		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+		return true, nil
+	}
+	w.Tick(context.Background())
+	if got.Address != "new.example" {
+		t.Fatalf("Generate address %q, want the subscription hostname", got.Address)
+	}
+	if f.cfg.Xray.ActiveServer == nil || f.cfg.Xray.ActiveServer.Address != "new.example" {
+		t.Fatalf("active_server %+v, want hostname new.example", f.cfg.Xray.ActiveServer)
 	}
 }
 
@@ -1196,6 +1218,69 @@ func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
 	}
 	if !w.lastImport.IsZero() {
 		t.Fatal("lastImport must reset on successful restore")
+	}
+}
+
+func overlapFailedOverCfg() *vpnconfig.VPNDirectorConfig {
+	cfg := baseCfg()
+	cfg.Xray.Clients = []string{"192.168.1.8", "192.168.1.3"}
+	cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	vpnconfig.MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	return cfg
+}
+
+func TestTick_RestoreKeepsOverlapOnFallbackTunnel(t *testing.T) {
+	f := &fake{
+		cfg:  overlapFailedOverCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	w := runningWatch(liveImportWatch(f))
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("must restore")
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") || !contains(f.cfg.Xray.Clients, "192.168.1.3") {
+		t.Fatalf("xray %v", f.cfg.Xray.Clients)
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("added client still on tunnel")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("overlap must stay on the tunnel")
+	}
+}
+
+func TestTick_RestoreApplyFailurePreservesOverlapOnWriteBack(t *testing.T) {
+	f := &fake{
+		cfg:      overlapFailedOverCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:      time.Unix(1_700_000_000, 0),
+		applyErr: errApply,
+	}
+	w := runningWatch(liveImportWatch(f))
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("write-back")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("overlap after failed restore-Apply")
+	}
+	if !contains(f.cfg.Xray.Failover.Added, "192.168.1.8") {
+		t.Fatalf("added %v", f.cfg.Xray.Failover.Added)
+	}
+	if contains(f.cfg.Xray.Failover.Added, "192.168.1.3") {
+		t.Fatal("overlap is not added")
+	}
+
+	f.applyErr = nil
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("added client still on tunnel after retry")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("overlap must stay on the tunnel after retry")
 	}
 }
 

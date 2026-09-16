@@ -108,6 +108,9 @@ func TestMoveAndRestore_KeepsForeignTunnelClients(t *testing.T) {
 	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatal("moved client must leave the tunnel")
 	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("overlap must stay on the tunnel")
+	}
 	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.4") {
 		t.Fatal("foreign tunnel-only client")
 	}
@@ -127,6 +130,26 @@ func TestRestore_ReturnsOverlapClientToXray(t *testing.T) {
 	RestoreXrayClientsFromFailover(cfg)
 	if !contains(cfg.Xray.Clients, "192.168.1.5") {
 		t.Fatal("overlap must return to Xray")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.5") {
+		t.Fatal("overlap must stay on the tunnel")
+	}
+}
+
+func TestRestore_OverlapCIDRStaysOnTunnel(t *testing.T) {
+	cfg := sample()
+	cfg.Xray.Clients = []string{"192.168.50.0/24"}
+	cfg.TunnelDirector.Tunnels["wgc1"] = TunnelConfig{Clients: []string{"192.168.50.0/24"}}
+	MoveXrayClientsToTunnel(cfg, "wgc1")
+	if !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.50.0/24"}) {
+		t.Fatalf("snapshot %v", cfg.Xray.Failover.Clients)
+	}
+	RestoreXrayClientsFromFailover(cfg)
+	if !contains(cfg.Xray.Clients, "192.168.50.0/24") {
+		t.Fatal("overlap must return to Xray")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["wgc1"].Clients, "192.168.50.0/24") {
+		t.Fatal("original wgc1 assignment must survive restore")
 	}
 }
 
@@ -199,6 +222,69 @@ func TestRestore_SkipsClientsRemovedFromTunnelDuringFailover(t *testing.T) {
 	}
 	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatalf("tunnel after restore %v", cfg.TunnelDirector.Tunnels["ovpnc2"].Clients)
+	}
+}
+
+func TestRestore_NilAddedRemovesAllRestoredFromTunnel(t *testing.T) {
+	cfg := sample()
+	cfg.Xray.Clients = []string{"192.168.1.9"}
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = TunnelConfig{Clients: []string{"192.168.1.5", "192.168.1.4"}}
+	cfg.Xray.Failover = &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.5"}}
+	RestoreXrayClientsFromFailover(cfg)
+	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.5") {
+		t.Fatal("legacy record without added must still take restored addresses off the tunnel")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.4") {
+		t.Fatal("foreign tunnel-only client")
+	}
+}
+
+func TestFailoverJSON_RoundTripKeepsOverlapOnTunnel(t *testing.T) {
+	cfg := sample()
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	raw, err := json.Marshal(cfg.Xray.Failover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fo XrayFailover
+	if err := json.Unmarshal(raw, &fo); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(fo.Added, []string{"192.168.1.8"}) {
+		t.Fatalf("added %v from %s", fo.Added, raw)
+	}
+	cfg.Xray.Failover = &fo
+	RestoreXrayClientsFromFailover(cfg)
+	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("added client")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("overlap after JSON round-trip")
+	}
+}
+
+func TestFailoverJSON_EmptyAddedIsNotNilAfterRoundTrip(t *testing.T) {
+	cfg := sample()
+	cfg.Xray.Clients = []string{"192.168.1.3"}
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	if cfg.Xray.Failover.Added == nil {
+		t.Fatal("all-overlap added must be an empty slice, not nil")
+	}
+	raw, err := json.Marshal(cfg.Xray.Failover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fo XrayFailover
+	if err := json.Unmarshal(raw, &fo); err != nil {
+		t.Fatal(err)
+	}
+	if fo.Added == nil {
+		t.Fatalf("round-trip nil added from %s; omitempty would drop overlap on restore", raw)
+	}
+	cfg.Xray.Failover = &fo
+	RestoreXrayClientsFromFailover(cfg)
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+		t.Fatal("overlap after empty-added round-trip")
 	}
 }
 

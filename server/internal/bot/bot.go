@@ -126,7 +126,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				}
 				ports := service.InboundPorts{}
 				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
-				return service.GenerateAndRecordActiveServer(configSvc, xraySvc, s, ports)
+				return service.GenerateAndRecordDialedServer(configSvc, xraySvc, subwatch.ServerForDial(s), s, ports)
 			},
 			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
 				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
