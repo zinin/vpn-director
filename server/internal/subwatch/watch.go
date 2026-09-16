@@ -126,8 +126,21 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	if cfg.Xray.Failover != nil {
 		staged := vpnconfig.FailoverStaged(cfg)
-		if staged && w.probeOK(ctx, cfg) {
-			w.abandonStaged()
+		if w.probeOK(ctx, cfg) {
+			if staged {
+				w.abandonStaged()
+				return
+			}
+			// Current outbound already carries HTTPS; do not wait on Fetch.
+			if !w.commitRestore(cfg) {
+				return
+			}
+			name := "unknown"
+			if cfg.Xray.ActiveServer != nil {
+				name = cfg.Xray.ActiveServer.Name
+			}
+			slog.Info("Xray clients restored", "server", name)
+			w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
 			return
 		}
 		wasPending := w.pendingApply || staged

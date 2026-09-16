@@ -34,6 +34,7 @@ type fake struct {
 	applies  int
 	notes    []string
 	now      time.Time
+	picked   bool // Generate has written a walked outbound (liveImportWatch)
 }
 
 // cloneCfg hands out what production's LoadVPN does: a fresh parse, which a
@@ -441,14 +442,36 @@ func TestTick_NoTunnelPickApplyFailureLeavesNothingPending(t *testing.T) {
 	}
 }
 
-func TestTick_FailoverPresentSkipsHealthyProbeRestore(t *testing.T) {
-	cfg := baseCfg()
-	cfg.Xray.Failover = &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}}
-	cfg.Xray.Clients = []string{"192.168.1.9"}
-	f := &fake{cfg: cfg, probeErr: nil, now: time.Unix(1_700_000_000, 0)}
-	runningWatch(f.watch()).Tick(context.Background())
-	if f.cfg.Xray.Failover == nil {
-		t.Fatal("live SOCKS must not restore")
+func TestTick_CommittedFailoverRestoresWhenSOCKSHealthy(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	fetches := 0
+	w := runningWatch(f.watch())
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("cdn down")
+	}
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("live SOCKS must restore without a subscription fetch")
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("client not restored")
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("added client still on tunnel")
+	}
+	if fetches != 0 {
+		t.Fatalf("fetches %d; a healthy outbound must not wait on the subscription", fetches)
+	}
+	found := false
+	for _, n := range f.notes {
+		if n == "LAN clients back on Xray; server Oslo" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("notes %v", f.notes)
 	}
 }
 
@@ -478,6 +501,7 @@ func TestTick_GenerateKeepsSubscriptionHostname(t *testing.T) {
 	var got vpnconfig.Server
 	w.Generate = func(s vpnconfig.Server) (bool, error) {
 		got = s
+		f.picked = true
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
 		return true, nil
 	}
@@ -851,10 +875,21 @@ func liveImportWatch(f *fake) *Watch {
 			{Name: "Backup", Address: "b.example", Port: 443, IPs: []string{"203.0.113.11", "198.51.100.8", ""}},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server) (bool, error) { return true, nil }
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		f.picked = true
+		return true, nil
+	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
-	w.Probe = func(context.Context, int) error { return nil }
+	// Health probe of the current outbound fails until Generate has picked a
+	// server; the walk probe then succeeds. A nil Probe restored immediately
+	// and skipped Fetch.
+	w.Probe = func(context.Context, int) error {
+		if f.picked {
+			return nil
+		}
+		return errProbe
+	}
 	return w
 }
 
@@ -942,7 +977,7 @@ func TestTick_RestoreResetsImportBackoff(t *testing.T) {
 	w.Tick(context.Background()) // dead servers: the next wave backs off to 10m
 	f.probeErr = nil
 	f.now = f.now.Add(10 * time.Minute)
-	w.Tick(context.Background()) // Oslo is live
+	w.Tick(context.Background()) // current outbound is live; restore without Fetch
 	if f.cfg.Xray.Failover != nil {
 		t.Fatal("the second wave must restore")
 	}
@@ -952,24 +987,24 @@ func TestTick_RestoreResetsImportBackoff(t *testing.T) {
 	fetchErr = errors.New("cdn down")
 	f.now = f.now.Add(ProbeInterval)
 	tickUntilDead(w, f)
-	if fetches != 3 {
+	if fetches != 2 {
 		t.Fatalf("fetches %d, want the new episode's first wave", fetches)
 	}
 	dead := f.now
 	f.now = dead.Add(ImportRetry - time.Second)
 	w.Tick(context.Background())
-	if fetches != 3 {
+	if fetches != 2 {
 		t.Fatalf("fetch %v after a failed download", ImportRetry-time.Second)
 	}
 	f.now = dead.Add(ImportRetry)
 	w.Tick(context.Background())
-	if fetches != 4 {
+	if fetches != 3 {
 		t.Fatalf("fetches %d; after a restore the retry is back to %v", fetches, ImportRetry)
 	}
 }
 
 func TestTick_FailedFetchKeepsFiveMinuteRetry(t *testing.T) {
-	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	fetches := 0
 	w := runningWatch(f.watch())
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
@@ -1056,7 +1091,12 @@ func TestTick_NoLiveWaveReturnsToPreferredServer(t *testing.T) {
 	}
 
 	events = nil
-	f.probeErr = nil
+	w.Probe = func(context.Context, int) error {
+		if len(events) > 0 {
+			return nil
+		}
+		return errProbe
+	}
 	f.now = f.now.Add(2 * ImportRetry) // the dead wave backed the next one off to 10m
 	w.Tick(context.Background())
 	if !reflect.DeepEqual(events, []string{"Oslo", "restart"}) {
@@ -1146,6 +1186,7 @@ func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
 	}
 	w.Generate = func(vpnconfig.Server) (bool, error) {
 		generates++
+		f.picked = true
 		return true, nil
 	}
 	w.RestartXray = func() error {
@@ -1395,8 +1436,8 @@ func TestTick_RestoreApplyFailureWithWriteBackRetriesApplyBeforeImport(t *testin
 	f.applyErr = nil
 	f.now = f.now.Add(ImportRetry)
 	w.Tick(context.Background())
-	if want := []string{"apply", "fetch", "apply"}; !reflect.DeepEqual(events, want) {
-		t.Fatalf("events %v, want %v (the pending Apply before the import)", events, want)
+	if want := []string{"apply"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events %v, want %v (healthy SOCKS restores without Fetch)", events, want)
 	}
 	if f.cfg.Xray.Failover != nil {
 		t.Fatal("must restore once Apply succeeds")
@@ -1499,7 +1540,7 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 }
 
 func TestTick_FirstTickReappliesFailoverFromEarlierProcess(t *testing.T) {
-	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	fetches := 0
 	w := f.watch()
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
@@ -1526,7 +1567,7 @@ func TestTick_FirstTickReappliesFailoverFromEarlierProcess(t *testing.T) {
 }
 
 func TestTick_CommittedFailoverApplyFailureStillImports(t *testing.T) {
-	f := &fake{cfg: failedOverCfg(), applyErr: errApply, now: time.Unix(1_700_000_000, 0)}
+	f := &fake{cfg: failedOverCfg(), applyErr: errApply, probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	fetches := 0
 	w := f.watch()
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
@@ -1557,8 +1598,9 @@ func TestTick_CommittedFailoverApplyFailureStillImports(t *testing.T) {
 
 func TestTick_ImportSyncsXrayServers(t *testing.T) {
 	f := &fake{
-		cfg: failedOverCfg(),
-		now: time.Unix(1_700_000_000, 0),
+		cfg:      failedOverCfg(),
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
 	}
 	w := runningWatch(f.watch())
 	w.SaveServers = func([]vpnconfig.Server) error { return nil }
