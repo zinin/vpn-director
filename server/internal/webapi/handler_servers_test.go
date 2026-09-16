@@ -303,41 +303,6 @@ func TestHandleImportServers_EmptyURLUsesSavedURL(t *testing.T) {
 	}
 }
 
-func TestCollectServerIPs(t *testing.T) {
-	servers := []vpnconfig.Server{
-		{IPs: []string{"2.2.2.2", "1.1.1.1"}},
-		{IPs: []string{"1.1.1.1", "3.3.3.3"}}, // 1.1.1.1 is a duplicate
-		{IPs: []string{""}},                   // empty IP skipped
-	}
-
-	got := collectServerIPs(servers)
-
-	if joined := strings.Join(got, ","); joined != "1.1.1.1,2.2.2.2,3.3.3.3" {
-		t.Errorf("collectServerIPs = %q, want sorted deduped 1.1.1.1,2.2.2.2,3.3.3.3", joined)
-	}
-}
-
-func TestCollectServerIPs_EmptyMarshalsToJSONArray(t *testing.T) {
-	// With no usable IPs the result must marshal to an empty JSON array, not
-	// null: it is persisted as xray.servers in vpn-director.json, where null
-	// reads differently than [] for consumers that don't apply a `// []` default.
-	cases := map[string][]vpnconfig.Server{
-		"nil-slice": nil,
-		"empty-IPs": {{IPs: []string{""}}},
-	}
-	for name, servers := range cases {
-		t.Run(name, func(t *testing.T) {
-			b, err := json.Marshal(collectServerIPs(servers))
-			if err != nil {
-				t.Fatalf("marshal: %v", err)
-			}
-			if string(b) != "[]" {
-				t.Errorf("collectServerIPs(%s) marshals to %s, want []", name, b)
-			}
-		})
-	}
-}
-
 func TestDownloadErrMessage(t *testing.T) {
 	// A blocked-address error must NOT echo the resolved internal IP back to the
 	// client (the dial guard wraps ssrf.ErrBlockedAddress around the IP).

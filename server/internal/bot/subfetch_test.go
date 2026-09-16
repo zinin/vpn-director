@@ -3,12 +3,14 @@ package bot
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -306,5 +308,20 @@ func TestNewTunnelHTTPClient_DoesNotFollowRedirects(t *testing.T) {
 	}
 	if targetHits != 0 {
 		t.Fatalf("redirect followed: target hits %d", targetHits)
+	}
+}
+
+func TestServersFromSubscription(t *testing.T) {
+	if _, err := serversFromSubscription([]byte("not base64 !!!")); err == nil || err.Error() != "no VLESS servers" {
+		t.Fatalf("err %v, want no VLESS servers", err)
+	}
+
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443#Oslo"))
+	servers, err := serversFromSubscription([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || servers[0].Name != "Oslo" || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.10"}) {
+		t.Fatalf("servers %+v, want Oslo on 203.0.113.10", servers)
 	}
 }

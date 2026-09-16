@@ -14,6 +14,7 @@ import (
 
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
+	"github.com/zinin/vpn-director/server/internal/vless"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -83,6 +84,19 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 	return fetchWANThenOptionalTunnel(ctx, rawURL, wan, func() *http.Client {
 		return subscriptionTunnelClient(cfgSvc, vpnSvc)
 	})
+}
+
+// serversFromSubscription decodes a fetched subscription body for the watch and
+// keeps the servers whose addresses resolved.
+func serversFromSubscription(body []byte) ([]vpnconfig.Server, error) {
+	result := vless.DecodeAndResolve(string(body))
+	if result.Parsed == 0 {
+		return nil, errors.New("no VLESS servers")
+	}
+	if len(result.Servers) == 0 {
+		return nil, errors.New("could not resolve IP for any server")
+	}
+	return result.Servers, nil
 }
 
 func subscriptionTunnelClient(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) *http.Client {

@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/url"
-	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -296,7 +295,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	slog.Info("Subscription refreshed", "servers", len(servers))
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-			current.Xray.Servers = uniqueServerIPs(servers)
+			current.Xray.Servers = vpnconfig.ServerIPs(servers)
 			return nil
 		}); err != nil {
 			slog.Warn("Failed to sync xray.servers after the subscription refresh", "error", err)
@@ -399,23 +398,6 @@ func (w *Watch) returnToPreferred(s vpnconfig.Server) {
 	if err == nil {
 		slog.Info("Xray config returned to the preferred server", "server", s.Name)
 	}
-}
-
-// uniqueServerIPs is the same de-dupe as handler/import.go and webapi.collectServerIPs:
-// xray.servers feeds TPROXY_BYPASS, so every imported endpoint must be present.
-func uniqueServerIPs(servers []vpnconfig.Server) []string {
-	seen := make(map[string]bool)
-	ips := make([]string, 0)
-	for _, s := range servers {
-		for _, ip := range s.IPs {
-			if ip != "" && !seen[ip] {
-				seen[ip] = true
-				ips = append(ips, ip)
-			}
-		}
-	}
-	sort.Strings(ips)
-	return ips
 }
 
 func (w *Watch) apply() error {

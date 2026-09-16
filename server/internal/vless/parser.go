@@ -235,3 +235,28 @@ func DecodeSubscription(encoded string) ([]*Server, []error) {
 
 	return servers, parseErrors
 }
+
+// Import is a decoded subscription whose servers resolved. Servers keeps
+// subscription order.
+type Import struct {
+	Servers       []vpnconfig.Server
+	Parsed        int
+	ParseErrors   []error
+	ResolveErrors int
+}
+
+// DecodeAndResolve decodes a subscription body and resolves every parsed
+// server. The bot's /import, the Web UI import and the subscription watch all
+// go through it.
+func DecodeAndResolve(body string) Import {
+	parsed, parseErrors := DecodeSubscription(body)
+	result := Import{Parsed: len(parsed), ParseErrors: parseErrors}
+	for _, s := range parsed {
+		if err := s.ResolveIPs(); err != nil {
+			result.ResolveErrors++
+			continue
+		}
+		result.Servers = append(result.Servers, s.ToVPNConfig())
+	}
+	return result
+}

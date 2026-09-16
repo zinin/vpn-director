@@ -8,7 +8,6 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
@@ -91,14 +90,14 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Decode VLESS subscription
-	servers, parseErrors := vless.DecodeSubscription(string(body))
-	if len(servers) == 0 {
+	// Decode VLESS subscription and resolve IPs for each server
+	result := vless.DecodeAndResolve(string(body))
+	if result.Parsed == 0 {
 		var sb strings.Builder
 		sb.WriteString("No VLESS servers found")
-		if len(parseErrors) > 0 {
+		if len(result.ParseErrors) > 0 {
 			sb.WriteString("\nErrors:\n")
-			for _, e := range parseErrors {
+			for _, e := range result.ParseErrors {
 				sb.WriteString(fmt.Sprintf("- %s\n", e))
 			}
 		}
@@ -106,41 +105,18 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Resolve IPs for each server
-	var resolved []vpnconfig.Server
-	var resolveErrors int
-	totalParsed := len(servers)
-
-	for _, s := range servers {
-		if err := s.ResolveIPs(); err != nil {
-			resolveErrors++
-			continue
-		}
-		resolved = append(resolved, s.ToVPNConfig())
-	}
-
-	if len(resolved) == 0 {
+	if len(result.Servers) == 0 {
 		h.deps.Sender.Send(msg.Chat.ID, "Could not resolve IP for any server")
 		return
 	}
 
 	// Save servers (SaveServers creates directory if needed)
-	if err := h.deps.Config.SaveServers(resolved); err != nil {
+	if err := h.deps.Config.SaveServers(result.Servers); err != nil {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Save error: %v", err)))
 		return
 	}
 
-	seen := make(map[string]bool)
-	var serverIPs []string
-	for _, s := range resolved {
-		for _, ip := range s.IPs {
-			if ip != "" && !seen[ip] {
-				seen[ip] = true
-				serverIPs = append(serverIPs, ip)
-			}
-		}
-	}
-	sort.Strings(serverIPs)
+	serverIPs := vpnconfig.ServerIPs(result.Servers)
 
 	// Auto-sync xray.servers with IPs from all imported servers. A missing
 	// vpn-director.json is not an error here: /import works before the first
@@ -159,25 +135,25 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 
 	// Build response with grouped stats
 	var sb strings.Builder
-	if resolveErrors > 0 || len(parseErrors) > 0 {
-		sb.WriteString(fmt.Sprintf("Imported %d of %d servers:\n", len(resolved), totalParsed))
+	if result.ResolveErrors > 0 || len(result.ParseErrors) > 0 {
+		sb.WriteString(fmt.Sprintf("Imported %d of %d servers:\n", len(result.Servers), result.Parsed))
 	} else {
-		sb.WriteString(fmt.Sprintf("Imported %d servers:\n", len(resolved)))
+		sb.WriteString(fmt.Sprintf("Imported %d servers:\n", len(result.Servers)))
 	}
 
-	groupedStr := groupServersByCountry(resolved)
+	groupedStr := groupServersByCountry(result.Servers)
 	sb.WriteString(telegram.EscapeMarkdownV2(groupedStr))
 
-	if resolveErrors > 0 || len(parseErrors) > 0 {
+	if result.ResolveErrors > 0 || len(result.ParseErrors) > 0 {
 		sb.WriteString("\n\n")
-		if resolveErrors > 0 {
-			sb.WriteString(fmt.Sprintf("%d DNS errors", resolveErrors))
+		if result.ResolveErrors > 0 {
+			sb.WriteString(fmt.Sprintf("%d DNS errors", result.ResolveErrors))
 		}
-		if len(parseErrors) > 0 {
-			if resolveErrors > 0 {
+		if len(result.ParseErrors) > 0 {
+			if result.ResolveErrors > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteString(fmt.Sprintf("%d parse errors", len(parseErrors)))
+			sb.WriteString(fmt.Sprintf("%d parse errors", len(result.ParseErrors)))
 		}
 	}
 

@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"sort"
 	"strings"
 	"time"
 
@@ -92,7 +91,7 @@ func handleSelectServer(deps *Deps) http.HandlerFunc {
 		// xray restart would pick it up against the old vpn-director.json.
 		var ports service.InboundPorts
 		err = deps.Config.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
-			cfg.Xray.Servers = collectServerIPs(servers)
+			cfg.Xray.Servers = vpnconfig.ServerIPs(servers)
 			// Read here, where the config is already in hand: the generated
 			// inbound has to listen where the TPROXY rules send traffic.
 			ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
@@ -203,24 +202,15 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 			return
 		}
 
-		// Decode VLESS subscription. Parse errors travel back to the user so a
-		// rejected link explains itself, as the bot's /import does.
-		vlessServers, parseErrs := vless.DecodeSubscription(string(body))
-		if len(vlessServers) == 0 {
-			jsonError(w, http.StatusBadRequest, noServersMessage(parseErrs))
+		// Decode VLESS subscription and resolve IPs. Parse errors travel back to
+		// the user so a rejected link explains itself, as the bot's /import does.
+		result := vless.DecodeAndResolve(string(body))
+		if result.Parsed == 0 {
+			jsonError(w, http.StatusBadRequest, noServersMessage(result.ParseErrors))
 			return
 		}
 
-		// Resolve IPs and convert to vpnconfig.Server.
-		var resolved []vpnconfig.Server
-		for _, s := range vlessServers {
-			if err := s.ResolveIPs(); err != nil {
-				continue
-			}
-			resolved = append(resolved, s.ToVPNConfig())
-		}
-
-		if len(resolved) == 0 {
+		if len(result.Servers) == 0 {
 			jsonError(w, http.StatusBadRequest, "could not resolve IP for any server")
 			return
 		}
@@ -231,7 +221,7 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		}
 		defer unlock()
 
-		if err := deps.Config.SaveServers(resolved); err != nil {
+		if err := deps.Config.SaveServers(result.Servers); err != nil {
 			jsonError(w, http.StatusInternalServerError, "failed to save servers")
 			return
 		}
@@ -241,13 +231,13 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		// servers.json is already saved here, so the message says so explicitly:
 		// the import partially persisted (servers stored, xray.servers stale) and
 		// the client must not read the 500 as "nothing changed".
-		if err := syncXrayServers(deps.Config, resolved, req.URL); err != nil {
+		if err := syncXrayServers(deps.Config, result.Servers, req.URL); err != nil {
 			jsonError(w, http.StatusInternalServerError,
 				fmt.Sprintf("servers saved, but xray.servers sync failed: %s", err))
 			return
 		}
 
-		jsonOK(w, map[string]interface{}{"ok": true, "count": len(resolved)})
+		jsonOK(w, map[string]interface{}{"ok": true, "count": len(result.Servers)})
 	}
 }
 
@@ -267,25 +257,6 @@ func downloadErrMessage(err error) string {
 		err = ue.Err
 	}
 	return fmt.Sprintf("download failed: %s", err)
-}
-
-// collectServerIPs returns the sorted, de-duplicated list of all non-empty IPs
-// across the given servers. xray.servers feeds the TPROXY bypass set, so every
-// configured server endpoint must be present (otherwise the proxy's own egress
-// could be routed back through itself).
-func collectServerIPs(servers []vpnconfig.Server) []string {
-	seen := make(map[string]bool)
-	ips := make([]string, 0) // non-nil so an empty result marshals to [] not null
-	for _, s := range servers {
-		for _, ip := range s.IPs {
-			if ip != "" && !seen[ip] {
-				seen[ip] = true
-				ips = append(ips, ip)
-			}
-		}
-	}
-	sort.Strings(ips)
-	return ips
 }
 
 // resolveSubscriptionURL returns the posted URL, or the saved one when the
@@ -310,7 +281,7 @@ func resolveSubscriptionURL(reqURL string, cfg *vpnconfig.VPNDirectorConfig) (st
 // user's face.
 func syncXrayServers(config service.ConfigStore, servers []vpnconfig.Server, subscriptionURL string) error {
 	return config.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
-		cfg.Xray.Servers = collectServerIPs(servers)
+		cfg.Xray.Servers = vpnconfig.ServerIPs(servers)
 		if subscriptionURL != "" {
 			cfg.Xray.SubscriptionURL = subscriptionURL
 		}

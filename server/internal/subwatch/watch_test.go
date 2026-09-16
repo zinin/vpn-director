@@ -1317,17 +1317,3 @@ func TestTick_ImportSyncsXrayServers(t *testing.T) {
 		t.Fatal("Generate is nil; must stay failed over")
 	}
 }
-
-func TestUniqueServerIPs(t *testing.T) {
-	got := uniqueServerIPs([]vpnconfig.Server{
-		{IPs: []string{"2.2.2.2", "", "1.1.1.1"}},
-		{IPs: []string{"1.1.1.1", "3.3.3.3"}},
-	})
-	want := []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("%v, want %v", got, want)
-	}
-	if uniqueServerIPs(nil) == nil {
-		t.Fatal("empty result must be non-nil so JSON is []")
-	}
-}

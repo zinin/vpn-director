@@ -23,6 +23,25 @@ type Server struct {
 	ALPN        []string `json:"alpn,omitempty"`
 }
 
+// ServerIPs returns every non-empty IP across servers, de-duplicated and
+// sorted. xray.servers feeds TPROXY_BYPASS, so every configured server endpoint
+// must be present (otherwise the proxy's own egress could be routed back through
+// itself). The result is never nil, so an empty list marshals to [] not null.
+func ServerIPs(servers []Server) []string {
+	seen := make(map[string]bool)
+	ips := make([]string, 0)
+	for _, s := range servers {
+		for _, ip := range s.IPs {
+			if ip != "" && !seen[ip] {
+				seen[ip] = true
+				ips = append(ips, ip)
+			}
+		}
+	}
+	sort.Strings(ips)
+	return ips
+}
+
 type WebUIConfig struct {
 	Port      int    `json:"port,omitempty"`
 	CertFile  string `json:"cert_file,omitempty"`

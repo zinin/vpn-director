@@ -6,9 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
-	"strconv"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/chatstore"
@@ -21,7 +19,6 @@ import (
 	"github.com/zinin/vpn-director/server/internal/telegram"
 	"github.com/zinin/vpn-director/server/internal/updateflow"
 	"github.com/zinin/vpn-director/server/internal/updater"
-	"github.com/zinin/vpn-director/server/internal/vless"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/wizard"
 )
@@ -155,29 +152,12 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
 				return service.GenerateAndRecordActiveServer(configSvc, xraySvc, s, ports)
 			},
-			Probe: func(ctx context.Context, port int) error {
-				return subwatch.ProbeSOCKS(ctx, net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), subwatch.ProbeURL)
-			},
 			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
 				body, err := b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
 				if err != nil {
 					return nil, err
 				}
-				parsed, _ := vless.DecodeSubscription(string(body))
-				if len(parsed) == 0 {
-					return nil, errors.New("no VLESS servers")
-				}
-				var resolved []vpnconfig.Server
-				for _, s := range parsed {
-					if err := s.ResolveIPs(); err != nil {
-						continue
-					}
-					resolved = append(resolved, s.ToVPNConfig())
-				}
-				if len(resolved) == 0 {
-					return nil, errors.New("could not resolve IP for any server")
-				}
-				return resolved, nil
+				return serversFromSubscription(body)
 			},
 			Notify: b.notifyActiveChats,
 		}
