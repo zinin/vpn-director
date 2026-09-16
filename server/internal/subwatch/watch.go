@@ -69,6 +69,7 @@ type Watch struct {
 	pendingApply         bool          // JSON mutated; Apply has not yet succeeded
 	pendingRestoreNotify bool          // pendingApply is a committed restore, so notify when Apply succeeds
 	reconciled           bool          // the first armed Tick has checked for a failover left by an earlier process
+	lastNoTunnelCheck    time.Time     // last LoadPlatform while announcing no fallback
 	running              bool
 }
 
@@ -205,6 +206,10 @@ func (w *Watch) Tick(ctx context.Context) {
 		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, "error", err)
 		return
 	}
+	if w.lastRouteKind == noteNoTunnel && !w.lastNoTunnelCheck.IsZero() && now.Sub(w.lastNoTunnelCheck) < ImportRetry {
+		w.maybeImportAndPick(ctx, cfg)
+		return
+	}
 	// With no tunnel to move to, every later tick comes back here: log the
 	// transition only until the user has been told there is no fallback.
 	announce := w.lastRouteKind != noteNoTunnel
@@ -222,6 +227,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	id := vpnconfig.FirstTDExit(cfg, plat)
 	if id == "" {
+		w.lastNoTunnelCheck = now
 		if announce {
 			slog.Info("No Tunnel Director fallback for Xray clients")
 		}
@@ -229,6 +235,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
+	w.lastNoTunnelCheck = time.Time{}
 	if w.UpdateVPN == nil {
 		return
 	}
@@ -285,7 +292,6 @@ func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPND
 	}
 	if !w.fallbackReady(cfg) {
 		slog.Warn("Failover tunnel is not applied yet; keeping Xray membership")
-		w.pendingApply = true
 		return cfg, false
 	}
 	if w.UpdateVPN != nil {
@@ -430,12 +436,13 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			continue
 		}
 		slog.Info("Subscription server picked", "server", s.Name)
-		// Only a watch that moved clients has anything to bring back to Xray.
-		moved := failoverTunnel(cfg) != ""
+		// Only a committed failover left Xray. Staged clients never left, so
+		// "back on Xray" would be a false message.
+		committed := failoverTunnel(cfg) != "" && !vpnconfig.FailoverStaged(cfg)
 		if !w.commitRestore(cfg) {
 			return
 		}
-		if moved {
+		if committed {
 			slog.Info("Xray clients restored", "server", s.Name)
 			w.notify(noteRestored, fmt.Sprintf(msgRestored, s.Name))
 		} else {

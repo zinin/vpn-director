@@ -297,6 +297,56 @@ func TestTick_StagedRestoreApplyFailureKeepsXrayMembership(t *testing.T) {
 	}
 }
 
+func TestTick_DoesNotReapplyWhileWaitingForFailoverReady(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.FallbackReady = func(string) bool { return false }
+	tickUntilDead(w, f)
+	n := f.applies
+	if n == 0 {
+		t.Fatal("the move apply")
+	}
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != n {
+		t.Fatalf("applies %d after %d; waiting for failover_ready must not re-apply", f.applies, n)
+	}
+}
+
+func TestTick_StagedPickNotifiesPickedNotRestored(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	vpnconfig.StageXrayClientsToTunnel(cfg, "ovpnc2")
+	f := &fake{
+		cfg:  cfg,
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	w := runningWatch(liveImportWatch(f))
+	w.FallbackReady = func(string) bool { return false }
+	w.Tick(context.Background())
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "LAN clients back on Xray") {
+			t.Fatalf("staged pick must not send restored: %v", f.notes)
+		}
+	}
+	found := false
+	for _, n := range f.notes {
+		if n == "Subscription refreshed; selected server Oslo" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
 func TestServerForDial_UsesResolvedIPKeepsHostnameSNI(t *testing.T) {
 	s := ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls"})
 	if s.Address != "203.0.113.50" {
@@ -331,6 +381,36 @@ func TestTick_NoTunnelStillNotifiesOnce(t *testing.T) {
 	w.Tick(context.Background())
 	if len(f.notes) != 1 {
 		t.Fatalf("duplicate notify %v", f.notes)
+	}
+}
+
+func TestTick_NoTunnelDoesNotReloadPlatformEveryTick(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	platforms := 0
+	w := f.watch()
+	load := w.LoadPlatform
+	w.LoadPlatform = func() (vpnconfig.PlatformInfo, error) {
+		platforms++
+		return load()
+	}
+	tickUntilDead(w, f)
+	if platforms == 0 {
+		t.Fatal("the first no-tunnel tick must read the platform")
+	}
+	n := platforms
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if platforms != n {
+		t.Fatalf("platform %d after %d; must not spawn platform every tick after no-tunnel", platforms, n)
+	}
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+	if platforms == n {
+		t.Fatal("must re-check for a tunnel on the import cadence")
 	}
 }
 

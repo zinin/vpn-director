@@ -104,8 +104,8 @@ configured tunnel was applied) and returns 0 with a WARN, so S99 start, hooks an
 do not fail while the fallback interface is still coming up. Deleting the hash forced the next
 apply through `tunnel_stop`. The watch does not Commit Xray membership until
 `/tmp/tunnel_director/failover_ready` names that tunnel (route and ip rule installed);
-`TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path re-checks the
-failover tunnel's route and its ip rule (`pref TUN_DIR_PREF_BASE+idx` from `TUN_DIR_TABLES`)
+`TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path always re-installs recorded routes, then re-checks the
+failover tunnel's row in `TUN_DIR_TABLES` and its ip rule (`pref TUN_DIR_PREF_BASE+idx`)
 and rewrites or removes `failover_ready` without a rebuild.
 
 The rebuild loop also releases each tunnel's table right before it ensures the route

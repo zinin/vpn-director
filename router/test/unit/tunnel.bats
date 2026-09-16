@@ -574,6 +574,36 @@ load '../test_helper'
     assert_success
 }
 
+# The up-to-date failover check used to `||` the TABLES membership test in
+# front of _tunnel_ensure_routes, so a missing failover row skipped route
+# re-install for every other tunnel too (Keenetic flaps).
+@test "tunnel_apply: up-to-date path still re-ensures other tunnels when the failover row is missing" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-ensure.json"
+    jq '.tunnel_director.tunnels = {
+            "wgc1": {"clients":["192.168.50.0/24"],"exclude":[]},
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    grep -v ' ovpnc2$' "$TUN_DIR_TABLES" > "$TUN_DIR_TABLES.tmp"
+    mv "$TUN_DIR_TABLES.tmp" "$TUN_DIR_TABLES"
+    platform_tunnel_route_ensure() { echo "ensure $1 $2" >> "$BATS_TEST_TMPDIR/ensure.log"; return 0; }
+    fw_chain_exists() { return 0; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "up-to-date"
+    grep -q "ensure wgc1" "$BATS_TEST_TMPDIR/ensure.log"
+}
+
 @test "tunnel_apply: up-to-date path re-ensures every recorded route" {
     load_tunnel_module
     run tunnel_apply

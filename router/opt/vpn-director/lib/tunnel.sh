@@ -392,9 +392,14 @@ tunnel_apply() {
     fi
 
     if [[ $rebuild -eq 0 ]]; then
+        # Always re-install recorded routes first. Gating that on the failover
+        # row being in TUN_DIR_TABLES skipped Keenetic route repair for every
+        # other tunnel after an interface flap.
+        local route_rc=0
+        _tunnel_ensure_routes || route_rc=$?
         if _tunnel_failover_needed; then
             if ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES" \
-                || ! _tunnel_ensure_routes \
+                || [[ $route_rc -ne 0 ]] \
                 || ! _tunnel_failover_rule_present; then
                 rm -f "$TUN_DIR_FAILOVER_READY"
                 log -l WARN "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
@@ -403,7 +408,6 @@ tunnel_apply() {
             fi
         else
             rm -f "$TUN_DIR_FAILOVER_READY"
-            _tunnel_ensure_routes || true
         fi
         log "Rules are applied and up-to-date"
         return 0
