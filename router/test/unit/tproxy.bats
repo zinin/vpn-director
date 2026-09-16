@@ -195,6 +195,22 @@ load '../test_helper'
     assert_success
 }
 
+@test "tproxy_apply: does not record ready when TPROXY targets cannot be installed" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    iptables() {
+        if [[ $* == *TPROXY* && ( $* == *-A* || $* == *-I* ) ]]; then
+            echo "iptables $*" >> /tmp/bats_iptables_calls.log
+            return 1
+        fi
+        command iptables "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
 @test "tproxy_apply: records ready when rules are installed" {
     load_tproxy_module
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"

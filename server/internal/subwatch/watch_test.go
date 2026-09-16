@@ -264,11 +264,14 @@ func TestTick_AbandonStagedApplyFailureDoesNotNotifyRestored(t *testing.T) {
 	f.probeErr = nil
 	f.applyErr = errApply
 	w.Tick(context.Background())
-	if f.cfg.Xray.Failover != nil {
-		t.Fatal("JSON must already be restored")
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("must keep failover until TPROXY apply succeeds")
 	}
 	f.applyErr = nil
 	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("must drop failover after TPROXY apply")
+	}
 	for _, n := range f.notes {
 		if strings.HasPrefix(n, "LAN clients back on Xray") {
 			t.Fatalf("staged abandon must not send restored: %v", f.notes)
@@ -598,8 +601,8 @@ func TestTick_RestoreKeepsFallbackWhenTPROXYNotReady(t *testing.T) {
 	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatal("fallback membership")
 	}
-	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
-		t.Fatal("committed write-back must take the client off Xray")
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("must stay on Xray until TPROXY is intercepting; do not strip TUN_DIR first")
 	}
 	for _, n := range f.notes {
 		if strings.HasPrefix(n, "LAN clients back on Xray") {
@@ -647,6 +650,55 @@ func TestTick_WalkAbandonsWhenANewerServerWasSelected(t *testing.T) {
 		t.Fatalf("generate %v; must not overwrite a newer manual selection", generated)
 	}
 	if f.cfg.Xray.ActiveServer == nil || f.cfg.Xray.ActiveServer.Name != "Manual" {
+		t.Fatalf("active %+v", f.cfg.Xray.ActiveServer)
+	}
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("abandoned walk must not restore")
+	}
+}
+
+func TestTick_WalkAbandonsWhenUserReselectsStartedServer(t *testing.T) {
+	f := &fake{
+		cfg:  failedOverCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+			{Name: "Extra", Address: "extra.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if len(generated) == 0 {
+			return errProbe
+		}
+		last := generated[len(generated)-1]
+		if last == "Backup" {
+			f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+			return errProbe
+		}
+		if last == "Oslo" {
+			return errProbe
+		}
+		return nil
+	}
+	w.Tick(context.Background())
+	if len(generated) != 2 || generated[0] != "Oslo" || generated[1] != "Backup" {
+		t.Fatalf("generate %v; must not overwrite a re-selection of the original server", generated)
+	}
+	if f.cfg.Xray.ActiveServer == nil || f.cfg.Xray.ActiveServer.Name != "Oslo" {
 		t.Fatalf("active %+v", f.cfg.Xray.ActiveServer)
 	}
 	if f.cfg.Xray.Failover == nil {
@@ -808,6 +860,7 @@ func TestTick_SameNameDeadWalksList(t *testing.T) {
 	w.Generate = func(s vpnconfig.Server) (bool, error) {
 		generated = append(generated, s.Name)
 		liveAfter = s.Name
+		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
 		return true, nil
 	}
 	w.RestartXray = func() error { return nil }
@@ -1406,7 +1459,7 @@ func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
 		return nil
 	}
 	w.Tick(context.Background())
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 	if fetches != 1 || generates != 1 || restarts != 1 {
 		t.Fatalf("first tick fetches=%d generates=%d restarts=%d", fetches, generates, restarts)
 	}
@@ -1416,7 +1469,7 @@ func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
 
 	f.now = f.now.Add(ProbeInterval)
 	w.Tick(context.Background())
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 	if fetches != 1 || generates != 1 || restarts != 1 {
 		t.Fatalf("30s later must not re-import, fetches=%d generates=%d restarts=%d", fetches, generates, restarts)
 	}
@@ -1434,7 +1487,7 @@ func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
 	}
 	w := runningWatch(liveImportWatch(f))
 	w.Tick(context.Background())
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 	if f.applies != 1 {
 		t.Fatalf("applies %d, want 1", f.applies)
 	}
@@ -1549,7 +1602,7 @@ func TestTick_RestoreApplyFailureDoesNotMoveUnrelatedXrayClients(t *testing.T) {
 	w := runningWatch(liveImportWatch(f))
 	w.Tick(context.Background())
 
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 	if !contains(f.cfg.Xray.Clients, "192.168.1.10") {
 		t.Fatal("a client added on Xray during failover must stay on Xray when restore-Apply fails")
 	}
@@ -1590,36 +1643,26 @@ func TestTick_RestoreApplyAndWriteBackFailureRetriesApplyBeforeProbe(t *testing.
 	}
 
 	w.Tick(context.Background())
-	if f.cfg.Xray.Failover != nil {
-		t.Fatalf("failover %+v; the write-back was meant to fail", f.cfg.Xray.Failover)
-	}
-	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
-		t.Fatal("JSON must look restored")
-	}
+	assertStagedOnTunnel(t, f.cfg)
 	if f.applies != 1 || probes != 1 {
 		t.Fatalf("first tick applies=%d probes=%d", f.applies, probes)
 	}
 
 	f.now = f.now.Add(ProbeInterval)
 	w.Tick(context.Background())
+	assertStagedOnTunnel(t, f.cfg)
 	if f.applies != 2 {
-		t.Fatalf("applies %d, want the pending Apply retried", f.applies)
-	}
-	if probes != 1 {
-		t.Fatalf("probes %d; no probe while the restore is not applied", probes)
+		t.Fatalf("applies %d, want the staged restore Apply retried", f.applies)
 	}
 
 	f.applyErr = nil
 	f.now = f.now.Add(ProbeInterval)
 	w.Tick(context.Background())
-	if f.applies != 3 {
-		t.Fatalf("applies %d, want the pending Apply", f.applies)
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("must restore once Apply succeeds")
 	}
 	if n := len(f.notes); n == 0 || f.notes[n-1] != "LAN clients back on Xray; server Oslo" {
 		t.Fatalf("notes %v", f.notes)
-	}
-	if probes != 2 {
-		t.Fatalf("probes %d; the probe must run in the Tick whose Apply succeeded", probes)
 	}
 }
 
@@ -1642,14 +1685,14 @@ func TestTick_RestoreApplyFailureWithWriteBackRetriesApplyBeforeImport(t *testin
 	}
 
 	w.Tick(context.Background())
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 
 	events = nil
 	f.applyErr = nil
 	f.now = f.now.Add(ImportRetry)
 	w.Tick(context.Background())
-	if want := []string{"apply"}; !reflect.DeepEqual(events, want) {
-		t.Fatalf("events %v, want %v (healthy SOCKS restores without Fetch)", events, want)
+	if want := []string{"apply", "apply"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events %v, want %v (stage apply, then drop tunnel after TPROXY)", events, want)
 	}
 	if f.cfg.Xray.Failover != nil {
 		t.Fatal("must restore once Apply succeeds")

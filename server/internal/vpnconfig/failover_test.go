@@ -337,6 +337,24 @@ func TestApplyFailoverSnapshot_OnlyMovesListedClients(t *testing.T) {
 	}
 }
 
+func TestEnsureFailoverStaged_PutsSnapshotOnXrayAndTunnel(t *testing.T) {
+	cfg := sample()
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	if contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("committed")
+	}
+	EnsureFailoverStaged(cfg)
+	if !contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("must return to Xray")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("must stay on the tunnel")
+	}
+	if cfg.Xray.Failover == nil {
+		t.Fatal("failover")
+	}
+}
+
 func TestRestageFailover_KeepsXrayMembership(t *testing.T) {
 	cfg := sample()
 	cfg.Xray.Clients = []string{"192.168.1.8"}

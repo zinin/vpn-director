@@ -506,16 +506,16 @@ _tproxy_setup_iptables() {
         log "Added exclusion for ipset: $resolved_set"
     done
 
-    # Rule 9: Apply TPROXY for remaining traffic
-    # TCP
+    # Rule 9: Apply TPROXY for remaining traffic.
+    # This function runs under "if !", which turns errexit off for the whole
+    # body; a failed ensure_fw_rule would otherwise fall through to the log
+    # and look like success. The watch publishes TPROXY ready from that.
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
         -p tcp -j TPROXY --on-port "$XRAY_TPROXY_PORT" \
-        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK"
-
-    # UDP
+        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK" || return 1
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
         -p udp -j TPROXY --on-port "$XRAY_TPROXY_PORT" \
-        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK"
+        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK" || return 1
 
     # Rules the platform needs outside our chain (Keenetic: mangle INPUT accept).
     # The status is ours to report: this function runs under "if !", which turns
@@ -534,7 +534,7 @@ _tproxy_setup_iptables() {
     while IFS= read -r lan_if; do
         [[ -n $lan_if ]] || continue
         sync_fw_rule -q mangle PREROUTING "-i $lan_if -j $XRAY_CHAIN\$" \
-            "-i $lan_if -j $XRAY_CHAIN" "$pos"
+            "-i $lan_if -j $XRAY_CHAIN" "$pos" || return 1
         pos=$((pos + 1))
     done <<< "$lan_ifaces"
 

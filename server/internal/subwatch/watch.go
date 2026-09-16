@@ -130,20 +130,18 @@ func (w *Watch) Tick(ctx context.Context) {
 	if cfg.Xray.Failover != nil {
 		staged := vpnconfig.FailoverStaged(cfg)
 		if w.probeOK(ctx, cfg) {
-			if staged {
-				w.abandonStaged()
-				return
-			}
-			// Current outbound already carries HTTPS; do not wait on Fetch.
+			announceRestored := !staged || w.pendingRestoreNotify
 			if !w.commitRestore(cfg) {
 				return
 			}
-			name := "unknown"
-			if cfg.Xray.ActiveServer != nil {
-				name = cfg.Xray.ActiveServer.Name
+			if announceRestored {
+				name := "unknown"
+				if cfg.Xray.ActiveServer != nil {
+					name = cfg.Xray.ActiveServer.Name
+				}
+				slog.Info("Xray clients restored", "server", name)
+				w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
 			}
-			slog.Info("Xray clients restored", "server", name)
-			w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
 			return
 		}
 		wasPending := w.pendingApply || staged
@@ -368,9 +366,9 @@ func (w *Watch) walkSuperseded(started, lastGen string) bool {
 	if cur == "" || cur == lastGen {
 		return false
 	}
-	// Generate did not record (tests keep started) or the user re-selected
-	// started. Only a third name is a Select that must not be overwritten.
-	return cur != started
+	// Production Generate records each candidate. A current name that is not
+	// lastGen is a newer Select, including a re-selection of started.
+	return true
 }
 
 func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
@@ -470,11 +468,11 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		}
 		// Only a committed failover left Xray. Staged clients never left, so
 		// "back on Xray" would be a false message.
-		committed := failoverTunnel(cfg) != "" && !vpnconfig.FailoverStaged(cfg)
+		announceRestored := failoverTunnel(cfg) != "" && (!vpnconfig.FailoverStaged(cfg) || w.pendingRestoreNotify)
 		if !w.commitRestore(cfg) {
 			return
 		}
-		if committed {
+		if announceRestored {
 			slog.Info("Xray clients restored", "server", s.Name)
 			w.notify(noteRestored, fmt.Sprintf(msgRestored, s.Name))
 		} else {
@@ -553,36 +551,6 @@ func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) b
 	return w.Probe(ctx, w.socksPort(cfg)) == nil
 }
 
-func (w *Watch) abandonStaged() {
-	var fo *vpnconfig.XrayFailover
-	if w.UpdateVPN != nil {
-		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-			if current.Xray.Failover != nil {
-				cp := *current.Xray.Failover
-				fo = &cp
-			}
-			vpnconfig.RestoreXrayClientsFromFailover(current)
-			return nil
-		}); err != nil {
-			slog.Warn("Failed to drop the staged failover after Xray recovered", "error", err)
-			return
-		}
-	}
-	w.pendingApply = false
-	w.failSince = time.Time{}
-	w.importRetry = 0
-	if err := w.apply(); err != nil {
-		slog.Warn("Apply after dropping the staged failover failed", "error", err)
-		w.pendingApply = true
-		return
-	}
-	if !w.tproxyReady() {
-		slog.Warn("TPROXY is not intercepting LAN; keeping the staged failover")
-		w.restage(fo)
-		w.pendingApply = true
-	}
-}
-
 // ServerForDial uses a tunnel-resolved IPv4 for vnext so Xray does not go
 // back to the system resolver. SNI keeps the hostname. Web UI /xray keep
 // s.Address and let Xray resolve, so a CDN IP change still works there.
@@ -608,68 +576,47 @@ func (w *Watch) tproxyReady() bool {
 	return w.TPROXYReady()
 }
 
-func (w *Watch) failoverRecord(tunnel string, restored, added []string, addedSet bool) *vpnconfig.XrayFailover {
-	if tunnel == "" {
-		return nil
-	}
-	fo := &vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored}
-	if addedSet {
-		kept := make([]string, 0, len(added))
-		for _, ip := range added {
-			for _, r := range restored {
-				if ip == r {
-					kept = append(kept, ip)
-					break
-				}
-			}
-		}
-		fo.Added = kept
-	}
-	return fo
-}
-
-func (w *Watch) restage(fo *vpnconfig.XrayFailover) {
-	if fo == nil || w.UpdateVPN == nil {
-		return
-	}
-	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-		vpnconfig.RestageFailover(current, fo)
-		return nil
-	}); err != nil {
-		slog.Warn("Failed to restage the Xray failover", "tunnel", fo.Tunnel, "error", err)
-	}
-}
-
-func (w *Watch) writeBackFailover(fo *vpnconfig.XrayFailover) {
-	if fo == nil || fo.Tunnel == "" || w.UpdateVPN == nil {
-		return
-	}
-	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-		vpnconfig.ApplyFailoverSnapshot(current, fo)
-		return nil
-	}); err != nil {
-		slog.Warn("Failed to write the Xray failover back", "tunnel", fo.Tunnel, "error", err)
-	}
-}
-
-// commitRestore persists Restore+Apply as one transaction. On Apply error the
-// failover record is written back so a later Tick can retry instead of
-// guessing that clients are already on Xray. failSince and lastImport clear
-// only after Apply succeeds. The write-back is the addresses this restore
-// moved, not a fresh Move of every current Xray client.
+// commitRestore puts snapshot addresses on Xray while they stay on the
+// fallback tunnel, applies, and only then drops tunnel membership — after
+// TPROXY is confirmed. A SOCKS-only success with tproxy_apply soft-fail must
+// not strip kernel fallback routing.
 func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
-	tunnel := failoverTunnel(cfg)
-	wasStaged := vpnconfig.FailoverStaged(cfg)
-	var restored []string
-	var added []string
-	addedSet := false
+	if failoverTunnel(cfg) == "" {
+		if err := w.apply(); err != nil {
+			slog.Warn("Apply after picking an Xray server failed", "error", err)
+			return false
+		}
+		return true
+	}
+	startedCommitted := !vpnconfig.FailoverStaged(cfg)
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-			if current.Xray.Failover != nil && current.Xray.Failover.Added != nil {
-				added = append([]string(nil), current.Xray.Failover.Added...)
-				addedSet = true
-			}
-			restored = vpnconfig.RestoreXrayClientsFromFailover(current)
+			vpnconfig.EnsureFailoverStaged(current)
+			return nil
+		}); err != nil {
+			slog.Warn("Failed to stage Xray clients for restore", "error", err)
+			return false
+		}
+	}
+	if err := w.apply(); err != nil {
+		slog.Warn("Apply after staging Xray clients for restore failed", "error", err)
+		w.pendingApply = true
+		if startedCommitted {
+			w.pendingRestoreNotify = true
+		}
+		return false
+	}
+	if !w.tproxyReady() {
+		slog.Warn("TPROXY is not intercepting LAN; keeping fallback routing")
+		w.pendingApply = true
+		if startedCommitted {
+			w.pendingRestoreNotify = true
+		}
+		return false
+	}
+	if w.UpdateVPN != nil {
+		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+			vpnconfig.RestoreXrayClientsFromFailover(current)
 			return nil
 		}); err != nil {
 			slog.Warn("Failed to restore Xray clients from the failover", "error", err)
@@ -677,30 +624,9 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 		}
 	}
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after restoring Xray clients failed", "error", err)
-		if !wasStaged {
-			w.writeBackFailover(w.failoverRecord(tunnel, restored, added, addedSet))
-		}
-		if tunnel != "" || wasStaged {
-			w.pendingApply = true
-			if !wasStaged {
-				w.pendingRestoreNotify = true
-			}
-		}
-		return false
-	}
-	if !w.tproxyReady() {
-		slog.Warn("TPROXY is not intercepting LAN; keeping the failover")
-		fo := w.failoverRecord(tunnel, restored, added, addedSet)
-		if wasStaged {
-			w.restage(fo)
-		} else {
-			w.writeBackFailover(fo)
-		}
+		slog.Warn("Apply after dropping fallback membership failed", "error", err)
 		w.pendingApply = true
-		if !wasStaged {
-			w.pendingRestoreNotify = true
-		}
+		w.pendingRestoreNotify = true
 		return false
 	}
 	w.pendingApply = false
