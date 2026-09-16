@@ -46,18 +46,19 @@ const (
 )
 
 type Watch struct {
-	LoadVPN      func() (*vpnconfig.VPNDirectorConfig, error)
-	LoadPlatform func() (vpnconfig.PlatformInfo, error)
-	UpdateVPN    func(func(*vpnconfig.VPNDirectorConfig) error) error
-	Apply        func() error
-	RestartXray  func() error
-	SaveServers  func([]vpnconfig.Server) error
-	Generate     func(vpnconfig.Server) (generated bool, err error)
-	Probe        func(ctx context.Context, socksPort int) error
-	Fetch        func(ctx context.Context, url string) ([]vpnconfig.Server, error)
-	Notify       func(msg string)
-	Now          func() time.Time
-	AfterRestart func(time.Duration)
+	LoadVPN       func() (*vpnconfig.VPNDirectorConfig, error)
+	LoadPlatform  func() (vpnconfig.PlatformInfo, error)
+	UpdateVPN     func(func(*vpnconfig.VPNDirectorConfig) error) error
+	Apply         func() error
+	RestartXray   func() error
+	SaveServers   func([]vpnconfig.Server) error
+	Generate      func(vpnconfig.Server) (generated bool, err error)
+	Probe         func(ctx context.Context, socksPort int) error
+	Fetch         func(ctx context.Context, url string) ([]vpnconfig.Server, error)
+	Notify        func(msg string)
+	Now           func() time.Time
+	AfterRestart  func(time.Duration)
+	FallbackReady func(tunnel string) bool // nil => ready; false keeps Xray membership
 
 	mu             sync.Mutex
 	failSince      time.Time // zero => last probe succeeded
@@ -257,6 +258,11 @@ func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPND
 	if !vpnconfig.FailoverStaged(cfg) {
 		return cfg, true
 	}
+	if !w.fallbackReady(cfg) {
+		slog.Warn("Failover tunnel is not applied yet; keeping Xray membership")
+		w.pendingApply = true
+		return cfg, false
+	}
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
 			vpnconfig.CommitXrayFailover(current)
@@ -292,6 +298,17 @@ func pickOrder(servers []vpnconfig.Server, activeName string) []vpnconfig.Server
 		rest = append(rest, s)
 	}
 	return append(first, rest...)
+}
+
+func (w *Watch) fallbackReady(cfg *vpnconfig.VPNDirectorConfig) bool {
+	if w.FallbackReady == nil {
+		return true
+	}
+	id := failoverTunnel(cfg)
+	if id == "" {
+		return true
+	}
+	return w.FallbackReady(id)
 }
 
 func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {

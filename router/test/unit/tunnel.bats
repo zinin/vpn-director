@@ -299,6 +299,7 @@ load '../test_helper'
     source "$LIB_DIR/config.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
 
     run tunnel_apply
     assert_success
@@ -326,6 +327,7 @@ load '../test_helper'
     source "$LIB_DIR/config.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
 
     run tunnel_apply
     assert_success
@@ -415,6 +417,44 @@ load '../test_helper'
     assert_output --partial "route not installed"
     grep -q "ensure wgc1 0" "$BATS_TEST_TMPDIR/ensure.log"
     grep -q 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1' /tmp/bats_ip_calls.log
+}
+
+@test "tunnel_apply: fails when the failover tunnel is unknown to the platform" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-unknown.json"
+    jq '.tunnel_director.tunnels = {
+            "wgc1": {"clients":["192.168.50.0/24"],"exclude":["ru"]},
+            "OpenVPN0": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"OpenVPN0","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "OpenVPN0"
+}
+
+@test "tunnel_apply: fails when the failover tunnel's route cannot be installed" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-route.json"
+    jq '.tunnel_director.tunnels = {
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 1; }
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "ovpnc2"
 }
 
 @test "tunnel_apply: up-to-date path re-ensures every recorded route" {

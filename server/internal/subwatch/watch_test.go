@@ -180,6 +180,32 @@ func TestTick_MoveKeepsXrayMembershipUntilTunnelApply(t *testing.T) {
 	}
 }
 
+func TestTick_DoesNotCommitIfFallbackTunnelWasNotApplied(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.FallbackReady = func(string) bool { return false }
+	tickUntilDead(w, f)
+	assertStagedOnTunnel(t, f.cfg)
+	if len(f.notes) != 0 {
+		t.Fatalf("must not report moved: %v", f.notes)
+	}
+
+	w.Tick(context.Background())
+	assertStagedOnTunnel(t, f.cfg)
+
+	w.FallbackReady = func(string) bool { return true }
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+	if len(f.notes) != 1 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
 func TestTick_NoTunnelStillNotifiesOnce(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),

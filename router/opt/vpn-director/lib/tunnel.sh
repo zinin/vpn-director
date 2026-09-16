@@ -157,14 +157,18 @@ _tunnel_gateway() {
 # keeps the tunnel tables; on Keenetic the route follows the interface state.
 # -------------------------------------------------------------------------------------------------
 _tunnel_ensure_routes() {
-    local idx tunnel
+    local idx tunnel rc=0
     [[ -f $TUN_DIR_TABLES ]] || return 0
     while read -r idx tunnel; do
         [[ -n $tunnel ]] || continue
         if ! platform_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
             log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
+            if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
+                rc=1
+            fi
         fi
     done < "$TUN_DIR_TABLES"
+    return "$rc"
 }
 
 # One client's RETURN / offload / MARK in TUN_DIR. Offload sits immediately
@@ -367,7 +371,14 @@ tunnel_apply() {
     fi
 
     if [[ $rebuild -eq 0 ]]; then
-        _tunnel_ensure_routes
+        if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] && ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES"; then
+            log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+            return 1
+        fi
+        if ! _tunnel_ensure_routes; then
+            log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+            return 1
+        fi
         log "Rules are applied and up-to-date"
         return 0
     fi
@@ -442,6 +453,7 @@ tunnel_apply() {
 
     # Process each tunnel
     local tunnel_idx=0
+    local fo_applied=0 fo_route_ok=1 fo_rule_ok=1
     local tables_tmp
     tables_tmp="$(tmp_file)"
     local tunnels
@@ -591,9 +603,11 @@ tunnel_apply() {
         # that fails now (interface down) would leave the previous owner's
         # route behind the ip rule installed below. No-op on Merlin.
         platform_tunnel_table_release "$tunnel" "$tunnel_idx" || true
+        local route_ok=1 rule_ok=1
         if ! platform_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
             log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
             warnings=1
+            route_ok=0
         fi
 
         local pref=$((TUN_DIR_PREF_BASE + tunnel_idx))
@@ -601,9 +615,15 @@ tunnel_apply() {
         if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
             log -l ERROR "Failed to add ip rule: pref=$pref fwmark=$mark_hex lookup=$table"
             warnings=1
+            rule_ok=0
         fi
 
         printf '%s %s\n' "$tunnel_idx" "$tunnel" >> "$tables_tmp"
+        if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
+            fo_applied=1
+            [[ $route_ok -eq 1 ]] || fo_route_ok=0
+            [[ $rule_ok -eq 1 ]] || fo_rule_ok=0
+        fi
         tunnel_idx=$((tunnel_idx + 1))
     done <<< "$tunnels"
 
@@ -632,13 +652,20 @@ tunnel_apply() {
     # Merlin the only case is a typo in the tunnel id, which then warns on every
     # apply instead of once.
     mkdir -p "$(dirname "$TUN_DIR_HASH")"
+    cp -f "$tables_tmp" "$TUN_DIR_TABLES"
+
+    if [[ -n ${XRAY_FAILOVER_TUNNEL:-} && ( $fo_applied -eq 0 || $fo_route_ok -eq 0 || $fo_rule_ok -eq 0 ) ]]; then
+        rm -f "$TUN_DIR_HASH"
+        log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+        return 1
+    fi
+
     if [[ $skipped_unknown -eq 0 ]]; then
         printf '%s\n' "$new_hash" > "$TUN_DIR_HASH"
     else
         rm -f "$TUN_DIR_HASH"
         log -l WARN "Tunnel Director: a configured tunnel is unknown to the platform (RCI down, or a typo in the id); this apply is not recorded as up-to-date and the next apply retries"
     fi
-    cp -f "$tables_tmp" "$TUN_DIR_TABLES"
 
     if [[ $changes -eq 0 ]]; then
         log "No changes applied"

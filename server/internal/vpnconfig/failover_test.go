@@ -131,6 +131,29 @@ func TestStageThenCommit_DropsXrayAfterTunnelHasClients(t *testing.T) {
 	}
 }
 
+func TestRestore_SkipsSnapshotWhenFallbackTunnelKeyIsGone(t *testing.T) {
+	cfg := sample()
+	cfg.Xray.Clients = append(cfg.Xray.Clients, "192.168.1.7")
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	// Wizard rebuilt tunnel_director.tunnels without the old fallback key
+	// and put those addresses on another tunnel.
+	delete(cfg.TunnelDirector.Tunnels, "ovpnc2")
+	wgc := cfg.TunnelDirector.Tunnels["wgc1"]
+	wgc.Clients = append(wgc.Clients, "192.168.1.8", "192.168.1.7")
+	cfg.TunnelDirector.Tunnels["wgc1"] = wgc
+
+	RestoreXrayClientsFromFailover(cfg)
+	if cfg.Xray.Failover != nil {
+		t.Fatal("failover")
+	}
+	if contains(cfg.Xray.Clients, "192.168.1.8") || contains(cfg.Xray.Clients, "192.168.1.7") {
+		t.Fatalf("reassigned clients back on Xray: %v", cfg.Xray.Clients)
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["wgc1"].Clients, "192.168.1.8") {
+		t.Fatal("wgc1 assignment")
+	}
+}
+
 func TestRestore_SkipsClientsRemovedFromTunnelDuringFailover(t *testing.T) {
 	cfg := sample()
 	cfg.Xray.Clients = append(cfg.Xray.Clients, "192.168.1.7")

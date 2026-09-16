@@ -171,12 +171,13 @@ func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) []string {
 		return nil
 	}
 	fo := cfg.Xray.Failover
-	restore := fo.Clients
+	// Only addresses still on the fallback tunnel come back to Xray. A
+	// missing key is the wizard dropping that tunnel (and possibly moving
+	// the clients elsewhere); restoring the whole snapshot would put them
+	// on Xray and override the new assignment.
+	restore := make([]string, 0, len(fo.Clients))
 	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
 	if ok {
-		// A client deleted from the tunnel, or moved to another one, during
-		// failover stays where the user put it instead of coming back on Xray.
-		restore = make([]string, 0, len(fo.Clients))
 		for _, ip := range fo.Clients {
 			if contains(tun.Clients, ip) {
 				restore = append(restore, ip)
