@@ -76,20 +76,61 @@ func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([
 	return body, nil
 }
 
-func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) ([]byte, error) {
+func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) ([]vpnconfig.Server, error) {
 	if u, err := url.Parse(rawURL); err != nil || u.Scheme != "https" {
 		return nil, fmt.Errorf("subscription URL must use https")
 	}
 	wan := ssrf.NewClient(10 * time.Second)
-	return fetchWANThenOptionalTunnel(ctx, rawURL, wan, func() *http.Client {
-		return subscriptionTunnelClient(cfgSvc, vpnSvc)
-	})
+	p, tunnel := subscriptionTunnel(cfgSvc, vpnSvc)
+	var tunnelLookup func(host string) ([]net.IP, error)
+	if tunnel != nil {
+		path := p
+		tunnelLookup = func(host string) ([]net.IP, error) {
+			return lookupIPv4OnPath(ctx, path, host)
+		}
+	}
+	return fetchServers(ctx, rawURL, wan, tunnel, tunnelLookup)
+}
+
+// fetchServers GETs via wan, then tunnel. A WAN body is resolved with
+// net.LookupIP; a tunneled body uses tunnelLookup so VLESS hostnames follow
+// the same path that fetched the list.
+func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
+	body, err := getSubscription(ctx, wan, rawURL)
+	if err == nil {
+		return serversFromSubscription(body)
+	}
+	if tunnel == nil {
+		return nil, err
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = ue.Err
+	}
+	slog.Debug("Subscription fetch over WAN failed, trying the tunnel", "error", err)
+	body, err = getSubscription(ctx, tunnel, rawURL)
+	if err != nil {
+		return nil, err
+	}
+	if tunnelLookup != nil {
+		return serversFromSubscriptionLookup(body, tunnelLookup)
+	}
+	return serversFromSubscription(body)
 }
 
 // serversFromSubscription decodes a fetched subscription body for the watch and
 // keeps the servers whose addresses resolved.
 func serversFromSubscription(body []byte) ([]vpnconfig.Server, error) {
-	result := vless.DecodeAndResolve(string(body))
+	return serversFromSubscriptionLookup(body, nil)
+}
+
+func serversFromSubscriptionLookup(body []byte, lookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
+	var result vless.Import
+	if lookup == nil {
+		result = vless.DecodeAndResolve(string(body))
+	} else {
+		result = vless.DecodeAndResolveLookup(string(body), lookup)
+	}
 	if result.Parsed == 0 {
 		return nil, errors.New("no VLESS servers")
 	}
@@ -99,13 +140,13 @@ func serversFromSubscription(body []byte) ([]vpnconfig.Server, error) {
 	return result.Servers, nil
 }
 
-func subscriptionTunnelClient(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) *http.Client {
+func subscriptionTunnel(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) (Path, *http.Client) {
 	if cfgSvc == nil || vpnSvc == nil {
-		return nil
+		return Path{}, nil
 	}
 	cfg, err := cfgSvc.LoadVPNConfig()
 	if err != nil || cfg == nil {
-		return nil
+		return Path{}, nil
 	}
 	plat, platErr := vpnSvc.Platform()
 	if platErr != nil {
@@ -113,10 +154,10 @@ func subscriptionTunnelClient(cfgSvc service.ConfigStore, vpnSvc service.VPNDire
 	}
 	id := vpnconfig.FirstTDExit(cfg, plat)
 	if id == "" {
-		return nil
+		return Path{}, nil
 	}
 	p := subscriptionTunnelPath(cfg, plat, id)
-	return newTunnelHTTPClient(func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return p, newTunnelHTTPClient(func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return refusePrivatePeer(DialPath(ctx, p, "tcp4", addr))
 	})
 }

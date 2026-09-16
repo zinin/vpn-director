@@ -69,6 +69,19 @@ func DialPath(ctx context.Context, p Path, network, addr string) (net.Conn, erro
 	return productionDialer.dial(ctx, p, network, addr)
 }
 
+// lookupIPv4OnPath resolves host the way DialPath would for p: system DNS on
+// a direct path, 8.8.8.8 then 1.1.1.1 over the bound device on a tunnel.
+func lookupIPv4OnPath(ctx context.Context, p Path, host string) ([]net.IP, error) {
+	return productionDialer.lookupIPs(ctx, p, host)
+}
+
+func (d *pathDialer) lookupIPs(ctx context.Context, p Path, host string) ([]net.IP, error) {
+	if p.kind == kindTunnel {
+		return d.lookupTunnel(ctx, p.iface, p.mark, host)
+	}
+	return d.lookupDirect(ctx, host)
+}
+
 func (d *pathDialer) dial(ctx context.Context, p Path, network, addr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(ctx, productionDialTimeout)
 	defer cancel()

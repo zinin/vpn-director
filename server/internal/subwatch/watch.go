@@ -299,6 +299,8 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			return nil
 		}); err != nil {
 			slog.Warn("Failed to sync xray.servers after the subscription refresh", "error", err)
+			w.notifyRefreshFailed(cfg)
+			return
 		}
 	}
 	if w.Generate == nil {

@@ -224,15 +224,15 @@ func TestFetchSubscription_WANDialErrorNilTunnel(t *testing.T) {
 }
 
 func TestFetchSub_RejectsNonHTTPS(t *testing.T) {
-	body, err := (&Bot{}).fetchSub(context.Background(), "http://cdn.example/s/token", nil, nil)
+	servers, err := (&Bot{}).fetchSub(context.Background(), "http://cdn.example/s/token", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "https") {
 		t.Fatalf("err %v, want an https error", err)
 	}
 	if strings.Contains(err.Error(), "cdn.example") {
 		t.Fatalf("error %q carries the subscription URL", err)
 	}
-	if body != nil {
-		t.Fatalf("body %q", body)
+	if servers != nil {
+		t.Fatalf("servers %v", servers)
 	}
 }
 
@@ -323,5 +323,54 @@ func TestServersFromSubscription(t *testing.T) {
 	}
 	if len(servers) != 1 || servers[0].Name != "Oslo" || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.10"}) {
 		t.Fatalf("servers %+v, want Oslo on 203.0.113.10", servers)
+	}
+}
+
+func TestFetchServers_WANSuccessDoesNotUseTunnelLookup(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443#Oslo"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	looked := 0
+	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), nil, func(host string) ([]net.IP, error) {
+		looked++
+		return nil, errors.New("tunnel lookup must not run")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if looked != 0 {
+		t.Fatalf("WAN success must resolve on the system resolver, lookups %d", looked)
+	}
+	if len(servers) != 1 || servers[0].Name != "Oslo" || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.10"}) {
+		t.Fatalf("servers %+v", servers)
+	}
+}
+
+func TestFetchServers_TunnelFetchUsesTunnelLookup(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "wan-down", http.StatusBadGateway)
+	}))
+	t.Cleanup(wan.Close)
+	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(tun.Close)
+
+	looked := []string{}
+	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(tun), func(host string) ([]net.IP, error) {
+		looked = append(looked, host)
+		return []net.IP{net.ParseIP("203.0.113.50")}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(looked, []string{"oslo.example.invalid"}) {
+		t.Fatalf("tunnel lookup %v", looked)
+	}
+	if len(servers) != 1 || servers[0].Name != "Oslo" || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.50"}) {
+		t.Fatalf("servers %+v", servers)
 	}
 }

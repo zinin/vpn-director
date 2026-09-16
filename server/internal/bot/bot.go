@@ -153,11 +153,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				return service.GenerateAndRecordActiveServer(configSvc, xraySvc, s, ports)
 			},
 			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
-				body, err := b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
-				if err != nil {
-					return nil, err
-				}
-				return serversFromSubscription(body)
+				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
 			},
 			Notify: b.notifyActiveChats,
 		}

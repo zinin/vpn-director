@@ -1317,3 +1317,35 @@ func TestTick_ImportSyncsXrayServers(t *testing.T) {
 		t.Fatal("Generate is nil; must stay failed over")
 	}
 }
+
+func TestTick_SyncXrayServersFailureStopsTheWave(t *testing.T) {
+	f := &fake{
+		cfg: failedOverCfg(),
+		now: time.Unix(1_700_000_000, 0),
+	}
+	generates, restarts := 0, 0
+	w := runningWatch(liveImportWatch(f))
+	w.Generate = func(vpnconfig.Server) (bool, error) {
+		generates++
+		return true, nil
+	}
+	w.RestartXray = func() error {
+		restarts++
+		return nil
+	}
+	w.UpdateVPN = func(func(*vpnconfig.VPNDirectorConfig) error) error {
+		return errors.New("config lock")
+	}
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+	if generates != 0 || restarts != 0 {
+		t.Fatalf("must not switch servers after xray.servers sync fails, generates=%d restarts=%d", generates, restarts)
+	}
+	if len(f.cfg.Xray.Servers) != 0 {
+		t.Fatalf("Xray.Servers %v, want unchanged", f.cfg.Xray.Servers)
+	}
+	want := "Subscription refresh failed; still on tunnel:ovpnc2"
+	if len(f.notes) != 1 || f.notes[0] != want {
+		t.Fatalf("notes %v, want %q", f.notes, want)
+	}
+}

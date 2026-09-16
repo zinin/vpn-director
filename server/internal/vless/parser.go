@@ -173,7 +173,14 @@ func ParseURI(uri string) (*Server, error) {
 }
 
 func (s *Server) ResolveIPs() error {
-	ips, err := net.LookupIP(s.Address)
+	return s.resolveIPs(net.LookupIP)
+}
+
+func (s *Server) resolveIPs(lookup func(host string) ([]net.IP, error)) error {
+	if lookup == nil {
+		lookup = net.LookupIP
+	}
+	ips, err := lookup(s.Address)
 	if err != nil {
 		return err
 	}
@@ -246,13 +253,19 @@ type Import struct {
 }
 
 // DecodeAndResolve decodes a subscription body and resolves every parsed
-// server. The bot's /import, the Web UI import and the subscription watch all
-// go through it.
+// server through net.LookupIP. The bot's /import and the Web UI import use
+// this; a tunneled watch fetch uses DecodeAndResolveLookup.
 func DecodeAndResolve(body string) Import {
+	return DecodeAndResolveLookup(body, net.LookupIP)
+}
+
+// DecodeAndResolveLookup is DecodeAndResolve with a caller-supplied lookup
+// (the watch uses the tunnel DNS path after a tunneled GET).
+func DecodeAndResolveLookup(body string, lookup func(host string) ([]net.IP, error)) Import {
 	parsed, parseErrors := DecodeSubscription(body)
 	result := Import{Parsed: len(parsed), ParseErrors: parseErrors}
 	for _, s := range parsed {
-		if err := s.ResolveIPs(); err != nil {
+		if err := s.resolveIPs(lookup); err != nil {
 			result.ResolveErrors++
 			continue
 		}

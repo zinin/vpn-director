@@ -2,6 +2,7 @@ package vless
 
 import (
 	"encoding/base64"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -529,5 +530,26 @@ func TestDecodeAndResolve(t *testing.T) {
 	}
 	if got := result.Servers[1]; got.Name != "Paris" || !reflect.DeepEqual(got.IPs, []string{"198.51.100.7"}) {
 		t.Errorf("second server %+v, want Paris on 198.51.100.7", got)
+	}
+}
+
+func TestDecodeAndResolveLookup(t *testing.T) {
+	subscription := "vless://uuid-1@oslo.example.invalid:443#Oslo"
+	looked := []string{}
+	result := DecodeAndResolveLookup(base64.StdEncoding.EncodeToString([]byte(subscription)), func(host string) ([]net.IP, error) {
+		looked = append(looked, host)
+		if host != "oslo.example.invalid" {
+			t.Fatalf("lookup host %q", host)
+		}
+		return []net.IP{net.ParseIP("203.0.113.50")}, nil
+	})
+	if result.Parsed != 1 || result.ResolveErrors != 0 || len(result.Servers) != 1 {
+		t.Fatalf("%+v", result)
+	}
+	if got := result.Servers[0]; got.Name != "Oslo" || !reflect.DeepEqual(got.IPs, []string{"203.0.113.50"}) {
+		t.Fatalf("%+v", got)
+	}
+	if !reflect.DeepEqual(looked, []string{"oslo.example.invalid"}) {
+		t.Fatalf("lookup %v", looked)
 	}
 }
