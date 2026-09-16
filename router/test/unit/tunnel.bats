@@ -312,6 +312,27 @@ load '../test_helper'
     (( main_host < cidr ))
 }
 
+@test "tunnel_apply: failover override skips IPs no longer on the fallback tunnel" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-deleted.json"
+    jq '.tunnel_director.tunnels = {
+            "main": {"clients":["192.168.1.20"],"exclude":[]},
+            "ovpnc2": {"clients":["192.168.1.3"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+
+    run tunnel_apply
+    assert_success
+    refute_output --partial "Added: client=192.168.1.8 tunnel=ovpnc2"
+    assert_output --partial "Added: client=192.168.1.20 tunnel=main"
+}
+
 @test "tunnel_apply: handles overlapping clients in different tunnels (first-match wins)" {
     load_common
     source "$LIB_DIR/firewall.sh"

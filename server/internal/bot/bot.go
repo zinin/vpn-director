@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/chatstore"
@@ -25,19 +26,21 @@ import (
 
 // Bot is the main Telegram bot struct with DI
 type Bot struct {
-	api         *tgbotapi.BotAPI
-	auth        *Auth
-	router      *Router
-	sender      telegram.MessageSender
-	devMode     bool
-	executor    service.ShellExecutor
-	updater     updater.Updater
-	chatStore   *chatstore.Store
-	pathManager *PathManager
-	subWatch    *subwatch.Watch
-	httpClient  *http.Client
-	endpoint    string
-	wire        func(*tgbotapi.BotAPI)
+	api           *tgbotapi.BotAPI
+	auth          *Auth
+	router        *Router
+	mu            sync.Mutex
+	sender        telegram.MessageSender
+	pendingNotify []string
+	devMode       bool
+	executor      service.ShellExecutor
+	updater       updater.Updater
+	chatStore     *chatstore.Store
+	pathManager   *PathManager
+	subWatch      *subwatch.Watch
+	httpClient    *http.Client
+	endpoint      string
+	wire          func(*tgbotapi.BotAPI)
 	// apiBase is empty in production and set only by tests, where one local
 	// server answers both the path probe and the Telegram API, as one host
 	// does in production.
@@ -142,7 +145,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	b.wire = func(api *tgbotapi.BotAPI) {
 		sender := telegram.NewSender(api)
 		b.api = api
-		b.sender = sender
+		b.setSender(sender)
 		deps := &handler.Deps{
 			Sender:      sender,
 			Config:      configSvc,
@@ -201,27 +204,55 @@ func (b *Bot) Connect(cfg *config.Config) error {
 	return nil
 }
 
+func (b *Bot) setSender(s telegram.MessageSender) {
+	b.mu.Lock()
+	b.sender = s
+	pending := b.pendingNotify
+	b.pendingNotify = nil
+	store := b.chatStore
+	auth := b.auth
+	b.mu.Unlock()
+	for _, msg := range pending {
+		sendActiveChats(s, store, auth, msg)
+	}
+}
+
 // notifyActiveChats sends msg to every active chat whose user is still in
 // allowed_users, once per ChatID: one person who renamed their handle is two
-// chatstore records with one ChatID.
+// chatstore records with one ChatID. Before Telegram is connected the
+// messages are queued so a failover during getMe retries is not lost.
 func (b *Bot) notifyActiveChats(msg string) {
-	if b.chatStore == nil || b.sender == nil {
+	b.mu.Lock()
+	sender := b.sender
+	store := b.chatStore
+	auth := b.auth
+	if sender == nil {
+		b.pendingNotify = append(b.pendingNotify, msg)
+		b.mu.Unlock()
 		return
 	}
-	users, err := b.chatStore.GetActiveUsers()
+	b.mu.Unlock()
+	sendActiveChats(sender, store, auth, msg)
+}
+
+func sendActiveChats(sender telegram.MessageSender, store *chatstore.Store, auth *Auth, msg string) {
+	if store == nil || sender == nil {
+		return
+	}
+	users, err := store.GetActiveUsers()
 	if err != nil {
 		return
 	}
 	seen := make(map[int64]struct{}, len(users))
 	for _, u := range users {
-		if b.auth == nil || !b.auth.IsAuthorized(u.Username) {
+		if auth == nil || !auth.IsAuthorized(u.Username) {
 			continue
 		}
 		if _, dup := seen[u.ChatID]; dup {
 			continue
 		}
 		seen[u.ChatID] = struct{}{}
-		b.sender.SendPlain(u.ChatID, msg)
+		sender.SendPlain(u.ChatID, msg)
 	}
 }
 
@@ -354,5 +385,7 @@ func (b *Bot) Auth() *Auth {
 
 // Sender returns the message sender (for update checker).
 func (b *Bot) Sender() telegram.MessageSender {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.sender
 }

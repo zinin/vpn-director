@@ -81,6 +81,14 @@ func contains(list []string, s string) bool {
 }
 
 func MoveXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
+	StageXrayClientsToTunnel(cfg, tunnel)
+	CommitXrayFailover(cfg)
+}
+
+// StageXrayClientsToTunnel appends unpaused Xray clients to the tunnel and
+// records failover, but leaves them in xray.clients so TPROXY still matches
+// until TUN_DIR is applied.
+func StageXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 	if cfg == nil || tunnel == "" {
 		return
 	}
@@ -93,23 +101,69 @@ func MoveXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 	}
 	paused := pausedSet(cfg)
 	added := make([]string, 0)
-	keptXray := make([]string, 0, len(cfg.Xray.Clients))
 	for _, ip := range cfg.Xray.Clients {
 		if _, skip := paused[ip]; skip {
-			keptXray = append(keptXray, ip)
 			continue
 		}
 		if !contains(tun.Clients, ip) {
 			tun.Clients = append(tun.Clients, ip)
 			added = append(added, ip)
 		}
-		// unpaused Xray clients leave xray.clients even if they already sat on the tunnel
 	}
 	cfg.TunnelDirector.Tunnels[tunnel] = tun
-	cfg.Xray.Clients = keptXray
 	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: added}
 	// TUN_DIR is first-match: tunnel.sh emits these snapshot IPs first so a
 	// covering earlier rule (often main) does not send them to WAN.
+}
+
+// CommitXrayFailover drops staged clients from xray.clients: snapshot
+// addresses and anyone already on the failover tunnel. Paused clients stay.
+func CommitXrayFailover(cfg *VPNDirectorConfig) {
+	if cfg == nil || cfg.Xray.Failover == nil {
+		return
+	}
+	paused := pausedSet(cfg)
+	fo := cfg.Xray.Failover
+	tun := cfg.TunnelDirector.Tunnels[fo.Tunnel]
+	drop := make(map[string]struct{}, len(fo.Clients)+len(tun.Clients))
+	for _, ip := range fo.Clients {
+		drop[ip] = struct{}{}
+	}
+	for _, ip := range tun.Clients {
+		drop[ip] = struct{}{}
+	}
+	kept := make([]string, 0, len(cfg.Xray.Clients))
+	for _, ip := range cfg.Xray.Clients {
+		if _, skip := paused[ip]; skip {
+			kept = append(kept, ip)
+			continue
+		}
+		if _, gone := drop[ip]; gone {
+			continue
+		}
+		kept = append(kept, ip)
+	}
+	cfg.Xray.Clients = kept
+}
+
+// FailoverStaged reports that failover is recorded but TPROXY still matches
+// those clients, so the drop Apply has not run.
+func FailoverStaged(cfg *VPNDirectorConfig) bool {
+	if cfg == nil || cfg.Xray.Failover == nil {
+		return false
+	}
+	paused := pausedSet(cfg)
+	fo := cfg.Xray.Failover
+	tun := cfg.TunnelDirector.Tunnels[fo.Tunnel]
+	for _, ip := range cfg.Xray.Clients {
+		if _, skip := paused[ip]; skip {
+			continue
+		}
+		if contains(fo.Clients, ip) || contains(tun.Clients, ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) []string {

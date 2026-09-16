@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -155,13 +156,24 @@ type sentPlain struct {
 
 // recordingSender keeps every SendPlain; the rest of MessageSender is unused.
 type recordingSender struct {
+	mu    sync.Mutex
 	plain []sentPlain
 }
 
 func (s *recordingSender) Send(int64, string) error { return nil }
 func (s *recordingSender) SendPlain(chatID int64, text string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.plain = append(s.plain, sentPlain{chatID: chatID, text: text})
 	return nil
+}
+
+func (s *recordingSender) snapshot() []sentPlain {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]sentPlain, len(s.plain))
+	copy(out, s.plain)
+	return out
 }
 func (s *recordingSender) SendLongPlain(int64, string) error { return nil }
 func (s *recordingSender) SendWithKeyboard(int64, string, tgbotapi.InlineKeyboardMarkup) error {
@@ -172,6 +184,48 @@ func (s *recordingSender) EditMessage(int64, int, string, tgbotapi.InlineKeyboar
 	return nil
 }
 func (s *recordingSender) AckCallback(string) error { return nil }
+
+func TestNotifyActiveChats_QueuesUntilSender(t *testing.T) {
+	store := chatstore.New(filepath.Join(t.TempDir(), "chats.json"))
+	if err := store.RecordInteraction("alice", 100); err != nil {
+		t.Fatal(err)
+	}
+	sender := &recordingSender{}
+	b := &Bot{auth: NewAuth([]string{"alice"}), chatStore: store}
+
+	b.notifyActiveChats("Xray outbound is down")
+	if len(sender.plain) != 0 {
+		t.Fatalf("sent %+v before Telegram connected", sender.plain)
+	}
+
+	b.setSender(sender)
+	want := []sentPlain{{chatID: 100, text: "Xray outbound is down"}}
+	if !reflect.DeepEqual(sender.snapshot(), want) {
+		t.Fatalf("flushed %+v, want %+v", sender.snapshot(), want)
+	}
+}
+
+func TestNotifyActiveChats_NoRaceWithSetSender(t *testing.T) {
+	store := chatstore.New(filepath.Join(t.TempDir(), "chats.json"))
+	if err := store.RecordInteraction("alice", 100); err != nil {
+		t.Fatal(err)
+	}
+	b := &Bot{auth: NewAuth([]string{"alice"}), chatStore: store}
+	sender := &recordingSender{}
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 200; i++ {
+			b.notifyActiveChats("Xray outbound is down")
+		}
+		close(done)
+	}()
+	b.setSender(sender)
+	<-done
+	b.notifyActiveChats("LAN clients back on Xray")
+	if len(sender.snapshot()) == 0 {
+		t.Fatal("expected at least the post-connect notification")
+	}
+}
 
 func TestNotifyActiveChats_AuthorizedOncePerChat(t *testing.T) {
 	store := chatstore.New(filepath.Join(t.TempDir(), "chats.json"))
@@ -193,7 +247,7 @@ func TestNotifyActiveChats_AuthorizedOncePerChat(t *testing.T) {
 	b.notifyActiveChats("Xray outbound is down")
 
 	want := []sentPlain{{chatID: 100, text: "Xray outbound is down"}}
-	if !reflect.DeepEqual(sender.plain, want) {
-		t.Fatalf("sent %+v, want %+v", sender.plain, want)
+	if !reflect.DeepEqual(sender.snapshot(), want) {
+		t.Fatalf("sent %+v, want %+v", sender.snapshot(), want)
 	}
 }

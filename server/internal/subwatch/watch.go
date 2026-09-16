@@ -124,18 +124,19 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 	}
 	if cfg.Xray.Failover != nil {
-		if w.pendingApply {
-			if err := w.apply(); err != nil {
-				slog.Warn("Apply retry after moving Xray clients failed", "error", err)
-				// No walk until the move is applied: its restart of Xray would
-				// rebuild TPROXY from a JSON that no longer lists the moved
-				// clients while Tunnel Director has not been applied, sending
-				// them straight out through the WAN.
-				return
-			}
-			w.pendingApply = false
+		wasPending := w.pendingApply || vpnconfig.FailoverStaged(cfg)
+		var ok bool
+		cfg, ok = w.applyFailover(cfg)
+		if !ok {
+			return
+		}
+		if wasPending {
 			if id := failoverTunnel(cfg); id != "" {
-				slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", len(cfg.Xray.Failover.Clients))
+				n := 0
+				if cfg.Xray.Failover != nil {
+					n = len(cfg.Xray.Failover.Clients)
+				}
+				slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", n)
 				w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 			}
 		}
@@ -212,7 +213,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	movedClients := 0
 	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-		vpnconfig.MoveXrayClientsToTunnel(current, id)
+		vpnconfig.StageXrayClientsToTunnel(current, id)
 		if current.Xray.Failover == nil {
 			return fmt.Errorf("tunnel %s no longer configured", id)
 		}
@@ -227,13 +228,53 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.pendingApply = true
 		return
 	}
-	w.pendingApply = false
-	slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", movedClients)
-	w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 	if reloaded, err := w.LoadVPN(); err == nil {
 		cfg = reloaded
 	}
+	var ok bool
+	cfg, ok = w.applyFailover(cfg)
+	if !ok {
+		return
+	}
+	slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", movedClients)
+	w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 	w.maybeImportAndPick(ctx, cfg)
+}
+
+// applyFailover installs remaining failover applies: a pending kernel apply,
+// then dropping Xray membership once TUN_DIR already has the clients.
+func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPNDirectorConfig, bool) {
+	if w.pendingApply {
+		if err := w.apply(); err != nil {
+			slog.Warn("Apply retry after moving Xray clients failed", "error", err)
+			return cfg, false
+		}
+		w.pendingApply = false
+		if reloaded, err := w.LoadVPN(); err == nil {
+			cfg = reloaded
+		}
+	}
+	if !vpnconfig.FailoverStaged(cfg) {
+		return cfg, true
+	}
+	if w.UpdateVPN != nil {
+		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+			vpnconfig.CommitXrayFailover(current)
+			return nil
+		}); err != nil {
+			slog.Warn("Failed to drop staged Xray clients after the tunnel apply", "error", err)
+			return cfg, false
+		}
+	}
+	if reloaded, err := w.LoadVPN(); err == nil {
+		cfg = reloaded
+	}
+	if err := w.apply(); err != nil {
+		slog.Warn("Apply after dropping staged Xray clients failed", "error", err)
+		w.pendingApply = true
+		return cfg, false
+	}
+	return cfg, true
 }
 
 func pickOrder(servers []vpnconfig.Server, activeName string) []vpnconfig.Server {

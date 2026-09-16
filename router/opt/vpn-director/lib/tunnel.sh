@@ -452,7 +452,7 @@ tunnel_apply() {
     # tunnel's mark. Reordering the whole tunnel would pull its other clients
     # ahead of earlier rules (main containing a host that a later CIDR also
     # covers). Slot assignment here must match the apply loop below.
-    local fo_mark=""
+    local fo_mark="" fo_on_tunnel=""
     if [[ -n ${XRAY_FAILOVER_TUNNEL:-} && -n ${XRAY_FAILOVER_CLIENTS:-} ]]; then
         local plan_idx=0 plan_t plan_type plan_clients_type plan_clients plan_slot
         while IFS= read -r plan_t; do
@@ -470,6 +470,7 @@ tunnel_apply() {
             fi
             if [[ $plan_t == "$XRAY_FAILOVER_TUNNEL" ]]; then
                 fo_mark=$(printf '0x%x' $(( plan_slot << _tunnel_mark_shift_val )))
+                fo_on_tunnel=$plan_clients
                 break
             fi
             plan_idx=$((plan_idx + 1))
@@ -482,6 +483,17 @@ tunnel_apply() {
             fo_excludes=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].exclude // [] | .[]')
         fi
         for fo_client in $XRAY_FAILOVER_CLIENTS; do
+            # DELETE /api/clients drops the address from the tunnel but leaves
+            # xray.failover. An override for an IP no longer on this tunnel
+            # would first-match it onto the old fallback.
+            local fo_still=0 fo_have
+            while IFS= read -r fo_have; do
+                if [[ $fo_have == "$fo_client" ]]; then
+                    fo_still=1
+                    break
+                fi
+            done <<< "$fo_on_tunnel"
+            [[ $fo_still -eq 1 ]] || continue
             _tunnel_emit_client "$fo_client" "$XRAY_FAILOVER_TUNNEL" "$fo_mark" "$fo_excludes"
         done
     fi

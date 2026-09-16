@@ -139,8 +139,8 @@ func TestTick_ThreeMinutesMovesClients(t *testing.T) {
 	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
 		t.Fatal("foreign client dropped")
 	}
-	if f.applies != 1 {
-		t.Fatalf("applies %d", f.applies)
+	if f.applies != 2 {
+		t.Fatalf("applies %d, want tunnel rules staged then Xray membership dropped", f.applies)
 	}
 	if len(f.notes) != 1 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
 		t.Fatalf("notes %v", f.notes)
@@ -148,6 +148,35 @@ func TestTick_ThreeMinutesMovesClients(t *testing.T) {
 	w.Tick(context.Background())
 	if len(f.notes) != 1 {
 		t.Fatalf("duplicate notify %v", f.notes)
+	}
+}
+
+func TestTick_MoveKeepsXrayMembershipUntilTunnelApply(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	var xrayAtApply [][]string
+	w := f.watch()
+	apply := w.Apply
+	w.Apply = func() error {
+		xrayAtApply = append(xrayAtApply, append([]string(nil), f.cfg.Xray.Clients...))
+		return apply()
+	}
+	tickUntilDead(w, f)
+	if len(xrayAtApply) != 2 {
+		t.Fatalf("applies %d, want 2", len(xrayAtApply))
+	}
+	if !contains(xrayAtApply[0], "192.168.1.8") {
+		t.Fatalf("first apply xray %v; fallback rules must be installed while TPROXY still matches", xrayAtApply[0])
+	}
+	if contains(xrayAtApply[1], "192.168.1.8") {
+		t.Fatalf("second apply xray %v; membership drops only after the tunnel apply", xrayAtApply[1])
+	}
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("still in xray.clients after the move")
 	}
 }
 
@@ -1000,6 +1029,19 @@ func assertStillOnTunnel(t *testing.T, cfg *vpnconfig.VPNDirectorConfig) {
 	}
 }
 
+func assertStagedOnTunnel(t *testing.T, cfg *vpnconfig.VPNDirectorConfig) {
+	t.Helper()
+	if cfg.Xray.Failover == nil || cfg.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Fatalf("failover %+v", cfg.Xray.Failover)
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("client must be on the tunnel")
+	}
+	if !contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("Xray membership must remain until the tunnel apply succeeds")
+	}
+}
+
 func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
 	f := &fake{
 		cfg:      failedOverCfg(),
@@ -1221,7 +1263,7 @@ func TestTick_MoveApplyFailureRetriesApply(t *testing.T) {
 	}
 	w := f.watch()
 	tickUntilDead(w, f)
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 	if f.applies != 1 {
 		t.Fatalf("applies %d, want 1", f.applies)
 	}
@@ -1230,7 +1272,7 @@ func TestTick_MoveApplyFailureRetriesApply(t *testing.T) {
 	}
 
 	w.Tick(context.Background())
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 	if f.applies != 2 {
 		t.Fatalf("later Tick must retry Apply, got %d", f.applies)
 	}
@@ -1241,8 +1283,8 @@ func TestTick_MoveApplyFailureRetriesApply(t *testing.T) {
 	f.applyErr = nil
 	w.Tick(context.Background())
 	assertStillOnTunnel(t, f.cfg)
-	if f.applies != 3 {
-		t.Fatalf("applies %d, want 3", f.applies)
+	if f.applies != 4 {
+		t.Fatalf("applies %d, want the pending tunnel apply then the Xray drop", f.applies)
 	}
 	if len(f.notes) != 1 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
 		t.Fatalf("notes %v", f.notes)
@@ -1291,7 +1333,7 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 		t.Fatalf("walk ran before the move was applied: fetches=%d saves=%d generates=%d restarts=%d settles=%d",
 			fetches, saves, generates, restarts, settles)
 	}
-	assertStillOnTunnel(t, f.cfg)
+	assertStagedOnTunnel(t, f.cfg)
 	if len(f.notes) != 0 {
 		t.Fatalf("notes %v", f.notes)
 	}

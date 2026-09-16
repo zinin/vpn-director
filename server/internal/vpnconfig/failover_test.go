@@ -107,6 +107,30 @@ func TestMoveAndRestore_KeepsForeignTunnelClients(t *testing.T) {
 	}
 }
 
+func TestStageThenCommit_DropsXrayAfterTunnelHasClients(t *testing.T) {
+	cfg := sample()
+	StageXrayClientsToTunnel(cfg, "ovpnc2")
+	if !FailoverStaged(cfg) {
+		t.Fatal("staged")
+	}
+	if !contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("TPROXY must still match during the tunnel apply")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("fallback client")
+	}
+	CommitXrayFailover(cfg)
+	if FailoverStaged(cfg) {
+		t.Fatal("committed")
+	}
+	if contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("still in xray.clients")
+	}
+	if contains(cfg.Xray.Clients, "192.168.1.3") {
+		t.Fatal("overlap client must leave Xray")
+	}
+}
+
 func TestRestore_SkipsClientsRemovedFromTunnelDuringFailover(t *testing.T) {
 	cfg := sample()
 	cfg.Xray.Clients = append(cfg.Xray.Clients, "192.168.1.7")
