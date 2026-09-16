@@ -79,7 +79,7 @@ func TestImportHandler_HandleImport_NoURL(t *testing.T) {
 func TestImportHandler_HandleImport_NoArgsUsesSavedURL(t *testing.T) {
 	vlessURL := "vless://test-uuid-1234@example.com:443?type=tcp#TestServer"
 	encoded := base64.StdEncoding.EncodeToString([]byte(vlessURL))
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(encoded))
 	}))
@@ -92,7 +92,7 @@ func TestImportHandler_HandleImport_NoArgsUsesSavedURL(t *testing.T) {
 	}
 	deps := &Deps{Sender: sender, Config: config}
 	h := NewImportHandler(deps)
-	h.httpClient = &http.Client{}
+	h.httpClient = server.Client()
 	msg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: 123},
 		Text: "/import",
@@ -173,7 +173,7 @@ func TestImportHandler_HandleImport_NoArgsConfigLoadError(t *testing.T) {
 func TestImportHandler_HandleImport_SavesPostedURL(t *testing.T) {
 	vlessURL := "vless://test-uuid-1234@example.com:443?type=tcp#TestServer"
 	encoded := base64.StdEncoding.EncodeToString([]byte(vlessURL))
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(encoded))
 	}))
@@ -186,7 +186,7 @@ func TestImportHandler_HandleImport_SavesPostedURL(t *testing.T) {
 	}
 	deps := &Deps{Sender: sender, Config: config}
 	h := NewImportHandler(deps)
-	h.httpClient = &http.Client{} // bypass SSRF guard to reach the loopback test server
+	h.httpClient = server.Client() // bypass SSRF guard to reach the loopback test server
 
 	msg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: 789},
@@ -226,6 +226,48 @@ func TestImportHandler_HandleImport_InvalidScheme(t *testing.T) {
 	}
 }
 
+func TestImportHandler_HandleImport_RejectsHTTPURL(t *testing.T) {
+	vlessURL := "vless://test-uuid-1234@example.com:443?type=tcp#TestServer"
+	encoded := base64.StdEncoding.EncodeToString([]byte(vlessURL))
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(encoded))
+	}))
+	defer server.Close()
+
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{
+		dataDirVal: t.TempDir(),
+		cfg:        &vpnconfig.VPNDirectorConfig{},
+	}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = &http.Client{} // bypass SSRF guard: only the scheme check may stop this import
+
+	msg := &tgbotapi.Message{
+		Chat: &tgbotapi.Chat{ID: 789},
+		Text: "/import " + server.URL,
+		Entities: []tgbotapi.MessageEntity{
+			{Type: "bot_command", Offset: 0, Length: 7},
+		},
+	}
+	h.HandleImport(msg)
+
+	if !strings.Contains(sender.lastText, "https") {
+		t.Errorf("expected a reply asking for https, got %q", sender.lastText)
+	}
+	if hits != 0 {
+		t.Errorf("http URL downloaded %d times", hits)
+	}
+	if len(config.savedServers) != 0 {
+		t.Errorf("expected nothing saved, got %v", config.savedServers)
+	}
+	if config.cfg.Xray.SubscriptionURL != "" {
+		t.Errorf("SubscriptionURL %q written for a rejected URL", config.cfg.Xray.SubscriptionURL)
+	}
+}
+
 func TestImportHandler_TimeoutConfiguration(t *testing.T) {
 	h := NewImportHandler(&Deps{})
 
@@ -249,7 +291,7 @@ func TestImportHandler_HandleImport_ValidSubscription(t *testing.T) {
 	encoded := base64.StdEncoding.EncodeToString([]byte(vlessURL))
 
 	// Create mock HTTP server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(encoded))
 	}))
@@ -259,7 +301,7 @@ func TestImportHandler_HandleImport_ValidSubscription(t *testing.T) {
 	config := &mockConfigStoreForImport{dataDirVal: t.TempDir()}
 	deps := &Deps{Sender: sender, Config: config}
 	h := NewImportHandler(deps)
-	h.httpClient = &http.Client{} // bypass SSRF guard to reach the loopback test server
+	h.httpClient = server.Client() // bypass SSRF guard to reach the loopback test server
 
 	msg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: 789},
@@ -281,7 +323,7 @@ func TestImportHandler_HandleImport_ValidSubscription(t *testing.T) {
 
 func TestImportHandler_HandleImport_HTTPError(t *testing.T) {
 	// Create mock HTTP server that returns error
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer server.Close()
@@ -290,7 +332,7 @@ func TestImportHandler_HandleImport_HTTPError(t *testing.T) {
 	config := &mockConfigStoreForImport{}
 	deps := &Deps{Sender: sender, Config: config}
 	h := NewImportHandler(deps)
-	h.httpClient = &http.Client{} // bypass SSRF guard to reach the loopback test server
+	h.httpClient = server.Client() // bypass SSRF guard to reach the loopback test server
 
 	msg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: 111},
@@ -311,7 +353,7 @@ func TestImportHandler_HandleImport_HTTPError(t *testing.T) {
 
 func TestImportHandler_HandleImport_InvalidBase64(t *testing.T) {
 	// Create mock HTTP server that returns invalid base64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("not valid base64!!!"))
 	}))
@@ -321,7 +363,7 @@ func TestImportHandler_HandleImport_InvalidBase64(t *testing.T) {
 	config := &mockConfigStoreForImport{}
 	deps := &Deps{Sender: sender, Config: config}
 	h := NewImportHandler(deps)
-	h.httpClient = &http.Client{} // bypass SSRF guard to reach the loopback test server
+	h.httpClient = server.Client() // bypass SSRF guard to reach the loopback test server
 
 	msg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: 222},
@@ -345,7 +387,7 @@ func TestImportHandler_HandleImport_EmptySubscription(t *testing.T) {
 	// Create a subscription with no VLESS URLs
 	encoded := base64.StdEncoding.EncodeToString([]byte("just some text\nno vless here"))
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(encoded))
 	}))
@@ -355,7 +397,7 @@ func TestImportHandler_HandleImport_EmptySubscription(t *testing.T) {
 	config := &mockConfigStoreForImport{}
 	deps := &Deps{Sender: sender, Config: config}
 	h := NewImportHandler(deps)
-	h.httpClient = &http.Client{} // bypass SSRF guard to reach the loopback test server
+	h.httpClient = server.Client() // bypass SSRF guard to reach the loopback test server
 
 	msg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: 333},
@@ -384,7 +426,7 @@ func TestImportHandler_HandleImport_BlocksPrivateURL(t *testing.T) {
 
 	msg := &tgbotapi.Message{
 		Chat: &tgbotapi.Chat{ID: 999},
-		Text: "/import http://127.0.0.1:9/sub",
+		Text: "/import https://127.0.0.1:9/sub",
 		Entities: []tgbotapi.MessageEntity{
 			{Type: "bot_command", Offset: 0, Length: 7},
 		},

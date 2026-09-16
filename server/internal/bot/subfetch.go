@@ -76,6 +76,9 @@ func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([
 }
 
 func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) ([]byte, error) {
+	if u, err := url.Parse(rawURL); err != nil || u.Scheme != "https" {
+		return nil, fmt.Errorf("subscription URL must use https")
+	}
 	wan := ssrf.NewClient(10 * time.Second)
 	return fetchWANThenOptionalTunnel(ctx, rawURL, wan, func() *http.Client {
 		return subscriptionTunnelClient(cfgSvc, vpnSvc)

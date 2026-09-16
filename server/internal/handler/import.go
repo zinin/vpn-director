@@ -57,8 +57,8 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 
 	// Validate URL scheme
 	parsedURL, err := url.Parse(fetchURL)
-	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
-		h.deps.Sender.Send(msg.Chat.ID, "Invalid URL\\. Use http:// or https://")
+	if err != nil || parsedURL.Scheme != "https" {
+		h.deps.Sender.Send(msg.Chat.ID, "Invalid URL\\. Use https://")
 		return
 	}
 
