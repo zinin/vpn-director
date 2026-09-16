@@ -538,7 +538,7 @@ func TestTick_NoTunnelNoLiveNotifiesOncePerChannel(t *testing.T) {
 	w.Generate = func(vpnconfig.Server) (bool, error) { return true, nil }
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
-	tickFor(w, f, 30*time.Minute)
+	tickFor(w, f, 60*time.Minute)
 	if fetches < 3 {
 		t.Fatalf("fetches %d; the outage must span several import waves", fetches)
 	}
@@ -767,6 +767,117 @@ func recordingWalkWatch(f *fake, servers []vpnconfig.Server, generates func(vpnc
 
 func allGenerate(vpnconfig.Server) bool { return true }
 
+func TestTick_NoLiveWavesBackOffImportRetry(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	fetches := 0
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) { return true, nil }
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+
+	start := f.now
+	w.Tick(context.Background())
+	if fetches != 1 {
+		t.Fatalf("fetches %d after the first wave", fetches)
+	}
+	// Every wave finds only dead servers: the next one waits 10m, 20m, then 30m.
+	for _, at := range []time.Duration{10 * time.Minute, 30 * time.Minute, 60 * time.Minute, 90 * time.Minute} {
+		want := fetches
+		f.now = start.Add(at - time.Second)
+		w.Tick(context.Background())
+		if fetches != want {
+			t.Fatalf("fetch at %v, a second before the backed-off wave", at-time.Second)
+		}
+		f.now = start.Add(at)
+		w.Tick(context.Background())
+		if fetches != want+1 {
+			t.Fatalf("no fetch at %v", at)
+		}
+	}
+}
+
+func TestTick_RestoreResetsImportBackoff(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	fetches := 0
+	var fetchErr error
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		if fetchErr != nil {
+			return nil, fetchErr
+		}
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) { return true, nil }
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background()) // dead servers: the next wave backs off to 10m
+	f.probeErr = nil
+	f.now = f.now.Add(10 * time.Minute)
+	w.Tick(context.Background()) // Oslo is live
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("the second wave must restore")
+	}
+
+	// A new episode with no healthy probe in between; its first download fails.
+	f.probeErr = errProbe
+	fetchErr = errors.New("cdn down")
+	f.now = f.now.Add(ProbeInterval)
+	tickUntilDead(w, f)
+	if fetches != 3 {
+		t.Fatalf("fetches %d, want the new episode's first wave", fetches)
+	}
+	dead := f.now
+	f.now = dead.Add(ImportRetry - time.Second)
+	w.Tick(context.Background())
+	if fetches != 3 {
+		t.Fatalf("fetch %v after a failed download", ImportRetry-time.Second)
+	}
+	f.now = dead.Add(ImportRetry)
+	w.Tick(context.Background())
+	if fetches != 4 {
+		t.Fatalf("fetches %d; after a restore the retry is back to %v", fetches, ImportRetry)
+	}
+}
+
+func TestTick_FailedFetchKeepsFiveMinuteRetry(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+	fetches := 0
+	w := runningWatch(f.watch())
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("cdn down")
+	}
+
+	start := f.now
+	w.Tick(context.Background())
+	for i := 1; i <= 3; i++ {
+		at := time.Duration(i) * ImportRetry
+		f.now = start.Add(at - time.Second)
+		w.Tick(context.Background())
+		if fetches != i {
+			t.Fatalf("fetches %d at %v, want %d", fetches, at-time.Second, i)
+		}
+		f.now = start.Add(at)
+		w.Tick(context.Background())
+		if fetches != i+1 {
+			t.Fatalf("fetches %d at %v, want %d", fetches, at, i+1)
+		}
+	}
+}
+
 func TestTick_NoLiveWaveReturnsToPreferredServer(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	servers := []vpnconfig.Server{
@@ -788,7 +899,7 @@ func TestTick_NoLiveWaveReturnsToPreferredServer(t *testing.T) {
 
 	events = nil
 	f.probeErr = nil
-	f.now = f.now.Add(ImportRetry)
+	f.now = f.now.Add(2 * ImportRetry) // the dead wave backed the next one off to 10m
 	w.Tick(context.Background())
 	if !reflect.DeepEqual(events, []string{"Oslo", "restart"}) {
 		t.Fatalf("live wave events %v, want Oslo tried first", events)

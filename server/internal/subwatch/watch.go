@@ -19,6 +19,7 @@ const (
 	ProbeInterval      = 30 * time.Second
 	DeadAfter          = 3 * time.Minute
 	ImportRetry        = 5 * time.Minute
+	ImportRetryMax     = 30 * time.Minute
 	SettleAfterRestart = 3 * time.Second
 	defaultSOCKSPort   = 12346
 )
@@ -62,10 +63,11 @@ type Watch struct {
 	mu             sync.Mutex
 	failSince      time.Time // zero => last probe succeeded
 	lastImport     time.Time
-	lastRouteKind  noteKind // noteMoved, noteNoTunnel
-	lastImportKind noteKind // noteRefreshFailed, noteNoLive, noteRestored
-	pendingApply   bool     // JSON mutated; Apply has not yet succeeded
-	reconciled     bool     // the first armed Tick has checked for a failover left by an earlier process
+	importRetry    time.Duration // current wait between import waves; zero means ImportRetry
+	lastRouteKind  noteKind      // noteMoved, noteNoTunnel
+	lastImportKind noteKind      // noteRefreshFailed, noteNoLive, noteRestored
+	pendingApply   bool          // JSON mutated; Apply has not yet succeeded
+	reconciled     bool          // the first armed Tick has checked for a failover left by an earlier process
 	running        bool
 }
 
@@ -152,6 +154,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.pendingApply = false
 		w.failSince = time.Time{}
 		w.lastImport = time.Time{}
+		w.importRetry = 0
 		name := "unknown"
 		if cfg.Xray.ActiveServer != nil {
 			name = cfg.Xray.ActiveServer.Name
@@ -167,6 +170,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	err = w.Probe(ctx, socks)
 	if err == nil {
 		w.failSince = time.Time{}
+		w.importRetry = 0
 		w.lastRouteKind = noteNone
 		w.lastImportKind = noteNone
 		return
@@ -262,7 +266,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	now := w.Now()
-	if !w.lastImport.IsZero() && now.Sub(w.lastImport) < ImportRetry {
+	if !w.lastImport.IsZero() && now.Sub(w.lastImport) < w.importInterval() {
 		return
 	}
 	w.lastImport = now
@@ -356,7 +360,22 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	if preferred != nil && lastGenerated != "" && lastGenerated != activeName {
 		w.returnToPreferred(*preferred)
 	}
+	if tried > 0 {
+		// Every tried server cost an Xray restart and a config write; on a large
+		// all-dead subscription back-to-back waves would never stop doing that.
+		w.lastImport = w.Now()
+		w.importRetry = min(2*w.importInterval(), ImportRetryMax)
+		slog.Info("Next subscription refresh backed off", "after", w.importRetry)
+	}
 	w.notifyNoLive(cfg)
+}
+
+// importInterval is the current wait between import waves.
+func (w *Watch) importInterval() time.Duration {
+	if w.importRetry != 0 {
+		return w.importRetry
+	}
+	return ImportRetry
 }
 
 // returnToPreferred generates the preferred server back after a walk found
@@ -446,6 +465,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	w.pendingApply = false
 	w.failSince = time.Time{}
 	w.lastImport = time.Time{}
+	w.importRetry = 0
 	return true
 }
 

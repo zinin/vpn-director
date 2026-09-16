@@ -86,7 +86,7 @@ Otherwise the loop is idle: no probes, no messages.
 |----------|--------|
 | Probe interval | 30 s |
 | Dead after | 3 minutes of consecutive failed probes |
-| Import retry while failed over | 5 minutes |
+| Import retry while failed over | 5 minutes; after a walk with no live server 10, 20, then 30 minutes |
 | Probe URL | `https://www.gstatic.com/generate_204` |
 | Success | HTTP 204 through SOCKS (no body required) |
 | Settle after Xray restart | 3 s before the next SOCKS probe |
@@ -227,7 +227,7 @@ changed (new count, restore, or a successful pick).
 | SOCKS down | Failed probe. |
 | No TD candidate | No client move; import and walk still run. |
 | Import fails | Keep `servers.json`; retry in 5 min; one message for that wave. |
-| Every server dead | Stay failed over; import again in 5 min. |
+| Every server dead | Stay failed over; import again after 10, 20, then every 30 minutes. |
 | `apply` or Xray restart fails | Do not drop `failover` to guess. Retry. If the client move never landed, do not write `failover`. |
 | `--dev` | Watch does not start. |
 | Paused addresses | Not in the snapshot. |
