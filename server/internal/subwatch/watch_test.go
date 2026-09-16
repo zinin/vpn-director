@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -292,6 +293,57 @@ func TestTick_NoTunnelPickNotifiesSelectedServer(t *testing.T) {
 	}
 	if !reflect.DeepEqual(f.notes, want) {
 		t.Fatalf("notes %v, want %v", f.notes, want)
+	}
+}
+
+func TestTick_NoTunnelPickApplyFailureLeavesNothingPending(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		probeErr: errProbe,
+		applyErr: errApply,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	generated, probes := false, 0
+	w := f.watch()
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) {
+		generated = true
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	// Oslo answers once generated: the walk's probe and every later one succeed.
+	w.Probe = func(context.Context, int) error {
+		probes++
+		if generated {
+			return nil
+		}
+		return f.probeErr
+	}
+	tickUntilDead(w, f)
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want the failed pick Apply", f.applies)
+	}
+	if w.pendingApply {
+		t.Fatal("no failover was restored, so nothing may stay pending")
+	}
+
+	probesBefore := probes
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != 1 {
+		t.Fatalf("applies %d; the next Tick must not re-apply", f.applies)
+	}
+	if probes != probesBefore+1 {
+		t.Fatalf("probes %d, want %d; the health probe must run", probes, probesBefore+1)
+	}
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "LAN clients back on Xray") {
+			t.Fatalf("notes %v; nothing left Xray", f.notes)
+		}
 	}
 }
 

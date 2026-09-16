@@ -436,7 +436,11 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after restoring Xray clients failed", "error", err)
 		w.writeBackFailover(tunnel)
-		w.pendingApply = true
+		// Only a restored failover record changed the JSON routing; without one
+		// there is nothing to re-apply and the next Tick's health probe decides.
+		if tunnel != "" {
+			w.pendingApply = true
+		}
 		return false
 	}
 	w.pendingApply = false
