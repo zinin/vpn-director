@@ -133,6 +133,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			},
 			Notify:        b.notifyActiveChats,
 			FallbackReady: failoverTunnelReady,
+			TPROXYReady:   tproxyRulesReady,
 		}
 		b.subWatch = sw
 		go sw.Start(ctx)

@@ -68,6 +68,11 @@ fi
 # Initialization flag
 _tproxy_initialized=0
 
+# Written only when TPROXY rules were actually installed. Soft-fail skips
+# (no module, missing ipsets, iptables setup) remove it so the watch does
+# not drop fallback membership on a SOCKS-only success.
+XRAY_TPROXY_READY="${XRAY_TPROXY_READY:-/tmp/xray_tproxy/ready}"
+
 ###################################################################################################
 # Internal helper functions (defined before --source-only for testability)
 ###################################################################################################
@@ -669,6 +674,7 @@ tproxy_stop() {
     log "Stopping Xray TPROXY routing..."
     _tproxy_teardown_iptables
     _tproxy_teardown_routing
+    rm -f "$XRAY_TPROXY_READY"
     log "Xray TPROXY routing removed"
 
     return 0
@@ -688,6 +694,7 @@ tproxy_apply() {
     # Soft-fail: if xt_TPROXY module not available, return 0 without applying
     if ! _tproxy_check_module; then
         log -l WARN "xt_TPROXY module not available; skipping TPROXY setup"
+        rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
 
@@ -695,6 +702,7 @@ tproxy_apply() {
     if ! _tproxy_check_required_ipsets; then
         log -l WARN "Required ipsets not ready; exiting without applying rules"
         log -l WARN "Run 'vpn-director.sh apply' first to build required ipsets"
+        rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
 
@@ -705,9 +713,12 @@ tproxy_apply() {
     # Soft-fail if iptables setup fails
     if ! _tproxy_setup_iptables; then
         log -l WARN "Failed to setup iptables rules; TPROXY may not be active"
+        rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
 
+    mkdir -p "$(dirname "$XRAY_TPROXY_READY")"
+    printf 'ok\n' > "$XRAY_TPROXY_READY"
     log "Xray TPROXY routing applied successfully"
 
     return 0

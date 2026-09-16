@@ -337,6 +337,21 @@ func TestApplyFailoverSnapshot_OnlyMovesListedClients(t *testing.T) {
 	}
 }
 
+func TestRestageFailover_KeepsXrayMembership(t *testing.T) {
+	cfg := sample()
+	cfg.Xray.Clients = []string{"192.168.1.8"}
+	RestageFailover(cfg, &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}, Added: []string{"192.168.1.8"}})
+	if !contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("must stay on Xray")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("must be on the tunnel")
+	}
+	if cfg.Xray.Failover == nil || !reflect.DeepEqual(cfg.Xray.Failover.Added, []string{"192.168.1.8"}) {
+		t.Fatalf("failover %+v", cfg.Xray.Failover)
+	}
+}
+
 func TestXrayConfig_OmitsSubscriptionURLAndFailoverWhenEmpty(t *testing.T) {
 	out, err := json.Marshal(VPNDirectorConfig{})
 	if err != nil {

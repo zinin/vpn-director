@@ -59,6 +59,7 @@ type Watch struct {
 	Now           func() time.Time
 	AfterRestart  func(time.Duration)
 	FallbackReady func(tunnel string) bool // nil => ready; false keeps Xray membership
+	TPROXYReady   func() bool              // nil => ready; false keeps fallback membership after restore
 
 	mu                   sync.Mutex
 	failSince            time.Time // zero => last probe succeeded
@@ -349,6 +350,29 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 	return cfg.Xray.Failover.Tunnel
 }
 
+func (w *Watch) walkSuperseded(started, lastGen string) bool {
+	if w.LoadVPN == nil {
+		return false
+	}
+	cfg, err := w.LoadVPN()
+	if err != nil || cfg == nil {
+		return false
+	}
+	cur := ""
+	if cfg.Xray.ActiveServer != nil {
+		cur = cfg.Xray.ActiveServer.Name
+	}
+	if lastGen == "" {
+		return cur != "" && cur != started
+	}
+	if cur == "" || cur == lastGen {
+		return false
+	}
+	// Generate did not record (tests keep started) or the user re-selected
+	// started. Only a third name is a Select that must not be overwritten.
+	return cur != started
+}
+
 func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.Fetch == nil {
 		return
@@ -415,6 +439,10 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	tried := 0
 	lastGenerated := ""
 	for _, s := range order {
+		if w.walkSuperseded(activeName, lastGenerated) {
+			slog.Info("Subscription walk abandoned; a newer server was selected")
+			return
+		}
 		generated, err := w.Generate(s)
 		if err != nil || !generated {
 			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, "error", err)
@@ -436,6 +464,10 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			continue
 		}
 		slog.Info("Subscription server picked", "server", s.Name)
+		if w.walkSuperseded(activeName, lastGenerated) {
+			slog.Info("Subscription walk abandoned; a newer server was selected")
+			return
+		}
 		// Only a committed failover left Xray. Staged clients never left, so
 		// "back on Xray" would be a false message.
 		committed := failoverTunnel(cfg) != "" && !vpnconfig.FailoverStaged(cfg)
@@ -451,6 +483,10 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	slog.Info("No live server in the subscription", "tried", tried)
+	if w.walkSuperseded(activeName, lastGenerated) {
+		slog.Info("Subscription walk abandoned; a newer server was selected")
+		return
+	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != activeName {
 		w.returnToPreferred(*preferred)
 	}
@@ -518,8 +554,13 @@ func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) b
 }
 
 func (w *Watch) abandonStaged() {
+	var fo *vpnconfig.XrayFailover
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+			if current.Xray.Failover != nil {
+				cp := *current.Xray.Failover
+				fo = &cp
+			}
 			vpnconfig.RestoreXrayClientsFromFailover(current)
 			return nil
 		}); err != nil {
@@ -532,6 +573,12 @@ func (w *Watch) abandonStaged() {
 	w.importRetry = 0
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after dropping the staged failover failed", "error", err)
+		w.pendingApply = true
+		return
+	}
+	if !w.tproxyReady() {
+		slog.Warn("TPROXY is not intercepting LAN; keeping the staged failover")
+		w.restage(fo)
 		w.pendingApply = true
 	}
 }
@@ -552,6 +599,45 @@ func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
 		break
 	}
 	return s
+}
+
+func (w *Watch) tproxyReady() bool {
+	if w.TPROXYReady == nil {
+		return true
+	}
+	return w.TPROXYReady()
+}
+
+func (w *Watch) failoverRecord(tunnel string, restored, added []string, addedSet bool) *vpnconfig.XrayFailover {
+	if tunnel == "" {
+		return nil
+	}
+	fo := &vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored}
+	if addedSet {
+		kept := make([]string, 0, len(added))
+		for _, ip := range added {
+			for _, r := range restored {
+				if ip == r {
+					kept = append(kept, ip)
+					break
+				}
+			}
+		}
+		fo.Added = kept
+	}
+	return fo
+}
+
+func (w *Watch) restage(fo *vpnconfig.XrayFailover) {
+	if fo == nil || w.UpdateVPN == nil {
+		return
+	}
+	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+		vpnconfig.RestageFailover(current, fo)
+		return nil
+	}); err != nil {
+		slog.Warn("Failed to restage the Xray failover", "tunnel", fo.Tunnel, "error", err)
+	}
 }
 
 func (w *Watch) writeBackFailover(fo *vpnconfig.XrayFailover) {
@@ -592,29 +678,28 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after restoring Xray clients failed", "error", err)
-		// A staged restore already left clients on Xray. ApplyFailoverSnapshot
-		// would drop them and look committed while TUN_DIR may not carry them.
 		if !wasStaged {
-			wb := &vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored}
-			if addedSet {
-				kept := make([]string, 0, len(added))
-				for _, ip := range added {
-					for _, r := range restored {
-						if ip == r {
-							kept = append(kept, ip)
-							break
-						}
-					}
-				}
-				wb.Added = kept
-			}
-			w.writeBackFailover(wb)
+			w.writeBackFailover(w.failoverRecord(tunnel, restored, added, addedSet))
 		}
 		if tunnel != "" || wasStaged {
 			w.pendingApply = true
 			if !wasStaged {
 				w.pendingRestoreNotify = true
 			}
+		}
+		return false
+	}
+	if !w.tproxyReady() {
+		slog.Warn("TPROXY is not intercepting LAN; keeping the failover")
+		fo := w.failoverRecord(tunnel, restored, added, addedSet)
+		if wasStaged {
+			w.restage(fo)
+		} else {
+			w.writeBackFailover(fo)
+		}
+		w.pendingApply = true
+		if !wasStaged {
+			w.pendingRestoreNotify = true
 		}
 		return false
 	}

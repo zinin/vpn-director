@@ -266,3 +266,28 @@ func ApplyFailoverSnapshot(cfg *VPNDirectorConfig, fo *XrayFailover) {
 	cfg.Xray.Clients = keptXray
 	cfg.Xray.Failover = &XrayFailover{Tunnel: fo.Tunnel, Clients: clients, Added: fo.Added}
 }
+
+// RestageFailover puts fo.Clients on the tunnel and records failover without
+// dropping them from xray.clients. Used when TPROXY is not intercepting LAN
+// after a staged restore, so the fallback still has them.
+func RestageFailover(cfg *VPNDirectorConfig, fo *XrayFailover) {
+	if cfg == nil || fo == nil || fo.Tunnel == "" {
+		return
+	}
+	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
+	if !ok {
+		return
+	}
+	clients := make([]string, 0, len(fo.Clients))
+	for _, ip := range fo.Clients {
+		if ip == "" {
+			continue
+		}
+		clients = append(clients, ip)
+		if !contains(tun.Clients, ip) {
+			tun.Clients = append(tun.Clients, ip)
+		}
+	}
+	cfg.TunnelDirector.Tunnels[fo.Tunnel] = tun
+	cfg.Xray.Failover = &XrayFailover{Tunnel: fo.Tunnel, Clients: clients, Added: fo.Added}
+}

@@ -195,6 +195,14 @@ load '../test_helper'
     assert_success
 }
 
+@test "tproxy_apply: records ready when rules are installed" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+}
+
 @test "tproxy_apply: logs application message" {
     load_tproxy_module
     run tproxy_apply
@@ -222,9 +230,12 @@ EOF
     export PATH="/tmp/bats_mock_fail:$PATH"
 
     source "$LIB_DIR/tproxy.sh" --source-only
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
     run tproxy_apply
     # Should soft-fail (return 0, not fail)
     assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
 
     rm -rf /tmp/bats_mock_fail
 }

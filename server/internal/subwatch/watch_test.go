@@ -587,6 +587,73 @@ func TestTick_NoTunnelPickApplyFailureLeavesNothingPending(t *testing.T) {
 	}
 }
 
+func TestTick_RestoreKeepsFallbackWhenTPROXYNotReady(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	w.TPROXYReady = func() bool { return false }
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("must keep failover while TPROXY is not intercepting LAN")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("fallback membership")
+	}
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("committed write-back must take the client off Xray")
+	}
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "LAN clients back on Xray") {
+			t.Fatalf("must not announce restore: %v", f.notes)
+		}
+	}
+}
+
+func TestTick_WalkAbandonsWhenANewerServerWasSelected(t *testing.T) {
+	f := &fake{
+		cfg:  failedOverCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+		if s.Name == "Oslo" {
+			f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Manual", Address: "manual.example", Port: 443}
+		}
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if len(generated) == 0 {
+			return errProbe
+		}
+		if generated[len(generated)-1] == "Oslo" {
+			return errProbe
+		}
+		return nil
+	}
+	w.Tick(context.Background())
+	if len(generated) != 1 || generated[0] != "Oslo" {
+		t.Fatalf("generate %v; must not overwrite a newer manual selection", generated)
+	}
+	if f.cfg.Xray.ActiveServer == nil || f.cfg.Xray.ActiveServer.Name != "Manual" {
+		t.Fatalf("active %+v", f.cfg.Xray.ActiveServer)
+	}
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("abandoned walk must not restore")
+	}
+}
+
 func TestTick_CommittedFailoverRestoresWhenSOCKSHealthy(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
 	fetches := 0
