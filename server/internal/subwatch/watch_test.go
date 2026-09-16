@@ -190,10 +190,20 @@ func TestTick_DoesNotCommitIfFallbackTunnelWasNotApplied(t *testing.T) {
 	}
 	w := f.watch()
 	w.FallbackReady = func(string) bool { return false }
+	fetches := 0
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("cdn down")
+	}
 	tickUntilDead(w, f)
 	assertStagedOnTunnel(t, f.cfg)
-	if len(f.notes) != 0 {
-		t.Fatalf("must not report moved: %v", f.notes)
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "Xray outbound is down; LAN clients moved") {
+			t.Fatalf("must not report moved: %v", f.notes)
+		}
+	}
+	if fetches != 1 {
+		t.Fatalf("fetches %d; a staged apply that is not yet ready must still refresh the subscription", fetches)
 	}
 
 	w.Tick(context.Background())
@@ -202,7 +212,14 @@ func TestTick_DoesNotCommitIfFallbackTunnelWasNotApplied(t *testing.T) {
 	w.FallbackReady = func(string) bool { return true }
 	w.Tick(context.Background())
 	assertStillOnTunnel(t, f.cfg)
-	if len(f.notes) != 1 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
+	found := false
+	for _, n := range f.notes {
+		if n == "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
+			found = true
+			break
+		}
+	}
+	if !found {
 		t.Fatalf("notes %v", f.notes)
 	}
 }
@@ -229,6 +246,54 @@ func TestTick_StagedFailoverAbandonsWhenXrayRecovers(t *testing.T) {
 	}
 	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatal("staged tunnel assignment must be rolled back")
+	}
+}
+
+func TestTick_AbandonStagedApplyFailureDoesNotNotifyRestored(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.FallbackReady = func(string) bool { return false }
+	tickUntilDead(w, f)
+	assertStagedOnTunnel(t, f.cfg)
+
+	f.probeErr = nil
+	f.applyErr = errApply
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("JSON must already be restored")
+	}
+	f.applyErr = nil
+	w.Tick(context.Background())
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "LAN clients back on Xray") {
+			t.Fatalf("staged abandon must not send restored: %v", f.notes)
+		}
+	}
+}
+
+func TestTick_StagedRestoreApplyFailureKeepsXrayMembership(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	vpnconfig.StageXrayClientsToTunnel(cfg, "ovpnc2")
+	f := &fake{
+		cfg:      cfg,
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:      time.Unix(1_700_000_000, 0),
+		applyErr: errApply,
+	}
+	w := runningWatch(liveImportWatch(f))
+	w.FallbackReady = func(string) bool { return false }
+	w.Tick(context.Background())
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("staged restore-Apply failure must not drop Xray membership")
+	}
+	if f.cfg.Xray.Failover != nil && !vpnconfig.FailoverStaged(f.cfg) {
+		t.Fatal("write-back must not commit a staged failover")
 	}
 }
 

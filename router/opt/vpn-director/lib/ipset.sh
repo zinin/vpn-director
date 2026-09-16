@@ -63,11 +63,15 @@ TUN_DIR_HASH="$TUN_DIRECTOR_DIR/tun_dir_rules.sha256"
 # every apply and releases their tables on stop.
 TUN_DIR_TABLES="$TUN_DIRECTOR_DIR/tun_dir_tables"
 
+# Tunnel id when the failover tunnel's route and ip rule are installed.
+# The watch reads this so a plain apply can return 0 while Xray membership stays.
+TUN_DIR_FAILOVER_READY="$TUN_DIRECTOR_DIR/failover_ready"
+
 # Ensure directories exist
 mkdir -p "$IPS_BUILDER_DIR" "$TUN_DIRECTOR_DIR"
 
 # Export for use by other modules
-export IPS_BUILDER_DIR TUN_DIRECTOR_DIR TUN_DIR_HASH TUN_DIR_TABLES
+export IPS_BUILDER_DIR TUN_DIRECTOR_DIR TUN_DIR_HASH TUN_DIR_TABLES TUN_DIR_FAILOVER_READY
 
 ###################################################################################################
 # Constants (defined before --source-only for testability)

@@ -60,15 +60,16 @@ type Watch struct {
 	AfterRestart  func(time.Duration)
 	FallbackReady func(tunnel string) bool // nil => ready; false keeps Xray membership
 
-	mu             sync.Mutex
-	failSince      time.Time // zero => last probe succeeded
-	lastImport     time.Time
-	importRetry    time.Duration // current wait between import waves; zero means ImportRetry
-	lastRouteKind  noteKind      // noteMoved, noteNoTunnel
-	lastImportKind noteKind      // noteRefreshFailed, noteNoLive, noteRestored
-	pendingApply   bool          // JSON mutated; Apply has not yet succeeded
-	reconciled     bool          // the first armed Tick has checked for a failover left by an earlier process
-	running        bool
+	mu                   sync.Mutex
+	failSince            time.Time // zero => last probe succeeded
+	lastImport           time.Time
+	importRetry          time.Duration // current wait between import waves; zero means ImportRetry
+	lastRouteKind        noteKind      // noteMoved, noteNoTunnel
+	lastImportKind       noteKind      // noteRefreshFailed, noteNoLive, noteRestored
+	pendingApply         bool          // JSON mutated; Apply has not yet succeeded
+	pendingRestoreNotify bool          // pendingApply is a committed restore, so notify when Apply succeeds
+	reconciled           bool          // the first armed Tick has checked for a failover left by an earlier process
+	running              bool
 }
 
 func (w *Watch) Start(ctx context.Context) {
@@ -168,15 +169,19 @@ func (w *Watch) Tick(ctx context.Context) {
 			return
 		}
 		w.pendingApply = false
+		notifyRestore := w.pendingRestoreNotify
+		w.pendingRestoreNotify = false
 		w.failSince = time.Time{}
 		w.lastImport = time.Time{}
 		w.importRetry = 0
-		name := "unknown"
-		if cfg.Xray.ActiveServer != nil {
-			name = cfg.Xray.ActiveServer.Name
+		if notifyRestore {
+			name := "unknown"
+			if cfg.Xray.ActiveServer != nil {
+				name = cfg.Xray.ActiveServer.Name
+			}
+			slog.Info("Xray clients restored", "server", name)
+			w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
 		}
-		slog.Info("Xray clients restored", "server", name)
-		w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
 	}
 
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
@@ -254,6 +259,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	var ok bool
 	cfg, ok = w.applyFailover(cfg)
 	if !ok {
+		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
 	slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", movedClients)
@@ -560,6 +566,7 @@ func (w *Watch) writeBackFailover(fo *vpnconfig.XrayFailover) {
 // moved, not a fresh Move of every current Xray client.
 func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	tunnel := failoverTunnel(cfg)
+	wasStaged := vpnconfig.FailoverStaged(cfg)
 	var restored []string
 	var added []string
 	addedSet := false
@@ -578,28 +585,34 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after restoring Xray clients failed", "error", err)
-		wb := &vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored}
-		if addedSet {
-			kept := make([]string, 0, len(added))
-			for _, ip := range added {
-				for _, r := range restored {
-					if ip == r {
-						kept = append(kept, ip)
-						break
+		// A staged restore already left clients on Xray. ApplyFailoverSnapshot
+		// would drop them and look committed while TUN_DIR may not carry them.
+		if !wasStaged {
+			wb := &vpnconfig.XrayFailover{Tunnel: tunnel, Clients: restored}
+			if addedSet {
+				kept := make([]string, 0, len(added))
+				for _, ip := range added {
+					for _, r := range restored {
+						if ip == r {
+							kept = append(kept, ip)
+							break
+						}
 					}
 				}
+				wb.Added = kept
 			}
-			wb.Added = kept
+			w.writeBackFailover(wb)
 		}
-		w.writeBackFailover(wb)
-		// Only a restored failover record changed the JSON routing; without one
-		// there is nothing to re-apply and the next Tick's health probe decides.
-		if tunnel != "" {
+		if tunnel != "" || wasStaged {
 			w.pendingApply = true
+			if !wasStaged {
+				w.pendingRestoreNotify = true
+			}
 		}
 		return false
 	}
 	w.pendingApply = false
+	w.pendingRestoreNotify = false
 	w.failSince = time.Time{}
 	w.lastImport = time.Time{}
 	w.importRetry = 0

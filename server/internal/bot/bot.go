@@ -131,11 +131,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
 				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
 			},
-			Notify: b.notifyActiveChats,
-			FallbackReady: func(id string) bool {
-				_, ok := loadTunnelIdxFile(defaultTunnelTablesPath)[id]
-				return ok
-			},
+			Notify:        b.notifyActiveChats,
+			FallbackReady: failoverTunnelReady,
 		}
 		b.subWatch = sw
 		go sw.Start(ctx)

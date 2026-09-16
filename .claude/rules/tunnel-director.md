@@ -100,11 +100,13 @@ indices to other tunnels, and on Keenetic table `2000+idx` then still held the p
 route.
 
 A failover tunnel whose route or ip rule cannot be installed still writes the hash (when every
-configured tunnel was applied) and returns 1, so the watch does not drop Xray membership. Deleting
-the hash there forced every later apply through `tunnel_stop`, which takes TUN_DIR down for every
-client while the fallback interface is still coming up. The up-to-date path then re-checks the
-failover tunnel's route and its ip rule (`pref TUN_DIR_PREF_BASE+idx` from `TUN_DIR_TABLES`); a
-missing rule still returns 1 without a rebuild.
+configured tunnel was applied) and returns 0 with a WARN, so S99 start, hooks and Web UI Apply
+do not fail while the fallback interface is still coming up. Deleting the hash forced the next
+apply through `tunnel_stop`. The watch does not Commit Xray membership until
+`/tmp/tunnel_director/failover_ready` names that tunnel (route and ip rule installed);
+`TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path re-checks the
+failover tunnel's route and its ip rule (`pref TUN_DIR_PREF_BASE+idx` from `TUN_DIR_TABLES`)
+and rewrites or removes `failover_ready` without a rebuild.
 
 The rebuild loop also releases each tunnel's table right before it ensures the route
 (`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that dies after

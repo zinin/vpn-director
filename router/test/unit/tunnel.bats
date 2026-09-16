@@ -419,7 +419,7 @@ load '../test_helper'
     grep -q 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1' /tmp/bats_ip_calls.log
 }
 
-@test "tunnel_apply: fails when the failover tunnel is unknown to the platform" {
+@test "tunnel_apply: warns when the failover tunnel is unknown to the platform" {
     load_common
     source "$LIB_DIR/firewall.sh"
     local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-unknown.json"
@@ -434,11 +434,12 @@ load '../test_helper'
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     run tunnel_apply
-    assert_failure
+    assert_success
     assert_output --partial "OpenVPN0"
+    [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
 }
 
-@test "tunnel_apply: fails when the failover tunnel's route cannot be installed" {
+@test "tunnel_apply: warns when the failover tunnel's route cannot be installed" {
     load_common
     source "$LIB_DIR/firewall.sh"
     local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-route.json"
@@ -453,8 +454,9 @@ load '../test_helper'
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 1; }
     run tunnel_apply
-    assert_failure
+    assert_success
     assert_output --partial "ovpnc2"
+    [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
 }
 
 # Deleting the hash on a failover route failure sent every later apply down the
@@ -481,24 +483,22 @@ load '../test_helper'
         return 0
     }
     run tunnel_apply
-    assert_failure
+    assert_success
     [ -f "$TUN_DIR_HASH" ]
+    [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
 
     : > /tmp/bats_iptables_calls.log
     : > /tmp/bats_ip_calls.log
     run tunnel_apply
-    assert_failure
+    assert_success
     refute_output --partial "Stopping Tunnel Director"
     refute grep -q -- '-t mangle -X TUN_DIR' /tmp/bats_iptables_calls.log
 }
 
-# iproute2 4.4 refuses "ip rule show pref N". The up-to-date path used to
-# check only TUN_DIR_TABLES and the route, so a first apply that recorded the
-# hash after ip rule add failed then returned 0 on the next apply. The watch
-# took that as FallbackReady and dropped Xray membership onto a mark with no
-# ip rule — WAN. Keep the hash (do not tunnel_stop); still return 1 until the
-# failover pref exists.
-@test "tunnel_apply: a missing failover ip rule keeps the hash and still fails the next apply" {
+# iproute2 4.4 refuses "ip rule show pref N". A missing failover ip rule must
+# not delete the hash (that would tunnel_stop every client) and must not
+# return 1 (that would fail S99 start). The watch reads failover_ready instead.
+@test "tunnel_apply: a missing failover ip rule keeps the hash and does not fail the apply" {
     load_common
     source "$LIB_DIR/firewall.sh"
     local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-rule.json"
@@ -523,14 +523,37 @@ load '../test_helper'
         command ip "$@"
     }
     run tunnel_apply
-    assert_failure
+    assert_success
     [ -f "$TUN_DIR_HASH" ]
+    [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
 
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
-    assert_failure
+    assert_success
     refute_output --partial "Stopping Tunnel Director"
     refute grep -q -- '-t mangle -X TUN_DIR' /tmp/bats_iptables_calls.log
+    [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
+}
+
+@test "tunnel_apply: records failover ready when the route and ip rule are installed" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-ready.json"
+    jq '.tunnel_director.tunnels = {
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    local ready="${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}"
+    [ -f "$ready" ]
+    grep -qx ovpnc2 "$ready"
 }
 
 @test "tunnel_apply: succeeds when the failover tunnel has no effective clients" {

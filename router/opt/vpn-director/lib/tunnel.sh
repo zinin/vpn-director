@@ -335,7 +335,7 @@ tunnel_stop() {
     fi
 
     # Clear hash file
-    rm -f "$TUN_DIR_HASH"
+    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY"
 
     log "Tunnel Director stopped"
     return 0
@@ -393,19 +393,16 @@ tunnel_apply() {
 
     if [[ $rebuild -eq 0 ]]; then
         if _tunnel_failover_needed; then
-            if ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES"; then
-                log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
-                return 1
-            fi
-            if ! _tunnel_ensure_routes; then
-                log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
-                return 1
-            fi
-            if ! _tunnel_failover_rule_present; then
-                log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
-                return 1
+            if ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES" \
+                || ! _tunnel_ensure_routes \
+                || ! _tunnel_failover_rule_present; then
+                rm -f "$TUN_DIR_FAILOVER_READY"
+                log -l WARN "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+            else
+                printf '%s\n' "$XRAY_FAILOVER_TUNNEL" > "$TUN_DIR_FAILOVER_READY"
             fi
         else
+            rm -f "$TUN_DIR_FAILOVER_READY"
             _tunnel_ensure_routes || true
         fi
         log "Rules are applied and up-to-date"
@@ -690,13 +687,18 @@ tunnel_apply() {
         log -l WARN "Tunnel Director: a configured tunnel is unknown to the platform (RCI down, or a typo in the id); this apply is not recorded as up-to-date and the next apply retries"
     fi
 
-    # Still return 1 so the watch does not drop Xray membership. Keep the hash
-    # when every configured tunnel was applied: deleting it forced the next
-    # apply through tunnel_stop, which takes TUN_DIR down for every client
-    # while the fallback interface is still coming up.
-    if _tunnel_failover_needed && [[ $fo_applied -eq 0 || $fo_route_ok -eq 0 || $fo_rule_ok -eq 0 ]]; then
-        log -l ERROR "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
-        return 1
+    # Keep the hash when every configured tunnel was applied: deleting it
+    # forced the next apply through tunnel_stop. Do not return 1: S99 start,
+    # hooks and Web UI Apply would then skip cron and report failure while
+    # the fallback interface is still coming up. The watch reads
+    # TUN_DIR_FAILOVER_READY instead of the apply exit status.
+    if _tunnel_failover_needed && [[ $fo_applied -eq 1 && $fo_route_ok -eq 1 && $fo_rule_ok -eq 1 ]]; then
+        printf '%s\n' "$XRAY_FAILOVER_TUNNEL" > "$TUN_DIR_FAILOVER_READY"
+    else
+        rm -f "$TUN_DIR_FAILOVER_READY"
+        if _tunnel_failover_needed; then
+            log -l WARN "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+        fi
     fi
 
     if [[ $changes -eq 0 ]]; then

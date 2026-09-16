@@ -25,6 +25,7 @@ const defaultSOCKSPort = 12346
 const defaultMarkShift = 16
 
 const defaultTunnelTablesPath = "/tmp/tunnel_director/tun_dir_tables"
+const defaultFailoverReadyPath = "/tmp/tunnel_director/failover_ready"
 
 type Path struct {
 	kind      pathKind
@@ -116,6 +117,23 @@ func loadTunnelIdxFile(path string) map[string]int {
 	}
 	defer f.Close()
 	return parseTunnelTables(f)
+}
+
+// failoverTunnelReady is true when TUN_DIR_TABLES lists id and tunnel_apply
+// wrote failover_ready for that id (route and ip rule installed). TABLES
+// alone is not enough: it is written even when the route or rule failed.
+func failoverTunnelReady(id string) bool {
+	if id == "" {
+		return false
+	}
+	if _, ok := loadTunnelIdxFile(defaultTunnelTablesPath)[id]; !ok {
+		return false
+	}
+	b, err := os.ReadFile(defaultFailoverReadyPath)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(b)) == id
 }
 
 func candidates(cfg *vpnconfig.VPNDirectorConfig, plat vpnconfig.PlatformInfo, socksUp bool, idxByID map[string]int) []Path {
