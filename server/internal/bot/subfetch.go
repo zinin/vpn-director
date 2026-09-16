@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ func fetchWANThenOptionalTunnel(ctx context.Context, rawURL string, wan *http.Cl
 	if err == nil {
 		return body, nil
 	}
+	// Even ssrf.ErrBlockedAddress falls back: a WAN resolver's private stub for a blocked domain is what the tunnel's own DNS gets around.
 	if tunnel == nil {
 		return nil, err
 	}
@@ -97,15 +99,41 @@ func subscriptionTunnelClient(cfgSvc service.ConfigStore, vpnSvc service.VPNDire
 		return nil
 	}
 	p := subscriptionTunnelPath(cfg, plat, id)
+	return newTunnelHTTPClient(func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return refusePrivatePeer(DialPath(ctx, p, "tcp4", addr))
+	})
+}
+
+// newTunnelHTTPClient gives the tunnel fetch what ssrf.NewClient gives the WAN
+// one: no redirects, so a 3xx surfaces as "HTTP 3xx", and TLS 1.2 at least.
+func newTunnelHTTPClient(dial func(ctx context.Context, network, addr string) (net.Conn, error)) *http.Client {
 	return &http.Client{
 		Timeout: 10 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 		Transport: &http.Transport{
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				return DialPath(ctx, p, "tcp4", addr)
-			},
+			DialContext:       dial,
+			TLSClientConfig:   &tls.Config{MinVersion: tls.VersionTLS12},
 			ForceAttemptHTTP2: false,
 		},
 	}
+}
+
+// refusePrivatePeer is the tunnel's stand-in for the ssrf dial guard, which
+// DialPath has no hook for: it checks the peer once connected and closes a
+// connection to a private or reserved address before a byte of HTTP is sent.
+func refusePrivatePeer(conn net.Conn, err error) (net.Conn, error) {
+	if err != nil {
+		return nil, err
+	}
+	remote := conn.RemoteAddr()
+	tcp, ok := remote.(*net.TCPAddr)
+	if !ok || tcp == nil || tcp.IP == nil || ssrf.IsPrivateOrReserved(tcp.IP) {
+		_ = conn.Close()
+		return nil, fmt.Errorf("%w: %s", ssrf.ErrBlockedAddress, remote)
+	}
+	return conn, nil
 }
 
 func subscriptionTunnelPath(cfg *vpnconfig.VPNDirectorConfig, plat vpnconfig.PlatformInfo, id string) Path {

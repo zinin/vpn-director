@@ -5,11 +5,14 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/zinin/vpn-director/server/internal/ssrf"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -215,5 +218,80 @@ func TestFetchSubscription_WANDialErrorNilTunnel(t *testing.T) {
 	}
 	if body != nil {
 		t.Fatalf("body %q", body)
+	}
+}
+
+// remoteConn is a net.Conn that only answers RemoteAddr.
+type remoteConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c remoteConn) RemoteAddr() net.Addr { return c.remote }
+
+func TestRefusePrivatePeer(t *testing.T) {
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	raw, err := net.Dial("tcp4", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+
+	conn, err := refusePrivatePeer(raw, nil)
+	if !errors.Is(err, ssrf.ErrBlockedAddress) {
+		t.Fatalf("loopback peer: err %v, want ssrf.ErrBlockedAddress", err)
+	}
+	if conn != nil {
+		t.Fatal("loopback peer: connection returned")
+	}
+	if _, werr := raw.Write([]byte("GET")); !errors.Is(werr, net.ErrClosed) {
+		t.Fatalf("loopback peer: connection left open, write err %v", werr)
+	}
+
+	public := remoteConn{remote: &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 443}}
+	conn, err = refusePrivatePeer(public, nil)
+	if err != nil {
+		t.Fatalf("public peer: %v", err)
+	}
+	if conn != public {
+		t.Fatalf("public peer: got %v, want the dialled connection", conn)
+	}
+
+	dialErr := errors.New("tunnel down")
+	conn, err = refusePrivatePeer(nil, dialErr)
+	if err != dialErr {
+		t.Fatalf("dial error: err %v, want it unchanged", err)
+	}
+	if conn != nil {
+		t.Fatal("dial error: connection returned")
+	}
+}
+
+func TestNewTunnelHTTPClient_DoesNotFollowRedirects(t *testing.T) {
+	var targetHits int
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		targetHits++
+		_, _ = io.WriteString(w, "internal")
+	}))
+	t.Cleanup(target.Close)
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+
+	dialer := &net.Dialer{}
+	body, err := getSubscription(context.Background(), newTunnelHTTPClient(dialer.DialContext), redirect.URL)
+	if err == nil || !strings.Contains(err.Error(), "HTTP 302") {
+		t.Fatalf("err %v, want HTTP 302", err)
+	}
+	if body != nil {
+		t.Fatalf("body %q", body)
+	}
+	if targetHits != 0 {
+		t.Fatalf("redirect followed: target hits %d", targetHits)
 	}
 }
