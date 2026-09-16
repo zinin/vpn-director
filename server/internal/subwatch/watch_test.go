@@ -833,8 +833,8 @@ func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
 	if fetches != 1 || generates != 1 || restarts != 1 {
 		t.Fatalf("30s later must not re-import, fetches=%d generates=%d restarts=%d", fetches, generates, restarts)
 	}
-	if f.applies != 1 {
-		t.Fatalf("applies %d, want 1 (no restore-Apply until ImportRetry)", f.applies)
+	if f.applies != 2 {
+		t.Fatalf("applies %d, want 2 (the second Apply is the pending retry, not a restore-Apply)", f.applies)
 	}
 }
 
@@ -884,6 +884,101 @@ func TestTick_RestoreApplyFailureKeepsFailoverThenRetries(t *testing.T) {
 	}
 	if !w.lastImport.IsZero() {
 		t.Fatal("lastImport must reset on successful restore")
+	}
+}
+
+func TestTick_RestoreApplyAndWriteBackFailureRetriesApplyBeforeProbe(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		now:      time.Unix(1_700_000_000, 0),
+		applyErr: errApply,
+	}
+	probes := 0
+	w := runningWatch(liveImportWatch(f))
+	w.Probe = func(context.Context, int) error {
+		probes++
+		return nil
+	}
+	// Fail only the write-back: the update right after the one that restored.
+	updates, restoredAt := 0, 0
+	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		updates++
+		if restoredAt != 0 && updates == restoredAt+1 {
+			return errors.New("config lock timeout")
+		}
+		if err := fn(f.cfg); err != nil {
+			return err
+		}
+		if restoredAt == 0 && f.cfg.Xray.Failover == nil {
+			restoredAt = updates
+		}
+		return nil
+	}
+
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v; the write-back was meant to fail", f.cfg.Xray.Failover)
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("JSON must look restored")
+	}
+	if f.applies != 1 || probes != 1 {
+		t.Fatalf("first tick applies=%d probes=%d", f.applies, probes)
+	}
+
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != 2 {
+		t.Fatalf("applies %d, want the pending Apply retried", f.applies)
+	}
+	if probes != 1 {
+		t.Fatalf("probes %d; no probe while the restore is not applied", probes)
+	}
+
+	f.applyErr = nil
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != 3 {
+		t.Fatalf("applies %d, want the pending Apply", f.applies)
+	}
+	if n := len(f.notes); n == 0 || f.notes[n-1] != "LAN clients back on Xray; server Oslo" {
+		t.Fatalf("notes %v", f.notes)
+	}
+	if probes != 2 {
+		t.Fatalf("probes %d; the probe must run in the Tick whose Apply succeeded", probes)
+	}
+}
+
+func TestTick_RestoreApplyFailureWithWriteBackRetriesApplyBeforeImport(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		now:      time.Unix(1_700_000_000, 0),
+		applyErr: errApply,
+	}
+	var events []string
+	w := runningWatch(liveImportWatch(f))
+	apply, fetch := w.Apply, w.Fetch
+	w.Apply = func() error {
+		events = append(events, "apply")
+		return apply()
+	}
+	w.Fetch = func(ctx context.Context, url string) ([]vpnconfig.Server, error) {
+		events = append(events, "fetch")
+		return fetch(ctx, url)
+	}
+
+	w.Tick(context.Background())
+	assertStillOnTunnel(t, f.cfg)
+
+	events = nil
+	f.applyErr = nil
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+	if want := []string{"apply", "fetch", "apply"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events %v, want %v (the pending Apply before the import)", events, want)
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("must restore once Apply succeeds")
 	}
 }
 

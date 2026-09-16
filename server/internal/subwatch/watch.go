@@ -141,6 +141,24 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
+	if w.pendingApply {
+		// The JSON says restored, but the restore Apply never succeeded (the
+		// write-back failed), so the kernel may still route the clients
+		// through the tunnel.
+		if err := w.apply(); err != nil {
+			slog.Warn("Apply retry after restoring Xray clients failed", "error", err)
+			return
+		}
+		w.pendingApply = false
+		w.failSince = time.Time{}
+		w.lastImport = time.Time{}
+		name := "unknown"
+		if cfg.Xray.ActiveServer != nil {
+			name = cfg.Xray.ActiveServer.Name
+		}
+		slog.Info("Xray clients restored", "server", name)
+		w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
+	}
 
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
 	if socks == 0 {
@@ -418,6 +436,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after restoring Xray clients failed", "error", err)
 		w.writeBackFailover(tunnel)
+		w.pendingApply = true
 		return false
 	}
 	w.pendingApply = false
