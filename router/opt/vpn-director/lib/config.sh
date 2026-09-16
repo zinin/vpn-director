@@ -69,21 +69,19 @@ _cfg_is_ipv4() {
 # malformed (e.g. string-valued) clients through untouched so tunnel_apply can
 # validate and warn. Without the array guard, "string - $p" is a jq type error
 # that, under set -e, aborts sourcing this file.
-# xray.failover.tunnel is applied first: TUN_DIR is first-match, and an
-# earlier covering rule (often main's LAN CIDR) would send failover clients
-# out the WAN after they leave xray.clients. keys_unsorted in tunnel.sh
-# keeps this order.
 TUN_DIR_TUNNELS_JSON=$(jq --argjson p "$_PAUSED_CLIENTS_JSON" \
-    '(.xray.failover.tunnel // "") as $fo
-     | (.tunnel_director.tunnels // {})
+    '(.tunnel_director.tunnels // {})
      | to_entries
      | map(if (.value | type) == "object" and ((.value.clients // []) | type) == "array"
            then .value.clients = ((.value.clients // []) - $p)
            else . end)
-     | if $fo != "" then
-         ([.[] | select(.key == $fo)] + [.[] | select(.key != $fo)])
-       else . end
      | from_entries' "$VPD_CONFIG_FILE")
+
+# Snapshot clients only: tunnel.sh emits their MARK first so a covering
+# earlier rule (often main) does not send them to WAN, without reordering
+# the other tunnels' clients.
+XRAY_FAILOVER_TUNNEL=$(_cfg '.xray.failover.tunnel')
+XRAY_FAILOVER_CLIENTS=$(_cfg_arr_active '.xray.failover.clients')
 
 # Spec 12: drop a tunnel.gateway that is not a dotted IPv4. Validate in bash
 # (jq on Keenetic has no regex). Do not abort the load; _tunnel_gateway is
@@ -144,6 +142,7 @@ BOOT_WAIT_DELAY=$(_cfg '.advanced.boot.wait_delay')
 readonly \
     VPD_CONFIG_FILE \
     TUN_DIR_TUNNELS_JSON IPS_BDR_DIR \
+    XRAY_FAILOVER_TUNNEL XRAY_FAILOVER_CLIENTS \
     XRAY_CLIENTS XRAY_SERVERS XRAY_EXCLUDE_IPS XRAY_EXCLUDE_SETS \
     XRAY_TPROXY_PORT XRAY_ROUTE_TABLE XRAY_RULE_PREF \
     XRAY_FWMARK XRAY_FWMARK_MASK XRAY_CHAIN \

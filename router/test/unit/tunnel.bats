@@ -285,6 +285,33 @@ load '../test_helper'
     assert_output --partial "192.168.50.0/24"
 }
 
+@test "tunnel_apply: failover snapshot clients are marked before overlapping tunnels" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-clients.json"
+    jq '.tunnel_director.tunnels = {
+            "main": {"clients":["192.168.1.20"],"exclude":[]},
+            "ovpnc2": {"clients":["192.168.1.0/24","192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+
+    run tunnel_apply
+    assert_success
+
+    local snap main_host cidr
+    snap=$(printf '%s\n' "$output" | grep -n 'Added: client=192.168.1.8 tunnel=ovpnc2' | head -1 | cut -d: -f1)
+    main_host=$(printf '%s\n' "$output" | grep -n 'Added: client=192.168.1.20 tunnel=main' | head -1 | cut -d: -f1)
+    cidr=$(printf '%s\n' "$output" | grep -n 'Added: client=192.168.1.0/24 tunnel=ovpnc2' | head -1 | cut -d: -f1)
+    [[ -n $snap && -n $main_host && -n $cidr ]]
+    (( snap < main_host ))
+    (( main_host < cidr ))
+}
+
 @test "tunnel_apply: handles overlapping clients in different tunnels (first-match wins)" {
     load_common
     source "$LIB_DIR/firewall.sh"

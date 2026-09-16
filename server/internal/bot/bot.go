@@ -35,6 +35,9 @@ type Bot struct {
 	chatStore   *chatstore.Store
 	pathManager *PathManager
 	subWatch    *subwatch.Watch
+	httpClient  *http.Client
+	endpoint    string
+	wire        func(*tgbotapi.BotAPI)
 	// apiBase is empty in production and set only by tests, where one local
 	// server answers both the path probe and the Telegram API, as one host
 	// does in production.
@@ -91,11 +94,10 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	networkSvc := service.NewNetworkService(b.executor)
 	logSvc := service.NewLogService(b.executor)
 
-	var httpClient *http.Client
-	var stopMonitor context.CancelFunc
-	var monitorCtx context.Context
+	b.auth = NewAuth(cfg.AllowedUsers)
+
 	if b.devMode {
-		httpClient = &http.Client{}
+		b.httpClient = &http.Client{}
 	} else {
 		pm := NewPathManager(PathManagerConfig{
 			Token:        cfg.BotToken,
@@ -105,37 +107,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		})
 		pm.SelectOnce(ctx)
 		b.pathManager = pm
-		httpClient = NewPathClient(pm)
-		var stop context.CancelFunc
-		monitorCtx, stop = context.WithCancel(ctx)
-		stopMonitor = stop
-		go pm.Start(monitorCtx)
-	}
-
-	endpoint := tgbotapi.APIEndpoint
-	if b.apiBase != "" {
-		endpoint = b.apiBase + "/bot%s/%s"
-	}
-	api, err := tgbotapi.NewBotAPIWithClient(cfg.BotToken, endpoint, httpClient)
-	if err != nil {
-		if stopMonitor != nil {
-			stopMonitor()
-		}
-		var apiErr *tgbotapi.Error
-		if errors.As(err, &apiErr) && apiErr.Code == 401 {
-			return nil, &PermanentError{Err: fmt.Errorf("invalid bot token: %w", err)}
-		}
-		return nil, err
-	}
-
-	slog.Info("Authorized", "username", api.Self.UserName)
-
-	sender := telegram.NewSender(api)
-	b.api = api
-	b.auth = NewAuth(cfg.AllowedUsers)
-	b.sender = sender
-
-	if !b.devMode {
+		b.httpClient = NewPathClient(pm)
+		go pm.Start(ctx)
 		sw := &subwatch.Watch{
 			LoadVPN:      configSvc.LoadVPNConfig,
 			LoadPlatform: vpnSvc.Platform,
@@ -158,45 +131,74 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Notify: b.notifyActiveChats,
 		}
 		b.subWatch = sw
+		go sw.Start(ctx)
 	}
 
-	// Create handler dependencies
-	deps := &handler.Deps{
-		Sender:      sender,
-		Config:      configSvc,
-		VPN:         vpnSvc,
-		Xray:        xraySvc,
-		Network:     networkSvc,
-		Logs:        logSvc,
-		Paths:       p,
-		Version:     version,
-		VersionFull: versionFull,
-		Commit:      commit,
-		BuildDate:   buildDate,
-		DevMode:     b.devMode,
-	}
-	if pm := b.pathManager; pm != nil {
-		deps.TelegramPath = func() string { return pm.Current().String() }
+	b.endpoint = tgbotapi.APIEndpoint
+	if b.apiBase != "" {
+		b.endpoint = b.apiBase + "/bot%s/%s"
 	}
 
-	// Create handlers
-	statusHandler := handler.NewStatusHandler(deps)
-	serversHandler := handler.NewServersHandler(deps)
-	importHandler := handler.NewImportHandler(deps)
-	miscHandler := handler.NewMiscHandler(deps)
-	// updateflow owns every decision behind /update; the handler is an adapter.
-	updateFlow := updateflow.New(b.updater, version, b.devMode)
-	updateHandler := handler.NewUpdateHandler(sender, updateFlow, version)
-	wizardHandler := wizard.NewHandler(sender, configSvc, vpnSvc, xraySvc)
-	xrayHandler := handler.NewXrayHandler(deps)
-	excludeHandler := handler.NewExcludeHandler(deps)
-	clientsHandler := handler.NewClientsHandler(deps)
+	b.wire = func(api *tgbotapi.BotAPI) {
+		sender := telegram.NewSender(api)
+		b.api = api
+		b.sender = sender
+		deps := &handler.Deps{
+			Sender:      sender,
+			Config:      configSvc,
+			VPN:         vpnSvc,
+			Xray:        xraySvc,
+			Network:     networkSvc,
+			Logs:        logSvc,
+			Paths:       p,
+			Version:     version,
+			VersionFull: versionFull,
+			Commit:      commit,
+			BuildDate:   buildDate,
+			DevMode:     b.devMode,
+		}
+		if pm := b.pathManager; pm != nil {
+			deps.TelegramPath = func() string { return pm.Current().String() }
+		}
+		statusHandler := handler.NewStatusHandler(deps)
+		serversHandler := handler.NewServersHandler(deps)
+		importHandler := handler.NewImportHandler(deps)
+		miscHandler := handler.NewMiscHandler(deps)
+		updateFlow := updateflow.New(b.updater, version, b.devMode)
+		updateHandler := handler.NewUpdateHandler(sender, updateFlow, version)
+		wizardHandler := wizard.NewHandler(sender, configSvc, vpnSvc, xraySvc)
+		xrayHandler := handler.NewXrayHandler(deps)
+		excludeHandler := handler.NewExcludeHandler(deps)
+		clientsHandler := handler.NewClientsHandler(deps)
+		b.router = NewRouter(statusHandler, serversHandler, importHandler, miscHandler, updateHandler, wizardHandler, xrayHandler, excludeHandler, clientsHandler)
+	}
 
-	// Create router
-	router := NewRouter(statusHandler, serversHandler, importHandler, miscHandler, updateHandler, wizardHandler, xrayHandler, excludeHandler, clientsHandler)
-	b.router = router
-
+	if err := b.Connect(cfg); err != nil {
+		return b, err
+	}
 	return b, nil
+}
+
+// Connect authorizes with Telegram and wires handlers. The subscription
+// watch (and PathManager) already run; a failed getMe must not tear them
+// down, or recovery waits on the connection it should repair.
+func (b *Bot) Connect(cfg *config.Config) error {
+	if b.api != nil {
+		return nil
+	}
+	api, err := tgbotapi.NewBotAPIWithClient(cfg.BotToken, b.endpoint, b.httpClient)
+	if err != nil {
+		var apiErr *tgbotapi.Error
+		if errors.As(err, &apiErr) && apiErr.Code == 401 {
+			return &PermanentError{Err: fmt.Errorf("invalid bot token: %w", err)}
+		}
+		return err
+	}
+	slog.Info("Authorized", "username", api.Self.UserName)
+	if b.wire != nil {
+		b.wire(api)
+	}
+	return nil
 }
 
 // notifyActiveChats sends msg to every active chat whose user is still in

@@ -93,6 +93,26 @@ func TestNew_DevModeDoesNotStartWatch(t *testing.T) {
 	}
 }
 
+func TestNew_WatchStartsWhenGetMeFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"ok":false,"error_code":500,"description":"down"}`)
+	}))
+	t.Cleanup(srv.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b, err := New(ctx, testConfig(), testPaths(t), "v0.0.0", "v0.0.0-test", "deadbee", "2026-01-01",
+		withAPIBase(srv.URL))
+	if err == nil {
+		t.Fatal("getMe must fail")
+	}
+	if b == nil || b.subWatch == nil {
+		t.Fatal("subscription watch must start even when Telegram authorization fails")
+	}
+}
+
 func TestNew_ProductionUsesPathClientAndManager(t *testing.T) {
 	srv := newAPIServer(t)
 	ctx, cancel := context.WithCancel(context.Background())

@@ -167,6 +167,45 @@ _tunnel_ensure_routes() {
     done < "$TUN_DIR_TABLES"
 }
 
+# One client's RETURN / offload / MARK in TUN_DIR. Offload sits immediately
+# before MARK with the same match so excluded destinations keep acceleration.
+# warnings and changes are tunnel_apply's locals (bash dynamic scope).
+_tunnel_emit_client() {
+    local client="$1" tunnel="$2" mark_hex="$3" excludes="$4"
+    local client_ip="${client%%/*}"
+    if ! is_lan_ip "$client_ip"; then
+        log -l WARN "Client '$client' is not RFC1918; skipping"
+        warnings=1
+        return 0
+    fi
+
+    local excl excl_set
+    while IFS= read -r excl; do
+        [[ -n $excl ]] || continue
+        excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
+        if ! _ipset_exists "$excl_set"; then
+            log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
+            warnings=1
+            continue
+        fi
+        ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
+            -s "$client" -m set --match-set "$excl_set" dst -j RETURN
+    done <<< "$excludes"
+
+    if [[ -n $offload_target ]]; then
+        ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
+            -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
+            -j "$offload_target"
+    fi
+
+    ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
+        -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
+        -j MARK --set-xmark "$mark_hex/$_tunnel_mark_mask_hex"
+
+    log "Added: client=$client tunnel=$tunnel mark=$mark_hex"
+    changes=1
+}
+
 ###################################################################################################
 # Public API (defined before --source-only for testability)
 ###################################################################################################
@@ -310,9 +349,10 @@ tunnel_apply() {
         return 1
     fi
 
-    # Compute config hash for change detection
+    # Compute config hash for change detection. Failover snapshot clients are
+    # extra MARK rules, not a key reorder, so they belong in the hash.
     local new_hash old_hash empty_hash
-    new_hash=$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)
+    new_hash=$(printf '%s\n%s\n%s' "$TUN_DIR_TUNNELS_JSON" "${XRAY_FAILOVER_TUNNEL:-}" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
     empty_hash=$(printf '' | compute_hash)
     old_hash=$(cat "$TUN_DIR_HASH" 2>/dev/null || printf '%s' "$empty_hash")
 
@@ -408,6 +448,44 @@ tunnel_apply() {
     # Use keys_unsorted to preserve JSON file order (not alphabetical sorting)
     tunnels=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[]')
 
+    # Failover snapshot IPs get MARK first (first-match) with the failover
+    # tunnel's mark. Reordering the whole tunnel would pull its other clients
+    # ahead of earlier rules (main containing a host that a later CIDR also
+    # covers). Slot assignment here must match the apply loop below.
+    local fo_mark=""
+    if [[ -n ${XRAY_FAILOVER_TUNNEL:-} && -n ${XRAY_FAILOVER_CLIENTS:-} ]]; then
+        local plan_idx=0 plan_t plan_type plan_clients_type plan_clients plan_slot
+        while IFS= read -r plan_t; do
+            [[ -n $plan_t ]] || continue
+            _tunnel_table_allowed "$plan_t" || continue
+            plan_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$plan_t" '.[$t] | type')
+            [[ $plan_type == object ]] || continue
+            plan_clients_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$plan_t" '.[$t].clients | type')
+            [[ $plan_clients_type == array || $plan_clients_type == null ]] || continue
+            plan_clients=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$plan_t" '.[$t].clients // [] | .[]')
+            [[ -n $plan_clients ]] || continue
+            plan_slot=$((plan_idx + 1))
+            if [[ $plan_slot -gt $_tunnel_mark_field_max ]]; then
+                break
+            fi
+            if [[ $plan_t == "$XRAY_FAILOVER_TUNNEL" ]]; then
+                fo_mark=$(printf '0x%x' $(( plan_slot << _tunnel_mark_shift_val )))
+                break
+            fi
+            plan_idx=$((plan_idx + 1))
+        done <<< "$tunnels"
+    fi
+    if [[ -n $fo_mark ]]; then
+        local fo_excl_type fo_excludes="" fo_client
+        fo_excl_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].exclude | type')
+        if [[ $fo_excl_type == array ]]; then
+            fo_excludes=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].exclude // [] | .[]')
+        fi
+        for fo_client in $XRAY_FAILOVER_CLIENTS; do
+            _tunnel_emit_client "$fo_client" "$XRAY_FAILOVER_TUNNEL" "$fo_mark" "$fo_excludes"
+        done
+    fi
+
     while IFS= read -r tunnel; do
         [[ -n $tunnel ]] || continue
 
@@ -473,52 +551,20 @@ tunnel_apply() {
         local mark_hex
         mark_hex=$(printf '0x%x' "$mark_val")
 
-        # Add rules for each client
+        # Add rules for each client. Snapshot IPs were already emitted first.
         while IFS= read -r client; do
             [[ -n $client ]] || continue
-
-            # Validate client is RFC1918
-            local client_ip="${client%%/*}"
-            if ! is_lan_ip "$client_ip"; then
-                log -l WARN "Client '$client' is not RFC1918; skipping"
-                warnings=1
-                continue
+            if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" && -n ${XRAY_FAILOVER_CLIENTS:-} ]]; then
+                local fo_skip=0 fo_c
+                for fo_c in $XRAY_FAILOVER_CLIENTS; do
+                    if [[ $client == "$fo_c" ]]; then
+                        fo_skip=1
+                        break
+                    fi
+                done
+                [[ $fo_skip -eq 0 ]] || continue
             fi
-
-            # Add RETURN rules for each exclude ipset
-            while IFS= read -r excl; do
-                [[ -n $excl ]] || continue
-                local excl_set
-                excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
-
-                if ! _ipset_exists "$excl_set"; then
-                    log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
-                    warnings=1
-                    continue
-                fi
-
-                ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
-                    -s "$client" -m set --match-set "$excl_set" dst -j RETURN
-            done <<< "$excludes"
-
-            # Take the flow out of the firmware's fast path, with the same
-            # match as the MARK rule below and immediately before it. The
-            # exclusion RETURNs above fire first, so an excluded destination
-            # keeps its acceleration; after MARK the mark test would no longer
-            # match the packet MARK had just marked.
-            if [[ -n $offload_target ]]; then
-                ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
-                    -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
-                    -j "$offload_target"
-            fi
-
-            # Add MARK rule for this client (first-match: only if not already marked)
-            ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
-                -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
-                -j MARK --set-xmark "$mark_hex/$_tunnel_mark_mask_hex"
-
-            log "Added: client=$client tunnel=$tunnel mark=$mark_hex"
-            changes=1
+            _tunnel_emit_client "$client" "$tunnel" "$mark_hex" "$excludes"
         done <<< "$clients"
 
         # Routing table for this tunnel: a firmware table on Merlin, one this

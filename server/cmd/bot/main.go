@@ -150,7 +150,11 @@ func main() {
 	{
 		backoffs := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second, 60 * time.Second}
 		for attempt := 0; ; attempt++ {
-			b, err = bot.New(ctx, cfg, p, Version, VersionFull, Commit, BuildDate, opts...)
+			if b == nil {
+				b, err = bot.New(ctx, cfg, p, Version, VersionFull, Commit, BuildDate, opts...)
+			} else {
+				err = b.Connect(cfg)
+			}
 			if err == nil {
 				break
 			}

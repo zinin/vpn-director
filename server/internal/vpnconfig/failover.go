@@ -108,8 +108,8 @@ func MoveXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 	cfg.TunnelDirector.Tunnels[tunnel] = tun
 	cfg.Xray.Clients = keptXray
 	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: added}
-	// TUN_DIR is first-match: config.sh puts this tunnel first while failover is set,
-	// so a covering earlier rule (often main) does not send these clients to WAN.
+	// TUN_DIR is first-match: tunnel.sh emits these snapshot IPs first so a
+	// covering earlier rule (often main) does not send them to WAN.
 }
 
 func RestoreXrayClientsFromFailover(cfg *VPNDirectorConfig) []string {
