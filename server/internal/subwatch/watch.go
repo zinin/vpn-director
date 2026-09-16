@@ -116,12 +116,16 @@ func (w *Watch) Tick(ctx context.Context) {
 		if w.pendingApply {
 			if err := w.apply(); err != nil {
 				slog.Warn("Apply retry after moving Xray clients failed", "error", err)
-			} else {
-				w.pendingApply = false
-				if id := failoverTunnel(cfg); id != "" {
-					slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", len(cfg.Xray.Failover.Clients))
-					w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
-				}
+				// No walk until the move is applied: its restart of Xray would
+				// rebuild TPROXY from a JSON that no longer lists the moved
+				// clients while Tunnel Director has not been applied, sending
+				// them straight out through the WAN.
+				return
+			}
+			w.pendingApply = false
+			if id := failoverTunnel(cfg); id != "" {
+				slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", len(cfg.Xray.Failover.Clients))
+				w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 			}
 		}
 		w.maybeImportAndPick(ctx, cfg)

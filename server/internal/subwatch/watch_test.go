@@ -918,6 +918,64 @@ func TestTick_MoveApplyFailureRetriesApply(t *testing.T) {
 	}
 }
 
+func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		applyErr: errApply,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	fetches, saves, generates, restarts, settles := 0, 0, 0, 0, 0
+	w := f.watch()
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
+	}
+	w.SaveServers = func([]vpnconfig.Server) error {
+		saves++
+		return nil
+	}
+	w.Generate = func(vpnconfig.Server) (bool, error) {
+		generates++
+		return true, nil
+	}
+	w.RestartXray = func() error {
+		restarts++
+		return nil
+	}
+	w.AfterRestart = func(time.Duration) { settles++ }
+
+	tickUntilDead(w, f)
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want the failed move-Apply", f.applies)
+	}
+
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != 2 {
+		t.Fatalf("applies %d, want the failed retry", f.applies)
+	}
+	if fetches != 0 || saves != 0 || generates != 0 || restarts != 0 || settles != 0 {
+		t.Fatalf("walk ran before the move was applied: fetches=%d saves=%d generates=%d restarts=%d settles=%d",
+			fetches, saves, generates, restarts, settles)
+	}
+	assertStillOnTunnel(t, f.cfg)
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v", f.notes)
+	}
+
+	f.applyErr = nil
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if len(f.notes) == 0 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
+		t.Fatalf("notes %v", f.notes)
+	}
+	if fetches != 1 {
+		t.Fatalf("fetches %d; the import must run in the Tick whose Apply succeeded", fetches)
+	}
+}
+
 func TestTick_ImportSyncsXrayServers(t *testing.T) {
 	f := &fake{
 		cfg: failedOverCfg(),
