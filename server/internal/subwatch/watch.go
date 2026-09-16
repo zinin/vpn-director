@@ -126,6 +126,10 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	if cfg.Xray.Failover != nil {
 		staged := vpnconfig.FailoverStaged(cfg)
+		if staged && w.probeOK(ctx, cfg) {
+			w.abandonStaged()
+			return
+		}
 		wasPending := w.pendingApply || staged
 		var ok bool
 		cfg, ok = w.applyFailover(cfg)
@@ -138,13 +142,6 @@ func (w *Watch) Tick(ctx context.Context) {
 				slog.Info("Xray clients moved to Tunnel Director", "tunnel", id, "clients", n)
 				w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 			}
-		}
-		if !ok && staged {
-			// Keep Xray membership until TUN_DIR exists. A committed
-			// failover already dropped TPROXY; blocking import would
-			// leave clients without a working outbound until the
-			// unrelated fallback tunnel returns.
-			return
 		}
 		w.maybeImportAndPick(ctx, cfg)
 		return
@@ -232,6 +229,10 @@ func (w *Watch) Tick(ctx context.Context) {
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after moving Xray clients failed", "tunnel", id, "error", err)
 		w.pendingApply = true
+		if reloaded, err := w.LoadVPN(); err == nil {
+			cfg = reloaded
+		}
+		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
 	if reloaded, err := w.LoadVPN(); err == nil {
@@ -389,7 +390,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	tried := 0
 	lastGenerated := ""
 	for _, s := range order {
-		generated, err := w.Generate(s)
+		generated, err := w.Generate(serverForDial(s))
 		if err != nil || !generated {
 			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, "error", err)
 		}
@@ -450,7 +451,7 @@ func (w *Watch) importInterval() time.Duration {
 // so without this the next wave would start from the last server tried rather
 // than the user's. No probe and no restore: the walk has just found it down.
 func (w *Watch) returnToPreferred(s vpnconfig.Server) {
-	generated, err := w.Generate(s)
+	generated, err := w.Generate(serverForDial(s))
 	if err != nil || !generated {
 		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
 	}
@@ -473,6 +474,58 @@ func (w *Watch) apply() error {
 		return nil
 	}
 	return w.Apply()
+}
+
+func (w *Watch) socksPort(cfg *vpnconfig.VPNDirectorConfig) int {
+	_, socks := vpnconfig.XrayInboundPorts(cfg)
+	if socks == 0 {
+		return defaultSOCKSPort
+	}
+	return socks
+}
+
+func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
+	if w.Probe == nil {
+		return false
+	}
+	return w.Probe(ctx, w.socksPort(cfg)) == nil
+}
+
+func (w *Watch) abandonStaged() {
+	if w.UpdateVPN != nil {
+		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+			vpnconfig.RestoreXrayClientsFromFailover(current)
+			return nil
+		}); err != nil {
+			slog.Warn("Failed to drop the staged failover after Xray recovered", "error", err)
+			return
+		}
+	}
+	w.pendingApply = false
+	w.failSince = time.Time{}
+	w.importRetry = 0
+	if err := w.apply(); err != nil {
+		slog.Warn("Apply after dropping the staged failover failed", "error", err)
+		w.pendingApply = true
+	}
+}
+
+// serverForDial uses a tunnel-resolved IPv4 for vnext so Xray does not go
+// back to the system resolver. SNI keeps the hostname. Web UI /xray keep
+// s.Address and let Xray resolve, so a CDN IP change still works there.
+func serverForDial(s vpnconfig.Server) vpnconfig.Server {
+	host := s.Address
+	for _, ip := range s.IPs {
+		if ip == "" {
+			continue
+		}
+		s.Address = ip
+		if s.SNI == "" {
+			s.SNI = host
+		}
+		break
+	}
+	return s
 }
 
 func (w *Watch) writeBackFailover(fo *vpnconfig.XrayFailover) {

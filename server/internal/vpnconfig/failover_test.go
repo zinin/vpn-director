@@ -76,34 +76,57 @@ func TestArmed(t *testing.T) {
 
 func TestMoveAndRestore_KeepsForeignTunnelClients(t *testing.T) {
 	cfg := sample()
+	tun := cfg.TunnelDirector.Tunnels["ovpnc2"]
+	tun.Clients = append(tun.Clients, "192.168.1.4")
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = tun
 	MoveXrayClientsToTunnel(cfg, "ovpnc2")
 	if cfg.Xray.Failover == nil || cfg.Xray.Failover.Tunnel != "ovpnc2" {
 		t.Fatalf("failover = %+v", cfg.Xray.Failover)
 	}
-	// failover.clients is only addresses this move added, not IPs already on
-	// the tunnel. 192.168.1.3 stays on ovpnc2 (spec §9).
-	if !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.1.8"}) {
-		t.Fatalf("added snapshot %v", cfg.Xray.Failover.Clients)
+	// 192.168.1.3 is already on ovpnc2 and in xray.clients (Xray wins). It
+	// still belongs in the snapshot so restore puts it back on Xray.
+	if !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.1.8", "192.168.1.3"}) {
+		t.Fatalf("snapshot %v", cfg.Xray.Failover.Clients)
 	}
 	if !reflect.DeepEqual(cfg.Xray.Clients, []string{"192.168.1.9"}) {
 		t.Fatalf("xray.clients %v", cfg.Xray.Clients)
 	}
-	if !reflect.DeepEqual(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, []string{"192.168.1.3", "192.168.1.8"}) {
+	if !reflect.DeepEqual(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, []string{"192.168.1.3", "192.168.1.4", "192.168.1.8"}) {
 		t.Fatalf("tunnel %v", cfg.TunnelDirector.Tunnels["ovpnc2"].Clients)
 	}
 	MoveXrayClientsToTunnel(cfg, "ovpnc2")
-	if len(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients) != 2 {
+	if len(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients) != 3 {
 		t.Fatal("second move must not duplicate")
 	}
 	RestoreXrayClientsFromFailover(cfg)
 	if cfg.Xray.Failover != nil {
 		t.Fatal("failover")
 	}
-	if !reflect.DeepEqual(cfg.Xray.Clients, []string{"192.168.1.9", "192.168.1.8"}) {
+	if !reflect.DeepEqual(cfg.Xray.Clients, []string{"192.168.1.9", "192.168.1.8", "192.168.1.3"}) {
 		t.Fatalf("restored xray %v", cfg.Xray.Clients)
 	}
-	if !reflect.DeepEqual(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, []string{"192.168.1.3"}) {
-		t.Fatalf("tunnel after restore %v", cfg.TunnelDirector.Tunnels["ovpnc2"].Clients)
+	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("moved client must leave the tunnel")
+	}
+	if !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.4") {
+		t.Fatal("foreign tunnel-only client")
+	}
+}
+
+func TestRestore_ReturnsOverlapClientToXray(t *testing.T) {
+	cfg := sample()
+	cfg.Xray.Clients = []string{"192.168.1.5"}
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = TunnelConfig{Clients: []string{"192.168.1.5"}}
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	if !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.1.5"}) {
+		t.Fatalf("snapshot %v", cfg.Xray.Failover.Clients)
+	}
+	if contains(cfg.Xray.Clients, "192.168.1.5") {
+		t.Fatal("overlap must leave Xray during failover")
+	}
+	RestoreXrayClientsFromFailover(cfg)
+	if !contains(cfg.Xray.Clients, "192.168.1.5") {
+		t.Fatal("overlap must return to Xray")
 	}
 }
 
@@ -158,8 +181,8 @@ func TestRestore_SkipsClientsRemovedFromTunnelDuringFailover(t *testing.T) {
 	cfg := sample()
 	cfg.Xray.Clients = append(cfg.Xray.Clients, "192.168.1.7")
 	MoveXrayClientsToTunnel(cfg, "ovpnc2")
-	if !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.1.8", "192.168.1.7"}) {
-		t.Fatalf("added snapshot %v", cfg.Xray.Failover.Clients)
+	if !reflect.DeepEqual(cfg.Xray.Failover.Clients, []string{"192.168.1.8", "192.168.1.3", "192.168.1.7"}) {
+		t.Fatalf("snapshot %v", cfg.Xray.Failover.Clients)
 	}
 	// DELETE /api/clients drops the address from its route and leaves
 	// xray.failover as it was.
@@ -171,10 +194,10 @@ func TestRestore_SkipsClientsRemovedFromTunnelDuringFailover(t *testing.T) {
 	if cfg.Xray.Failover != nil {
 		t.Fatal("failover")
 	}
-	if !reflect.DeepEqual(cfg.Xray.Clients, []string{"192.168.1.9", "192.168.1.8"}) {
+	if !reflect.DeepEqual(cfg.Xray.Clients, []string{"192.168.1.9", "192.168.1.8", "192.168.1.3"}) {
 		t.Fatalf("restored xray %v, want the removed client left out", cfg.Xray.Clients)
 	}
-	if !reflect.DeepEqual(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, []string{"192.168.1.3"}) {
+	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatalf("tunnel after restore %v", cfg.TunnelDirector.Tunnels["ovpnc2"].Clients)
 	}
 }

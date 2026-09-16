@@ -89,7 +89,11 @@ func buildOutbound(s vpnconfig.Server) xrayOutbound {
 		}
 	default: // legacy: empty security -> TLS to address with alpn h2, no flow
 		stream.Security = "tls"
-		stream.TLSSettings = &xrayTLS{ServerName: s.Address, ALPN: []string{"h2"}}
+		serverName := s.SNI
+		if serverName == "" {
+			serverName = s.Address
+		}
+		stream.TLSSettings = &xrayTLS{ServerName: serverName, ALPN: []string{"h2"}}
 	}
 	// Per spec, flow belongs only to tls/reality outbounds; a legacy record
 	// (empty security) must not carry it even if the field is populated.
@@ -97,21 +101,11 @@ func buildOutbound(s vpnconfig.Server) xrayOutbound {
 	if s.Security == "" {
 		userFlow = ""
 	}
-	// Dial the resolved IPv4 when import populated IPs (a tunneled
-	// subscription lookup never reaches Xray's system resolver). TLS/REALITY
-	// SNI stays on s.Address / s.SNI above.
-	dial := s.Address
-	for _, ip := range s.IPs {
-		if ip != "" {
-			dial = ip
-			break
-		}
-	}
 	return xrayOutbound{
 		Protocol: "vless",
 		Settings: map[string]interface{}{
 			"vnext": []xrayVnext{{
-				Address: dial,
+				Address: s.Address,
 				Port:    s.Port,
 				Users:   []xrayUser{{ID: s.UUID, Encryption: "none", Flow: userFlow}},
 			}},

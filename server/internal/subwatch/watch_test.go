@@ -206,6 +206,45 @@ func TestTick_DoesNotCommitIfFallbackTunnelWasNotApplied(t *testing.T) {
 	}
 }
 
+func TestTick_StagedFailoverAbandonsWhenXrayRecovers(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.FallbackReady = func(string) bool { return false }
+	tickUntilDead(w, f)
+	assertStagedOnTunnel(t, f.cfg)
+
+	f.probeErr = nil
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("healthy Xray must drop the staged failover")
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("client must stay on Xray")
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("staged tunnel assignment must be rolled back")
+	}
+}
+
+func TestServerForDial_UsesResolvedIPKeepsHostnameSNI(t *testing.T) {
+	s := serverForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls"})
+	if s.Address != "203.0.113.50" {
+		t.Fatalf("address %q", s.Address)
+	}
+	if s.SNI != "oslo.example" {
+		t.Fatalf("sni %q", s.SNI)
+	}
+	s = serverForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls", SNI: "cdn.example"})
+	if s.SNI != "cdn.example" {
+		t.Fatalf("explicit sni %q", s.SNI)
+	}
+}
+
 func TestTick_NoTunnelStillNotifiesOnce(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
@@ -1349,29 +1388,28 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 	if f.applies != 1 {
 		t.Fatalf("applies %d, want the failed move-Apply", f.applies)
 	}
+	if fetches != 1 {
+		t.Fatalf("fetches %d; a staged apply failure must still refresh the subscription", fetches)
+	}
 
 	f.now = f.now.Add(ProbeInterval)
 	w.Tick(context.Background())
 	if f.applies != 2 {
 		t.Fatalf("applies %d, want the failed retry", f.applies)
 	}
-	if fetches != 0 || saves != 0 || generates != 0 || restarts != 0 || settles != 0 {
-		t.Fatalf("walk ran before the move was applied: fetches=%d saves=%d generates=%d restarts=%d settles=%d",
-			fetches, saves, generates, restarts, settles)
+	if fetches != 1 {
+		t.Fatalf("fetches %d; ImportRetry has not elapsed", fetches)
 	}
 	assertStagedOnTunnel(t, f.cfg)
-	if len(f.notes) != 0 {
+	if len(f.notes) != 1 || f.notes[0] != "No live server in the subscription; still on tunnel:ovpnc2" {
 		t.Fatalf("notes %v", f.notes)
 	}
 
 	f.applyErr = nil
 	f.now = f.now.Add(ProbeInterval)
 	w.Tick(context.Background())
-	if len(f.notes) == 0 || f.notes[0] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
+	if n := len(f.notes); n == 0 || f.notes[n-1] != "Xray outbound is down; LAN clients moved to tunnel:ovpnc2" {
 		t.Fatalf("notes %v", f.notes)
-	}
-	if fetches != 1 {
-		t.Fatalf("fetches %d; the import must run in the Tick whose Apply succeeded", fetches)
 	}
 }
 

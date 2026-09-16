@@ -100,18 +100,18 @@ func StageXrayClientsToTunnel(cfg *VPNDirectorConfig, tunnel string) {
 		return
 	}
 	paused := pausedSet(cfg)
-	added := make([]string, 0)
+	dropped := make([]string, 0)
 	for _, ip := range cfg.Xray.Clients {
 		if _, skip := paused[ip]; skip {
 			continue
 		}
+		dropped = append(dropped, ip)
 		if !contains(tun.Clients, ip) {
 			tun.Clients = append(tun.Clients, ip)
-			added = append(added, ip)
 		}
 	}
 	cfg.TunnelDirector.Tunnels[tunnel] = tun
-	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: added}
+	cfg.Xray.Failover = &XrayFailover{Tunnel: tunnel, Clients: dropped}
 	// TUN_DIR is first-match: tunnel.sh emits these snapshot IPs first so a
 	// covering earlier rule (often main) does not send them to WAN.
 }
@@ -124,12 +124,8 @@ func CommitXrayFailover(cfg *VPNDirectorConfig) {
 	}
 	paused := pausedSet(cfg)
 	fo := cfg.Xray.Failover
-	tun := cfg.TunnelDirector.Tunnels[fo.Tunnel]
-	drop := make(map[string]struct{}, len(fo.Clients)+len(tun.Clients))
+	drop := make(map[string]struct{}, len(fo.Clients))
 	for _, ip := range fo.Clients {
-		drop[ip] = struct{}{}
-	}
-	for _, ip := range tun.Clients {
 		drop[ip] = struct{}{}
 	}
 	kept := make([]string, 0, len(cfg.Xray.Clients))
@@ -154,12 +150,11 @@ func FailoverStaged(cfg *VPNDirectorConfig) bool {
 	}
 	paused := pausedSet(cfg)
 	fo := cfg.Xray.Failover
-	tun := cfg.TunnelDirector.Tunnels[fo.Tunnel]
 	for _, ip := range cfg.Xray.Clients {
 		if _, skip := paused[ip]; skip {
 			continue
 		}
-		if contains(fo.Clients, ip) || contains(tun.Clients, ip) {
+		if contains(fo.Clients, ip) {
 			return true
 		}
 	}

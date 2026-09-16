@@ -77,45 +77,18 @@ func vnextAddress(t *testing.T, cfg map[string]interface{}) string {
 	return addr
 }
 
-func TestGenerateConfig_DialsResolvedIPKeepsHostnameForSNI(t *testing.T) {
+func TestGenerateConfig_DialsHostnameNotCachedIP(t *testing.T) {
 	cfg := generate(t, vpnconfig.Server{
 		Address: "oslo.example", Port: 443, UUID: "u",
 		IPs:      []string{"203.0.113.50", "203.0.113.51"},
 		Security: "tls",
 	})
-	if got := vnextAddress(t, cfg); got != "203.0.113.50" {
-		t.Fatalf("vnext.address = %q, want the first resolved IPv4", got)
+	if got := vnextAddress(t, cfg); got != "oslo.example" {
+		t.Fatalf("vnext.address = %q, want the hostname so CDN/DDNS updates still resolve", got)
 	}
 	tls := outbound0(t, cfg)["streamSettings"].(map[string]interface{})["tlsSettings"].(map[string]interface{})
 	if tls["serverName"] != "oslo.example" {
 		t.Fatalf("tls serverName = %v, want the hostname", tls["serverName"])
-	}
-
-	cfg = generate(t, vpnconfig.Server{
-		Address: "oslo.example", Port: 443, UUID: "u",
-		IPs:      []string{"203.0.113.50"},
-		Security: "tls", SNI: "cdn.example", Fingerprint: "chrome",
-	})
-	if got := vnextAddress(t, cfg); got != "203.0.113.50" {
-		t.Fatalf("vnext.address = %q with explicit SNI", got)
-	}
-	tls = outbound0(t, cfg)["streamSettings"].(map[string]interface{})["tlsSettings"].(map[string]interface{})
-	if tls["serverName"] != "cdn.example" {
-		t.Fatalf("tls serverName = %v, want the configured SNI", tls["serverName"])
-	}
-
-	cfg = generate(t, vpnconfig.Server{
-		Address: "oslo.example", Port: 443, UUID: "u",
-		IPs:      []string{"203.0.113.50"},
-		Security: "reality", Network: "tcp", Flow: "xtls-rprx-vision",
-		SNI: "cdn3-87.yahoo.com", Fingerprint: "firefox", PublicKey: "PBKEY", ShortID: "55e6",
-	})
-	if got := vnextAddress(t, cfg); got != "203.0.113.50" {
-		t.Fatalf("reality vnext.address = %q", got)
-	}
-	rs := outbound0(t, cfg)["streamSettings"].(map[string]interface{})["realitySettings"].(map[string]interface{})
-	if rs["serverName"] != "cdn3-87.yahoo.com" {
-		t.Fatalf("reality serverName = %v", rs["serverName"])
 	}
 }
 
