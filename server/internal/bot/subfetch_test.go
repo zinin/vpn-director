@@ -261,7 +261,7 @@ func TestFetchServers_WANSuccessDoesNotUseTunnelLookup(t *testing.T) {
 	}))
 	t.Cleanup(wan.Close)
 	looked := 0
-	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), nil, func(host string) ([]net.IP, error) {
+	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), nil, nil, func(host string) ([]net.IP, error) {
 		looked++
 		return nil, errors.New("tunnel lookup must not run")
 	})
@@ -288,7 +288,7 @@ func TestFetchServers_TunnelFetchUsesTunnelLookup(t *testing.T) {
 	t.Cleanup(tun.Close)
 
 	looked := []string{}
-	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(tun), func(host string) ([]net.IP, error) {
+	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(tun), nil, func(host string) ([]net.IP, error) {
 		looked = append(looked, host)
 		return []net.IP{net.ParseIP("203.0.113.50")}, nil
 	})
@@ -300,5 +300,56 @@ func TestFetchServers_TunnelFetchUsesTunnelLookup(t *testing.T) {
 	}
 	if len(servers) != 1 || servers[0].Name != "Oslo" || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.50"}) {
 		t.Fatalf("servers %+v", servers)
+	}
+}
+
+// The WAN path resolves the subscription's hostnames too, and on this router
+// that lookup has to be IPv4-only and cancellable - the caller passes it in.
+func TestFetchServers_WANSuccessUsesTheWANLookup(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+
+	looked := []string{}
+	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), nil,
+		func(host string) ([]net.IP, error) {
+			looked = append(looked, host)
+			return []net.IP{net.ParseIP("203.0.113.50")}, nil
+		},
+		func(host string) ([]net.IP, error) {
+			return nil, errors.New("tunnel lookup must not run")
+		})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(looked, []string{"oslo.example.invalid"}) {
+		t.Fatalf("WAN lookup %v; the WAN path must resolve through the lookup it was given", looked)
+	}
+	if len(servers) != 1 || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.50"}) {
+		t.Fatalf("servers %+v", servers)
+	}
+}
+
+// A body that arrives over the WAN whose hostnames the WAN resolver cannot
+// answer is the resolver's failure, not the subscription's: the tunnel queries
+// 8.8.8.8 bound to its interface and may well answer.
+func TestFetchServers_TunnelTakesOverWhenNothingResolvesOnWAN(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo"))
+	serve := func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, body) }
+	wan := httptest.NewServer(http.HandlerFunc(serve))
+	t.Cleanup(wan.Close)
+	tun := httptest.NewServer(http.HandlerFunc(serve))
+	t.Cleanup(tun.Close)
+
+	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(tun),
+		func(host string) ([]net.IP, error) { return nil, errors.New("no answer") },
+		func(host string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.50")}, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(servers) != 1 || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.50"}) {
+		t.Fatalf("servers %+v; the tunnel path must take over a WAN body nothing resolved", servers)
 	}
 }

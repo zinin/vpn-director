@@ -1,6 +1,7 @@
 package vless
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -172,13 +173,25 @@ func ParseURI(uri string) (*Server, error) {
 	return s, nil
 }
 
+// LookupIPv4 resolves over IPv4 only, through ctx. The router's own resolver is
+// reached straight over the WAN, and an AF_UNSPEC lookup there waits out the
+// AAAA half that often goes unanswered - glibc's full five seconds per host,
+// in a loop over the whole subscription (.claude/rules/shell-conventions.md
+// has the measurement). Anything that is not IPv4 is discarded below anyway,
+// so the second family is pure waiting.
+func LookupIPv4(ctx context.Context) func(host string) ([]net.IP, error) {
+	return func(host string) ([]net.IP, error) {
+		return net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	}
+}
+
 func (s *Server) ResolveIPs() error {
-	return s.resolveIPs(net.LookupIP)
+	return s.resolveIPs(LookupIPv4(context.Background()))
 }
 
 func (s *Server) resolveIPs(lookup func(host string) ([]net.IP, error)) error {
 	if lookup == nil {
-		lookup = net.LookupIP
+		lookup = LookupIPv4(context.Background())
 	}
 	ips, err := lookup(s.Address)
 	if err != nil {
@@ -256,7 +269,7 @@ type Import struct {
 // server through net.LookupIP. The bot's /import and the Web UI import use
 // this; a tunneled watch fetch uses DecodeAndResolveLookup.
 func DecodeAndResolve(body string) Import {
-	return DecodeAndResolveLookup(body, net.LookupIP)
+	return DecodeAndResolveLookup(body, LookupIPv4(context.Background()))
 }
 
 // DecodeAndResolveLookup is DecodeAndResolve with a caller-supplied lookup

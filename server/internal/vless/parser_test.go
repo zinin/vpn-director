@@ -1,6 +1,7 @@
 package vless
 
 import (
+	"context"
 	"encoding/base64"
 	"net"
 	"reflect"
@@ -551,5 +552,30 @@ func TestDecodeAndResolveLookup(t *testing.T) {
 	}
 	if !reflect.DeepEqual(looked, []string{"oslo.example.invalid"}) {
 		t.Fatalf("lookup %v", looked)
+	}
+}
+
+func TestLookupIPv4_ReturnsOnlyIPv4(t *testing.T) {
+	ips, err := LookupIPv4(context.Background())("localhost")
+	if err != nil {
+		t.Skipf("no local resolver for localhost: %v", err)
+	}
+	if len(ips) == 0 {
+		t.Fatal("localhost resolved to nothing")
+	}
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			t.Fatalf("resolved %v; an AF_UNSPEC lookup is what waits out the AAAA half", ip)
+		}
+	}
+}
+
+// The subscription of a router can name tens of hosts, resolved one after the
+// other inside a watch tick. A stop or a shutdown has to be able to end that.
+func TestLookupIPv4_HonoursTheContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := LookupIPv4(ctx)("localhost"); err == nil {
+		t.Fatal("a canceled context must end the lookup")
 	}
 }

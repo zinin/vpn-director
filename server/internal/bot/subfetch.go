@@ -20,6 +20,10 @@ import (
 
 const maxSubscriptionBody = 1 << 20
 
+// errNoResolved is a subscription that decoded and whose hostnames went
+// unanswered - the one download failure worth retrying over the other path.
+var errNoResolved = errors.New("could not resolve IP for any server")
+
 func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
 	if client == nil {
 		return nil, fmt.Errorf("no http client")
@@ -53,6 +57,10 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 		return nil, fmt.Errorf("subscription URL must use https")
 	}
 	wan := ssrf.NewClient(10 * time.Second)
+	// IPv4 only and bound to ctx: an AF_UNSPEC lookup of every hostname in the
+	// subscription can hold a watch tick for minutes on this router, and a stop
+	// has to be able to end it.
+	wanLookup := vless.LookupIPv4(ctx)
 	p, tunnel := subscriptionTunnel(cfgSvc, vpnSvc)
 	var tunnelLookup func(host string) ([]net.IP, error)
 	if tunnel != nil {
@@ -61,25 +69,35 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 			return lookupIPv4OnPath(ctx, path, host)
 		}
 	}
-	return fetchServers(ctx, rawURL, wan, tunnel, tunnelLookup)
+	return fetchServers(ctx, rawURL, wan, tunnel, wanLookup, tunnelLookup)
 }
 
-// fetchServers GETs via wan, then tunnel. A WAN body is resolved with
-// net.LookupIP; a tunneled body uses tunnelLookup so VLESS hostnames follow
-// the same path that fetched the list.
-func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
+// fetchServers GETs via wan, then tunnel. Each body is resolved with the lookup
+// of the path that fetched it, so VLESS hostnames follow that path.
+func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
 	body, err := getSubscription(ctx, wan, rawURL)
 	if err == nil {
-		return serversFromSubscription(body)
+		servers, rerr := serversFromSubscriptionLookup(body, wanLookup)
+		if rerr == nil {
+			return servers, nil
+		}
+		// A body that arrived while none of its hostnames answered is the WAN
+		// resolver's failure, not the subscription's: the tunnel asks 8.8.8.8
+		// over its own interface and may well get an answer.
+		if tunnel == nil || !errors.Is(rerr, errNoResolved) {
+			return nil, rerr
+		}
+		slog.Debug("Subscription hostnames did not resolve over the WAN, trying the tunnel", "error", rerr)
+	} else {
+		if tunnel == nil {
+			return nil, err
+		}
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		slog.Debug("Subscription fetch over WAN failed, trying the tunnel", "error", err)
 	}
-	if tunnel == nil {
-		return nil, err
-	}
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		err = ue.Err
-	}
-	slog.Debug("Subscription fetch over WAN failed, trying the tunnel", "error", err)
 	body, err = getSubscription(ctx, tunnel, rawURL)
 	if err != nil {
 		return nil, err
@@ -107,7 +125,7 @@ func serversFromSubscriptionLookup(body []byte, lookup func(host string) ([]net.
 		return nil, errors.New("no VLESS servers")
 	}
 	if len(result.Servers) == 0 {
-		return nil, errors.New("could not resolve IP for any server")
+		return nil, errNoResolved
 	}
 	return result.Servers, nil
 }
