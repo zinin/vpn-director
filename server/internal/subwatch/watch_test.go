@@ -590,6 +590,62 @@ func TestTick_NoTunnelPickApplyFailureLeavesNothingPending(t *testing.T) {
 	}
 }
 
+func TestTick_RestoreSkipsClientRemovedFromTunnelDuringFailover(t *testing.T) {
+	cfg := failedOverCfg()
+	tun := cfg.TunnelDirector.Tunnels["ovpnc2"]
+	kept := make([]string, 0)
+	for _, ip := range tun.Clients {
+		if ip != "192.168.1.8" {
+			kept = append(kept, ip)
+		}
+	}
+	tun.Clients = kept
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = tun
+	f := &fake{cfg: cfg, probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	runningWatch(f.watch()).Tick(context.Background())
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("deleted client must not return to Xray")
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("must not put a deleted client back on the tunnel")
+	}
+}
+
+func TestTick_RestoreSkipsSnapshotWhenFallbackTunnelKeyIsGone(t *testing.T) {
+	cfg := failedOverCfg()
+	delete(cfg.TunnelDirector.Tunnels, "ovpnc2")
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.8"}}
+	f := &fake{cfg: cfg, probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	runningWatch(f.watch()).Tick(context.Background())
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("must not restore onto Xray after the wizard moved the client")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["wgc1"].Clients, "192.168.1.8") {
+		t.Fatal("wizard assignment")
+	}
+}
+
+func TestTick_DoesNotReapplyWhileTPROXYIsNotReady(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	w.TPROXYReady = func() bool { return false }
+	w.Tick(context.Background())
+	n := f.applies
+	if n == 0 {
+		t.Fatal("first restore must try apply")
+	}
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.applies != n {
+		t.Fatalf("applies %d after %d; waiting for TPROXY must not re-apply every tick", f.applies, n)
+	}
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+	if f.applies == n {
+		t.Fatal("must retry apply on the import cadence")
+	}
+}
+
 func TestTick_RestoreKeepsFallbackWhenTPROXYNotReady(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
 	w := runningWatch(f.watch())

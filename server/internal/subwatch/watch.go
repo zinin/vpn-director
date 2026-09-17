@@ -71,6 +71,7 @@ type Watch struct {
 	pendingRestoreNotify bool          // pendingApply is a committed restore, so notify when Apply succeeds
 	reconciled           bool          // the first armed Tick has checked for a failover left by an earlier process
 	lastNoTunnelCheck    time.Time     // last LoadPlatform while announcing no fallback
+	lastTPROXYFail       time.Time     // last apply that found TPROXY not intercepting
 	running              bool
 }
 
@@ -130,6 +131,9 @@ func (w *Watch) Tick(ctx context.Context) {
 	if cfg.Xray.Failover != nil {
 		staged := vpnconfig.FailoverStaged(cfg)
 		if w.probeOK(ctx, cfg) {
+			if !w.tproxyReady() && !w.lastTPROXYFail.IsZero() && w.Now().Sub(w.lastTPROXYFail) < ImportRetry {
+				return
+			}
 			announceRestored := !staged || w.pendingRestoreNotify
 			if !w.commitRestore(cfg) {
 				return
@@ -588,6 +592,9 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 		}
 		return true
 	}
+	if !w.tproxyReady() && !w.lastTPROXYFail.IsZero() && w.Now().Sub(w.lastTPROXYFail) < ImportRetry {
+		return false
+	}
 	startedCommitted := !vpnconfig.FailoverStaged(cfg)
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
@@ -608,12 +615,13 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	if !w.tproxyReady() {
 		slog.Warn("TPROXY is not intercepting LAN; keeping fallback routing")
-		w.pendingApply = true
+		w.lastTPROXYFail = w.Now()
 		if startedCommitted {
 			w.pendingRestoreNotify = true
 		}
 		return false
 	}
+	w.lastTPROXYFail = time.Time{}
 	if w.UpdateVPN != nil {
 		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
 			vpnconfig.RestoreXrayClientsFromFailover(current)

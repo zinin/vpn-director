@@ -267,30 +267,22 @@ func ApplyFailoverSnapshot(cfg *VPNDirectorConfig, fo *XrayFailover) {
 	cfg.Xray.Failover = &XrayFailover{Tunnel: fo.Tunnel, Clients: clients, Added: fo.Added}
 }
 
-// EnsureFailoverStaged puts snapshot addresses on xray.clients and the
-// fallback tunnel without clearing failover. Restore then drops tunnel
-// membership only after TPROXY is confirmed, so a soft-fail tproxy_apply
-// cannot strip kernel fallback routing.
+// EnsureFailoverStaged puts snapshot addresses that are still on the fallback
+// tunnel onto xray.clients without clearing failover. It does not put deleted
+// or wizard-moved addresses back on the tunnel. Restore then drops tunnel
+// membership only after TPROXY is confirmed.
 func EnsureFailoverStaged(cfg *VPNDirectorConfig) {
 	if cfg == nil || cfg.Xray.Failover == nil {
 		return
 	}
-	fo := cfg.Xray.Failover
 	paused := pausedSet(cfg)
-	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
-	for _, ip := range fo.Clients {
-		if ip == "" {
+	for _, ip := range snapshotOnTunnel(cfg) {
+		if _, skip := paused[ip]; skip {
 			continue
 		}
-		if _, skip := paused[ip]; !skip && !contains(cfg.Xray.Clients, ip) {
+		if !contains(cfg.Xray.Clients, ip) {
 			cfg.Xray.Clients = append(cfg.Xray.Clients, ip)
 		}
-		if ok && !contains(tun.Clients, ip) {
-			tun.Clients = append(tun.Clients, ip)
-		}
-	}
-	if ok {
-		cfg.TunnelDirector.Tunnels[fo.Tunnel] = tun
 	}
 }
 

@@ -337,6 +337,37 @@ func TestApplyFailoverSnapshot_OnlyMovesListedClients(t *testing.T) {
 	}
 }
 
+func TestEnsureFailoverStaged_SkipsClientsRemovedFromTunnel(t *testing.T) {
+	cfg := sample()
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	tun := cfg.TunnelDirector.Tunnels["ovpnc2"]
+	kept := make([]string, 0)
+	for _, ip := range tun.Clients {
+		if ip != "192.168.1.8" {
+			kept = append(kept, ip)
+		}
+	}
+	tun.Clients = kept
+	cfg.TunnelDirector.Tunnels["ovpnc2"] = tun
+	EnsureFailoverStaged(cfg)
+	if contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("deleted client must not return to Xray")
+	}
+	if contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("must not put a deleted client back on the tunnel")
+	}
+}
+
+func TestEnsureFailoverStaged_SkipsWhenTunnelKeyIsGone(t *testing.T) {
+	cfg := sample()
+	MoveXrayClientsToTunnel(cfg, "ovpnc2")
+	delete(cfg.TunnelDirector.Tunnels, "ovpnc2")
+	EnsureFailoverStaged(cfg)
+	if contains(cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("must not restore onto Xray after the wizard dropped the fallback tunnel")
+	}
+}
+
 func TestEnsureFailoverStaged_PutsSnapshotOnXrayAndTunnel(t *testing.T) {
 	cfg := sample()
 	MoveXrayClientsToTunnel(cfg, "ovpnc2")
