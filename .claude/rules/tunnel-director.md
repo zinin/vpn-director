@@ -104,9 +104,15 @@ configured tunnel was applied) and returns 0 with a WARN, so S99 start, hooks an
 do not fail while the fallback interface is still coming up. Deleting the hash forced the next
 apply through `tunnel_stop`. The watch does not Commit Xray membership until
 `/tmp/tunnel_director/failover_ready` names that tunnel (route and ip rule installed);
-`TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path always re-installs recorded routes, then re-checks the
-failover tunnel's row in `TUN_DIR_TABLES` and its ip rule (`pref TUN_DIR_PREF_BASE+idx`)
-and rewrites or removes `failover_ready` without a rebuild.
+`TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path always re-installs
+recorded routes **and ip rules** (`_tunnel_rule_ensure`, one per row of `TUN_DIR_TABLES`), then
+re-checks the failover tunnel's row and its rule (`pref TUN_DIR_PREF_BASE+idx`) and rewrites or
+removes `failover_ready` without a rebuild. Re-installing the rules is what makes a failed
+`ip rule add` recoverable at all: the hash is recorded regardless, so every later apply lands in
+this branch, and a rule that is only checked here would stay missing until the configuration
+changed — the clients of that tunnel falling through to `main`, and the watch waiting on a
+`failover_ready` nothing would write. A rule that is in place is left alone; deleting and
+re-adding it is a window in which marked packets reach `main`.
 
 The rebuild loop also releases each tunnel's table right before it ensures the route
 (`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that dies after

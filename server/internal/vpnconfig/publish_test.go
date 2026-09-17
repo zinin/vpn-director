@@ -22,7 +22,7 @@ func TestPublishServers_SavesTheListInsideTheConfigUpdate(t *testing.T) {
 		return nil
 	}
 
-	if err := PublishServers(update, save, []Server{{IPs: []string{"1.1.1.1"}}}, ""); err != nil {
+	if err := PublishServers(update, save, []Server{{IPs: []string{"1.1.1.1"}}}, "", nil); err != nil {
 		t.Fatalf("PublishServers: %v", err)
 	}
 	if !savedUnderLock {
@@ -44,7 +44,7 @@ func TestPublishServers_LockFailureDoesNotWriteTheList(t *testing.T) {
 		return nil
 	}
 
-	err := PublishServers(update, save, []Server{{IPs: []string{"1.1.1.1"}}}, "")
+	err := PublishServers(update, save, []Server{{IPs: []string{"1.1.1.1"}}}, "", nil)
 	if !errors.Is(err, errLock) {
 		t.Fatalf("err %v, want the lock error", err)
 	}
@@ -58,7 +58,7 @@ func TestPublishServers_SaveFailureLeavesTheBypassList(t *testing.T) {
 	update := func(fn func(*VPNDirectorConfig) error) error { return fn(cfg) }
 	save := func([]Server) error { return errors.New("no space left on device") }
 
-	err := PublishServers(update, save, []Server{{IPs: []string{"1.1.1.1"}}}, "")
+	err := PublishServers(update, save, []Server{{IPs: []string{"1.1.1.1"}}}, "", nil)
 	if !errors.Is(err, ErrSaveServers) {
 		t.Fatalf("err %v, want ErrSaveServers", err)
 	}
@@ -71,7 +71,7 @@ func TestPublishServers_KeepsASavedURLWhenNoneIsGiven(t *testing.T) {
 	cfg := &VPNDirectorConfig{Xray: XrayConfig{SubscriptionURL: "https://cdn.example/s/token"}}
 	update := func(fn func(*VPNDirectorConfig) error) error { return fn(cfg) }
 
-	if err := PublishServers(update, nil, []Server{{IPs: []string{"1.1.1.1"}}}, ""); err != nil {
+	if err := PublishServers(update, nil, []Server{{IPs: []string{"1.1.1.1"}}}, "", nil); err != nil {
 		t.Fatalf("PublishServers: %v", err)
 	}
 	if cfg.Xray.SubscriptionURL != "https://cdn.example/s/token" {

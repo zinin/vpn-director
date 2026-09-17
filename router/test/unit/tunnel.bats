@@ -535,6 +535,75 @@ load '../test_helper'
     [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
 }
 
+# A transient ip rule add failure used to be permanent. The rebuild records the
+# hash anyway - dropping it would send the next apply through tunnel_stop and
+# take TUN_DIR down for every client - so every later apply takes the up-to-date
+# path, which only looked for the rule. With one fallback tunnel the watch then
+# waited for failover_ready that nothing would ever write.
+@test "tunnel_apply: up-to-date path re-installs a missing failover ip rule" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-rule-retry.json"
+    jq '.tunnel_director.tunnels = {
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+            return 1
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
+    local ready="${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}"
+    [ ! -e "$ready" ]
+
+    # The kernel takes the rule again. This apply is the up-to-date path, and it
+    # has to put the rule back rather than report it missing forever.
+    unset -f ip
+    fw_chain_exists() { return 0; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "up-to-date"
+    [ -f "$ready" ]
+    grep -qx ovpnc2 "$ready"
+}
+
+# Re-installing means putting back what is gone. Deleting and re-adding a rule
+# that is in place is a window in which marked packets fall through to main.
+@test "tunnel_apply: up-to-date path leaves an installed failover ip rule alone" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-rule-keep.json"
+    jq '.tunnel_director.tunnels = {
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+
+    : > /tmp/bats_ip_calls.log
+    fw_chain_exists() { return 0; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "up-to-date"
+    refute grep -q "rule add pref .* lookup ovpnc2" /tmp/bats_ip_calls.log
+}
+
 @test "tunnel_apply: records failover ready when the route and ip rule are installed" {
     load_common
     source "$LIB_DIR/firewall.sh"

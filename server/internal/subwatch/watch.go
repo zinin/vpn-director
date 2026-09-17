@@ -54,7 +54,7 @@ type Watch struct {
 	Apply         func() error
 	RestartXray   func() error
 	SaveServers   func([]vpnconfig.Server) error
-	Generate      func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, err error)
+	Generate      func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error)
 	Probe         func(ctx context.Context, socksPort int) error
 	Fetch         func(ctx context.Context, url string) ([]vpnconfig.Server, error)
 	Notify        func(msg string)
@@ -417,6 +417,10 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 // server the walk did not put there.
 var errSuperseded = errors.New("a newer server was selected")
 
+// errSubscriptionChanged is a publication its guard refused: the saved link is
+// no longer the one this wave downloaded.
+var errSubscriptionChanged = errors.New("the subscription URL changed")
+
 func (w *Watch) walkSuperseded(started, lastRecorded string, expectedSeq int) bool {
 	if w.LoadVPN == nil {
 		return false
@@ -426,22 +430,6 @@ func (w *Watch) walkSuperseded(started, lastRecorded string, expectedSeq int) bo
 		return false
 	}
 	return superseded(cfg, started, lastRecorded, expectedSeq)
-}
-
-// observedSeq is the active_server counter after a record of the walk's own.
-// Production moves it on by one; read it back rather than assume, so a config
-// whose records do not carry the counter still walks. A selection committed in
-// the instant between the write and this read is adopted as the walk's own -
-// the same instant the identity comparison has always missed.
-func (w *Watch) observedSeq(fallback int) int {
-	if w.LoadVPN == nil {
-		return fallback
-	}
-	cfg, err := w.LoadVPN()
-	if err != nil {
-		return fallback
-	}
-	return vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 }
 
 // supersededGuard is the guard the walk hands Generate. It runs under the config
@@ -524,7 +512,23 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	}
 	// servers.json and xray.servers are published together, under the config
 	// lock, so this wave cannot end up beside half of a Web UI or /import one.
-	if err := vpnconfig.PublishServers(w.UpdateVPN, w.SaveServers, servers, ""); err != nil {
+	// The same lock is where the saved link is checked: a download takes longer
+	// than it takes someone to paste another subscription, and publishing this
+	// list then leaves it beside a link that did not produce it.
+	sameURL := func(current *vpnconfig.VPNDirectorConfig) error {
+		if current.Xray.SubscriptionURL != rawURL {
+			return errSubscriptionChanged
+		}
+		return nil
+	}
+	if err := vpnconfig.PublishServers(w.UpdateVPN, w.SaveServers, servers, "", sameURL); err != nil {
+		if errors.Is(err, errSubscriptionChanged) {
+			slog.Info("Subscription refresh abandoned; the saved link is no longer the one that was downloaded")
+			// The link that replaced it deserves a wave of its own rather than
+			// the wait left over from the one thrown away.
+			w.lastImport = prevImport
+			return
+		}
 		if errors.Is(err, vpnconfig.ErrSaveServers) {
 			slog.Warn("Failed to save the refreshed subscription servers", "error", err)
 		} else {
@@ -566,7 +570,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if ctx.Err() != nil || w.stopped() {
 			return
 		}
-		generated, err := w.Generate(s, supersededGuard(started, lastRecorded, lastSeq))
+		generated, seq, err := w.Generate(s, supersededGuard(started, lastRecorded, lastSeq))
 		if errors.Is(err, errSuperseded) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
@@ -581,7 +585,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if err == nil {
 			lastRecorded = lastGenerated
 		}
-		lastSeq = w.observedSeq(lastSeq)
+		lastSeq = seq
 		tried++
 		if ctx.Err() != nil {
 			return
@@ -657,7 +661,7 @@ func (w *Watch) importInterval() time.Duration {
 // than the user's. No probe and no restore: the walk has just found it down.
 // abandoned means guard found a newer selection and nothing was written.
 func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (abandoned bool) {
-	generated, err := w.Generate(s, guard)
+	generated, _, err := w.Generate(s, guard)
 	if errors.Is(err, errSuperseded) {
 		return true
 	}

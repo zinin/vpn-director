@@ -72,6 +72,13 @@ func (f *fake) watch() *Watch {
 	}
 }
 
+// seq is what production's Generate returns: the counter active_server carries
+// once the write is done. A fake that records one returns the value it just
+// wrote; one that records nothing returns what the config already held.
+func (f *fake) seq() int {
+	return vpnconfig.ActiveSeq(f.cfg.Xray.ActiveServer)
+}
+
 // checkGuard runs the guard a Generate call carries against f.cfg, where
 // production runs it under the config lock right before config.json is written.
 func (f *fake) checkGuard(guard func(*vpnconfig.VPNDirectorConfig) error) error {
@@ -82,11 +89,11 @@ func (f *fake) checkGuard(guard func(*vpnconfig.VPNDirectorConfig) error) error 
 }
 
 // generateAll is a Generate that writes every server its guard lets through.
-func (f *fake) generateAll(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+func (f *fake) generateAll(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 	if err := f.checkGuard(guard); err != nil {
-		return false, err
+		return false, f.seq(), err
 	}
-	return true, nil
+	return true, f.seq(), nil
 }
 
 func baseCfg() *vpnconfig.VPNDirectorConfig {
@@ -566,13 +573,13 @@ func TestTick_StopDuringTheWalkEndsItQuietly(t *testing.T) {
 					{Name: "Backup", Address: "backup.example", Port: 443},
 				}, nil
 			}
-			w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+			w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 				if err := f.checkGuard(guard); err != nil {
-					return false, err
+					return false, f.seq(), err
 				}
 				record("generate " + s.Name)
 				f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-				return true, nil
+				return true, f.seq(), nil
 			}
 			w.RestartXray = func() error {
 				record("restart")
@@ -763,13 +770,13 @@ func TestTick_WalkStopsWhenContextCanceled(t *testing.T) {
 		}, nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated++
 		cancel()
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -910,12 +917,12 @@ func TestTick_NoTunnelPickNotifiesSelectedServer(t *testing.T) {
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
-	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = true
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -948,12 +955,12 @@ func TestTick_NoTunnelPickApplyFailureLeavesNothingPending(t *testing.T) {
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
-	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = true
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1081,16 +1088,16 @@ func TestTick_WalkAbandonsWhenANewerServerWasSelected(t *testing.T) {
 			{Name: "Backup", Address: "backup.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
 		if s.Name == "Oslo" {
 			f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Manual", Address: "manual.example", Port: 443}
 		}
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1131,13 +1138,13 @@ func TestTick_WalkAbandonsWhenUserReselectsStartedServer(t *testing.T) {
 			{Name: "Extra", Address: "extra.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1197,13 +1204,13 @@ func TestTick_WalkAbandonsWhenTheActiveServerIsSelectedAgain(t *testing.T) {
 			{Name: "Backup", Address: "backup.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error {
 		restarts++
@@ -1234,14 +1241,14 @@ func TestTick_WalkDoesNotOverwriteASelectionMadeJustBeforeGenerate(t *testing.T)
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		f.cfg.Xray.ActiveServer = manual // commits while Generate waits for the lock
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error {
 		restarts++
@@ -1286,16 +1293,16 @@ func TestTick_NoLiveWalkDoesNotReturnOverASelectionMadeJustBeforeGenerate(t *tes
 			{Name: "Backup", Address: "backup.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if len(generated) == 2 {
 			f.cfg.Xray.ActiveServer = manual // commits while the return to Oslo waits for the lock
 		}
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error {
 		restarts++
@@ -1336,16 +1343,16 @@ func TestTick_WalkContinuesPastACandidateWhoseRecordWasNotSaved(t *testing.T) {
 			{Name: "Extra", Address: "extra.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		if s.Name == "Backup" {
-			return true, errSaveConfig
+			return true, f.seq(), errSaveConfig
 		}
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1381,12 +1388,12 @@ func TestTick_WalkRestoresOnACandidateWhoseRecordWasNotSaved(t *testing.T) {
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Backup", Address: "backup.example", Port: 443}}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
-		return true, errSaveConfig
+		return true, f.seq(), errSaveConfig
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1418,16 +1425,16 @@ func TestTick_NoLiveWalkReturnsToPreferredAfterAnUnsavedRecord(t *testing.T) {
 			{Name: "Backup", Address: "backup.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		if s.Name == "Backup" {
-			return true, errSaveConfig
+			return true, f.seq(), errSaveConfig
 		}
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1500,14 +1507,14 @@ func TestTick_GenerateKeepsSubscriptionHostname(t *testing.T) {
 	}
 	w := runningWatch(liveImportWatch(f))
 	var got vpnconfig.Server
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		got = s
 		f.picked = true
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.Tick(context.Background())
 	if got.Address != "new.example" {
@@ -1537,13 +1544,13 @@ func TestTick_ImportAndRestoreOnLiveServer(t *testing.T) {
 			{Name: "Backup", Address: "b.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		liveAfter = s.Name
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1600,14 +1607,14 @@ func TestTick_SameNameDeadWalksList(t *testing.T) {
 			{Name: "Backup", Address: "b.example", Port: 443},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = append(generated, s.Name)
 		liveAfter = s.Name
 		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1768,12 +1775,12 @@ func TestTick_NewDeathAfterRestoreNotifiesMovedAgain(t *testing.T) {
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
-	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generated = true
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1811,12 +1818,12 @@ func TestTick_NewEpisodeAfterRestoreNotifiesRestoredAgain(t *testing.T) {
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
-	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		justGenerated = true
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1892,12 +1899,12 @@ func liveImportWatch(f *fake) *Watch {
 			{Name: "Backup", Address: "b.example", Port: 443, IPs: []string{"203.0.113.11", "198.51.100.8", ""}},
 		}, nil
 	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		f.picked = true
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error { return nil }
 	w.AfterRestart = func(time.Duration) {}
@@ -1920,16 +1927,16 @@ func recordingWalkWatch(f *fake, servers []vpnconfig.Server, generates func(vpnc
 	w := f.watch()
 	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) { return servers, nil }
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		*events = append(*events, s.Name)
 		if !generates(s) {
-			return false, errors.New("rejected")
+			return false, f.seq(), errors.New("rejected")
 		}
 		f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: s.Name}
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error {
 		*events = append(*events, "restart")
@@ -2207,13 +2214,13 @@ func TestTick_RestoreApplyFailureKeepsLastImportWindow(t *testing.T) {
 			{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10"}},
 		}, nil
 	}
-	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generates++
 		f.picked = true
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error {
 		restarts++
@@ -2516,12 +2523,12 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 		saves++
 		return nil
 	}
-	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generates++
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error {
 		restarts++
@@ -2671,6 +2678,91 @@ func TestTick_ImportPublishesServersUnderTheConfigLock(t *testing.T) {
 	}
 }
 
+// The download can take longer than it takes someone to paste a new
+// subscription into the Web UI. Publishing this list then leaves a servers.json
+// from the old link beside the new one that is now saved, and the walk picks its
+// server out of it.
+func TestTick_ImportDoesNotPublishAfterTheSubscriptionChanged(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	saves, fetches, generates := 0, 0, 0
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error {
+		saves++
+		return nil
+	}
+	w.Generate = func(vpnconfig.Server, func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		generates++
+		return true, f.seq(), nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		// A Web UI import saves another subscription while this one is in flight.
+		f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
+		return []vpnconfig.Server{{Name: "Oslo", Address: "old.example", Port: 443, IPs: []string{"203.0.113.10"}}}, nil
+	}
+
+	w.Tick(context.Background())
+
+	if saves != 0 || len(f.cfg.Xray.Servers) != 0 {
+		t.Fatalf("saves %d, xray.servers %v; a list from the old subscription must not be published", saves, f.cfg.Xray.Servers)
+	}
+	if generates != 0 {
+		t.Fatalf("generates %d; the walk must not run on a list the config no longer asks for", generates)
+	}
+
+	// The link that replaced it deserves a wave of its own, not the wait left
+	// over from the one that was thrown away.
+	w.Tick(context.Background())
+	if fetches != 2 {
+		t.Fatalf("fetches %d; the abandoned wave must not spend the import window", fetches)
+	}
+}
+
+// A selection that lands after Generate released the config lock, before the
+// walk can look at the config again, used to be adopted as the walk's own
+// write: the next candidate then matched both the identity and the counter, and
+// the user's choice was overwritten. The counter the write itself reports
+// cannot be overtaken that way.
+func TestTick_WalkAbandonsWhenASelectionLandsRightAfterGenerate(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4}
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, f.seq(), err
+		}
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		written := f.seq()
+		if len(generated) == 1 {
+			// The user picks that same server again, once the lock is gone.
+			f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		}
+		return true, written, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background())
+
+	if len(generated) != 1 {
+		t.Fatalf("generated %v; the walk must stand down after a write it did not make", generated)
+	}
+	if got := vpnconfig.ActiveSeq(f.cfg.Xray.ActiveServer); got != 6 {
+		t.Fatalf("active_server %+v, want the user's own write", f.cfg.Xray.ActiveServer)
+	}
+}
+
 func TestTick_SyncXrayServersFailureStopsTheWave(t *testing.T) {
 	f := &fake{
 		cfg: failedOverCfg(),
@@ -2678,12 +2770,12 @@ func TestTick_SyncXrayServersFailureStopsTheWave(t *testing.T) {
 	}
 	generates, restarts := 0, 0
 	w := runningWatch(liveImportWatch(f))
-	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
-			return false, err
+			return false, f.seq(), err
 		}
 		generates++
-		return true, nil
+		return true, f.seq(), nil
 	}
 	w.RestartXray = func() error {
 		restarts++

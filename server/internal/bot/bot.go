@@ -119,10 +119,10 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Apply:        vpnSvc.ApplyUnlessStopped,
 			RestartXray:  vpnSvc.RestartXrayUnlessStopped,
 			SaveServers:  configSvc.SaveServers,
-			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 				cfg, err := configSvc.LoadVPNConfig()
 				if err != nil {
-					return false, err
+					return false, 0, err
 				}
 				ports := service.InboundPorts{}
 				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)

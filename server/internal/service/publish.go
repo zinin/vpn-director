@@ -12,7 +12,7 @@ import (
 // imported subscription, under the store's config lock. UpdateVPNConfig is that
 // lock; see vpnconfig.PublishServers for why both writes belong inside it.
 func PublishServers(store ConfigStore, servers []vpnconfig.Server, subscriptionURL string) error {
-	err := vpnconfig.PublishServers(store.UpdateVPNConfig, store.SaveServers, servers, subscriptionURL)
+	err := vpnconfig.PublishServers(store.UpdateVPNConfig, store.SaveServers, servers, subscriptionURL, nil)
 	if !errors.Is(err, ErrConfigLoad) {
 		return err
 	}

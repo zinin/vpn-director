@@ -31,7 +31,8 @@ import (
 // failure here leaves a new config.json against a config that already lists
 // its address in the bypass set, rather than one that does not.
 func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnconfig.Server, ports InboundPorts) (generated bool, err error) {
-	return GenerateAndRecordDialedServer(store, xray, s, s, ports, nil)
+	generated, _, err = GenerateAndRecordDialedServer(store, xray, s, s, ports, nil)
+	return generated, err
 }
 
 // GenerateAndRecordDialedServer writes config.json from generate (the watch
@@ -42,7 +43,12 @@ func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnc
 // protects; its error writes nothing and comes back as is. The watch passes one
 // so a selection another daemon committed after the watch last read the config
 // is refused rather than written over.
-func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, err error) {
+// seq is the counter active_server carries in the file once the call returns,
+// taken inside the transaction rather than read back after the lock is gone: a
+// selection committed in between would otherwise be adopted as the caller's own
+// write. It is meaningful only when generated is true.
+func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error) {
+	var prev, written int
 	err = store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
 		if guard != nil {
 			if err := guard(cfg); err != nil {
@@ -56,8 +62,14 @@ func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, genera
 		// One write on from what the config named: a reader that remembers the
 		// counter can tell this write happened even when it names the server
 		// that was already there.
+		prev = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 		cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(cfg.Xray.ActiveServer, identity)
+		written = prev + 1
 		return nil
 	})
-	return generated, err
+	if err != nil {
+		// config.json may be written, but the record of it is not in the file.
+		return generated, prev, err
+	}
+	return generated, written, nil
 }

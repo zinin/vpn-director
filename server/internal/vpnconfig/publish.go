@@ -22,8 +22,17 @@ var ErrSaveServers = errors.New("save servers")
 //
 // A non-empty subscriptionURL is stored with the list; an empty one leaves a
 // saved link in place, so a re-import from it does not clear it.
-func PublishServers(update func(func(*VPNDirectorConfig) error) error, save func([]Server) error, servers []Server, subscriptionURL string) error {
+//
+// A non-nil guard runs first, inside the same locked update, on the config the
+// lock protects: a publisher whose download is no longer the one the config
+// asks for refuses there rather than writing over a newer one.
+func PublishServers(update func(func(*VPNDirectorConfig) error) error, save func([]Server) error, servers []Server, subscriptionURL string, guard func(*VPNDirectorConfig) error) error {
 	publish := func(cfg *VPNDirectorConfig) error {
+		if guard != nil {
+			if err := guard(cfg); err != nil {
+				return err
+			}
+		}
 		if save != nil {
 			if err := save(servers); err != nil {
 				return fmt.Errorf("%w: %w", ErrSaveServers, err)

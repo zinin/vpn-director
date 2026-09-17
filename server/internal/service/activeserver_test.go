@@ -77,7 +77,7 @@ func TestGenerateAndRecordDialedServer_RecordsHostnameNotDialIP(t *testing.T) {
 	identity := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 	dial := vpnconfig.Server{Name: "Oslo", Address: "203.0.113.50", Port: 443, SNI: "oslo.example"}
 
-	generated, err := GenerateAndRecordDialedServer(store, xray, dial, identity, InboundPorts{TProxy: 12345, Socks: 12346}, nil)
+	generated, _, err := GenerateAndRecordDialedServer(store, xray, dial, identity, InboundPorts{TProxy: 12345, Socks: 12346}, nil)
 	if err != nil {
 		t.Fatalf("GenerateAndRecordDialedServer error: %v", err)
 	}
@@ -105,7 +105,7 @@ func TestGenerateAndRecordDialedServer_GuardRunsUnderTheConfigLock(t *testing.T)
 	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 	ran, underLock := false, false
 
-	generated, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+	generated, _, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
 		ran, underLock = true, store.inClosure
 		return nil
 	})
@@ -128,7 +128,7 @@ func TestGenerateAndRecordDialedServer_GuardRefusalWritesNothing(t *testing.T) {
 	refused := errors.New("a newer server was selected")
 	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 
-	generated, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+	generated, _, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
 		return refused
 	})
 
@@ -267,11 +267,14 @@ func TestGenerateAndRecordDialedServer_CountsTheWrite(t *testing.T) {
 	xray := &stubXray{store: store}
 	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 
-	generated, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, nil)
+	generated, seq, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, nil)
 	if err != nil || !generated {
 		t.Fatalf("generated %v, err %v", generated, err)
 	}
 	if got := vpnconfig.ActiveSeq(store.cfg.Xray.ActiveServer); got != 5 {
 		t.Fatalf("Seq %d, want 5: re-selecting the same server is a new write", got)
+	}
+	if seq != 5 {
+		t.Fatalf("returned seq %d, want the counter the transaction wrote", seq)
 	}
 }

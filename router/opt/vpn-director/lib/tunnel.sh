@@ -28,7 +28,7 @@
 # Internal functions (for testing):
 #   _tunnel_table_allowed()      - check if a tunnel id is one the platform lists
 #   _tunnel_gateway()            - the configured gateway of a tunnel, or nothing
-#   _tunnel_ensure_routes()      - re-install the routes of every applied tunnel
+#   _tunnel_ensure_routes()      - re-install the routes and ip rules of every applied tunnel
 #   _tunnel_init()               - initialize module state
 #
 # Usage:
@@ -167,8 +167,44 @@ _tunnel_ensure_routes() {
                 rc=1
             fi
         fi
+        # The rule outlives an interface flap, but one that never went in at
+        # rebuild time is retried nowhere else. The failover check below reads
+        # the result; a rule that cannot be installed has logged its own error.
+        _tunnel_rule_ensure "$idx" "$tunnel" || true
     done < "$TUN_DIR_TABLES"
     return "$rc"
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tunnel_rule_ensure - put back the ip rule of a recorded tunnel
+# -------------------------------------------------------------------------------------------------
+# A rebuild records TUN_DIR_HASH even when an "ip rule add" failed - dropping the
+# hash would send the next apply through tunnel_stop and take TUN_DIR down for
+# every client - so every later apply lands in the up-to-date branch and this is
+# the only place left to retry. Without it a rule that never went in stays gone
+# until the configuration changes: those clients fall through to main, and for
+# the failover tunnel failover_ready is never written, so the watch keeps its
+# Xray clients on a dead outbound.
+#
+# A rule that is in place is left alone. Deleting and re-adding it would open a
+# window in which marked packets fall through to main.
+# -------------------------------------------------------------------------------------------------
+_tunnel_rule_ensure() {
+    local idx="$1" tunnel="$2"
+    local pref=$((TUN_DIR_PREF_BASE + idx))
+    if ip rule show 2>/dev/null | grep -q "^${pref}:"; then
+        return 0
+    fi
+    local mark_hex table
+    mark_hex=$(printf '0x%x' $(( (idx + 1) << _tunnel_mark_shift_val )))
+    table="$(platform_tunnel_table "$tunnel" "$idx")"
+    ip rule del pref "$pref" 2>/dev/null || true
+    if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
+        log -l ERROR "Tunnel '$tunnel': ip rule still not installed: pref=$pref fwmark=$mark_hex lookup=$table"
+        return 1
+    fi
+    log "Tunnel '$tunnel': re-installed the ip rule at pref $pref"
+    return 0
 }
 
 # True when the failover tunnel has an ip rule at pref TUN_DIR_PREF_BASE+idx.
