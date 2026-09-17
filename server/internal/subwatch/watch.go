@@ -155,6 +155,11 @@ func (w *Watch) Tick(ctx context.Context) {
 			}
 			return
 		}
+		// A /stop can land while the probe waits. What follows drops Xray
+		// membership and announces; a stopped tick does neither.
+		if w.stopped() {
+			return
+		}
 		wasPending := w.pendingApply || staged
 		var ok bool
 		cfg, ok = w.applyFailover(cfg)
@@ -246,6 +251,11 @@ func (w *Watch) Tick(ctx context.Context) {
 		} else {
 			plat = p
 		}
+	}
+	// LoadPlatform shells out and takes no lock: a /stop can finish while it
+	// runs, and neither the stage write nor the message below may follow one.
+	if w.stopped() {
+		return
 	}
 	id := vpnconfig.FirstTDExit(cfg, plat)
 	if id == "" {
@@ -461,6 +471,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	if !w.lastImport.IsZero() && now.Sub(w.lastImport) < w.importInterval() {
 		return
 	}
+	prevImport := w.lastImport
 	w.lastImport = now
 
 	rawURL := ""
@@ -468,6 +479,13 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		rawURL = cfg.Xray.SubscriptionURL
 	}
 	servers, err := w.Fetch(ctx, rawURL)
+	// The download blocks for as long as the subscription host takes. A /stop
+	// that finished meanwhile ends the wave before servers.json is written, and
+	// a wave that did not happen leaves its window to the next one.
+	if w.stopped() {
+		w.lastImport = prevImport
+		return
+	}
 	if err != nil || len(servers) == 0 {
 		// A *url.Error carries the whole subscription URL, token included.
 		var ue *url.Error
@@ -823,6 +841,10 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 		} else {
 			plat = p
 		}
+	}
+	// The lookup blocks too; a /stop during it rules out moving the failover.
+	if w.stopped() {
+		return cfg
 	}
 	next := vpnconfig.NextTDExit(cfg, plat, skip)
 	if next == "" || w.UpdateVPN == nil {

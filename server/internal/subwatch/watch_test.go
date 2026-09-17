@@ -597,6 +597,135 @@ func TestTick_StopDuringTheWalkEndsItQuietly(t *testing.T) {
 	}
 }
 
+// The failover branch probes before it drops Xray membership. A /stop that
+// lands while that probe waits rules out the commit and the messages after it.
+func TestTick_StopDuringTheFailoverProbeKeepsTheStage(t *testing.T) {
+	cfg := baseCfg()
+	vpnconfig.StageXrayClientsToTunnel(cfg, "ovpnc2")
+	f := &fake{
+		cfg:  cfg,
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	stopped := false
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.Probe = func(context.Context, int) error {
+		stopped = true
+		return errProbe
+	}
+	w.Tick(context.Background())
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("xray.clients %v; a stopped router keeps the staged membership", f.cfg.Xray.Clients)
+	}
+	if f.applies != 0 || len(f.notes) != 0 {
+		t.Fatalf("applies %d, notes %v after /stop", f.applies, f.notes)
+	}
+}
+
+// LoadPlatform shells out to vpn-director.sh and takes no lock, so a /stop can
+// finish while it runs. Staging the clients and announcing the fallback are
+// writes and messages that stop rules out.
+func TestTick_StopDuringThePlatformLookupStagesNothing(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		plat vpnconfig.PlatformInfo
+	}{
+		{"with a fallback tunnel", vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}}},
+		{"with no fallback tunnel", vpnconfig.PlatformInfo{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fake{
+				cfg:      baseCfg(),
+				probeErr: errProbe,
+				now:      time.Unix(1_700_000_000, 0),
+			}
+			stopped := false
+			w := f.watch()
+			w.Stopped = func() bool { return stopped }
+			w.LoadPlatform = func() (vpnconfig.PlatformInfo, error) {
+				stopped = true
+				return tc.plat, nil
+			}
+			tickUntilDead(w, f)
+			if f.cfg.Xray.Failover != nil {
+				t.Fatalf("failover %+v staged after /stop", f.cfg.Xray.Failover)
+			}
+			if f.applies != 0 || len(f.notes) != 0 {
+				t.Fatalf("applies %d, notes %v after /stop", f.applies, f.notes)
+			}
+		})
+	}
+}
+
+// The same lookup on the retarget path: a stopped router must keep the exit it
+// failed over to.
+func TestTick_StopDuringTheRetargetPlatformLookupKeepsTheExit(t *testing.T) {
+	cfg := baseCfg()
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.4"}}
+	vpnconfig.StageXrayClientsToTunnel(cfg, "ovpnc2")
+	f := &fake{
+		cfg: cfg,
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{
+			{ID: "ovpnc2", Iface: "tun12", Connected: true},
+			{ID: "wgc1", Iface: "wgc1", Connected: true},
+		}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	stopped := false
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.FallbackReady = func(string) bool { return false }
+	w.LoadPlatform = func() (vpnconfig.PlatformInfo, error) {
+		stopped = true
+		return f.plat, nil
+	}
+	w.Tick(context.Background()) // not ready: the retry clock starts
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Fatalf("failover %+v; a stopped router was moved to another exit", f.cfg.Xray.Failover)
+	}
+}
+
+// The subscription download blocks for as long as the host takes, and what
+// follows it writes servers.json and xray.servers. A /stop finishing meanwhile
+// ends the wave, and the wave that never happened does not spend its window.
+func TestTick_StopDuringTheSubscriptionFetchWritesNothing(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	stopped := false
+	saves := 0
+	fetches := 0
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.SaveServers = func([]vpnconfig.Server) error {
+		saves++
+		return nil
+	}
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		stopped = true
+		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}}, nil
+	}
+	w.Generate = f.generateAll
+
+	w.Tick(context.Background())
+
+	if saves != 0 || len(f.cfg.Xray.Servers) != 0 {
+		t.Fatalf("saves %d, xray.servers %v written after /stop", saves, f.cfg.Xray.Servers)
+	}
+	if f.applies != 0 || len(f.notes) != 0 {
+		t.Fatalf("applies %d, notes %v after /stop", f.applies, f.notes)
+	}
+
+	stopped = false
+	w.Tick(context.Background())
+	if fetches != 2 {
+		t.Fatalf("fetches %d; an aborted wave must not spend the import window", fetches)
+	}
+}
+
 func TestTick_PlatformErrorDoesNotAnnounceNoTunnel(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
