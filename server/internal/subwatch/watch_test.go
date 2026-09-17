@@ -1063,13 +1063,49 @@ func TestTick_RestoreKeepsFallbackWhenTPROXYNotReady(t *testing.T) {
 	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatal("fallback membership")
 	}
-	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
-		t.Fatal("must stay on Xray until TPROXY is intercepting; do not strip TUN_DIR first")
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("must not hand the client to TPROXY while the marker is missing: the PREROUTING jumps go in even when the platform's own rules do not, and Xray beats TUN_DIR, so the tunnel it is still on would carry nothing")
 	}
 	for _, n := range f.notes {
 		if strings.HasPrefix(n, "LAN clients back on Xray") {
 			t.Fatalf("must not announce restore: %v", f.notes)
 		}
+	}
+}
+
+// And once the marker is there, the same restore goes through in one tick: the
+// clients are staged onto Xray, the fallback membership is dropped and the move
+// back is announced once.
+func TestTick_RestoreStagesOnceTPROXYIsReady(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	ready := false
+	w := runningWatch(f.watch())
+	w.TPROXYReady = func() bool { return ready }
+
+	w.Tick(context.Background())
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("staged onto Xray while the marker was missing")
+	}
+
+	ready = true
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v; the restore must finish once TPROXY is intercepting", f.cfg.Xray.Failover)
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("the client must be back on Xray")
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("fallback membership must be dropped once the clients are on Xray")
+	}
+	restored := 0
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "LAN clients back on Xray") {
+			restored++
+		}
+	}
+	if restored != 1 {
+		t.Fatalf("notes %v, want one restore announcement", f.notes)
 	}
 }
 

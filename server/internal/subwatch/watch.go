@@ -768,8 +768,29 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 		}
 		return true
 	}
-	if !w.tproxyReady() && !w.lastTPROXYFail.IsZero() && w.Now().Sub(w.lastTPROXYFail) < ImportRetry {
-		return false
+	// Staging the snapshot back into xray.clients is what hands these clients to
+	// TPROXY, and the marker is the only thing that says TPROXY can carry them:
+	// the PREROUTING jumps go in even when the platform's own rules do not - on
+	// Keenetic a missing mangle INPUT accept drops proxied HTTPS in
+	// _NDM_HTTP_INPUT_TLS_ - and Xray wins over TUN_DIR, so the tunnel they are
+	// still on would carry nothing. Until the marker is there they stay where
+	// they work, and only the apply that may yet install those rules is retried,
+	// on the import cadence rather than every tick.
+	if !w.tproxyReady() {
+		if !w.lastTPROXYFail.IsZero() && w.Now().Sub(w.lastTPROXYFail) < ImportRetry {
+			return false
+		}
+		if err := w.apply(); err != nil {
+			slog.Warn("Apply retry while TPROXY is not intercepting failed", "error", err)
+			w.lastTPROXYFail = w.Now()
+			return false
+		}
+		if !w.tproxyReady() {
+			slog.Warn("TPROXY is not intercepting LAN; keeping the clients on the fallback tunnel")
+			w.lastTPROXYFail = w.Now()
+			return false
+		}
+		w.lastTPROXYFail = time.Time{}
 	}
 	startedCommitted := !vpnconfig.FailoverStaged(cfg)
 	if w.UpdateVPN != nil {
