@@ -617,6 +617,45 @@ duplicate_last_rule() {
     grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log
 }
 
+# Every rule ahead of the TPROXY targets narrows what they take: without the
+# "! XRAY_CLIENTS" return TPROXY takes every LAN client, without the private
+# ranges LAN-to-LAN traffic, without an exclusion that country. errexit is off
+# under "if !", so a failed one has to stop the setup itself - before the targets,
+# and without a status that lets tproxy_apply publish ready.
+@test "_tproxy_setup_iptables: fails before the TPROXY targets when an earlier chain rule fails" {
+    load_tproxy_module
+    local failing
+    iptables() {
+        [[ $* == *"$FAILING"* ]] && return 1
+        command iptables "$@"
+    }
+    for failing in \
+        "-F XRAY_TPROXY" \
+        "-A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN" \
+        "-A XRAY_TPROXY -m set --match-set TPROXY_BYPASS dst -j RETURN" \
+        "-A XRAY_TPROXY -d 127.0.0.0/8 -j RETURN" \
+        "-A XRAY_TPROXY -d 10.0.0.0/8 -j RETURN" \
+        "-A XRAY_TPROXY -d 172.16.0.0/12 -j RETURN" \
+        "-A XRAY_TPROXY -d 192.168.0.0/16 -j RETURN" \
+        "-A XRAY_TPROXY -d 169.254.0.0/16 -j RETURN" \
+        "-A XRAY_TPROXY -d 224.0.0.0/4 -j RETURN" \
+        "-A XRAY_TPROXY -d 255.255.255.255/32 -j RETURN" \
+        "-A XRAY_TPROXY -m set --match-set ru dst -j RETURN"
+    do
+        FAILING="$failing"
+        : > /tmp/bats_iptables_calls.log
+        run _tproxy_setup_iptables
+        if [[ $status -eq 0 ]]; then
+            echo "succeeded although \"$failing\" failed"
+            return 1
+        fi
+        if grep -q -- "-j TPROXY" /tmp/bats_iptables_calls.log; then
+            echo "reached the TPROXY targets although \"$failing\" failed"
+            return 1
+        fi
+    done
+}
+
 @test "_tproxy_teardown_iptables: removes platform extra rules with the configured mark" {
     load_tproxy_module
     platform_tproxy_extra_rules() { echo "extra $1 $2" >> "$BATS_TEST_TMPDIR/extra.log"; }

@@ -88,6 +88,34 @@ func TestVPNDirectorService_RestartXray(t *testing.T) {
 	assertCall(t, mock.calls[0], "--wait", "restart", "xray")
 }
 
+// The subscription watch applies and restarts on its own. --unless-stopped has
+// the script check under its lock, so a stop that got there first stays in force.
+func TestVPNDirectorService_ApplyUnlessStopped(t *testing.T) {
+	mock := &mockExecutor{result: &shell.Result{Output: "applied", ExitCode: 0}}
+	svc := NewVPNDirectorService("/opt/vpn-director", mock)
+
+	if err := svc.ApplyUnlessStopped(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(mock.calls))
+	}
+	assertCall(t, mock.calls[0], "--wait", "--unless-stopped", "apply")
+}
+
+func TestVPNDirectorService_RestartXrayUnlessStopped(t *testing.T) {
+	mock := &mockExecutor{result: &shell.Result{Output: "ok", ExitCode: 0}}
+	svc := NewVPNDirectorService("/opt/vpn-director", mock)
+
+	if err := svc.RestartXrayUnlessStopped(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(mock.calls))
+	}
+	assertCall(t, mock.calls[0], "--wait", "--unless-stopped", "restart", "xray")
+}
+
 func TestVPNDirectorService_Apply(t *testing.T) {
 	mock := &mockExecutor{result: &shell.Result{Output: "applied", ExitCode: 0}}
 	svc := NewVPNDirectorService("/opt/vpn-director", mock)

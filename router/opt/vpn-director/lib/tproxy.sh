@@ -459,40 +459,45 @@ _tproxy_setup_iptables() {
 
     read -ra exclude_sets_array <<< "$(_tproxy_exclude_sets -q)"
 
-    # Create chain
-    create_fw_chain -f mangle "$XRAY_CHAIN"
+    # This function runs under "if !", which turns errexit off for the whole
+    # body; a failed ensure_fw_rule would otherwise fall through to the log and
+    # look like success, and the watch publishes TPROXY ready from that. Rules 1-8
+    # narrow what the TPROXY targets take - without rule 1 every LAN client,
+    # without rule 4 LAN-to-LAN traffic - so a failure there ends the setup before
+    # the targets exist, on a flushed chain that intercepts nothing.
+    create_fw_chain -f mangle "$XRAY_CHAIN" || return 1
 
     # Rule 1: Skip if source is not in our clients ipset
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -m set ! --match-set "$XRAY_CLIENTS_IPSET" src -j RETURN
+        -m set ! --match-set "$XRAY_CLIENTS_IPSET" src -j RETURN || return 1
 
     # Rule 2: Skip traffic to bypass destinations (Xray servers, user excludes, OpenVPN endpoints)
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -m set --match-set "$XRAY_BYPASS_IPSET" dst -j RETURN
+        -m set --match-set "$XRAY_BYPASS_IPSET" dst -j RETURN || return 1
 
     # Rule 3: Skip local destinations (loopback)
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 127.0.0.0/8 -j RETURN
+        -d 127.0.0.0/8 -j RETURN || return 1
 
     # Rule 4: Skip private network destinations (RFC1918)
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 10.0.0.0/8 -j RETURN
+        -d 10.0.0.0/8 -j RETURN || return 1
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 172.16.0.0/12 -j RETURN
+        -d 172.16.0.0/12 -j RETURN || return 1
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 192.168.0.0/16 -j RETURN
+        -d 192.168.0.0/16 -j RETURN || return 1
 
     # Rule 5: Skip link-local
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 169.254.0.0/16 -j RETURN
+        -d 169.254.0.0/16 -j RETURN || return 1
 
     # Rule 6: Skip multicast
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 224.0.0.0/4 -j RETURN
+        -d 224.0.0.0/4 -j RETURN || return 1
 
     # Rule 7: Skip broadcast
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 255.255.255.255/32 -j RETURN
+        -d 255.255.255.255/32 -j RETURN || return 1
 
     # Rule 8: Skip excluded country/custom ipsets
     for exclude_set in "${exclude_sets_array[@]}"; do
@@ -503,14 +508,11 @@ _tproxy_setup_iptables() {
             return 1
         }
         ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-            -m set --match-set "$resolved_set" dst -j RETURN
+            -m set --match-set "$resolved_set" dst -j RETURN || return 1
         log "Added exclusion for ipset: $resolved_set"
     done
 
     # Rule 9: Apply TPROXY for remaining traffic.
-    # This function runs under "if !", which turns errexit off for the whole
-    # body; a failed ensure_fw_rule would otherwise fall through to the log
-    # and look like success. The watch publishes TPROXY ready from that.
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
         -p tcp -j TPROXY --on-port "$XRAY_TPROXY_PORT" \
         --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK" || return 1

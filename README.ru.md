@@ -111,6 +111,7 @@ curl -fsSL \
 /opt/vpn-director/vpn-director.sh -f apply            # Принудительное применение
 /opt/vpn-director/vpn-director.sh --dry-run apply     # Показать, что будет сделано
 /opt/vpn-director/vpn-director.sh --wait apply        # Ждать занятый лок до 120 с вместо пропуска
+/opt/vpn-director/vpn-director.sh --unless-stopped apply  # Пропустить, если после этого был stop (так делает watch подписки в боте)
 
 # Импорт серверов
 /opt/vpn-director/import_server_list.sh

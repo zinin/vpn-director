@@ -123,7 +123,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.failSince = time.Time{}
 		return
 	}
-	if w.Stopped != nil && w.Stopped() {
+	if w.stopped() {
 		return
 	}
 	if !w.reconciled {
@@ -220,6 +220,10 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	if now.Sub(w.failSince) < DeadAfter {
 		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, "error", err)
+		return
+	}
+	// A /stop can land while the probe waits; the move is a write it rules out.
+	if w.stopped() {
 		return
 	}
 	if w.lastRouteKind == noteNoTunnel && !w.lastNoTunnelCheck.IsZero() && now.Sub(w.lastNoTunnelCheck) < ImportRetry {
@@ -403,7 +407,7 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 // server the walk did not put there.
 var errSuperseded = errors.New("a newer server was selected")
 
-func (w *Watch) walkSuperseded(started, lastGen string) bool {
+func (w *Watch) walkSuperseded(started, lastRecorded string) bool {
 	if w.LoadVPN == nil {
 		return false
 	}
@@ -411,32 +415,33 @@ func (w *Watch) walkSuperseded(started, lastGen string) bool {
 	if err != nil {
 		return false
 	}
-	return superseded(cfg, started, lastGen)
+	return superseded(cfg, started, lastRecorded)
 }
 
 // supersededGuard is the guard the walk hands Generate. It runs under the config
 // lock with the write, so a Web UI or /xray selection that commits after the
 // walk last read the config is refused instead of written over.
-func supersededGuard(started, lastGen string) func(*vpnconfig.VPNDirectorConfig) error {
+func supersededGuard(started, lastRecorded string) func(*vpnconfig.VPNDirectorConfig) error {
 	return func(cfg *vpnconfig.VPNDirectorConfig) error {
-		if superseded(cfg, started, lastGen) {
+		if superseded(cfg, started, lastRecorded) {
 			return errSuperseded
 		}
 		return nil
 	}
 }
 
-// superseded reports whether cfg names a server the walk did not generate: one
-// selected since the walk started (lastGen empty) or since its last Generate.
-func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastGen string) bool {
+// superseded reports whether cfg names a server the walk did not record: one
+// selected since the walk started (lastRecorded empty) or since the last
+// Generate whose record saved.
+func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string) bool {
 	if cfg == nil {
 		return false
 	}
 	cur := activeID(cfg.Xray.ActiveServer)
-	if lastGen == "" {
+	if lastRecorded == "" {
 		return cur != "" && cur != started
 	}
-	if cur == "" || cur == lastGen {
+	if cur == "" || cur == lastRecorded {
 		return false
 	}
 	// Same name with an empty recorded address is a test that did not fill
@@ -449,7 +454,7 @@ func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastGen string) bool 
 }
 
 func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
-	if w.Fetch == nil {
+	if w.Fetch == nil || w.stopped() {
 		return
 	}
 	now := w.Now()
@@ -514,11 +519,15 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	}
 	tried := 0
 	lastGenerated := ""
+	// lastRecorded is what active_server names: lastGenerated, unless the record
+	// of that config.json failed to save. The checks for a newer selection
+	// compare with it, or the walk's own unsaved write reads as someone else's.
+	lastRecorded := ""
 	for _, s := range order {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || w.stopped() {
 			return
 		}
-		generated, err := w.Generate(s, supersededGuard(started, lastGenerated))
+		generated, err := w.Generate(s, supersededGuard(started, lastRecorded))
 		if errors.Is(err, errSuperseded) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
@@ -530,6 +539,9 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			continue
 		}
 		lastGenerated = serverID(s)
+		if err == nil {
+			lastRecorded = lastGenerated
+		}
 		tried++
 		if ctx.Err() != nil {
 			return
@@ -546,7 +558,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			continue
 		}
 		slog.Info("Subscription server picked", "server", s.Name)
-		if w.walkSuperseded(started, lastGenerated) {
+		if w.walkSuperseded(started, lastRecorded) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
 		}
@@ -564,14 +576,20 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		}
 		return
 	}
+	if w.stopped() {
+		return
+	}
 	slog.Info("No live server in the subscription", "tried", tried)
-	if w.walkSuperseded(started, lastGenerated) {
+	if w.walkSuperseded(started, lastRecorded) {
 		slog.Info("Subscription walk abandoned; a newer server was selected")
 		return
 	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
-		if w.returnToPreferred(*preferred, supersededGuard(started, lastGenerated)) {
+		if w.returnToPreferred(*preferred, supersededGuard(started, lastRecorded)) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
+			return
+		}
+		if w.stopped() {
 			return
 		}
 	}
@@ -621,11 +639,34 @@ func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPND
 	return false
 }
 
+// errStopped is an apply the watch did not make, or the script skipped: VPN
+// Director was stopped, and the tick that sees it writes, applies and announces
+// nothing more.
+var errStopped = errors.New("VPN Director is stopped")
+
+// stopped reports the marker /stop leaves. A tick checks it first and again
+// after every wait - a probe, a restart, an apply queued for the lock - because
+// a stop that lands in between must not be undone by the rest of the tick.
+func (w *Watch) stopped() bool {
+	return w.Stopped != nil && w.Stopped()
+}
+
 func (w *Watch) apply() error {
 	if w.Apply == nil {
 		return nil
 	}
-	return w.Apply()
+	if w.stopped() {
+		return errStopped
+	}
+	if err := w.Apply(); err != nil {
+		return err
+	}
+	// Apply runs with --unless-stopped: the script skips it with exit 0 when a
+	// stop took the lock first, and the marker that stop left is how to tell.
+	if w.stopped() {
+		return errStopped
+	}
+	return nil
 }
 
 func (w *Watch) socksPort(cfg *vpnconfig.VPNDirectorConfig) int {
@@ -673,6 +714,9 @@ func (w *Watch) tproxyReady() bool {
 // TPROXY is confirmed. A SOCKS-only success with tproxy_apply soft-fail must
 // not strip kernel fallback routing.
 func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
+	if w.stopped() {
+		return false
+	}
 	if failoverTunnel(cfg) == "" {
 		if err := w.apply(); err != nil {
 			slog.Warn("Apply after picking an Xray server failed", "error", err)
@@ -764,6 +808,9 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 	}
 	w.lastFallbackFail = now
 	if err := w.apply(); err != nil {
+		if errors.Is(err, errStopped) {
+			return cfg
+		}
 		slog.Warn("Apply retry while the failover tunnel is not ready failed", "error", err)
 	} else if w.fallbackReady(cfg) {
 		return cfg

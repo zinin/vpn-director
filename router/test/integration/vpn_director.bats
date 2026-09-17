@@ -142,22 +142,72 @@ setup() {
     [ -f "$VPD_STOPPED_FILE" ]
 }
 
-@test "vpn-director: apply removes the stopped marker" {
-    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
-    printf '1\n' > "$VPD_STOPPED_FILE"
-    # The lock, the boot wait, the ipsets and both modules would touch the
-    # machine; the marker is all this test is about.
+# run_stubbed_cli <arguments...> runs the command the CLI parses from its
+# arguments with the lock, the boot wait and the ipsets stubbed. Each module call
+# that would change routing appends its name to $BATS_TEST_TMPDIR/calls instead.
+run_stubbed_cli() {
     run bash -c '
-        source "$1" --source-only
+        script=$1 calls=$2
+        shift 2
+        source "$script" --source-only "$@"
         _load_modules
         acquire_lock() { :; }
         _ipset_boot_wait() { :; }
         _ensure_ipsets() { :; }
-        tproxy_apply() { :; }
-        tunnel_apply() { :; }
-        cmd_apply
-    ' -- "$SCRIPTS_DIR/vpn-director.sh"
+        tproxy_restart_process() { echo tproxy_restart_process >> "$calls"; }
+        tproxy_stop() { echo tproxy_stop >> "$calls"; }
+        tunnel_stop() { echo tunnel_stop >> "$calls"; }
+        tproxy_apply() { echo tproxy_apply >> "$calls"; }
+        tunnel_apply() { echo tunnel_apply >> "$calls"; }
+        "cmd_$COMMAND"
+    ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" "$@"
+}
+
+@test "vpn-director: apply removes the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli apply
     assert_success
+    [ ! -e "$VPD_STOPPED_FILE" ]
+}
+
+# The subscription watch applies with --unless-stopped. A stop that took the lock
+# ahead of it - or finished while the watch was still probing - must survive: the
+# check runs under the lock, where the marker that stop left is visible.
+@test "vpn-director: apply --unless-stopped leaves a stopped router stopped" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli --unless-stopped apply
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+@test "vpn-director: apply --unless-stopped applies a running router" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    run_stubbed_cli --unless-stopped apply
+    assert_success
+    grep -qx tproxy_apply "$BATS_TEST_TMPDIR/calls"
+    grep -qx tunnel_apply "$BATS_TEST_TMPDIR/calls"
+}
+
+@test "vpn-director: restart xray --unless-stopped leaves a stopped router stopped" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli --unless-stopped restart xray
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# A full restart leaves the marker in its own stop half. Its apply half must not
+# take that for a stop someone else made.
+@test "vpn-director: restart --unless-stopped re-applies a running router" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    run_stubbed_cli --unless-stopped restart
+    assert_success
+    grep -qx tproxy_apply "$BATS_TEST_TMPDIR/calls"
+    grep -qx tunnel_apply "$BATS_TEST_TMPDIR/calls"
     [ ! -e "$VPD_STOPPED_FILE" ]
 }
 

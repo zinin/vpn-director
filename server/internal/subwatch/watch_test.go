@@ -16,6 +16,10 @@ import (
 var errProbe = errors.New("probe failed")
 var errApply = errors.New("apply failed")
 
+// errSaveConfig is Generate's error when config.json was written and only the
+// active_server record of it failed to save.
+var errSaveConfig = errors.New("save config: no space left on device")
+
 func contains(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
@@ -419,6 +423,177 @@ func TestTick_StoppedDoesNotApply(t *testing.T) {
 	}
 	if f.cfg.Xray.Failover != nil {
 		t.Fatal("must not stage after /stop")
+	}
+}
+
+// The watch applies with --unless-stopped, so a /stop that takes the lock first
+// makes the script skip the apply and exit 0. The marker it left is how the
+// watch can tell; nothing more in that tick may write, apply or announce.
+func TestTick_ApplySkippedByAStopEndsTheTick(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	stopped := false
+	w := f.watch()
+	w.Stopped = func() bool { return stopped }
+	w.Apply = func() error {
+		f.applies++
+		stopped = true
+		return nil
+	}
+	tickUntilDead(w, f)
+	if f.applies != 1 {
+		t.Fatalf("applies %d; nothing may follow the skipped apply", f.applies)
+	}
+	if !vpnconfig.FailoverStaged(f.cfg) {
+		t.Fatal("the move was committed after /stop")
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v after /stop", f.notes)
+	}
+}
+
+// A /stop that lands while the death tick is still probing: moving the clients
+// is a write the watch must no longer make.
+func TestTick_StopDuringTheDeathProbeStagesNothing(t *testing.T) {
+	f := &fake{
+		cfg:  baseCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	start := f.now
+	stopped := false
+	w := f.watch()
+	w.Stopped = func() bool { return stopped }
+	w.Probe = func(context.Context, int) error {
+		if f.now.Sub(start) >= DeadAfter {
+			stopped = true
+		}
+		return errProbe
+	}
+	tickUntilDead(w, f)
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v written after /stop", f.cfg.Xray.Failover)
+	}
+	if f.applies != 0 || len(f.notes) != 0 {
+		t.Fatalf("applies %d, notes %v after /stop", f.applies, f.notes)
+	}
+}
+
+// The same on the way back: a /stop during the probe that found the outbound
+// alive leaves the failover as it was.
+func TestTick_StopDuringTheRestoreProbeWritesNothing(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+	stopped := false
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.Probe = func(context.Context, int) error {
+		stopped = true
+		return nil
+	}
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover == nil || contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("restored after /stop: xray.clients %v, failover %+v", f.cfg.Xray.Clients, f.cfg.Xray.Failover)
+	}
+	if f.applies != 0 || len(f.notes) != 0 {
+		t.Fatalf("applies %d, notes %v after /stop", f.applies, f.notes)
+	}
+}
+
+// An unready fallback's retry apply is skipped by a /stop that got the lock
+// first; moving the failover to another exit is then a write after /stop.
+func TestTick_StopDoesNotRetargetAnUnreadyFallback(t *testing.T) {
+	cfg := baseCfg()
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.4"}}
+	vpnconfig.StageXrayClientsToTunnel(cfg, "ovpnc2")
+	f := &fake{
+		cfg: cfg,
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{
+			{ID: "ovpnc2", Iface: "tun12", Connected: true},
+			{ID: "wgc1", Iface: "wgc1", Connected: true},
+		}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	stopped := false
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.FallbackReady = func(string) bool { return false }
+	w.Tick(context.Background()) // not ready: the retry clock starts
+	f.now = f.now.Add(ImportRetry)
+	w.Apply = func() error {
+		f.applies++
+		stopped = true
+		return nil
+	}
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Fatalf("failover %+v; a stopped router was moved to another exit", f.cfg.Xray.Failover)
+	}
+}
+
+// A /stop can land anywhere in a walk that takes minutes. From then on the walk
+// generates, restarts and announces nothing.
+func TestTick_StopDuringTheWalkEndsItQuietly(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		stopAfter int // walk events before the stop lands
+	}{
+		{"while probing the first candidate", 4},
+		{"while probing the last candidate", 7},
+		{"while restarting onto the preferred server", 9},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+			f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+			stopped := false
+			var events []string
+			record := func(ev string) {
+				events = append(events, ev)
+				if len(events) == tc.stopAfter {
+					stopped = true
+				}
+			}
+			w := runningWatch(f.watch())
+			w.Stopped = func() bool { return stopped }
+			w.SaveServers = func([]vpnconfig.Server) error { return nil }
+			w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+				return []vpnconfig.Server{
+					{Name: "Oslo", Address: "oslo.example", Port: 443},
+					{Name: "Backup", Address: "backup.example", Port: 443},
+				}, nil
+			}
+			w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+				if err := f.checkGuard(guard); err != nil {
+					return false, err
+				}
+				record("generate " + s.Name)
+				f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+				return true, nil
+			}
+			w.RestartXray = func() error {
+				record("restart")
+				return nil
+			}
+			w.AfterRestart = func(time.Duration) {}
+			// Every server is dead: health probe, Oslo, Backup, then back to Oslo.
+			w.Probe = func(context.Context, int) error {
+				record("probe")
+				return errProbe
+			}
+
+			w.Tick(context.Background())
+
+			if len(events) != tc.stopAfter {
+				t.Fatalf("events %v; nothing may follow event %d, the stop", events, tc.stopAfter)
+			}
+			if len(f.notes) != 0 {
+				t.Fatalf("notes %v after /stop", f.notes)
+			}
+		})
 	}
 }
 
@@ -959,6 +1134,129 @@ func TestTick_NoLiveWalkDoesNotReturnOverASelectionMadeJustBeforeGenerate(t *tes
 	}
 	if restarts != 2 {
 		t.Fatalf("restarts %d, want one per walked server and none after the selection", restarts)
+	}
+}
+
+// Generate reports a written config.json whose active_server record failed to
+// save with generated=true and an error; the file still names the previous
+// server. That is the walk's own state, not a newer selection, so the walk goes
+// on to the next candidate.
+func TestTick_WalkContinuesPastACandidateWhoseRecordWasNotSaved(t *testing.T) {
+	f := &fake{
+		cfg:  failedOverCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Backup", Address: "backup.example", Port: 443},
+			{Name: "Extra", Address: "extra.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, err
+		}
+		generated = append(generated, s.Name)
+		if s.Name == "Backup" {
+			return true, errSaveConfig
+		}
+		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if len(generated) > 0 && generated[len(generated)-1] == "Extra" {
+			return nil
+		}
+		return errProbe
+	}
+
+	w.Tick(context.Background())
+
+	if !reflect.DeepEqual(generated, []string{"Backup", "Extra"}) {
+		t.Fatalf("generated %v; an unsaved record read as a newer selection", generated)
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("the live Extra must restore the clients")
+	}
+}
+
+// The same record failure on the candidate whose probe succeeds: the check
+// before the restore must not take the previous record for a newer selection.
+func TestTick_WalkRestoresOnACandidateWhoseRecordWasNotSaved(t *testing.T) {
+	f := &fake{
+		cfg:  failedOverCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Backup", Address: "backup.example", Port: 443}}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, err
+		}
+		generated = append(generated, s.Name)
+		return true, errSaveConfig
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if len(generated) == 0 {
+			return errProbe
+		}
+		return nil
+	}
+
+	w.Tick(context.Background())
+
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("generated %v; the live Backup must restore the clients", generated)
+	}
+}
+
+// All candidates dead, the last one's record unsaved: the walk still returns
+// config.json to the preferred server instead of abandoning over its own write.
+func TestTick_NoLiveWalkReturnsToPreferredAfterAnUnsavedRecord(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, err
+		}
+		generated = append(generated, s.Name)
+		if s.Name == "Backup" {
+			return true, errSaveConfig
+		}
+		f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background())
+
+	if !reflect.DeepEqual(generated, []string{"Oslo", "Backup", "Oslo"}) {
+		t.Fatalf("generated %v, want the walk and then the return to Oslo", generated)
 	}
 }
 

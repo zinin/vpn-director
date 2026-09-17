@@ -56,6 +56,7 @@ FORCE=0
 QUIET=0
 VERBOSE=0
 DRY_RUN=0
+UNLESS_STOPPED=0
 COMMAND=""
 COMPONENT=""
 
@@ -65,6 +66,7 @@ parse_option() {
         -q|--quiet)   QUIET=1; return 0 ;;
         -v|--verbose) VERBOSE=1; export DEBUG=1; return 0 ;;
         --dry-run)    DRY_RUN=1; return 0 ;;
+        --unless-stopped) UNLESS_STOPPED=1; return 0 ;;
         --wait)       export VPD_LOCK_WAIT=120; return 0 ;;
         --wait=*)
             local secs="${1#--wait=}"
@@ -119,12 +121,13 @@ Commands:
   cron install|remove         Schedule or drop the daily "update" job
 
 Options:
-  -f, --force    Force operation (ignore hash checks)
-  -q, --quiet    Minimal output
-  -v, --verbose  Debug output
-  --dry-run      Show what would be done
-  --wait[=SEC]   Wait up to SEC seconds (default 120) for a running instance instead of exiting
-  -h, --help     Show this help
+  -f, --force       Force operation (ignore hash checks)
+  -q, --quiet       Minimal output
+  -v, --verbose     Debug output
+  --dry-run         Show what would be done
+  --wait[=SEC]      Wait up to SEC seconds (default 120) for a running instance instead of exiting
+  --unless-stopped  Skip apply or restart if "stop" has run since (for automatic callers)
+  -h, --help        Show this help
 
 Examples:
   vpn-director status              # Show all status
@@ -169,6 +172,16 @@ _ensure_ipsets() {
         [[ -z $set ]] && continue
         ipset_ensure "$set" || return 1
     done
+}
+
+###################################################################################################
+# --unless-stopped is for automatic callers - the Telegram bot's subscription watch. Once stop has
+# left its marker, only an apply without it turns routing back on. The commands check right after
+# taking the lock, so an apply that queued behind that stop still sees the marker it left.
+###################################################################################################
+_skip_when_stopped() {
+    [[ $UNLESS_STOPPED -eq 1 && -e ${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped} ]] || return 1
+    log "VPN Director is stopped; skipping $1 (--unless-stopped)"
 }
 
 ###################################################################################################
@@ -227,6 +240,10 @@ cmd_apply() {
                 exit 1
                 ;;
         esac
+        return 0
+    fi
+
+    if _skip_when_stopped apply; then
         return 0
     fi
 
@@ -323,6 +340,12 @@ cmd_restart() {
     _load_common
     acquire_lock "vpn-director"
     _load_modules
+    if _skip_when_stopped restart; then
+        return 0
+    fi
+    # A full restart leaves the marker in its own stop half; the apply half must
+    # not take that for a stop someone else made.
+    UNLESS_STOPPED=0
     case "$COMPONENT" in
         ""|all)
             tproxy_restart_process

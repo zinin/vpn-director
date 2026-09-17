@@ -116,8 +116,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			LoadVPN:      configSvc.LoadVPNConfig,
 			LoadPlatform: vpnSvc.Platform,
 			UpdateVPN:    configSvc.UpdateVPNConfig,
-			Apply:        vpnSvc.Apply,
-			RestartXray:  vpnSvc.RestartXray,
+			Apply:        vpnSvc.ApplyUnlessStopped,
+			RestartXray:  vpnSvc.RestartXrayUnlessStopped,
 			SaveServers:  configSvc.SaveServers,
 			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
 				cfg, err := configSvc.LoadVPNConfig()

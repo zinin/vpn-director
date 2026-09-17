@@ -94,6 +94,18 @@ func (s *VPNDirectorService) RestartXray() error {
 	return s.runChecked(ApplyTimeout, "restart xray", "restart", "xray")
 }
 
+// ApplyUnlessStopped is Apply for an automatic caller, the subscription watch.
+// Under its lock the script skips it, exit 0 and the marker kept, when stop has
+// run since the last apply: a stop the watch queued behind stays in force.
+func (s *VPNDirectorService) ApplyUnlessStopped() error {
+	return s.runChecked(ApplyTimeout, "apply", "--unless-stopped", "apply")
+}
+
+// RestartXrayUnlessStopped is RestartXray for the same caller, skipped the same way.
+func (s *VPNDirectorService) RestartXrayUnlessStopped() error {
+	return s.runChecked(ApplyTimeout, "restart xray", "--unless-stopped", "restart", "xray")
+}
+
 // Stop stops VPN Director
 func (s *VPNDirectorService) Stop() error { return s.runChecked(ApplyTimeout, "stop", "stop") }
 

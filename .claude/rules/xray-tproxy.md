@@ -178,4 +178,6 @@ every rule went in, the platform's own included, and removes it on any soft-fail
 bot's subscription watch waits for it before Xray clients leave the fallback tunnel. A failed
 `platform_tproxy_extra_rules apply` (Keenetic's mangle INPUT accept) fails `_tproxy_setup_iptables`
 only after the PREROUTING jumps are in place, so interception stays as it was and only the marker
-is withheld.
+is withheld. The chain flush or a RETURN rule that does not go in (clients, bypass, the private
+ranges, an exclusion) ends it before the TPROXY targets instead, on a flushed chain that intercepts
+nothing: without those rules the targets would take every LAN client or LAN-to-LAN traffic.
