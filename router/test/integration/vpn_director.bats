@@ -130,6 +130,37 @@ setup() {
     assert_output --partial "tproxy ipsets"
 }
 
+# stop leaves a marker the Telegram bot's subscription watch honours, and apply
+# hands routing back to the watch by removing it. A dry run changes nothing, so
+# the watch must stay paused: otherwise it could apply a failover on a router
+# the user stopped.
+@test "vpn-director: apply --dry-run keeps the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run "$SCRIPTS_DIR/vpn-director.sh" apply --dry-run
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+}
+
+@test "vpn-director: apply removes the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    # The lock, the boot wait, the ipsets and both modules would touch the
+    # machine; the marker is all this test is about.
+    run bash -c '
+        source "$1" --source-only
+        _load_modules
+        acquire_lock() { :; }
+        _ipset_boot_wait() { :; }
+        _ensure_ipsets() { :; }
+        tproxy_apply() { :; }
+        tunnel_apply() { :; }
+        cmd_apply
+    ' -- "$SCRIPTS_DIR/vpn-director.sh"
+    assert_success
+    [ ! -e "$VPD_STOPPED_FILE" ]
+}
+
 # ============================================================================
 # Option parsing (both positions)
 # ============================================================================

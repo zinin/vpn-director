@@ -68,9 +68,10 @@ fi
 # Initialization flag
 _tproxy_initialized=0
 
-# Written only when TPROXY rules were actually installed. Soft-fail skips
-# (no module, missing ipsets, iptables setup) remove it so the watch does
-# not drop fallback membership on a SOCKS-only success.
+# Written only when TPROXY rules were actually installed, the platform's own
+# rules outside the chain included. Soft-fail skips (no module, missing
+# ipsets, iptables setup) remove it so the watch does not drop fallback
+# membership on a SOCKS-only success.
 XRAY_TPROXY_READY="${XRAY_TPROXY_READY:-/tmp/xray_tproxy/ready}"
 
 ###################################################################################################
@@ -521,9 +522,15 @@ _tproxy_setup_iptables() {
     # The status is ours to report: this function runs under "if !", which turns
     # errexit off for its whole body, and it ends in a log - so a failure here
     # would otherwise be an apply that says "successfully" while the firmware
-    # drops the proxied traffic.
-    platform_tproxy_extra_rules apply "$XRAY_FWMARK/$XRAY_FWMARK_MASK" ||
+    # drops the proxied traffic. It fails the function only after the jumps below,
+    # which still go in: a router without the subscription watch keeps the
+    # interception it had, and what changes is the ready marker tproxy_apply
+    # writes - the watch waits for it before Xray clients leave the fallback tunnel.
+    local extra_rc=0
+    if ! platform_tproxy_extra_rules apply "$XRAY_FWMARK/$XRAY_FWMARK_MASK"; then
         log -l WARN "Failed to apply platform TPROXY rules; proxied traffic may be dropped"
+        extra_rc=1
+    fi
 
     # Jump from PREROUTING to our chain for every LAN interface, each at its own
     # position (the first = before Tunnel Director). One shared position would
@@ -539,7 +546,7 @@ _tproxy_setup_iptables() {
         fi
         pos=$((pos + 1))
     done <<< "$lan_ifaces"
-    [[ $jump_rc -eq 0 ]] || return 1
+    [[ $jump_rc -eq 0 && $extra_rc -eq 0 ]] || return 1
 
     log "Applied TPROXY iptables rules"
 }

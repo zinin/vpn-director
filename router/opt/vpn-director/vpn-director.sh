@@ -205,7 +205,6 @@ cmd_apply() {
     _load_common
     acquire_lock "vpn-director"
     _load_modules
-    rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
 
     # Handle --dry-run: show plan without applying (skip boot wait and lock)
     if [[ $DRY_RUN -eq 1 ]]; then
@@ -230,6 +229,10 @@ cmd_apply() {
         esac
         return 0
     fi
+
+    # stop's marker pauses the Telegram bot's subscription watch, and an apply
+    # hands routing back to it - a real one only, so not above the dry run.
+    rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
 
     # Wait for network if system just booted (before any downloads)
     _ipset_boot_wait

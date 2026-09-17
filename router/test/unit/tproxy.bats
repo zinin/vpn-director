@@ -211,6 +211,19 @@ load '../test_helper'
     [ ! -e "$XRAY_TPROXY_READY" ]
 }
 
+# On Keenetic the platform's mangle INPUT accept is what lets proxied HTTPS past
+# _NDM_HTTP_INPUT_TLS_. The subscription watch reads ready as "Xray clients can
+# leave the fallback tunnel", so an apply without that rule must not publish it.
+@test "tproxy_apply: does not record ready when the platform cannot apply its extra rules" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    platform_tproxy_extra_rules() { return 1; }
+    run tproxy_apply
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
 @test "tproxy_apply: records ready when rules are installed" {
     load_tproxy_module
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
@@ -592,12 +605,16 @@ duplicate_last_rule() {
 # _tproxy_setup_iptables runs as "if ! _tproxy_setup_iptables", which turns
 # errexit off for its whole body, and its last command is a log - so a platform
 # that cannot install its own rules would otherwise be reported as a clean apply.
-@test "_tproxy_setup_iptables: warns when the platform cannot apply its extra rules" {
+# The jumps still go in: a router without the subscription watch keeps the
+# interception it had, and only the status - and so the ready marker - changes.
+@test "_tproxy_setup_iptables: fails after installing the jumps when the platform cannot apply its extra rules" {
     load_tproxy_module
     platform_tproxy_extra_rules() { return 1; }
+    : > /tmp/bats_iptables_calls.log
     run _tproxy_setup_iptables
-    assert_success
+    assert_failure
     assert_output --partial "Failed to apply platform TPROXY rules"
+    grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log
 }
 
 @test "_tproxy_teardown_iptables: removes platform extra rules with the configured mark" {
