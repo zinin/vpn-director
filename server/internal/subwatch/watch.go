@@ -417,7 +417,7 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 // server the walk did not put there.
 var errSuperseded = errors.New("a newer server was selected")
 
-func (w *Watch) walkSuperseded(started, lastRecorded string) bool {
+func (w *Watch) walkSuperseded(started, lastRecorded string, expectedSeq int) bool {
 	if w.LoadVPN == nil {
 		return false
 	}
@@ -425,15 +425,31 @@ func (w *Watch) walkSuperseded(started, lastRecorded string) bool {
 	if err != nil {
 		return false
 	}
-	return superseded(cfg, started, lastRecorded)
+	return superseded(cfg, started, lastRecorded, expectedSeq)
+}
+
+// observedSeq is the active_server counter after a record of the walk's own.
+// Production moves it on by one; read it back rather than assume, so a config
+// whose records do not carry the counter still walks. A selection committed in
+// the instant between the write and this read is adopted as the walk's own -
+// the same instant the identity comparison has always missed.
+func (w *Watch) observedSeq(fallback int) int {
+	if w.LoadVPN == nil {
+		return fallback
+	}
+	cfg, err := w.LoadVPN()
+	if err != nil {
+		return fallback
+	}
+	return vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 }
 
 // supersededGuard is the guard the walk hands Generate. It runs under the config
 // lock with the write, so a Web UI or /xray selection that commits after the
 // walk last read the config is refused instead of written over.
-func supersededGuard(started, lastRecorded string) func(*vpnconfig.VPNDirectorConfig) error {
+func supersededGuard(started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
 	return func(cfg *vpnconfig.VPNDirectorConfig) error {
-		if superseded(cfg, started, lastRecorded) {
+		if superseded(cfg, started, lastRecorded, expectedSeq) {
 			return errSuperseded
 		}
 		return nil
@@ -443,9 +459,16 @@ func supersededGuard(started, lastRecorded string) func(*vpnconfig.VPNDirectorCo
 // superseded reports whether cfg names a server the walk did not record: one
 // selected since the walk started (lastRecorded empty) or since the last
 // Generate whose record saved.
-func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string) bool {
+func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string, expectedSeq int) bool {
 	if cfg == nil {
 		return false
+	}
+	// Re-selecting the server that is already named changes nothing else, so
+	// the write counter is the only thing that reports it. Every record moves
+	// it on; a config whose records predate it keeps both sides at zero and
+	// leaves the decision to the identity below.
+	if vpnconfig.ActiveSeq(cfg.Xray.ActiveServer) != expectedSeq {
+		return true
 	}
 	cur := activeID(cfg.Xray.ActiveServer)
 	if lastRecorded == "" {
@@ -499,24 +522,18 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		w.notifyRefreshFailed(cfg)
 		return
 	}
-	if w.SaveServers != nil {
-		if err := w.SaveServers(servers); err != nil {
+	// servers.json and xray.servers are published together, under the config
+	// lock, so this wave cannot end up beside half of a Web UI or /import one.
+	if err := vpnconfig.PublishServers(w.UpdateVPN, w.SaveServers, servers, ""); err != nil {
+		if errors.Is(err, vpnconfig.ErrSaveServers) {
 			slog.Warn("Failed to save the refreshed subscription servers", "error", err)
-			w.notifyRefreshFailed(cfg)
-			return
+		} else {
+			slog.Warn("Failed to sync xray.servers after the subscription refresh", "error", err)
 		}
+		w.notifyRefreshFailed(cfg)
+		return
 	}
 	slog.Info("Subscription refreshed", "servers", len(servers))
-	if w.UpdateVPN != nil {
-		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-			current.Xray.Servers = vpnconfig.ServerIPs(servers)
-			return nil
-		}); err != nil {
-			slog.Warn("Failed to sync xray.servers after the subscription refresh", "error", err)
-			w.notifyRefreshFailed(cfg)
-			return
-		}
-	}
 	if w.Generate == nil {
 		return
 	}
@@ -526,6 +543,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		active = cfg.Xray.ActiveServer
 	}
 	started := activeID(active)
+	startedSeq := vpnconfig.ActiveSeq(active)
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
 	if socks == 0 {
 		socks = defaultSOCKSPort
@@ -541,11 +559,14 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	// of that config.json failed to save. The checks for a newer selection
 	// compare with it, or the walk's own unsaved write reads as someone else's.
 	lastRecorded := ""
+	// lastSeq is the counter of the walk's own last record, or the one it
+	// started from: any other value in the config is someone else's write.
+	lastSeq := startedSeq
 	for _, s := range order {
 		if ctx.Err() != nil || w.stopped() {
 			return
 		}
-		generated, err := w.Generate(s, supersededGuard(started, lastRecorded))
+		generated, err := w.Generate(s, supersededGuard(started, lastRecorded, lastSeq))
 		if errors.Is(err, errSuperseded) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
@@ -560,6 +581,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if err == nil {
 			lastRecorded = lastGenerated
 		}
+		lastSeq = w.observedSeq(lastSeq)
 		tried++
 		if ctx.Err() != nil {
 			return
@@ -576,7 +598,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			continue
 		}
 		slog.Info("Subscription server picked", "server", s.Name)
-		if w.walkSuperseded(started, lastRecorded) {
+		if w.walkSuperseded(started, lastRecorded, lastSeq) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
 		}
@@ -598,12 +620,12 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	slog.Info("No live server in the subscription", "tried", tried)
-	if w.walkSuperseded(started, lastRecorded) {
+	if w.walkSuperseded(started, lastRecorded, lastSeq) {
 		slog.Info("Subscription walk abandoned; a newer server was selected")
 		return
 	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
-		if w.returnToPreferred(*preferred, supersededGuard(started, lastRecorded)) {
+		if w.returnToPreferred(*preferred, supersededGuard(started, lastRecorded, lastSeq)) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
 		}

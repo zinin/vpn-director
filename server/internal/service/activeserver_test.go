@@ -13,16 +13,26 @@ import (
 // whether it is inside the locked section, which is how the test below can
 // tell where the generation ran.
 type stubStore struct {
-	cfg       *vpnconfig.VPNDirectorConfig
-	err       error // fails before the closure runs, as a load or lock failure does
-	saveErr   error // fails after it, as the save step does
-	inClosure bool
-	saved     bool
+	cfg              *vpnconfig.VPNDirectorConfig
+	err              error // fails before the closure runs, as a load or lock failure does
+	saveErr          error // fails after it, as the save step does
+	serversErr       error // fails the servers.json write
+	inClosure        bool
+	saved            bool
+	savedServers     []vpnconfig.Server
+	serversUnderLock bool
 }
 
 func (s *stubStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) { return s.cfg, nil }
 func (s *stubStore) LoadServers() ([]vpnconfig.Server, error)             { return nil, nil }
-func (s *stubStore) SaveServers([]vpnconfig.Server) error                 { return nil }
+func (s *stubStore) SaveServers(servers []vpnconfig.Server) error {
+	s.serversUnderLock = s.inClosure
+	if s.serversErr != nil {
+		return s.serversErr
+	}
+	s.savedServers = servers
+	return nil
+}
 func (s *stubStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	if s.err != nil {
 		return s.err
@@ -245,5 +255,23 @@ func TestGenerateAndRecordActiveServer_ReportsASaveFailureAsGenerated(t *testing
 	}
 	if err == nil {
 		t.Fatal("expected the save failure to come back, got nil")
+	}
+}
+
+// Every record moves the counter on, so a selection of the server already named
+// is still visible to a reader that remembers what it last saw.
+func TestGenerateAndRecordDialedServer_CountsTheWrite(t *testing.T) {
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4},
+	}}}
+	xray := &stubXray{store: store}
+	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
+
+	generated, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, nil)
+	if err != nil || !generated {
+		t.Fatalf("generated %v, err %v", generated, err)
+	}
+	if got := vpnconfig.ActiveSeq(store.cfg.Xray.ActiveServer); got != 5 {
+		t.Fatalf("Seq %d, want 5: re-selecting the same server is a new write", got)
 	}
 }

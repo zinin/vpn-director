@@ -310,32 +310,48 @@ _tproxy_teardown_routing() {
 # _tproxy_setup_clients_ipset - setup clients ipset
 # -------------------------------------------------------------------------------------------------
 # Always creates the ipset (even if empty) so iptables rules can reference it.
+#
+# Returns 1 when any effective client is missing from the set. The chain RETURNs
+# every source it does not list, so a missing client is not proxied at all, and
+# the watch drops its fallback tunnel on the ready marker tproxy_apply writes.
 # -------------------------------------------------------------------------------------------------
 _tproxy_setup_clients_ipset() {
     local ip
+    local rc=0
     local -a clients_array=()
 
     # Create ipset if not exists
     if ! ipset list "$XRAY_CLIENTS_IPSET" >/dev/null 2>&1; then
-        ipset create "$XRAY_CLIENTS_IPSET" hash:net
-        log "Created ipset: $XRAY_CLIENTS_IPSET"
+        if ipset create "$XRAY_CLIENTS_IPSET" hash:net; then
+            log "Created ipset: $XRAY_CLIENTS_IPSET"
+        else
+            log -l ERROR "Failed to create $XRAY_CLIENTS_IPSET"
+            return 1
+        fi
     fi
 
     # Flush and repopulate
-    ipset flush "$XRAY_CLIENTS_IPSET"
+    ipset flush "$XRAY_CLIENTS_IPSET" || {
+        log -l ERROR "Failed to flush $XRAY_CLIENTS_IPSET"
+        return 1
+    }
 
     # Handle empty XRAY_CLIENTS gracefully
     if [[ -n ${XRAY_CLIENTS:-} ]]; then
         read -ra clients_array <<< "$XRAY_CLIENTS"
         for ip in "${clients_array[@]}"; do
             [[ -n $ip ]] || continue
-            ipset add "$XRAY_CLIENTS_IPSET" "$ip" 2>/dev/null || {
+            # -exist: xray.clients is never validated, and a repeated address
+            # is the one failure that means nothing - the client is in the set.
+            ipset add -exist "$XRAY_CLIENTS_IPSET" "$ip" 2>/dev/null || {
                 log -l WARN "Failed to add $ip to $XRAY_CLIENTS_IPSET"
+                rc=1
             }
         done
     fi
 
     log "Populated $XRAY_CLIENTS_IPSET ipset (${#clients_array[@]} entries)"
+    return $rc
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -719,12 +735,25 @@ tproxy_apply() {
     fi
 
     _tproxy_setup_routing
-    _tproxy_setup_clients_ipset
+    local clients_ok=1
+    if ! _tproxy_setup_clients_ipset; then
+        clients_ok=0
+    fi
     _tproxy_setup_bypass_ipset
 
     # Soft-fail if iptables setup fails
     if ! _tproxy_setup_iptables; then
         log -l WARN "Failed to setup iptables rules; TPROXY may not be active"
+        rm -f "$XRAY_TPROXY_READY"
+        return 0
+    fi
+
+    # The watch reads the marker as "every Xray client is intercepted" and drops
+    # their fallback-tunnel membership on it. Rules that RETURN a client the
+    # ipset never took send it to the WAN instead, so an incomplete client set
+    # withholds the marker even though the chain itself is in place.
+    if [[ $clients_ok -eq 0 ]]; then
+        log -l WARN "Not every Xray client is in $XRAY_CLIENTS_IPSET; TPROXY readiness withheld"
         rm -f "$XRAY_TPROXY_READY"
         return 0
     fi

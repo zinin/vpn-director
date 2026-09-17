@@ -181,3 +181,7 @@ only after the PREROUTING jumps are in place, so interception stays as it was an
 is withheld. The chain flush or a RETURN rule that does not go in (clients, bypass, the private
 ranges, an exclusion) ends it before the TPROXY targets instead, on a flushed chain that intercepts
 nothing: without those rules the targets would take every LAN client or LAN-to-LAN traffic.
+`XRAY_CLIENTS` has to be complete too: nothing validates `xray.clients`, and an address the set
+does not take is RETURNed by rule 1 and left unproxied, so `_tproxy_setup_clients_ipset` reports it
+and the marker is withheld although the chain itself is in place. The adds pass `-exist`, so a
+repeated address is not a failure.

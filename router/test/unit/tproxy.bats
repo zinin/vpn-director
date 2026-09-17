@@ -224,6 +224,41 @@ load '../test_helper'
     [ ! -e "$XRAY_TPROXY_READY" ]
 }
 
+# The watch reads the marker as "every Xray client is intercepted" and drops
+# their fallback-tunnel membership on it. A client the ipset did not take is not
+# intercepted, and with the tunnel gone its traffic leaves through the WAN.
+@test "tproxy_apply: does not record ready when a client cannot be added to the ipset" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    ipset() {
+        if [[ $1 == add && $* == *"$XRAY_CLIENTS_IPSET"* ]]; then
+            return 1
+        fi
+        command ipset "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+# xray.clients is not validated anywhere, and a repeated address is the one add
+# failure that means nothing: the client is already in the set. The adds ask for
+# -exist, so a duplicate does not cost the whole LAN its marker.
+@test "tproxy_apply: records ready when a client is already in the ipset" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    ipset() {
+        if [[ $1 == add && $* != *-exist* ]]; then
+            return 1
+        fi
+        command ipset "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+}
+
 @test "tproxy_apply: records ready when rules are installed" {
     load_tproxy_module
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"

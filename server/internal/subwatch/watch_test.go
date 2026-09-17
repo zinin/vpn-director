@@ -1171,6 +1171,56 @@ func TestTick_WalkAbandonsWhenUserReselectsStartedServer(t *testing.T) {
 // but before Generate takes the config lock, is the one the walk cannot see from
 // outside that lock. Written over, it is gone: active_server then names the
 // walk's own server and no later look can tell.
+// Picking the server that is already running is the one selection whose name,
+// address and port are the ones the walk started from. Only the record's write
+// counter tells it from no selection at all, and the walk must still stand
+// down: the user asked for this server, not for the next candidate.
+func TestTick_WalkAbandonsWhenTheActiveServerIsSelectedAgain(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	running := &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4}
+	f.cfg.Xray.ActiveServer = running
+	generated, restarts := []string{}, 0
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		// The user re-selects the running server while the download is out.
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(running, vpnconfig.Server{
+			Name: "Oslo", Address: "oslo.example", Port: 443,
+		})
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, err
+		}
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		return true, nil
+	}
+	w.RestartXray = func() error {
+		restarts++
+		return nil
+	}
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background())
+
+	if len(generated) != 0 || restarts != 0 {
+		t.Fatalf("generated %v, restarts %d over a re-selection of the running server", generated, restarts)
+	}
+	if got := vpnconfig.ActiveSeq(f.cfg.Xray.ActiveServer); got != 5 {
+		t.Fatalf("active_server %+v, want the user's own write", f.cfg.Xray.ActiveServer)
+	}
+}
+
 func TestTick_WalkDoesNotOverwriteASelectionMadeJustBeforeGenerate(t *testing.T) {
 	f := &fake{
 		cfg:  failedOverCfg(),
@@ -2586,6 +2636,38 @@ func TestTick_ImportSyncsXrayServers(t *testing.T) {
 	}
 	if f.cfg.Xray.Failover == nil {
 		t.Fatal("Generate is nil; must stay failed over")
+	}
+}
+
+// The Web UI, /import and this wave all publish a list and the bypass IPs read
+// against it. Writing servers.json outside the config lock lets two waves
+// interleave into one file from each.
+func TestTick_ImportPublishesServersUnderTheConfigLock(t *testing.T) {
+	f := &fake{
+		cfg:      failedOverCfg(),
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	inUpdate := false
+	savedUnderLock := false
+	w := runningWatch(f.watch())
+	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		inUpdate = true
+		defer func() { inUpdate = false }()
+		return fn(f.cfg)
+	}
+	w.SaveServers = func([]vpnconfig.Server) error {
+		savedUnderLock = inUpdate
+		return nil
+	}
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10"}}}, nil
+	}
+
+	w.Tick(context.Background())
+
+	if !savedUnderLock {
+		t.Fatal("servers.json must be written inside the config update the watch takes the lock with")
 	}
 }
 

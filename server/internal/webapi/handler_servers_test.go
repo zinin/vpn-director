@@ -334,7 +334,7 @@ func TestSyncXrayServers_SaveError(t *testing.T) {
 		saveVPNCfgErr: errors.New("disk full"),
 	}
 
-	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
+	err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
 
 	if err == nil {
 		t.Fatal("expected error when saving config fails, got nil")
@@ -344,7 +344,7 @@ func TestSyncXrayServers_SaveError(t *testing.T) {
 func TestSyncXrayServers_LoadError(t *testing.T) {
 	mc := &mockConfig{err: errors.New("load failed")}
 
-	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
+	err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
 
 	if err == nil {
 		t.Fatal("expected error when LoadVPNConfig fails, got nil")
@@ -358,7 +358,7 @@ func TestSyncXrayServers_Success(t *testing.T) {
 		},
 	}
 
-	err := syncXrayServers(mc, []vpnconfig.Server{
+	err := service.PublishServers(mc, []vpnconfig.Server{
 		{IPs: []string{"2.2.2.2"}},
 		{IPs: []string{"1.1.1.1"}},
 	}, "")
@@ -382,7 +382,7 @@ func TestSyncXrayServers_MissingConfigIsSurfaced(t *testing.T) {
 	// caller must learn about rather than read as success.
 	mc := &mockConfig{cfg: nil}
 
-	err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
+	err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
 
 	if !errors.Is(err, service.ErrConfigLoad) {
 		t.Fatalf("expected a service.ErrConfigLoad failure when config is absent, got %v", err)
@@ -584,13 +584,13 @@ func TestResolveSubscriptionURL(t *testing.T) {
 
 func TestSyncXrayServers_WritesSubscriptionURL(t *testing.T) {
 	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
-	if err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "https://cdn.example/s/token"); err != nil {
+	if err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "https://cdn.example/s/token"); err != nil {
 		t.Fatal(err)
 	}
 	if mc.savedCfg.Xray.SubscriptionURL != "https://cdn.example/s/token" {
 		t.Fatalf("got %q", mc.savedCfg.Xray.SubscriptionURL)
 	}
-	if err := syncXrayServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, ""); err != nil {
+	if err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, ""); err != nil {
 		t.Fatal(err)
 	}
 	if mc.savedCfg.Xray.SubscriptionURL != "https://cdn.example/s/token" {

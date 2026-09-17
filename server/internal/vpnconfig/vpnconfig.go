@@ -96,6 +96,10 @@ type ActiveServer struct {
 	Name    string `json:"name"`
 	Address string `json:"address"`
 	Port    int    `json:"port"`
+	// Seq counts the writes of this record. Two selections of the very same
+	// server differ in nothing else, so it is what lets the subscription walk
+	// tell a choice made while it was busy from the one it started out with.
+	Seq int `json:"seq,omitempty"`
 }
 
 // NewActiveServer records the fields of s that identify it to a reader. The
@@ -103,6 +107,25 @@ type ActiveServer struct {
 // out over /api/config.
 func NewActiveServer(s Server) *ActiveServer {
 	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port}
+}
+
+// ActiveSeq is the write counter a carries, and zero for no record at all or
+// one written before the counter existed.
+func ActiveSeq(a *ActiveServer) int {
+	if a == nil {
+		return 0
+	}
+	return a.Seq
+}
+
+// RecordActiveServer names s as the running server, one write on from prev.
+// Every writer of active_server goes through here, so a reader that remembers
+// the counter can tell that something was written even when the name, address
+// and port it reads are the ones it saw before.
+func RecordActiveServer(prev *ActiveServer, s Server) *ActiveServer {
+	a := NewActiveServer(s)
+	a.Seq = ActiveSeq(prev) + 1
+	return a
 }
 
 // ClientInfo represents a VPN client with its route and pause status.

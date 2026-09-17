@@ -53,7 +53,10 @@ func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, genera
 			return err
 		}
 		generated = true
-		cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(identity)
+		// One write on from what the config named: a reader that remembers the
+		// counter can tell this write happened even when it names the server
+		// that was already there.
+		cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(cfg.Xray.ActiveServer, identity)
 		return nil
 	})
 	return generated, err

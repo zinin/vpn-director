@@ -110,24 +110,16 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Save servers (SaveServers creates directory if needed)
-	if err := h.deps.Config.SaveServers(result.Servers); err != nil {
+	// servers.json and the xray.servers bypass list go out together, under the
+	// config lock, so a Web UI import or the watch cannot leave one of ours
+	// beside one of theirs. A missing vpn-director.json is not an error here:
+	// /import works before the first configure, and the wizard writes
+	// xray.servers itself.
+	err = service.PublishServers(h.deps.Config, result.Servers, args)
+	if errors.Is(err, vpnconfig.ErrSaveServers) {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Save error: %v", err)))
 		return
 	}
-
-	serverIPs := vpnconfig.ServerIPs(result.Servers)
-
-	// Auto-sync xray.servers with IPs from all imported servers. A missing
-	// vpn-director.json is not an error here: /import works before the first
-	// configure, and the wizard writes xray.servers itself.
-	err = h.deps.Config.UpdateVPNConfig(func(vpnCfg *vpnconfig.VPNDirectorConfig) error {
-		vpnCfg.Xray.Servers = serverIPs
-		if args != "" {
-			vpnCfg.Xray.SubscriptionURL = args
-		}
-		return nil
-	})
 	if err != nil && !errors.Is(err, service.ErrConfigLoad) {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
 			fmt.Sprintf("Warning: servers imported but xray.servers sync failed: %v", err)))

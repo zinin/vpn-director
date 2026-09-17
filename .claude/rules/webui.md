@@ -90,8 +90,10 @@ written under the config lock and `vpn-director.sh apply` runs immediately
 after, as the bot does. The two server routes are the exception —
 `/api/servers/active` regenerates `config.json`, rewrites `xray.servers` under
 the lock and restarts Xray instead of applying, and `/api/servers/import` only
-writes `servers.json` and `xray.servers`. All of them serialize on
-`Deps.OpMutex`.
+writes `servers.json` and `xray.servers`, both inside one config-lock update
+(`vpnconfig.PublishServers`), because `SaveServers` takes no lock of its own and
+`Deps.OpMutex` does not reach the bot's `/import` or the subscription watch.
+All of them serialize on `Deps.OpMutex`.
 
 ## Authentication
 

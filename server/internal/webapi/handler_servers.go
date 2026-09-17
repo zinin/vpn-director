@@ -221,19 +221,22 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		}
 		defer unlock()
 
-		if err := deps.Config.SaveServers(result.Servers); err != nil {
-			jsonError(w, http.StatusInternalServerError, "failed to save servers")
-			return
-		}
-
-		// Sync xray.servers with all imported server IPs. Surface a persistence
-		// failure instead of returning 200 with a stale xray.servers on disk.
-		// servers.json is already saved here, so the message says so explicitly:
-		// the import partially persisted (servers stored, xray.servers stale) and
-		// the client must not read the 500 as "nothing changed".
-		if err := syncXrayServers(deps.Config, result.Servers, req.URL); err != nil {
-			jsonError(w, http.StatusInternalServerError,
-				fmt.Sprintf("servers saved, but xray.servers sync failed: %s", err))
+		// One publication under the config lock: servers.json and the
+		// xray.servers bypass list it is read against. Surface a persistence
+		// failure instead of returning 200 with a stale xray.servers on disk,
+		// and say which half landed - the client must not read a 500 that left
+		// servers.json published as "nothing changed", nor one that published
+		// nothing as "servers saved".
+		if err := service.PublishServers(deps.Config, result.Servers, req.URL); err != nil {
+			switch {
+			case errors.Is(err, vpnconfig.ErrSaveServers):
+				jsonError(w, http.StatusInternalServerError, "failed to save servers")
+			case errors.Is(err, service.ErrConfigLockTimeout):
+				jsonError(w, http.StatusInternalServerError, "config is busy, servers not saved")
+			default:
+				jsonError(w, http.StatusInternalServerError,
+					fmt.Sprintf("servers saved, but xray.servers sync failed: %s", err))
+			}
 			return
 		}
 
@@ -270,23 +273,6 @@ func resolveSubscriptionURL(reqURL string, cfg *vpnconfig.VPNDirectorConfig) (st
 		return cfg.Xray.SubscriptionURL, nil
 	}
 	return "", errors.New("url is required")
-}
-
-// syncXrayServers updates xray.servers with the IPs of all given servers under
-// the config lock. A non-empty subscriptionURL is written in the same update;
-// an empty one leaves a previously saved link in place so a re-import does not
-// clear it. The error is returned unwrapped: the only caller already prefixes
-// it with "xray.servers sync failed", and wrapping here produced
-// "servers saved, but xray.servers sync failed: sync xray.servers: ..." in the
-// user's face.
-func syncXrayServers(config service.ConfigStore, servers []vpnconfig.Server, subscriptionURL string) error {
-	return config.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
-		cfg.Xray.Servers = vpnconfig.ServerIPs(servers)
-		if subscriptionURL != "" {
-			cfg.Xray.SubscriptionURL = subscriptionURL
-		}
-		return nil
-	})
 }
 
 // noServersMessage explains an empty subscription. Up to three parse errors
