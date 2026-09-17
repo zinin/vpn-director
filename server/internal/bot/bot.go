@@ -119,14 +119,14 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Apply:        vpnSvc.Apply,
 			RestartXray:  vpnSvc.RestartXray,
 			SaveServers:  configSvc.SaveServers,
-			Generate: func(s vpnconfig.Server) (bool, error) {
+			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, error) {
 				cfg, err := configSvc.LoadVPNConfig()
 				if err != nil {
 					return false, err
 				}
 				ports := service.InboundPorts{}
 				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
-				return service.GenerateAndRecordDialedServer(configSvc, xraySvc, subwatch.ServerForDial(s), s, ports)
+				return service.GenerateAndRecordDialedServer(configSvc, xraySvc, subwatch.ServerForDial(s), s, ports, guard)
 			},
 			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
 				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)

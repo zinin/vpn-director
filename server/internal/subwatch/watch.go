@@ -54,7 +54,7 @@ type Watch struct {
 	Apply         func() error
 	RestartXray   func() error
 	SaveServers   func([]vpnconfig.Server) error
-	Generate      func(vpnconfig.Server) (generated bool, err error)
+	Generate      func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, err error)
 	Probe         func(ctx context.Context, socksPort int) error
 	Fetch         func(ctx context.Context, url string) ([]vpnconfig.Server, error)
 	Notify        func(msg string)
@@ -399,12 +399,37 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 	return cfg.Xray.Failover.Tunnel
 }
 
+// errSuperseded is a Generate its guard refused: xray.active_server names a
+// server the walk did not put there.
+var errSuperseded = errors.New("a newer server was selected")
+
 func (w *Watch) walkSuperseded(started, lastGen string) bool {
 	if w.LoadVPN == nil {
 		return false
 	}
 	cfg, err := w.LoadVPN()
-	if err != nil || cfg == nil {
+	if err != nil {
+		return false
+	}
+	return superseded(cfg, started, lastGen)
+}
+
+// supersededGuard is the guard the walk hands Generate. It runs under the config
+// lock with the write, so a Web UI or /xray selection that commits after the
+// walk last read the config is refused instead of written over.
+func supersededGuard(started, lastGen string) func(*vpnconfig.VPNDirectorConfig) error {
+	return func(cfg *vpnconfig.VPNDirectorConfig) error {
+		if superseded(cfg, started, lastGen) {
+			return errSuperseded
+		}
+		return nil
+	}
+}
+
+// superseded reports whether cfg names a server the walk did not generate: one
+// selected since the walk started (lastGen empty) or since its last Generate.
+func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastGen string) bool {
+	if cfg == nil {
 		return false
 	}
 	cur := activeID(cfg.Xray.ActiveServer)
@@ -493,11 +518,11 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if ctx.Err() != nil {
 			return
 		}
-		if w.walkSuperseded(started, lastGenerated) {
+		generated, err := w.Generate(s, supersededGuard(started, lastGenerated))
+		if errors.Is(err, errSuperseded) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
 		}
-		generated, err := w.Generate(s)
 		if err != nil || !generated {
 			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, "error", err)
 		}
@@ -545,7 +570,10 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
-		w.returnToPreferred(*preferred)
+		if w.returnToPreferred(*preferred, supersededGuard(started, lastGenerated)) {
+			slog.Info("Subscription walk abandoned; a newer server was selected")
+			return
+		}
 	}
 	if tried > 0 {
 		// Every tried server cost an Xray restart and a config write; on a large
@@ -569,23 +597,28 @@ func (w *Watch) importInterval() time.Duration {
 // nothing live. Generate records every server it writes as xray.active_server,
 // so without this the next wave would start from the last server tried rather
 // than the user's. No probe and no restore: the walk has just found it down.
-func (w *Watch) returnToPreferred(s vpnconfig.Server) {
-	generated, err := w.Generate(s)
+// abandoned means guard found a newer selection and nothing was written.
+func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (abandoned bool) {
+	generated, err := w.Generate(s, guard)
+	if errors.Is(err, errSuperseded) {
+		return true
+	}
 	if err != nil || !generated {
 		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
 	}
 	if !generated {
-		return
+		return false
 	}
 	if w.RestartXray != nil {
 		if err := w.RestartXray(); err != nil {
 			slog.Warn("Xray restart on the preferred server failed", "server", s.Name, "error", err)
-			return
+			return false
 		}
 	}
 	if err == nil {
 		slog.Info("Xray config returned to the preferred server", "server", s.Name)
 	}
+	return false
 }
 
 func (w *Watch) apply() error {

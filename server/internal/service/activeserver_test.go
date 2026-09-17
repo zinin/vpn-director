@@ -67,7 +67,7 @@ func TestGenerateAndRecordDialedServer_RecordsHostnameNotDialIP(t *testing.T) {
 	identity := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 	dial := vpnconfig.Server{Name: "Oslo", Address: "203.0.113.50", Port: 443, SNI: "oslo.example"}
 
-	generated, err := GenerateAndRecordDialedServer(store, xray, dial, identity, InboundPorts{TProxy: 12345, Socks: 12346})
+	generated, err := GenerateAndRecordDialedServer(store, xray, dial, identity, InboundPorts{TProxy: 12345, Socks: 12346}, nil)
 	if err != nil {
 		t.Fatalf("GenerateAndRecordDialedServer error: %v", err)
 	}
@@ -83,6 +83,59 @@ func TestGenerateAndRecordDialedServer_RecordsHostnameNotDialIP(t *testing.T) {
 	}
 	if got.Name != "Oslo" || got.Address != "oslo.example" || got.Port != 443 {
 		t.Errorf("recorded %+v, want the subscription hostname", *got)
+	}
+}
+
+// The subscription watch decides whether its walk still owns active_server.
+// Asked before the lock, a Web UI or /xray selection can commit in between and
+// be written over, so the guard has to see the config the lock protects.
+func TestGenerateAndRecordDialedServer_GuardRunsUnderTheConfigLock(t *testing.T) {
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{}}
+	xray := &stubXray{store: store}
+	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
+	ran, underLock := false, false
+
+	generated, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+		ran, underLock = true, store.inClosure
+		return nil
+	})
+
+	if err != nil || !generated {
+		t.Fatalf("generated = %v, error = %v; a passing guard must not stop the switch", generated, err)
+	}
+	if !ran {
+		t.Fatal("the guard never ran")
+	}
+	if !underLock {
+		t.Error("the guard ran outside the config lock; a concurrent selection can land after it")
+	}
+}
+
+func TestGenerateAndRecordDialedServer_GuardRefusalWritesNothing(t *testing.T) {
+	manual := &vpnconfig.ActiveServer{Name: "Manual", Address: "manual.example", Port: 443}
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{ActiveServer: manual}}}
+	xray := &stubXray{store: store}
+	refused := errors.New("a newer server was selected")
+	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
+
+	generated, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+		return refused
+	})
+
+	if generated {
+		t.Error("generated = true although the guard refused")
+	}
+	if !errors.Is(err, refused) {
+		t.Errorf("error = %v, want the guard's refusal", err)
+	}
+	if xray.called {
+		t.Error("config.json was generated although the guard refused")
+	}
+	if store.saved {
+		t.Error("the config was saved although the guard refused")
+	}
+	if store.cfg.Xray.ActiveServer != manual {
+		t.Errorf("active_server = %+v, want the selection the guard protected", store.cfg.Xray.ActiveServer)
 	}
 }
 

@@ -76,6 +76,20 @@ func FirstTDExit(cfg *VPNDirectorConfig, plat PlatformInfo) string {
 	return ids[0]
 }
 
+// FailoverTDExit is the exit the Xray clients are on while failed over: the
+// recorded failover tunnel while it is still an exit - the watch may have moved
+// them off the first one - and otherwise the first exit.
+func FailoverTDExit(cfg *VPNDirectorConfig, plat PlatformInfo) string {
+	ids := TDExits(cfg, plat)
+	if cfg != nil && cfg.Xray.Failover != nil && contains(ids, cfg.Xray.Failover.Tunnel) {
+		return cfg.Xray.Failover.Tunnel
+	}
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
+}
+
 // NextTDExit is the first connected tunnel that is not skip, so a staged
 // failover whose fallback never becomes ready can move to another exit.
 func NextTDExit(cfg *VPNDirectorConfig, plat PlatformInfo, skip string) string {

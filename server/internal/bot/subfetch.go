@@ -124,7 +124,9 @@ func subscriptionTunnel(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) 
 	if platErr != nil {
 		plat = vpnconfig.PlatformInfo{}
 	}
-	id := vpnconfig.FirstTDExit(cfg, plat)
+	// The tunnel the clients are on: after a retarget the first exit is the
+	// one the watch gave up on.
+	id := vpnconfig.FailoverTDExit(cfg, plat)
 	if id == "" {
 		return Path{}, nil
 	}

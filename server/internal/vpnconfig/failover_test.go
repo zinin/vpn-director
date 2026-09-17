@@ -47,6 +47,41 @@ func TestTDExits_MatchesPathManagerFilter(t *testing.T) {
 	}
 }
 
+func TestFailoverTDExit_PrefersTheRecordedFailoverTunnel(t *testing.T) {
+	both := PlatformInfo{Tunnels: []PlatformTunnel{
+		{ID: "ovpnc2", Iface: "tun12", Connected: true},
+		{ID: "wgc1", Iface: "wgc1", Connected: true},
+	}}
+	firstOnly := PlatformInfo{Tunnels: []PlatformTunnel{
+		{ID: "ovpnc2", Iface: "tun12", Connected: true},
+		{ID: "wgc1", Iface: "wgc1", Connected: false},
+	}}
+	tests := []struct {
+		name     string
+		failover *XrayFailover
+		plat     PlatformInfo
+		want     string
+	}{
+		{"moved to the second exit", &XrayFailover{Tunnel: "wgc1"}, both, "wgc1"},
+		{"recorded tunnel disconnected", &XrayFailover{Tunnel: "wgc1"}, firstOnly, "ovpnc2"},
+		{"recorded tunnel is not an exit", &XrayFailover{Tunnel: "ovpnc3"}, both, "ovpnc2"},
+		{"not failed over", nil, both, "ovpnc2"},
+		{"no exits", &XrayFailover{Tunnel: "wgc1"}, PlatformInfo{}, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := sample()
+			cfg.Xray.Failover = tt.failover
+			if got := FailoverTDExit(cfg, tt.plat); got != tt.want {
+				t.Fatalf("FailoverTDExit = %q, want %q", got, tt.want)
+			}
+		})
+	}
+	if got := FailoverTDExit(nil, both); got != "" {
+		t.Fatalf("FailoverTDExit(nil) = %q, want no exit", got)
+	}
+}
+
 func TestEffectiveXrayClients_DropsPaused(t *testing.T) {
 	got := EffectiveXrayClients(sample())
 	want := []string{"192.168.1.8", "192.168.1.3"}

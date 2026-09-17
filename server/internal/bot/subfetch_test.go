@@ -14,7 +14,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -115,6 +117,50 @@ func TestFetchSub_RejectsNonHTTPS(t *testing.T) {
 	}
 	if servers != nil {
 		t.Fatalf("servers %v", servers)
+	}
+}
+
+// configOnly and platformOnly answer the two calls subscriptionTunnel makes;
+// any other method hits the nil embedded interface.
+type configOnly struct {
+	service.ConfigStore
+	cfg *vpnconfig.VPNDirectorConfig
+}
+
+func (c configOnly) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) { return c.cfg, nil }
+
+type platformOnly struct {
+	service.VPNDirector
+	plat vpnconfig.PlatformInfo
+}
+
+func (p platformOnly) Platform() (vpnconfig.PlatformInfo, error) { return p.plat, nil }
+
+// The watch moves the clients off a first exit whose fallback never became
+// ready. A refresh through that first exit again goes through the tunnel the
+// watch has just given up on.
+func TestSubscriptionTunnel_DialsTheTunnelTheClientsWereMovedTo(t *testing.T) {
+	cfg := &vpnconfig.VPNDirectorConfig{
+		TunnelDirector: vpnconfig.TunnelDirectorConfig{Tunnels: map[string]vpnconfig.TunnelConfig{
+			"ovpnc2": {Clients: []string{"192.168.1.3"}},
+			"wgc1":   {Clients: []string{"192.168.1.4", "192.168.1.8"}},
+		}},
+		Xray: vpnconfig.XrayConfig{Failover: &vpnconfig.XrayFailover{
+			Tunnel: "wgc1", Clients: []string{"192.168.1.8"}, Added: []string{"192.168.1.8"},
+		}},
+	}
+	plat := vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "ovpnc2", Iface: "tun12", Connected: true},
+		{ID: "wgc1", Iface: "wgc1", Connected: true},
+	}}
+
+	p, client := subscriptionTunnel(configOnly{cfg: cfg}, platformOnly{plat: plat})
+
+	if client == nil {
+		t.Fatal("no tunnel client")
+	}
+	if p.id != "wgc1" || p.iface != "wgc1" {
+		t.Fatalf("path %s on %s, want wgc1, the tunnel the clients were moved to", p.id, p.iface)
 	}
 }
 

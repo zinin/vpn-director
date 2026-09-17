@@ -31,14 +31,24 @@ import (
 // failure here leaves a new config.json against a config that already lists
 // its address in the bypass set, rather than one that does not.
 func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnconfig.Server, ports InboundPorts) (generated bool, err error) {
-	return GenerateAndRecordDialedServer(store, xray, s, s, ports)
+	return GenerateAndRecordDialedServer(store, xray, s, s, ports, nil)
 }
 
 // GenerateAndRecordDialedServer writes config.json from generate (the watch
 // walk may have replaced Address with a resolved IPv4) and records identity
 // as active_server so the Web UI badge still matches servers.json.
-func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts) (generated bool, err error) {
+//
+// A non-nil guard runs first, under the same lock, on the config that lock
+// protects; its error writes nothing and comes back as is. The watch passes one
+// so a selection another daemon committed after the watch last read the config
+// is refused rather than written over.
+func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, err error) {
 	err = store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
+		if guard != nil {
+			if err := guard(cfg); err != nil {
+				return err
+			}
+		}
 		if err := xray.GenerateConfig(generate, ports); err != nil {
 			return err
 		}
