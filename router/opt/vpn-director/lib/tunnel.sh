@@ -192,6 +192,50 @@ _tunnel_failover_needed() {
     [[ -n $c ]]
 }
 
+# Prints "idx tunnel" for every tunnel that will get a slot. warnings and
+# skipped_unknown are tunnel_apply's locals (bash dynamic scope). One pass so
+# failover MARK slots cannot drift from the apply loop.
+_tunnel_collect_applied() {
+    local idx=0 tunnel tunnel_type clients_type clients slot
+    local tunnels
+    tunnels=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[]')
+    while IFS= read -r tunnel; do
+        [[ -n $tunnel ]] || continue
+        if ! _tunnel_table_allowed "$tunnel"; then
+            log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
+            warnings=1
+            skipped_unknown=1
+            continue
+        fi
+        tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
+        if [[ $tunnel_type != "object" ]]; then
+            log -l WARN "Tunnel '$tunnel' has invalid config (expected object, got $tunnel_type); skipping"
+            warnings=1
+            continue
+        fi
+        clients_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients | type')
+        if [[ $clients_type != "array" ]] && [[ $clients_type != "null" ]]; then
+            log -l WARN "Tunnel '$tunnel' has invalid clients (expected array, got $clients_type); skipping"
+            warnings=1
+            continue
+        fi
+        clients=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients // [] | .[]')
+        if [[ -z $clients ]]; then
+            log -l WARN "Tunnel '$tunnel' has no clients; skipping"
+            warnings=1
+            continue
+        fi
+        slot=$((idx + 1))
+        if [[ $slot -gt $_tunnel_mark_field_max ]]; then
+            log -l WARN "Too many tunnels (max $_tunnel_mark_field_max); skipping '$tunnel'"
+            warnings=1
+            continue
+        fi
+        printf '%s %s\n' "$idx" "$tunnel"
+        idx=$((idx + 1))
+    done <<< "$tunnels"
+}
+
 # One client's RETURN / offload / MARK in TUN_DIR. Offload sits immediately
 # before MARK with the same match so excluded destinations keep acceleration.
 # warnings and changes are tunnel_apply's locals (bash dynamic scope).
@@ -375,9 +419,14 @@ tunnel_apply() {
     fi
 
     # Compute config hash for change detection. Failover snapshot clients are
-    # extra MARK rules, not a key reorder, so they belong in the hash.
+    # extra MARK rules, not a key reorder, so they belong in the hash. With no
+    # failover, hash only the tunnels JSON so an upgrade does not rebuild TUN_DIR.
     local new_hash old_hash empty_hash
-    new_hash=$(printf '%s\n%s\n%s' "$TUN_DIR_TUNNELS_JSON" "${XRAY_FAILOVER_TUNNEL:-}" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
+    if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]]; then
+        new_hash=$(printf '%s\n%s\n%s' "$TUN_DIR_TUNNELS_JSON" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
+    else
+        new_hash=$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)
+    fi
     empty_hash=$(printf '' | compute_hash)
     old_hash=$(cat "$TUN_DIR_HASH" 2>/dev/null || printf '%s' "$empty_hash")
 
@@ -484,39 +533,21 @@ tunnel_apply() {
     # Process each tunnel
     local tunnel_idx=0
     local fo_applied=0 fo_route_ok=1 fo_rule_ok=1
-    local tables_tmp
+    local tables_tmp slots_tmp
     tables_tmp="$(tmp_file)"
-    local tunnels
-    # Use keys_unsorted to preserve JSON file order (not alphabetical sorting)
-    tunnels=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[]')
+    slots_tmp="$(tmp_file)"
+    _tunnel_collect_applied > "$slots_tmp"
 
     # Failover snapshot IPs get MARK first (first-match) with the failover
-    # tunnel's mark. Reordering the whole tunnel would pull its other clients
-    # ahead of earlier rules (main containing a host that a later CIDR also
-    # covers). Slot assignment here must match the apply loop below.
+    # tunnel's mark. Slots come from the same collect as the apply loop.
     local fo_mark="" fo_on_tunnel=""
     if [[ -n ${XRAY_FAILOVER_TUNNEL:-} && -n ${XRAY_FAILOVER_CLIENTS:-} ]]; then
-        local plan_idx=0 plan_t plan_type plan_clients_type plan_clients plan_slot
-        while IFS= read -r plan_t; do
-            [[ -n $plan_t ]] || continue
-            _tunnel_table_allowed "$plan_t" || continue
-            plan_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$plan_t" '.[$t] | type')
-            [[ $plan_type == object ]] || continue
-            plan_clients_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$plan_t" '.[$t].clients | type')
-            [[ $plan_clients_type == array || $plan_clients_type == null ]] || continue
-            plan_clients=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$plan_t" '.[$t].clients // [] | .[]')
-            [[ -n $plan_clients ]] || continue
-            plan_slot=$((plan_idx + 1))
-            if [[ $plan_slot -gt $_tunnel_mark_field_max ]]; then
-                break
-            fi
-            if [[ $plan_t == "$XRAY_FAILOVER_TUNNEL" ]]; then
-                fo_mark=$(printf '0x%x' $(( plan_slot << _tunnel_mark_shift_val )))
-                fo_on_tunnel=$plan_clients
-                break
-            fi
-            plan_idx=$((plan_idx + 1))
-        done <<< "$tunnels"
+        local fo_idx
+        fo_idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$slots_tmp")
+        if [[ -n $fo_idx ]]; then
+            fo_mark=$(printf '0x%x' $(( (fo_idx + 1) << _tunnel_mark_shift_val )))
+            fo_on_tunnel=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].clients // [] | .[]')
+        fi
     fi
     if [[ -n $fo_mark ]]; then
         local fo_excl_type fo_excludes="" fo_client
@@ -540,34 +571,8 @@ tunnel_apply() {
         done
     fi
 
-    while IFS= read -r tunnel; do
+    while read -r tunnel_idx tunnel; do
         [[ -n $tunnel ]] || continue
-
-        # Validate the tunnel is one the platform knows
-        if ! _tunnel_table_allowed "$tunnel"; then
-            log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
-            warnings=1
-            skipped_unknown=1
-            continue
-        fi
-
-        # Validate tunnel config is an object (not string or other type)
-        local tunnel_type
-        tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
-        if [[ $tunnel_type != "object" ]]; then
-            log -l WARN "Tunnel '$tunnel' has invalid config (expected object, got $tunnel_type); skipping"
-            warnings=1
-            continue
-        fi
-
-        # Validate clients is an array
-        local clients_type
-        clients_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients | type')
-        if [[ $clients_type != "array" ]] && [[ $clients_type != "null" ]]; then
-            log -l WARN "Tunnel '$tunnel' has invalid clients (expected array, got $clients_type); skipping"
-            warnings=1
-            continue
-        fi
 
         # Validate exclude is an array (if present)
         local exclude_type
@@ -587,19 +592,7 @@ tunnel_apply() {
             excludes=""
         fi
 
-        if [[ -z $clients ]]; then
-            log -l WARN "Tunnel '$tunnel' has no clients; skipping"
-            warnings=1
-            continue
-        fi
-
-        # Compute fwmark for this tunnel
         local slot=$((tunnel_idx + 1))
-        if [[ $slot -gt $_tunnel_mark_field_max ]]; then
-            log -l WARN "Too many tunnels (max $_tunnel_mark_field_max); skipping '$tunnel'"
-            warnings=1
-            continue
-        fi
 
         local mark_val=$(( slot << _tunnel_mark_shift_val ))
         local mark_hex
@@ -654,8 +647,7 @@ tunnel_apply() {
             [[ $route_ok -eq 1 ]] || fo_route_ok=0
             [[ $rule_ok -eq 1 ]] || fo_rule_ok=0
         fi
-        tunnel_idx=$((tunnel_idx + 1))
-    done <<< "$tunnels"
+    done < "$slots_tmp"
 
     # Jump from PREROUTING to TUN_DIR for traffic from every LAN interface, each
     # at its own position (base_pos, base_pos + 1, ...). One shared position

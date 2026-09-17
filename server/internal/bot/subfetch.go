@@ -20,34 +20,6 @@ import (
 
 const maxSubscriptionBody = 1 << 20
 
-func fetchSubscription(ctx context.Context, rawURL string, wan *http.Client, tunnel *http.Client) ([]byte, error) {
-	return fetchWANThenOptionalTunnel(ctx, rawURL, wan, func() *http.Client { return tunnel })
-}
-
-// fetchWANThenOptionalTunnel GETs via wan; on failure it builds the tunnel
-// client once and GETs through that only — it does not retry WAN.
-func fetchWANThenOptionalTunnel(ctx context.Context, rawURL string, wan *http.Client, tunnel func() *http.Client) ([]byte, error) {
-	body, err := getSubscription(ctx, wan, rawURL)
-	if err == nil {
-		return body, nil
-	}
-	// Even ssrf.ErrBlockedAddress falls back: a WAN resolver's private stub for a blocked domain is what the tunnel's own DNS gets around.
-	if tunnel == nil {
-		return nil, err
-	}
-	c := tunnel()
-	if c == nil {
-		return nil, err
-	}
-	// A *url.Error carries the whole subscription URL, token included.
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		err = ue.Err
-	}
-	slog.Debug("Subscription fetch over WAN failed, trying the tunnel", "error", err)
-	return getSubscription(ctx, c, rawURL)
-}
-
 func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([]byte, error) {
 	if client == nil {
 		return nil, fmt.Errorf("no http client")

@@ -530,13 +530,16 @@ _tproxy_setup_iptables() {
     # make every interface displace the one before it, so sync_fw_rule would
     # find each jump off its position and purge-and-re-insert all of them on
     # every apply - and each rewrite is a window with no jump for that interface.
-    local lan_if pos=1
+    local lan_if pos=1 jump_rc=0
     while IFS= read -r lan_if; do
         [[ -n $lan_if ]] || continue
-        sync_fw_rule -q mangle PREROUTING "-i $lan_if -j $XRAY_CHAIN\$" \
-            "-i $lan_if -j $XRAY_CHAIN" "$pos" || return 1
+        if ! sync_fw_rule -q mangle PREROUTING "-i $lan_if -j $XRAY_CHAIN\$" \
+            "-i $lan_if -j $XRAY_CHAIN" "$pos"; then
+            jump_rc=1
+        fi
         pos=$((pos + 1))
     done <<< "$lan_ifaces"
+    [[ $jump_rc -eq 0 ]] || return 1
 
     log "Applied TPROXY iptables rules"
 }

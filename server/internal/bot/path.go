@@ -27,6 +27,7 @@ const defaultMarkShift = 16
 const defaultTunnelTablesPath = "/tmp/tunnel_director/tun_dir_tables"
 const defaultFailoverReadyPath = "/tmp/tunnel_director/failover_ready"
 const defaultTproxyReadyPath = "/tmp/xray_tproxy/ready"
+const defaultStoppedPath = "/tmp/vpn-director/stopped"
 
 type Path struct {
 	kind      pathKind
@@ -135,6 +136,11 @@ func failoverTunnelReady(id string) bool {
 		return false
 	}
 	return strings.TrimSpace(string(b)) == id
+}
+
+func vpnDirectorStopped() bool {
+	_, err := os.Stat(defaultStoppedPath)
+	return err == nil
 }
 
 func tproxyRulesReady() bool {

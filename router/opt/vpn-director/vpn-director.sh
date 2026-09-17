@@ -205,6 +205,7 @@ cmd_apply() {
     _load_common
     acquire_lock "vpn-director"
     _load_modules
+    rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
 
     # Handle --dry-run: show plan without applying (skip boot wait and lock)
     if [[ $DRY_RUN -eq 1 ]]; then
@@ -305,6 +306,12 @@ cmd_stop() {
             exit 1
             ;;
     esac
+    case "$COMPONENT" in
+        ""|all)
+            mkdir -p "$(dirname "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}")"
+            printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
+            ;;
+    esac
 }
 
 cmd_restart() {
@@ -339,6 +346,7 @@ cmd_update() {
     _load_common
     acquire_lock "vpn-director"
     _load_modules
+    rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
 
     # Wait for network if system just booted (before any downloads)
     _ipset_boot_wait

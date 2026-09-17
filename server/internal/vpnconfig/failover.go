@@ -76,6 +76,17 @@ func FirstTDExit(cfg *VPNDirectorConfig, plat PlatformInfo) string {
 	return ids[0]
 }
 
+// NextTDExit is the first connected tunnel that is not skip, so a staged
+// failover whose fallback never becomes ready can move to another exit.
+func NextTDExit(cfg *VPNDirectorConfig, plat PlatformInfo, skip string) string {
+	for _, id := range TDExits(cfg, plat) {
+		if id != skip {
+			return id
+		}
+	}
+	return ""
+}
+
 func contains(list []string, s string) bool {
 	for _, v := range list {
 		if v == s {
@@ -284,29 +295,4 @@ func EnsureFailoverStaged(cfg *VPNDirectorConfig) {
 			cfg.Xray.Clients = append(cfg.Xray.Clients, ip)
 		}
 	}
-}
-
-// RestageFailover puts fo.Clients on the tunnel and records failover without
-// dropping them from xray.clients. Used when TPROXY is not intercepting LAN
-// after a staged restore, so the fallback still has them.
-func RestageFailover(cfg *VPNDirectorConfig, fo *XrayFailover) {
-	if cfg == nil || fo == nil || fo.Tunnel == "" {
-		return
-	}
-	tun, ok := cfg.TunnelDirector.Tunnels[fo.Tunnel]
-	if !ok {
-		return
-	}
-	clients := make([]string, 0, len(fo.Clients))
-	for _, ip := range fo.Clients {
-		if ip == "" {
-			continue
-		}
-		clients = append(clients, ip)
-		if !contains(tun.Clients, ip) {
-			tun.Clients = append(tun.Clients, ip)
-		}
-	}
-	cfg.TunnelDirector.Tunnels[fo.Tunnel] = tun
-	cfg.Xray.Failover = &XrayFailover{Tunnel: fo.Tunnel, Clients: clients, Added: fo.Added}
 }

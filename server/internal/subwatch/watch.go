@@ -24,14 +24,15 @@ const (
 )
 
 const (
-	msgMoved           = "Xray outbound is down; LAN clients moved to %s"
-	msgNoTunnel        = "Xray outbound is down; no Tunnel Director fallback"
-	msgRefreshFailed   = "Subscription refresh failed"
-	msgRefreshFailedOn = "Subscription refresh failed; still on tunnel:%s"
-	msgNoLive          = "No live server in the subscription"
-	msgNoLiveOn        = "No live server in the subscription; still on tunnel:%s"
-	msgRestored        = "LAN clients back on Xray; server %s"
-	msgPicked          = "Subscription refreshed; selected server %s"
+	msgMoved            = "Xray outbound is down; LAN clients moved to %s"
+	msgNoTunnel         = "Xray outbound is down; no Tunnel Director fallback"
+	msgFallbackNotReady = "Xray outbound is down; Tunnel Director fallback is not ready"
+	msgRefreshFailed    = "Subscription refresh failed"
+	msgRefreshFailedOn  = "Subscription refresh failed; still on tunnel:%s"
+	msgNoLive           = "No live server in the subscription"
+	msgNoLiveOn         = "No live server in the subscription; still on tunnel:%s"
+	msgRestored         = "LAN clients back on Xray; server %s"
+	msgPicked           = "Subscription refreshed; selected server %s"
 )
 
 type noteKind int
@@ -40,6 +41,7 @@ const (
 	noteNone noteKind = iota
 	noteMoved
 	noteNoTunnel
+	noteFallbackNotReady
 	noteRefreshFailed
 	noteNoLive
 	noteRestored
@@ -60,6 +62,7 @@ type Watch struct {
 	AfterRestart  func(time.Duration)
 	FallbackReady func(tunnel string) bool // nil => ready; false keeps Xray membership
 	TPROXYReady   func() bool              // nil => ready; false keeps fallback membership after restore
+	Stopped       func() bool              // nil => not stopped; true skips apply/restart after /stop
 
 	mu                   sync.Mutex
 	failSince            time.Time // zero => last probe succeeded
@@ -72,6 +75,7 @@ type Watch struct {
 	reconciled           bool          // the first armed Tick has checked for a failover left by an earlier process
 	lastNoTunnelCheck    time.Time     // last LoadPlatform while announcing no fallback
 	lastTPROXYFail       time.Time     // last apply that found TPROXY not intercepting
+	lastFallbackFail     time.Time     // last staged apply whose fallback was not ready
 	running              bool
 }
 
@@ -119,6 +123,9 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.failSince = time.Time{}
 		return
 	}
+	if w.Stopped != nil && w.Stopped() {
+		return
+	}
 	if !w.reconciled {
 		w.reconciled = true
 		// The move is written before Apply, and a process that stopped in
@@ -161,6 +168,10 @@ func (w *Watch) Tick(ctx context.Context) {
 				w.notify(noteMoved, fmt.Sprintf(msgMoved, "tunnel:"+id))
 			}
 		}
+		if !ok && staged && !w.pendingApply {
+			w.notify(noteFallbackNotReady, msgFallbackNotReady)
+			cfg = w.retryOrSwitchFallback(ctx, cfg)
+		}
 		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
@@ -170,21 +181,23 @@ func (w *Watch) Tick(ctx context.Context) {
 		// through the tunnel.
 		if err := w.apply(); err != nil {
 			slog.Warn("Apply retry after restoring Xray clients failed", "error", err)
-			return
-		}
-		w.pendingApply = false
-		notifyRestore := w.pendingRestoreNotify
-		w.pendingRestoreNotify = false
-		w.failSince = time.Time{}
-		w.lastImport = time.Time{}
-		w.importRetry = 0
-		if notifyRestore {
-			name := "unknown"
-			if cfg.Xray.ActiveServer != nil {
-				name = cfg.Xray.ActiveServer.Name
+			// Keep probing: a dead outbound during a stuck restore-Apply
+			// must still be able to fail over again.
+		} else {
+			w.pendingApply = false
+			notifyRestore := w.pendingRestoreNotify
+			w.pendingRestoreNotify = false
+			w.failSince = time.Time{}
+			w.lastImport = time.Time{}
+			w.importRetry = 0
+			if notifyRestore {
+				name := "unknown"
+				if cfg.Xray.ActiveServer != nil {
+					name = cfg.Xray.ActiveServer.Name
+				}
+				slog.Info("Xray clients restored", "server", name)
+				w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
 			}
-			slog.Info("Xray clients restored", "server", name)
-			w.notify(noteRestored, fmt.Sprintf(msgRestored, name))
 		}
 	}
 
@@ -221,15 +234,21 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 
 	var plat vpnconfig.PlatformInfo
+	platErr := false
 	if w.LoadPlatform != nil {
 		if p, err := w.LoadPlatform(); err != nil {
 			slog.Warn("Failed to read platform info for the Xray failover", "error", err)
+			platErr = true
 		} else {
 			plat = p
 		}
 	}
 	id := vpnconfig.FirstTDExit(cfg, plat)
 	if id == "" {
+		if platErr {
+			w.maybeImportAndPick(ctx, cfg)
+			return
+		}
 		w.lastNoTunnelCheck = now
 		if announce {
 			slog.Info("No Tunnel Director fallback for Xray clients")
@@ -269,6 +288,10 @@ func (w *Watch) Tick(ctx context.Context) {
 	var ok bool
 	cfg, ok = w.applyFailover(cfg)
 	if !ok {
+		if !w.pendingApply {
+			w.notify(noteFallbackNotReady, msgFallbackNotReady)
+			cfg = w.retryOrSwitchFallback(ctx, cfg)
+		}
 		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
@@ -317,14 +340,38 @@ func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPND
 	return cfg, true
 }
 
-func pickOrder(servers []vpnconfig.Server, activeName string) []vpnconfig.Server {
-	if activeName == "" {
+func sameServer(s vpnconfig.Server, a *vpnconfig.ActiveServer) bool {
+	if a == nil || s.Name != a.Name {
+		return false
+	}
+	if a.Address == "" && a.Port == 0 {
+		return true
+	}
+	return s.Address == a.Address && s.Port == a.Port
+}
+
+func activeID(a *vpnconfig.ActiveServer) string {
+	if a == nil {
+		return ""
+	}
+	if a.Address == "" && a.Port == 0 {
+		return a.Name
+	}
+	return a.Name + "\x1f" + a.Address + "\x1f" + strconv.Itoa(a.Port)
+}
+
+func serverID(s vpnconfig.Server) string {
+	return s.Name + "\x1f" + s.Address + "\x1f" + strconv.Itoa(s.Port)
+}
+
+func pickOrder(servers []vpnconfig.Server, active *vpnconfig.ActiveServer) []vpnconfig.Server {
+	if active == nil || active.Name == "" {
 		return servers
 	}
 	var first, rest []vpnconfig.Server
 	seen := false
 	for _, s := range servers {
-		if !seen && s.Name == activeName {
+		if !seen && sameServer(s, active) {
 			first = append(first, s)
 			seen = true
 			continue
@@ -360,18 +407,19 @@ func (w *Watch) walkSuperseded(started, lastGen string) bool {
 	if err != nil || cfg == nil {
 		return false
 	}
-	cur := ""
-	if cfg.Xray.ActiveServer != nil {
-		cur = cfg.Xray.ActiveServer.Name
-	}
+	cur := activeID(cfg.Xray.ActiveServer)
 	if lastGen == "" {
 		return cur != "" && cur != started
 	}
 	if cur == "" || cur == lastGen {
 		return false
 	}
-	// Production Generate records each candidate. A current name that is not
-	// lastGen is a newer Select, including a re-selection of started.
+	// Same name with an empty recorded address is a test that did not fill
+	// ActiveServer. A real Select of another host with the same name has
+	// an address and is a newer selection, including re-selecting started.
+	if cfg.Xray.ActiveServer != nil && cfg.Xray.ActiveServer.Address == "" && cfg.Xray.ActiveServer.Port == 0 {
+		return false
+	}
 	return true
 }
 
@@ -425,23 +473,27 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 
-	activeName := ""
-	if cfg != nil && cfg.Xray.ActiveServer != nil {
-		activeName = cfg.Xray.ActiveServer.Name
+	var active *vpnconfig.ActiveServer
+	if cfg != nil {
+		active = cfg.Xray.ActiveServer
 	}
+	started := activeID(active)
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
 	if socks == 0 {
 		socks = defaultSOCKSPort
 	}
-	order := pickOrder(servers, activeName)
+	order := pickOrder(servers, active)
 	var preferred *vpnconfig.Server
-	if activeName != "" && len(order) > 0 && order[0].Name == activeName {
+	if active != nil && len(order) > 0 && sameServer(order[0], active) {
 		preferred = &order[0]
 	}
 	tried := 0
 	lastGenerated := ""
 	for _, s := range order {
-		if w.walkSuperseded(activeName, lastGenerated) {
+		if ctx.Err() != nil {
+			return
+		}
+		if w.walkSuperseded(started, lastGenerated) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
 		}
@@ -452,8 +504,11 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if !generated {
 			continue
 		}
-		lastGenerated = s.Name
+		lastGenerated = serverID(s)
 		tried++
+		if ctx.Err() != nil {
+			return
+		}
 		if w.RestartXray != nil {
 			if err := w.RestartXray(); err != nil {
 				slog.Debug("Xray restart failed", "server", s.Name, "error", err)
@@ -466,7 +521,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			continue
 		}
 		slog.Info("Subscription server picked", "server", s.Name)
-		if w.walkSuperseded(activeName, lastGenerated) {
+		if w.walkSuperseded(started, lastGenerated) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
 		}
@@ -485,11 +540,11 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	slog.Info("No live server in the subscription", "tried", tried)
-	if w.walkSuperseded(activeName, lastGenerated) {
+	if w.walkSuperseded(started, lastGenerated) {
 		slog.Info("Subscription walk abandoned; a newer server was selected")
 		return
 	}
-	if preferred != nil && lastGenerated != "" && lastGenerated != activeName {
+	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
 		w.returnToPreferred(*preferred)
 	}
 	if tried > 0 {
@@ -645,20 +700,70 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	return true
 }
 
+func committedFailover(cfg *vpnconfig.VPNDirectorConfig) bool {
+	return cfg != nil && cfg.Xray.Failover != nil && !vpnconfig.FailoverStaged(cfg)
+}
+
 func (w *Watch) notifyRefreshFailed(cfg *vpnconfig.VPNDirectorConfig) {
-	if id := failoverTunnel(cfg); id != "" {
-		w.notify(noteRefreshFailed, fmt.Sprintf(msgRefreshFailedOn, id))
+	if committedFailover(cfg) {
+		w.notify(noteRefreshFailed, fmt.Sprintf(msgRefreshFailedOn, failoverTunnel(cfg)))
 		return
 	}
 	w.notify(noteRefreshFailed, msgRefreshFailed)
 }
 
 func (w *Watch) notifyNoLive(cfg *vpnconfig.VPNDirectorConfig) {
-	if id := failoverTunnel(cfg); id != "" {
-		w.notify(noteNoLive, fmt.Sprintf(msgNoLiveOn, id))
+	if committedFailover(cfg) {
+		w.notify(noteNoLive, fmt.Sprintf(msgNoLiveOn, failoverTunnel(cfg)))
 		return
 	}
 	w.notify(noteNoLive, msgNoLive)
+}
+
+func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDirectorConfig {
+	now := w.Now()
+	if w.lastFallbackFail.IsZero() {
+		w.lastFallbackFail = now
+		return cfg
+	}
+	if now.Sub(w.lastFallbackFail) < ImportRetry {
+		return cfg
+	}
+	w.lastFallbackFail = now
+	if err := w.apply(); err != nil {
+		slog.Warn("Apply retry while the failover tunnel is not ready failed", "error", err)
+	} else if w.fallbackReady(cfg) {
+		return cfg
+	}
+	skip := failoverTunnel(cfg)
+	var plat vpnconfig.PlatformInfo
+	if w.LoadPlatform != nil {
+		if p, err := w.LoadPlatform(); err != nil {
+			return cfg
+		} else {
+			plat = p
+		}
+	}
+	next := vpnconfig.NextTDExit(cfg, plat, skip)
+	if next == "" || w.UpdateVPN == nil {
+		return cfg
+	}
+	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+		vpnconfig.RestoreXrayClientsFromFailover(current)
+		vpnconfig.StageXrayClientsToTunnel(current, next)
+		return nil
+	}); err != nil {
+		slog.Warn("Failed to retarget the Xray failover", "from", skip, "to", next, "error", err)
+		return cfg
+	}
+	if err := w.apply(); err != nil {
+		slog.Warn("Apply after retargeting the Xray failover failed", "tunnel", next, "error", err)
+		w.pendingApply = true
+	}
+	if reloaded, err := w.LoadVPN(); err == nil {
+		return reloaded
+	}
+	return cfg
 }
 
 func (w *Watch) applyDefaults() {
@@ -688,7 +793,7 @@ func (w *Watch) notify(kind noteKind, msg string) {
 		// or no-tunnel message is news even without a healthy probe between.
 		w.lastRouteKind = noteNone
 	}
-	route := kind == noteMoved || kind == noteNoTunnel
+	route := kind == noteMoved || kind == noteNoTunnel || kind == noteFallbackNotReady
 	last := &w.lastImportKind
 	if route {
 		last = &w.lastRouteKind
@@ -696,11 +801,22 @@ func (w *Watch) notify(kind noteKind, msg string) {
 	if *last == kind {
 		return
 	}
+	n := w.Notify
+	if n == nil {
+		*last = kind
+		if route {
+			w.lastImportKind = noteNone
+		}
+		return
+	}
+	w.mu.Unlock()
+	n(msg)
+	w.mu.Lock()
+	if *last == kind {
+		return
+	}
 	*last = kind
 	if route {
 		w.lastImportKind = noteNone
-	}
-	if w.Notify != nil {
-		w.Notify(msg)
 	}
 }

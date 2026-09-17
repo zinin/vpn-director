@@ -41,166 +41,48 @@ func hostClient(srv *httptest.Server) *http.Client {
 	}
 }
 
-func TestFetchSubscription_WANSuccess(t *testing.T) {
-	var wanHits, tunHits int
+func TestGetSubscription_WANSuccess(t *testing.T) {
 	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		wanHits++
 		_, _ = io.WriteString(w, "wan-body")
 	}))
 	t.Cleanup(wan.Close)
-	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tunHits++
-		_, _ = io.WriteString(w, "tun-body")
-	}))
-	t.Cleanup(tun.Close)
 
-	body, err := fetchSubscription(context.Background(), wan.URL, hostClient(wan), hostClient(tun))
+	body, err := getSubscription(context.Background(), hostClient(wan), wan.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if string(body) != "wan-body" {
 		t.Fatalf("body %q, want wan-body", body)
 	}
-	if wanHits != 1 {
-		t.Fatalf("wan hits %d, want 1", wanHits)
-	}
-	if tunHits != 0 {
-		t.Fatalf("tunnel must not run after a WAN success; hits %d", tunHits)
-	}
 }
 
-func TestFetchSubscription_WANErrorNilTunnel(t *testing.T) {
-	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "wan-down", http.StatusBadGateway)
-	}))
-	t.Cleanup(wan.Close)
-
-	body, err := fetchSubscription(context.Background(), wan.URL, hostClient(wan), nil)
-	if err == nil {
-		t.Fatal("expected WAN error")
-	}
-	if body != nil {
-		t.Fatalf("non-200 must not return a body, got %q", body)
-	}
-}
-
-func TestFetchSubscription_WANErrorTunnelSuccess(t *testing.T) {
-	var wanHits, tunHits int
-	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		wanHits++
-		http.Error(w, "wan-down", http.StatusBadGateway)
-	}))
-	t.Cleanup(wan.Close)
-	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tunHits++
-		_, _ = io.WriteString(w, "tun-body")
-	}))
-	t.Cleanup(tun.Close)
-
-	body, err := fetchSubscription(context.Background(), "http://subscription.example/list", hostClient(wan), hostClient(tun))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "tun-body" {
-		t.Fatalf("body %q, want tun-body", body)
-	}
-	if wanHits != 1 {
-		t.Fatalf("WAN hits %d, want 1", wanHits)
-	}
-	if tunHits != 1 {
-		t.Fatalf("tunnel hits %d, want 1", tunHits)
-	}
-}
-
-func TestFetchWANThenOptionalTunnel_DoesNotRetryWAN(t *testing.T) {
-	var wanHits, tunHits, factoryCalls int
-	wanErr := errors.New("wan down")
-	wan := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-		wanHits++
-		return nil, wanErr
-	})}
-	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		tunHits++
-		_, _ = io.WriteString(w, "tun-body")
-	}))
-	t.Cleanup(tun.Close)
-
-	body, err := fetchWANThenOptionalTunnel(context.Background(), "http://subscription.example/list", wan, func() *http.Client {
-		factoryCalls++
-		return hostClient(tun)
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "tun-body" {
-		t.Fatalf("body %q, want tun-body", body)
-	}
-	if wanHits != 1 {
-		t.Fatalf("WAN hits %d; after WAN fails must not retry WAN", wanHits)
-	}
-	if factoryCalls != 1 {
-		t.Fatalf("tunnel factory %d, want 1", factoryCalls)
-	}
-	if tunHits != 1 {
-		t.Fatalf("tunnel hits %d, want 1", tunHits)
-	}
-}
-
-func TestFetchWANThenOptionalTunnel_SuccessSkipsTunnelFactory(t *testing.T) {
-	var factoryCalls int
-	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, "wan-body")
-	}))
-	t.Cleanup(wan.Close)
-
-	body, err := fetchWANThenOptionalTunnel(context.Background(), wan.URL, hostClient(wan), func() *http.Client {
-		factoryCalls++
-		t.Error("tunnel factory must not run after a WAN success")
-		return nil
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(body) != "wan-body" {
-		t.Fatalf("body %q", body)
-	}
-	if factoryCalls != 0 {
-		t.Fatalf("factory calls %d", factoryCalls)
-	}
-}
-
-func TestFetchSubscription_Non200DoesNotReturnBody(t *testing.T) {
+func TestGetSubscription_Non200DoesNotReturnBody(t *testing.T) {
 	payload := "not-a-subscription"
 	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		_, _ = io.WriteString(w, payload)
 	}))
 	t.Cleanup(wan.Close)
-	tun := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusForbidden)
-		_, _ = io.WriteString(w, payload)
-	}))
-	t.Cleanup(tun.Close)
 
-	body, err := fetchSubscription(context.Background(), "http://subscription.example/list", hostClient(wan), hostClient(tun))
+	body, err := getSubscription(context.Background(), hostClient(wan), wan.URL)
 	if err == nil {
 		t.Fatal("expected error on HTTP non-200")
 	}
 	if body != nil {
 		t.Fatalf("non-200 must not return a body to decode, got %q", body)
 	}
-	if !strings.Contains(err.Error(), "500") && !strings.Contains(err.Error(), "403") {
+	if !strings.Contains(err.Error(), "500") {
 		t.Fatalf("error %v should mention the HTTP status", err)
 	}
 }
 
-func TestFetchSubscription_CapsBody(t *testing.T) {
+func TestGetSubscription_CapsBody(t *testing.T) {
 	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(bytes.Repeat([]byte("A"), (1<<20)+64))
 	}))
 	t.Cleanup(wan.Close)
 
-	body, err := fetchSubscription(context.Background(), wan.URL, hostClient(wan), nil)
+	body, err := getSubscription(context.Background(), hostClient(wan), wan.URL)
 	if err == nil || !strings.Contains(err.Error(), "subscription body exceeds 1 MiB") {
 		t.Fatalf("err %v, want the 1 MiB cap", err)
 	}
@@ -209,12 +91,12 @@ func TestFetchSubscription_CapsBody(t *testing.T) {
 	}
 }
 
-func TestFetchSubscription_WANDialErrorNilTunnel(t *testing.T) {
+func TestGetSubscription_DialError(t *testing.T) {
 	wanErr := errors.New("wan down")
 	wan := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 		return nil, wanErr
 	})}
-	body, err := fetchSubscription(context.Background(), "http://subscription.example/list", wan, nil)
+	body, err := getSubscription(context.Background(), wan, "http://subscription.example/list")
 	if !errors.Is(err, wanErr) {
 		t.Fatalf("err %v, want WAN error", err)
 	}

@@ -134,6 +134,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Notify:        b.notifyActiveChats,
 			FallbackReady: failoverTunnelReady,
 			TPROXYReady:   tproxyRulesReady,
+			Stopped:       vpnDirectorStopped,
 		}
 		b.subWatch = sw
 		go sw.Start(ctx)
@@ -207,15 +208,21 @@ func (b *Bot) Connect(cfg *config.Config) error {
 }
 
 func (b *Bot) setSender(s telegram.MessageSender) {
-	b.mu.Lock()
-	b.sender = s
-	pending := b.pendingNotify
-	b.pendingNotify = nil
-	store := b.chatStore
-	auth := b.auth
-	b.mu.Unlock()
-	for _, msg := range pending {
-		sendActiveChats(s, store, auth, msg)
+	for {
+		b.mu.Lock()
+		pending := b.pendingNotify
+		b.pendingNotify = nil
+		store := b.chatStore
+		auth := b.auth
+		if len(pending) == 0 {
+			b.sender = s
+			b.mu.Unlock()
+			return
+		}
+		b.mu.Unlock()
+		for _, msg := range pending {
+			sendActiveChats(s, store, auth, msg)
+		}
 	}
 }
 

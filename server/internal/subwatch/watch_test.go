@@ -387,6 +387,75 @@ func TestTick_NoTunnelStillNotifiesOnce(t *testing.T) {
 	}
 }
 
+func TestTick_StoppedDoesNotApply(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.Stopped = func() bool { return true }
+	tickUntilDead(w, f)
+	if f.applies != 0 {
+		t.Fatalf("applies %d; /stop must not be undone", f.applies)
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("must not stage after /stop")
+	}
+}
+
+func TestTick_PlatformErrorDoesNotAnnounceNoTunnel(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	w := f.watch()
+	w.LoadPlatform = func() (vpnconfig.PlatformInfo, error) {
+		return vpnconfig.PlatformInfo{}, errors.New("rci timeout")
+	}
+	tickUntilDead(w, f)
+	for _, n := range f.notes {
+		if strings.Contains(n, "no Tunnel Director fallback") {
+			t.Fatalf("platform error must not look like no tunnel: %v", f.notes)
+		}
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatal("must not stage without platform tunnels")
+	}
+}
+
+func TestTick_WalkStopsWhenContextCanceled(t *testing.T) {
+	f := &fake{
+		cfg:  failedOverCfg(),
+		plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		now:  time.Unix(1_700_000_000, 0),
+	}
+	generated := 0
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	w.Generate = func(s vpnconfig.Server) (bool, error) {
+		generated++
+		cancel()
+		return true, nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error { return errProbe }
+	w.Tick(ctx)
+	if generated != 1 {
+		t.Fatalf("generate %d; canceled walk must not continue", generated)
+	}
+}
+
 func TestTick_NoTunnelDoesNotReloadPlatformEveryTick(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
@@ -801,11 +870,15 @@ func TestPickOrder_SameNameFirst(t *testing.T) {
 		{Name: "Oslo", Address: "2.example"},
 		{Name: "B", Address: "3.example"},
 	}
-	got := pickOrder(in, "Oslo")
+	got := pickOrder(in, &vpnconfig.ActiveServer{Name: "Oslo"})
 	if got[0].Name != "Oslo" || got[1].Name != "A" || got[2].Name != "B" {
 		t.Fatalf("%v", got)
 	}
-	got = pickOrder(in, "missing")
+	got = pickOrder(in, &vpnconfig.ActiveServer{Name: "Oslo", Address: "2.example"})
+	if got[0].Address != "2.example" {
+		t.Fatal("match address when recorded")
+	}
+	got = pickOrder(in, &vpnconfig.ActiveServer{Name: "missing"})
 	if got[0].Name != "A" {
 		t.Fatal("keep list order")
 	}
@@ -1838,7 +1911,7 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 		t.Fatalf("fetches %d; ImportRetry has not elapsed", fetches)
 	}
 	assertStagedOnTunnel(t, f.cfg)
-	if len(f.notes) != 1 || f.notes[0] != "No live server in the subscription; still on tunnel:ovpnc2" {
+	if len(f.notes) != 1 || f.notes[0] != "No live server in the subscription" {
 		t.Fatalf("notes %v", f.notes)
 	}
 
