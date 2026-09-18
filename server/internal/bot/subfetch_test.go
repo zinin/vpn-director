@@ -240,12 +240,12 @@ func TestNewTunnelHTTPClient_DoesNotFollowRedirects(t *testing.T) {
 }
 
 func TestServersFromSubscription(t *testing.T) {
-	if _, err := serversFromSubscription([]byte("not base64 !!!")); err == nil || err.Error() != "no VLESS servers" {
+	if _, err := serversFromSubscriptionLookup([]byte("not base64 !!!"), nil); err == nil || err.Error() != "no VLESS servers" {
 		t.Fatalf("err %v, want no VLESS servers", err)
 	}
 
 	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443#Oslo"))
-	servers, err := serversFromSubscription([]byte(body))
+	servers, err := serversFromSubscriptionLookup([]byte(body), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,6 +329,55 @@ func TestFetchServers_WANSuccessUsesTheWANLookup(t *testing.T) {
 	}
 	if len(servers) != 1 || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.50"}) {
 		t.Fatalf("servers %+v", servers)
+	}
+}
+
+// A stop or the fetch deadline can end the context while the hostnames are
+// still being resolved. Every lookup after that fails at once, and the servers
+// that resolved before it would come back as the whole subscription: the watch
+// would publish a list cut short.
+func TestFetchServers_AResolutionTheContextEndedReturnsNoList(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte(
+		"vless://uuid-1@a.example.invalid:443#A\nvless://uuid-2@b.example.invalid:443#B"))
+	serve := func(w http.ResponseWriter, r *http.Request) { _, _ = io.WriteString(w, body) }
+	down := func(w http.ResponseWriter, r *http.Request) { http.Error(w, "wan-down", http.StatusBadGateway) }
+	for _, tc := range []struct {
+		name     string
+		overWAN  bool
+		wanServe http.HandlerFunc
+	}{
+		{"over the WAN", true, serve},
+		{"over the tunnel", false, down},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wan := httptest.NewServer(tc.wanServe)
+			t.Cleanup(wan.Close)
+			tun := httptest.NewServer(http.HandlerFunc(serve))
+			t.Cleanup(tun.Close)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			// a resolves; the stop lands while b is being looked up.
+			lookup := func(host string) ([]net.IP, error) {
+				if host == "a.example.invalid" {
+					return []net.IP{net.ParseIP("203.0.113.10")}, nil
+				}
+				cancel()
+				return nil, ctx.Err()
+			}
+			wanLookup, tunnelLookup := lookup, lookup
+			if !tc.overWAN {
+				wanLookup = func(string) ([]net.IP, error) { return nil, errors.New("WAN lookup must not run") }
+			}
+
+			servers, err := fetchServers(ctx, "https://cdn.example/s/token", hostClient(wan), hostClient(tun), wanLookup, tunnelLookup)
+
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("err %v, want the context's", err)
+			}
+			if servers != nil {
+				t.Fatalf("servers %+v; a list cut short must not come back", servers)
+			}
+		})
 	}
 }
 

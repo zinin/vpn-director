@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -392,6 +393,19 @@ func TestServerForDial_UsesResolvedIPKeepsHostnameSNI(t *testing.T) {
 	}
 }
 
+// REALITY's server name is the site the handshake borrows, never the proxy's
+// own host. An entry without one cannot connect - the Web UI and /xray refuse
+// it - and the hostname must not make it look complete to the walk.
+func TestServerForDial_LeavesARealitySNIEmpty(t *testing.T) {
+	s := ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "reality"})
+	if s.Address != "203.0.113.50" {
+		t.Fatalf("address %q", s.Address)
+	}
+	if s.SNI != "" {
+		t.Fatalf("sni %q; a REALITY entry without one must stay without one", s.SNI)
+	}
+}
+
 func TestTick_NoTunnelStillNotifiesOnce(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
@@ -549,7 +563,12 @@ func TestTick_StopDuringTheWalkEndsItQuietly(t *testing.T) {
 		name      string
 		stopAfter int // walk events before the stop lands
 	}{
+		// The restart runs with --unless-stopped: a stop that took the lock first
+		// makes the script skip it and exit 0, and the probe after it would try a
+		// server that was never started.
+		{"while restarting onto the first candidate", 3},
 		{"while probing the first candidate", 4},
+		{"while restarting onto the last candidate", 6},
 		{"while probing the last candidate", 7},
 		{"while restarting onto the preferred server", 9},
 	} {
@@ -730,6 +749,64 @@ func TestTick_StopDuringTheSubscriptionFetchWritesNothing(t *testing.T) {
 	w.Tick(context.Background())
 	if fetches != 2 {
 		t.Fatalf("fetches %d; an aborted wave must not spend the import window", fetches)
+	}
+}
+
+// The download and the resolution of every host behind it can take minutes. A
+// /stop that lands meanwhile ends them: the tick's context ends with the stop,
+// and nothing the fetch brings back is published.
+func TestTick_AStopEndsAFetchThatIsStillRunning(t *testing.T) {
+	defer func(poll time.Duration) { stopPoll = poll }(stopPoll)
+	stopPoll = time.Millisecond
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	var stopped atomic.Bool
+	saves := 0
+	w := runningWatch(f.watch())
+	w.Stopped = stopped.Load
+	w.SaveServers = func([]vpnconfig.Server) error {
+		saves++
+		return nil
+	}
+	w.Generate = f.generateAll
+	w.Fetch = func(ctx context.Context, _ string) ([]vpnconfig.Server, error) {
+		stopped.Store(true)
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("the fetch ran on after /stop")
+		}
+		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}}, nil
+	}
+
+	w.Tick(context.Background())
+
+	if saves != 0 || len(f.cfg.Xray.Servers) != 0 {
+		t.Fatalf("saves %d, xray.servers %v written after /stop", saves, f.cfg.Xray.Servers)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v after /stop", f.notes)
+	}
+}
+
+// A resolver that answers nothing costs seconds per host, and a subscription has
+// dozens: the fetch has one deadline for all of it, or the watch - and every
+// probe behind it - waits as long as the list is long.
+func TestTick_TheFetchHasADeadline(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	var left time.Duration
+	bounded := false
+	w := runningWatch(f.watch())
+	w.Fetch = func(ctx context.Context, _ string) ([]vpnconfig.Server, error) {
+		var deadline time.Time
+		deadline, bounded = ctx.Deadline()
+		left = time.Until(deadline)
+		return nil, errors.New("cdn down")
+	}
+
+	w.Tick(context.Background())
+
+	if !bounded || left > FetchTimeout || left < FetchTimeout-time.Minute {
+		t.Fatalf("fetch deadline in %v (set: %v), want about %v", left, bounded, FetchTimeout)
 	}
 }
 
@@ -1775,6 +1852,65 @@ func TestPickOrder_SameNameFirst(t *testing.T) {
 	got = pickOrder(in, &vpnconfig.ActiveServer{Name: "missing"})
 	if got[0].Name != "A" {
 		t.Fatal("keep list order")
+	}
+	// A subscription that rotates endpoints moves a name to a new address: the
+	// name is what the user chose.
+	got = pickOrder(in, &vpnconfig.ActiveServer{Name: "Oslo", Address: "9.example", Port: 443})
+	if got[0].Name != "Oslo" || got[1].Name != "A" || got[2].Name != "B" {
+		t.Fatalf("%v; a recorded address the list no longer has must still put the name first", got)
+	}
+	two := []vpnconfig.Server{
+		{Name: "Oslo", Address: "a.example", Port: 443},
+		{Name: "Oslo", Address: "b.example", Port: 443},
+	}
+	got = pickOrder(two, &vpnconfig.ActiveServer{Name: "Oslo", Address: "b.example", Port: 443})
+	if got[0].Address != "b.example" {
+		t.Fatalf("%v; the entry the record names beats an earlier one of the same name", got)
+	}
+}
+
+// The walk starts from the name the user chose at the address it has today, and
+// an all-dead wave returns config.json to that server, not to the last one tried.
+func TestTick_TheChosenNameIsTriedFirstAtItsNewAddress(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo-1.example", Port: 443}
+	servers := []vpnconfig.Server{
+		{Name: "Amsterdam", Address: "amsterdam.example", Port: 443},
+		{Name: "Oslo", Address: "oslo-7.example", Port: 443},
+		{Name: "Berlin", Address: "berlin.example", Port: 443},
+	}
+	var events []string
+	w := runningWatch(recordingWalkWatch(f, servers, allGenerate, &events))
+
+	w.Tick(context.Background())
+
+	want := []string{"Oslo", "restart", "Amsterdam", "restart", "Berlin", "restart", "Oslo", "restart"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events %v, want %v", events, want)
+	}
+}
+
+// A walk cut short - the bot restarted, a /stop - leaves active_server on a
+// server it was only trying. The user's choice is kept beside it, and the next
+// wave starts from that one and returns to it, not to the server that happened
+// to be tried last.
+func TestTick_AnInterruptedWalkStartsAgainFromTheUsersChoice(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Backup", Address: "backup.example", Port: 443}
+	f.cfg.Xray.PreferredServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	servers := []vpnconfig.Server{
+		{Name: "Backup", Address: "backup.example", Port: 443},
+		{Name: "Paris", Address: "paris.example", Port: 443},
+		{Name: "Oslo", Address: "oslo.example", Port: 443},
+	}
+	var events []string
+	w := runningWatch(recordingWalkWatch(f, servers, allGenerate, &events))
+
+	w.Tick(context.Background())
+
+	want := []string{"Oslo", "restart", "Backup", "restart", "Paris", "restart", "Oslo", "restart"}
+	if !reflect.DeepEqual(events, want) {
+		t.Fatalf("events %v, want %v", events, want)
 	}
 }
 
@@ -3009,6 +3145,141 @@ func TestTick_ImportDoesNotPublishAfterTheSubscriptionChanged(t *testing.T) {
 	w.Tick(context.Background())
 	if fetches != 2 {
 		t.Fatalf("fetches %d; the abandoned wave must not spend the import window", fetches)
+	}
+}
+
+// The same change landing once the walk is under way: the list it walks came from
+// a link that is no longer saved, and every server it goes on to write is one the
+// new subscription may not have. The walk ends where it is, writes and announces
+// nothing more, and the new link gets a wave of its own at once.
+func TestTick_WalkAbandonsWhenTheSavedLinkChanges(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	generated, restarts, fetches := []string{}, 0, 0
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, f.seq(), err
+		}
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		return true, f.seq(), nil
+	}
+	w.RestartXray = func() error {
+		restarts++
+		if restarts == 1 {
+			// The Web UI imports another subscription while Oslo is being tried.
+			f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
+		}
+		return nil
+	}
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background())
+
+	if !reflect.DeepEqual(generated, []string{"Oslo"}) {
+		t.Fatalf("generated %v; nothing from the old list may follow the new link", generated)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v; an abandoned walk announces nothing", f.notes)
+	}
+
+	w.Tick(context.Background())
+	if fetches != 2 {
+		t.Fatalf("fetches %d; the new link must not wait out the abandoned wave's window", fetches)
+	}
+}
+
+// The same link saved just before the walk writes the preferred server back: the
+// return is refused under the lock, the all-dead wave announces nothing, and the
+// new link gets its wave at once rather than the backed-off one.
+func TestTick_NoLiveWalkDoesNotReturnAfterTheLinkChanged(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	generated, fetches := []string{}, 0
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		if fetches == 1 && len(generated) == 2 {
+			// Saved while the return to Oslo waits for the lock.
+			f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
+		}
+		if err := f.checkGuard(guard); err != nil {
+			return false, f.seq(), err
+		}
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		return true, f.seq(), nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background())
+
+	if !reflect.DeepEqual(generated, []string{"Oslo", "Backup"}) {
+		t.Fatalf("generated %v; the return must not write after the link changed", generated)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v; an abandoned walk announces nothing", f.notes)
+	}
+	w.Tick(context.Background())
+	if fetches != 2 {
+		t.Fatalf("fetches %d; the new link must not wait out the backoff of the abandoned wave", fetches)
+	}
+}
+
+// And while the probe of a candidate succeeds: the server is one of the old list,
+// and the walk that found it ends without the restore. The next tick's health
+// probe finds the live outbound either way.
+func TestTick_WalkDoesNotRestoreOnTheOldListAfterTheLinkChanged(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Backup", Address: "backup.example", Port: 443}}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, f.seq(), err
+		}
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		return true, f.seq(), nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if len(generated) == 0 {
+			return errProbe
+		}
+		f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
+		return nil
+	}
+
+	w.Tick(context.Background())
+
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("the walk restored on a server of a link that is no longer saved")
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v; an abandoned walk announces nothing", f.notes)
 	}
 }
 

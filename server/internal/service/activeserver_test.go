@@ -71,15 +71,15 @@ func (x *stubXray) GenerateConfig(s vpnconfig.Server, ports ...InboundPorts) err
 	return x.err
 }
 
-func TestGenerateAndRecordDialedServer_RecordsHostnameNotDialIP(t *testing.T) {
+func TestGenerateAndRecordWalkedServer_RecordsHostnameNotDialIP(t *testing.T) {
 	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{}}
 	xray := &stubXray{store: store}
 	identity := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 	dial := vpnconfig.Server{Name: "Oslo", Address: "203.0.113.50", Port: 443, SNI: "oslo.example"}
 
-	generated, _, err := GenerateAndRecordDialedServer(store, xray, dial, identity, InboundPorts{TProxy: 12345, Socks: 12346}, nil)
+	generated, _, err := GenerateAndRecordWalkedServer(store, xray, dial, identity, InboundPorts{TProxy: 12345, Socks: 12346}, nil)
 	if err != nil {
-		t.Fatalf("GenerateAndRecordDialedServer error: %v", err)
+		t.Fatalf("GenerateAndRecordWalkedServer error: %v", err)
 	}
 	if !generated {
 		t.Fatal("generated = false")
@@ -99,13 +99,13 @@ func TestGenerateAndRecordDialedServer_RecordsHostnameNotDialIP(t *testing.T) {
 // The subscription watch decides whether its walk still owns active_server.
 // Asked before the lock, a Web UI or /xray selection can commit in between and
 // be written over, so the guard has to see the config the lock protects.
-func TestGenerateAndRecordDialedServer_GuardRunsUnderTheConfigLock(t *testing.T) {
+func TestGenerateAndRecordWalkedServer_GuardRunsUnderTheConfigLock(t *testing.T) {
 	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{}}
 	xray := &stubXray{store: store}
 	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 	ran, underLock := false, false
 
-	generated, _, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+	generated, _, err := GenerateAndRecordWalkedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
 		ran, underLock = true, store.inClosure
 		return nil
 	})
@@ -121,14 +121,14 @@ func TestGenerateAndRecordDialedServer_GuardRunsUnderTheConfigLock(t *testing.T)
 	}
 }
 
-func TestGenerateAndRecordDialedServer_GuardRefusalWritesNothing(t *testing.T) {
+func TestGenerateAndRecordWalkedServer_GuardRefusalWritesNothing(t *testing.T) {
 	manual := &vpnconfig.ActiveServer{Name: "Manual", Address: "manual.example", Port: 443}
 	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{ActiveServer: manual}}}
 	xray := &stubXray{store: store}
 	refused := errors.New("a newer server was selected")
 	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 
-	generated, _, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+	generated, _, err := GenerateAndRecordWalkedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
 		return refused
 	})
 
@@ -260,14 +260,14 @@ func TestGenerateAndRecordActiveServer_ReportsASaveFailureAsGenerated(t *testing
 
 // Every record moves the counter on, so a selection of the server already named
 // is still visible to a reader that remembers what it last saw.
-func TestGenerateAndRecordDialedServer_CountsTheWrite(t *testing.T) {
+func TestGenerateAndRecordWalkedServer_CountsTheWrite(t *testing.T) {
 	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
 		ActiveServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4},
 	}}}
 	xray := &stubXray{store: store}
 	s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
 
-	generated, seq, err := GenerateAndRecordDialedServer(store, xray, s, s, InboundPorts{}, nil)
+	generated, seq, err := GenerateAndRecordWalkedServer(store, xray, s, s, InboundPorts{}, nil)
 	if err != nil || !generated {
 		t.Fatalf("generated %v, err %v", generated, err)
 	}
@@ -276,5 +276,89 @@ func TestGenerateAndRecordDialedServer_CountsTheWrite(t *testing.T) {
 	}
 	if seq != 5 {
 		t.Fatalf("returned seq %d, want the counter the transaction wrote", seq)
+	}
+}
+
+// walkedRecord runs one record of the subscription walk against cfg and returns
+// what the config holds afterwards.
+func walkedRecord(t *testing.T, cfg *vpnconfig.VPNDirectorConfig, s vpnconfig.Server) *vpnconfig.VPNDirectorConfig {
+	t.Helper()
+	store := &stubStore{cfg: cfg}
+	generated, _, err := GenerateAndRecordWalkedServer(store, &stubXray{store: store}, s, s, InboundPorts{}, nil)
+	if err != nil || !generated {
+		t.Fatalf("generated %v, err %v", generated, err)
+	}
+	return store.cfg
+}
+
+// The walk moves active_server off the server the user chose, and a walk cut
+// short - the bot restarted, a /stop - leaves it on a server nobody picked. The
+// choice is kept beside it, from the first record that leaves its name.
+func TestGenerateAndRecordWalkedServer_KeepsTheChoiceItMovesAwayFrom(t *testing.T) {
+	cfg := &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo-1.example", Port: 443, Seq: 4},
+	}}
+	chosen := vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo-1.example", Port: 443}
+
+	cfg = walkedRecord(t, cfg, vpnconfig.Server{Name: "Backup", Address: "backup.example", Port: 443})
+	if got := cfg.Xray.PreferredServer; got == nil || *got != chosen {
+		t.Fatalf("preferred_server %+v, want %+v", got, chosen)
+	}
+	if got := cfg.Xray.ActiveServer; got == nil || got.Name != "Backup" || got.Seq != 5 {
+		t.Fatalf("active_server %+v, want Backup at seq 5", got)
+	}
+
+	// The next server the walk tries is not the user's choice either.
+	cfg = walkedRecord(t, cfg, vpnconfig.Server{Name: "Extra", Address: "extra.example", Port: 443})
+	if got := cfg.Xray.PreferredServer; got == nil || *got != chosen {
+		t.Fatalf("preferred_server %+v after a second walked server, want %+v", got, chosen)
+	}
+}
+
+// Back on the chosen name - at whatever address the subscription gives it today -
+// the walk is where the user put it, and there is nothing left to remember.
+func TestGenerateAndRecordWalkedServer_ForgetsTheChoiceBackOnItsName(t *testing.T) {
+	cfg := &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer:    &vpnconfig.ActiveServer{Name: "Backup", Address: "backup.example", Port: 443, Seq: 5},
+		PreferredServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo-1.example", Port: 443},
+	}}
+
+	cfg = walkedRecord(t, cfg, vpnconfig.Server{Name: "Oslo", Address: "oslo-7.example", Port: 443})
+
+	if cfg.Xray.PreferredServer != nil {
+		t.Fatalf("preferred_server %+v, want none once the walk is back on Oslo", cfg.Xray.PreferredServer)
+	}
+}
+
+// A subscription that rotates endpoints moves a name to a new address every day.
+// The walk that follows it has not moved away from the user's choice.
+func TestGenerateAndRecordWalkedServer_ANewAddressOfTheChosenNameIsNoMove(t *testing.T) {
+	cfg := &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo-1.example", Port: 443, Seq: 4},
+	}}
+
+	cfg = walkedRecord(t, cfg, vpnconfig.Server{Name: "Oslo", Address: "oslo-7.example", Port: 443})
+
+	if cfg.Xray.PreferredServer != nil {
+		t.Fatalf("preferred_server %+v, want none", cfg.Xray.PreferredServer)
+	}
+}
+
+// A selection in the Web UI, /xray or the wizard is the user's new choice: what
+// the walk remembered of the old one is over.
+func TestGenerateAndRecordActiveServer_ASelectionEndsWhatTheWalkRemembered(t *testing.T) {
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer:    &vpnconfig.ActiveServer{Name: "Backup", Address: "backup.example", Port: 443, Seq: 5},
+		PreferredServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo-1.example", Port: 443},
+	}}}
+
+	generated, err := GenerateAndRecordActiveServer(store, &stubXray{store: store},
+		vpnconfig.Server{Name: "Paris", Address: "paris.example", Port: 443}, InboundPorts{})
+
+	if err != nil || !generated {
+		t.Fatalf("generated %v, err %v", generated, err)
+	}
+	if store.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("preferred_server %+v after the user selected Paris", store.cfg.Xray.PreferredServer)
 	}
 }

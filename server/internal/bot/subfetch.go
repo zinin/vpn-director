@@ -73,11 +73,17 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 }
 
 // fetchServers GETs via wan, then tunnel. Each body is resolved with the lookup
-// of the path that fetched it, so VLESS hostnames follow that path.
+// of the path that fetched it, so VLESS hostnames follow that path. A context
+// that ends during the resolution fails every lookup after it at once, and what
+// resolved before that is not the subscription: the context's error comes back
+// instead of a list cut short.
 func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
 	body, err := getSubscription(ctx, wan, rawURL)
 	if err == nil {
 		servers, rerr := serversFromSubscriptionLookup(body, wanLookup)
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
 		if rerr == nil {
 			return servers, nil
 		}
@@ -102,18 +108,16 @@ func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, 
 	if err != nil {
 		return nil, err
 	}
-	if tunnelLookup != nil {
-		return serversFromSubscriptionLookup(body, tunnelLookup)
+	servers, err := serversFromSubscriptionLookup(body, tunnelLookup)
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
 	}
-	return serversFromSubscription(body)
+	return servers, err
 }
 
-// serversFromSubscription decodes a fetched subscription body for the watch and
-// keeps the servers whose addresses resolved.
-func serversFromSubscription(body []byte) ([]vpnconfig.Server, error) {
-	return serversFromSubscriptionLookup(body, nil)
-}
-
+// serversFromSubscriptionLookup decodes a fetched subscription body for the
+// watch and keeps the servers whose addresses resolved through lookup, the
+// default resolver when it is nil.
 func serversFromSubscriptionLookup(body []byte, lookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
 	var result vless.Import
 	if lookup == nil {

@@ -101,9 +101,13 @@ func (s *VPNDirectorService) ApplyUnlessStopped() error {
 	return s.runChecked(ApplyTimeout, "apply", "--unless-stopped", "apply")
 }
 
-// RestartXrayUnlessStopped is RestartXray for the same caller, skipped the same way.
-func (s *VPNDirectorService) RestartXrayUnlessStopped() error {
-	return s.runChecked(ApplyTimeout, "restart xray", "--unless-stopped", "restart", "xray")
+// RestartXrayProcessUnlessStopped restarts the Xray process for the same
+// caller, skipped the same way, and leaves the TPROXY rules alone. The walk
+// writes one config.json per server it tries; the stop and apply of "restart
+// xray" would take the TPROXY jump away and put it back each time, and the
+// Xray clients leave through the WAN in between.
+func (s *VPNDirectorService) RestartXrayProcessUnlessStopped() error {
+	return s.runChecked(ApplyTimeout, "restart xray-process", "--unless-stopped", "restart", "xray-process")
 }
 
 // Stop stops VPN Director

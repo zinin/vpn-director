@@ -85,6 +85,11 @@ The record holds name, address and port only: `/api/config` hands this file to
 the browser, so the UUID and the REALITY material stay out. It is absent, and
 `active` is `null`, until something selects a server.
 
+`xray.preferred_server`, in the same three fields, is the server the user chose
+while the bot's subscription walk has `active_server` on another one (see
+`telegram-bot.md`). A selection is a new choice, so all three Go paths clear it
+and `configure.sh` deletes it.
+
 Client and exclusion mutations go through `updateAndApply`: the change is
 written under the config lock and `vpn-director.sh apply` runs immediately
 after, as the bot does. The two server routes are the exception —

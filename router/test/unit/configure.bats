@@ -274,6 +274,23 @@ write_daemon_config() {
     assert_output "Осло, Норвегия, Extra|1.2.3.4|443"
 }
 
+# The subscription watch keeps the server the user chose while its walk has
+# active_server on another one. A wizard run is a new choice, as a Web UI or
+# /xray selection is: the next walk must start from it, not from the old one.
+@test "step_generate_configs: ends the server choice the watch remembered" {
+    load_wizard
+    write_daemon_config
+    jq '.xray.preferred_server = {"name":"Oslo","address":"oslo.example","port":443}' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+    mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.xray | has("preferred_server")' "$VPD_DIR/vpn-director.json"
+    assert_output "false"
+}
+
 # The Web UI serves this file over /api/config. The record names the server and
 # stops there; the subscription UUID and the REALITY material stay in
 # servers.json and in the Xray config, which nobody hands to a browser.

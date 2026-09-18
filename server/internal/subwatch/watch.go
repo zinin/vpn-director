@@ -20,6 +20,10 @@ const (
 	ImportRetry        = 5 * time.Minute
 	ImportRetryMax     = 30 * time.Minute
 	SettleAfterRestart = 3 * time.Second
+	// FetchTimeout bounds one subscription download together with the resolution
+	// of every host in it: a resolver that answers nothing costs seconds per
+	// host, and the tick - every probe behind it - would wait all of them out.
+	FetchTimeout = 3 * time.Minute
 	// FallbackCheck is how often a committed failover asks the platform about
 	// its tunnel, and FallbackDownAfter how long that tunnel has to be gone
 	// before the clients leave it: a reconnecting tunnel shows as down for a
@@ -149,6 +153,10 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.failSince = time.Time{}
 		return
 	}
+	// A download, the resolution behind it or a probe can hold the tick for
+	// minutes; a stop ends what it is waiting on rather than waiting with it.
+	ctx, endWatch := w.cancelOnStop(ctx)
+	defer endWatch()
 	if !w.reconciled {
 		w.reconciled = true
 		// The move is written before Apply, and a process that stopped in
@@ -537,21 +545,39 @@ func serverID(s vpnconfig.Server) string {
 	return s.Name + "\x1f" + s.Address + "\x1f" + strconv.Itoa(s.Port)
 }
 
-func pickOrder(servers []vpnconfig.Server, active *vpnconfig.ActiveServer) []vpnconfig.Server {
-	if active == nil || active.Name == "" {
-		return servers
+// chosenIndex is where servers has the server a names: the entry with its name,
+// address and port, or else the first entry with its name - a subscription that
+// rotates endpoints gives a name a new address every day, and the name is what
+// the user chose. -1 when the list has neither.
+func chosenIndex(servers []vpnconfig.Server, a *vpnconfig.ActiveServer) int {
+	if a == nil || a.Name == "" {
+		return -1
 	}
-	var first, rest []vpnconfig.Server
-	seen := false
-	for _, s := range servers {
-		if !seen && sameServer(s, active) {
-			first = append(first, s)
-			seen = true
+	byName := -1
+	for i, s := range servers {
+		if s.Name != a.Name {
 			continue
 		}
-		rest = append(rest, s)
+		if sameServer(s, a) {
+			return i
+		}
+		if byName < 0 {
+			byName = i
+		}
 	}
-	return append(first, rest...)
+	return byName
+}
+
+// pickOrder is servers with the one chosen names moved to the front.
+func pickOrder(servers []vpnconfig.Server, chosen *vpnconfig.ActiveServer) []vpnconfig.Server {
+	i := chosenIndex(servers, chosen)
+	if i < 0 {
+		return servers
+	}
+	order := make([]vpnconfig.Server, 0, len(servers))
+	order = append(order, servers[i])
+	order = append(order, servers[:i]...)
+	return append(order, servers[i+1:]...)
 }
 
 func (w *Watch) fallbackReady(cfg *vpnconfig.VPNDirectorConfig) bool {
@@ -576,42 +602,68 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 // server the walk did not put there.
 var errSuperseded = errors.New("a newer server was selected")
 
-func (w *Watch) walkSuperseded(started, lastRecorded string, expectedSeq int) bool {
+// walkOwns is nil while the walk may still write, and otherwise why not: the
+// saved link is no longer the one its list came from - a server of the old
+// list may be gone from the new one, and the new link deserves a wave of its
+// own - or active_server names a server the walk did not record.
+func walkOwns(cfg *vpnconfig.VPNDirectorConfig, rawURL, started, lastRecorded string, expectedSeq int) error {
+	if err := vpnconfig.SubscriptionUnchanged(rawURL)(cfg); err != nil {
+		return err
+	}
+	if superseded(cfg, started, lastRecorded, expectedSeq) {
+		return errSuperseded
+	}
+	return nil
+}
+
+// walkOwnsNow is walkOwns on a fresh read of the config, for the checks of
+// the walk that write nothing themselves.
+func (w *Watch) walkOwnsNow(rawURL, started, lastRecorded string, expectedSeq int) error {
 	if w.LoadVPN == nil {
-		return false
+		return nil
 	}
 	cfg, err := w.LoadVPN()
 	if err != nil {
-		return false
-	}
-	return superseded(cfg, started, lastRecorded, expectedSeq)
-}
-
-// supersededGuard is the guard the walk hands Generate. It runs under the config
-// lock with the write, so a Web UI or /xray selection that commits after the
-// walk last read the config is refused instead of written over.
-func supersededGuard(started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
-	return func(cfg *vpnconfig.VPNDirectorConfig) error {
-		if superseded(cfg, started, lastRecorded, expectedSeq) {
-			return errSuperseded
-		}
 		return nil
 	}
+	return walkOwns(cfg, rawURL, started, lastRecorded, expectedSeq)
 }
 
 // walkGuard is the guard every write of the walk carries. It runs under the
 // config lock Generate takes, after whatever wait that lock cost: a /stop that
 // finished meanwhile refuses the write there - a new config.json and
 // active_server on a stopped router would take effect on the next manual
-// apply - and a newer selection does as before.
-func (w *Watch) walkGuard(started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
-	superseded := supersededGuard(started, lastRecorded, expectedSeq)
+// apply - and so do a newly saved link and a Web UI or /xray selection that
+// committed after the walk last read the config, instead of being written over.
+func (w *Watch) walkGuard(rawURL, started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
 	return func(cfg *vpnconfig.VPNDirectorConfig) error {
 		if w.stopped() {
 			return errStopped
 		}
-		return superseded(cfg)
+		return walkOwns(cfg, rawURL, started, lastRecorded, expectedSeq)
 	}
+}
+
+// endsWalk is an error after which the walk writes nothing more: a stop, a newer
+// selection, or a link saved since the wave downloaded its own.
+func endsWalk(err error) bool {
+	return errors.Is(err, errStopped) || errors.Is(err, errSuperseded) || errors.Is(err, vpnconfig.ErrSubscriptionChanged)
+}
+
+// walkEnded reports whether err ends the walk, and settles what that leaves: a
+// newly saved link gets its wave at once rather than the window this one spent.
+func (w *Watch) walkEnded(err error, prevImport time.Time) bool {
+	if !endsWalk(err) {
+		return false
+	}
+	switch {
+	case errors.Is(err, errSuperseded):
+		slog.Info("Subscription walk abandoned; a newer server was selected")
+	case errors.Is(err, vpnconfig.ErrSubscriptionChanged):
+		slog.Info("Subscription walk abandoned; the saved link changed")
+		w.lastImport = prevImport
+	}
+	return true
 }
 
 // superseded reports whether cfg names a server the walk did not record: one
@@ -659,7 +711,9 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	if cfg != nil {
 		rawURL = cfg.Xray.SubscriptionURL
 	}
-	servers, err := w.Fetch(ctx, rawURL)
+	fetchCtx, cancel := context.WithTimeout(ctx, FetchTimeout)
+	servers, err := w.Fetch(fetchCtx, rawURL)
+	cancel()
 	// The download blocks for as long as the subscription host takes. A /stop
 	// that finished meanwhile ends the wave before servers.json is written, and
 	// a wave that did not happen leaves its window to the next one.
@@ -715,9 +769,15 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 
-	var active *vpnconfig.ActiveServer
+	var active, chosen *vpnconfig.ActiveServer
 	if cfg != nil {
 		active = cfg.Xray.ActiveServer
+		chosen = cfg.Xray.PreferredServer
+	}
+	// A walk cut short leaves active_server on a server it was only trying, and
+	// preferred_server then keeps the one the user chose.
+	if chosen == nil {
+		chosen = active
 	}
 	started := activeID(active)
 	startedSeq := vpnconfig.ActiveSeq(active)
@@ -725,9 +785,9 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	if socks == 0 {
 		socks = defaultSOCKSPort
 	}
-	order := pickOrder(servers, active)
+	order := pickOrder(servers, chosen)
 	var preferred *vpnconfig.Server
-	if active != nil && len(order) > 0 && sameServer(order[0], active) {
+	if chosenIndex(servers, chosen) >= 0 {
 		preferred = &order[0]
 	}
 	tried := 0
@@ -743,12 +803,8 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if ctx.Err() != nil || w.stopped() {
 			return
 		}
-		generated, seq, err := w.Generate(s, w.walkGuard(started, lastRecorded, lastSeq))
-		if errors.Is(err, errStopped) {
-			return
-		}
-		if errors.Is(err, errSuperseded) {
-			slog.Info("Subscription walk abandoned; a newer server was selected")
+		generated, seq, err := w.Generate(s, w.walkGuard(rawURL, started, lastRecorded, lastSeq))
+		if w.walkEnded(err, prevImport) {
 			return
 		}
 		if err != nil || !generated {
@@ -766,11 +822,12 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if ctx.Err() != nil {
 			return
 		}
-		if w.RestartXray != nil {
-			if err := w.RestartXray(); err != nil {
-				slog.Debug("Xray restart failed", "server", s.Name, "error", err)
-				continue
+		if err := w.restartXray(); err != nil {
+			if errors.Is(err, errStopped) {
+				return
 			}
+			slog.Debug("Xray restart failed", "server", s.Name, "error", err)
+			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
 		if err := w.Probe(ctx, socks); err != nil {
@@ -778,8 +835,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			continue
 		}
 		slog.Info("Subscription server picked", "server", s.Name)
-		if w.walkSuperseded(started, lastRecorded, lastSeq) {
-			slog.Info("Subscription walk abandoned; a newer server was selected")
+		if w.walkEnded(w.walkOwnsNow(rawURL, started, lastRecorded, lastSeq), prevImport) {
 			return
 		}
 		// Only a committed failover left Xray. Staged clients never left, so
@@ -799,13 +855,11 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	slog.Info("No live server in the subscription", "tried", tried)
-	if w.walkSuperseded(started, lastRecorded, lastSeq) {
-		slog.Info("Subscription walk abandoned; a newer server was selected")
+	if w.walkEnded(w.walkOwnsNow(rawURL, started, lastRecorded, lastSeq), prevImport) {
 		return
 	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
-		if w.returnToPreferred(*preferred, w.walkGuard(started, lastRecorded, lastSeq)) {
-			slog.Info("Subscription walk abandoned; a newer server was selected")
+		if w.walkEnded(w.returnToPreferred(*preferred, w.walkGuard(rawURL, started, lastRecorded, lastSeq)), prevImport) {
 			return
 		}
 		if w.stopped() {
@@ -834,32 +888,30 @@ func (w *Watch) importInterval() time.Duration {
 // nothing live. Generate records every server it writes as xray.active_server,
 // so without this the next wave would start from the last server tried rather
 // than the user's. No probe and no restore: the walk has just found it down.
-// abandoned means guard found a newer selection and nothing was written.
-func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (abandoned bool) {
+// The error is one that ends the walk - the guard refused and nothing was
+// written, or a stop skipped the restart - and nil otherwise.
+func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) error {
 	generated, _, err := w.Generate(s, guard)
-	if errors.Is(err, errSuperseded) {
-		return true
-	}
-	if errors.Is(err, errStopped) {
-		// Nothing was written; the caller ends the tick on the marker.
-		return false
+	if endsWalk(err) {
+		return err
 	}
 	if err != nil || !generated {
 		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
 	}
 	if !generated {
-		return false
+		return nil
 	}
-	if w.RestartXray != nil {
-		if err := w.RestartXray(); err != nil {
-			slog.Warn("Xray restart on the preferred server failed", "server", s.Name, "error", err)
-			return false
+	if rerr := w.restartXray(); rerr != nil {
+		if errors.Is(rerr, errStopped) {
+			return rerr
 		}
+		slog.Warn("Xray restart on the preferred server failed", "server", s.Name, "error", rerr)
+		return nil
 	}
 	if err == nil {
 		slog.Info("Xray config returned to the preferred server", "server", s.Name)
 	}
-	return false
+	return nil
 }
 
 // errStopped is an apply the watch did not make, or the script skipped: VPN
@@ -905,6 +957,59 @@ func (w *Watch) apply() error {
 	return nil
 }
 
+// restartXray is RestartXray the way apply is Apply: the restart runs with
+// --unless-stopped too, and a probe after one the script skipped would try a
+// server that was never started.
+func (w *Watch) restartXray() error {
+	if w.RestartXray == nil {
+		return nil
+	}
+	if w.stopped() {
+		return errStopped
+	}
+	if err := w.RestartXray(); err != nil {
+		return err
+	}
+	if w.stopped() {
+		return errStopped
+	}
+	return nil
+}
+
+// stopPoll is how often a tick looks for the stop marker while it waits.
+var stopPoll = time.Second
+
+// cancelOnStop is ctx cancelled once the stop marker appears, so whatever the
+// tick is waiting on ends with a /stop instead of running its course. end stops
+// the look and returns once it has ended: nothing of it outlives the tick.
+func (w *Watch) cancelOnStop(ctx context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(ctx)
+	if w.Stopped == nil {
+		return ctx, cancel
+	}
+	ended := make(chan struct{})
+	go func() {
+		defer close(ended)
+		t := time.NewTicker(stopPoll)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if w.Stopped() {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, func() {
+		cancel()
+		<-ended
+	}
+}
+
 func (w *Watch) socksPort(cfg *vpnconfig.VPNDirectorConfig) int {
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
 	if socks == 0 {
@@ -921,8 +1026,11 @@ func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) b
 }
 
 // ServerForDial uses a tunnel-resolved IPv4 for vnext so Xray does not go
-// back to the system resolver. SNI keeps the hostname. Web UI /xray keep
-// s.Address and let Xray resolve, so a CDN IP change still works there.
+// back to the system resolver. A TLS server name keeps the hostname. A REALITY
+// one is the site the handshake borrows, never the proxy's own host, so an
+// entry without one stays without one and is refused as the Web UI refuses it.
+// Web UI /xray keep s.Address and let Xray resolve, so a CDN IP change still
+// works there.
 func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
 	host := s.Address
 	for _, ip := range s.IPs {
@@ -930,7 +1038,7 @@ func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
 			continue
 		}
 		s.Address = ip
-		if s.SNI == "" {
+		if s.SNI == "" && s.Security != "reality" {
 			s.SNI = host
 		}
 		break

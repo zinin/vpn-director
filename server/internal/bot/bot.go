@@ -117,7 +117,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			LoadPlatform: vpnSvc.Platform,
 			UpdateVPN:    configSvc.UpdateVPNConfig,
 			Apply:        vpnSvc.ApplyUnlessStopped,
-			RestartXray:  vpnSvc.RestartXrayUnlessStopped,
+			RestartXray:  vpnSvc.RestartXrayProcessUnlessStopped,
 			SaveServers:  configSvc.SaveServers,
 			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 				cfg, err := configSvc.LoadVPNConfig()
@@ -126,7 +126,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				}
 				ports := service.InboundPorts{}
 				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
-				return service.GenerateAndRecordDialedServer(configSvc, xraySvc, subwatch.ServerForDial(s), s, ports, guard)
+				return service.GenerateAndRecordWalkedServer(configSvc, xraySvc, subwatch.ServerForDial(s), s, ports, guard)
 			},
 			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
 				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)

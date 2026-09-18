@@ -591,6 +591,7 @@ step_generate_configs() {
          .xray.exclude_sets = $exclude |
          .xray.servers = $servers |
          .xray.active_server = $active |
+         del(.xray.preferred_server) |
          .tunnel_director.tunnels = (
              $tunnels
              | to_entries

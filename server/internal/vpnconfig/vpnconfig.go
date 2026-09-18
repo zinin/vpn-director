@@ -83,6 +83,9 @@ type XrayConfig struct {
 	ActiveServer    *ActiveServer `json:"active_server,omitempty"`
 	SubscriptionURL string        `json:"subscription_url,omitempty"`
 	Failover        *XrayFailover `json:"failover,omitempty"`
+	// PreferredServer is the server the user chose while the subscription walk
+	// has active_server on another one, and absent otherwise (RecordWalkedServer).
+	PreferredServer *ActiveServer `json:"preferred_server,omitempty"`
 }
 
 // ActiveServer records which server the generated Xray config was built from.
@@ -126,6 +129,25 @@ func RecordActiveServer(prev *ActiveServer, s Server) *ActiveServer {
 	a := NewActiveServer(s)
 	a.Seq = ActiveSeq(prev) + 1
 	return a
+}
+
+// RecordWalkedServer names s as the running server for the subscription walk.
+// The walk tries servers nobody chose, and one cut short - the bot restarted, a
+// stop - leaves active_server on one of them. So the server the user chose is
+// kept in preferred_server from the first record that leaves its name until one
+// comes back to it. A new address under the same name is no move away: a
+// subscription that rotates endpoints gives a name one every day.
+func RecordWalkedServer(cfg *VPNDirectorConfig, s Server) {
+	x := &cfg.Xray
+	switch {
+	case x.PreferredServer != nil && x.PreferredServer.Name == s.Name:
+		x.PreferredServer = nil
+	case x.PreferredServer == nil && x.ActiveServer != nil && x.ActiveServer.Name != s.Name:
+		chosen := *x.ActiveServer
+		chosen.Seq = 0
+		x.PreferredServer = &chosen
+	}
+	x.ActiveServer = RecordActiveServer(x.ActiveServer, s)
 }
 
 // ClientInfo represents a VPN client with its route and pause status.

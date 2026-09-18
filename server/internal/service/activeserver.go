@@ -30,14 +30,22 @@ import (
 // The caller is expected to have persisted xray.servers already: a save
 // failure here leaves a new config.json against a config that already lists
 // its address in the bypass set, rather than one that does not.
+//
+// A selection is the user's new choice, so it also ends whatever the
+// subscription walk kept of the old one in preferred_server.
 func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnconfig.Server, ports InboundPorts) (generated bool, err error) {
-	generated, _, err = GenerateAndRecordDialedServer(store, xray, s, s, ports, nil)
+	generated, _, err = generateAndRecord(store, xray, s, ports, nil, func(cfg *vpnconfig.VPNDirectorConfig) {
+		cfg.Xray.PreferredServer = nil
+		cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(cfg.Xray.ActiveServer, s)
+	})
 	return generated, err
 }
 
-// GenerateAndRecordDialedServer writes config.json from generate (the watch
-// walk may have replaced Address with a resolved IPv4) and records identity
-// as active_server so the Web UI badge still matches servers.json.
+// GenerateAndRecordWalkedServer is the subscription walk's switch: config.json
+// from generate (the walk has replaced Address with a resolved IPv4), identity
+// recorded as active_server so the Web UI badge still matches servers.json, and
+// the user's own choice kept beside it while the walk is away from it
+// (vpnconfig.RecordWalkedServer).
 //
 // A non-nil guard runs first, under the same lock, on the config that lock
 // protects; its error writes nothing and comes back as is. The watch passes one
@@ -47,7 +55,15 @@ func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnc
 // taken inside the transaction rather than read back after the lock is gone: a
 // selection committed in between would otherwise be adopted as the caller's own
 // write. It is meaningful only when generated is true.
-func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error) {
+func GenerateAndRecordWalkedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error) {
+	return generateAndRecord(store, xray, generate, ports, guard, func(cfg *vpnconfig.VPNDirectorConfig) {
+		vpnconfig.RecordWalkedServer(cfg, identity)
+	})
+}
+
+// generateAndRecord writes config.json from generate and, once that succeeded,
+// has record name it in the config, both under the config lock.
+func generateAndRecord(store ConfigStore, xray XrayGenerator, generate vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error, record func(*vpnconfig.VPNDirectorConfig)) (generated bool, seq int, err error) {
 	var prev, written int
 	err = store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
 		if guard != nil {
@@ -59,12 +75,12 @@ func GenerateAndRecordDialedServer(store ConfigStore, xray XrayGenerator, genera
 			return err
 		}
 		generated = true
-		// One write on from what the config named: a reader that remembers the
-		// counter can tell this write happened even when it names the server
-		// that was already there.
+		// Every record moves the counter one write on from what the config
+		// named: a reader that remembers the counter can tell this write
+		// happened even when it names the server that was already there.
 		prev = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
-		cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(cfg.Xray.ActiveServer, identity)
-		written = prev + 1
+		record(cfg)
+		written = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 		return nil
 	})
 	if err != nil {
