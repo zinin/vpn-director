@@ -213,7 +213,7 @@ and `del_iQosRules()` in `qos.c` does the same when QoS stops. `-F` without a
 chain name empties every chain of the table, `TUN_DIR` and `XRAY_TPROXY`
 included, and deletes none of them - mangle is not reloaded with
 `iptables-restore`, which would have. `firewall-start` then runs
-`vpn-director.sh apply`, and a chain that exists no longer says its rules do:
+`vpn-director.sh --wait apply`, and a chain that exists no longer says its rules do:
 
 ```bash
 # succeeds for an empty chain
@@ -231,6 +231,13 @@ and rebuilds `XRAY_TPROXY`), or look for the rules themselves before calling it
 applied - `_tunnel_marks_present` asks `iptables -C` for every client's MARK
 rule and rebuilds when one is gone. KeeneticOS deletes our chains on every NDM
 rebuild, so there the missing chain is what sends the apply through a rebuild.
+
+Either way the apply after the last firewall start has to run. The firmware
+starts `firewall-start` and `wan-event` without waiting for them
+(`run_custom_script` with no timeout), a WAN coming up does both, and a plain
+`apply` exits at once while another instance holds the lock - so the chains of
+a flush that landed during a running apply stayed empty until the next event.
+Both hooks pass `--wait`, as the KeeneticOS hooks do.
 
 ### A dual-family DNS lookup on the router often never answers
 

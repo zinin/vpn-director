@@ -2,10 +2,12 @@
 
 load '../test_helper'
 
-# The Keenetic hooks under router/opt/etc/ndm. NDM runs them serially under a
-# 24-second timeout, so each one starts the CLI detached through nohup and
-# exits; a fake nohup records what it was asked to run and runs nothing.
+# The router hooks: KeeneticOS's under router/opt/etc/ndm, Asuswrt-Merlin's
+# under router/jffs/scripts. NDM runs its hooks serially under a 24-second
+# timeout, so each one starts the CLI detached through nohup and exits; a fake
+# nohup records what it was asked to run and runs nothing.
 HOOKS="$PROJECT_ROOT/opt/etc/ndm"
+MERLIN_HOOKS="$PROJECT_ROOT/jffs/scripts"
 
 setup_hook_env() {
     # The hooks name the router's own directories in PATH, the way the Merlin
@@ -137,6 +139,44 @@ assert_no_apply() {
         run_hook "$HOOKS/iflayerchanged.d/50-vpn-director.sh" start
     assert_success
     assert_no_apply
+}
+
+# ------------------------------------------------------------ Asuswrt-Merlin
+#
+# The firmware starts firewall-start and wan-event without waiting for them
+# (run_custom_script with no timeout), so they call the CLI directly. Every
+# firewall start empties every mangle chain - TUN_DIR and XRAY_TPROXY included -
+# and a plain apply exits at once while another one holds the lock: when that
+# was the apply of the last firewall start, the chains stayed empty until the
+# next event. --wait queues it behind the running one instead.
+
+# setup_merlin_hook_env - the fakes, and a CLI that notes what it was asked.
+setup_merlin_hook_env() {
+    setup_hook_env
+    printf '#!/bin/sh\necho "$*" >> "%s/apply.log"\n' "$BATS_TEST_TMPDIR" > "$VPD_SCRIPT"
+}
+
+@test "firewall-start: re-applies, queued behind a running apply" {
+    setup_merlin_hook_env
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output "--wait apply"
+}
+
+@test "wan-event: re-applies when a WAN connection comes up, queued behind a running apply" {
+    setup_merlin_hook_env
+    run_hook "$MERLIN_HOOKS/wan-event" 0 connected
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output "--wait apply"
+}
+
+@test "wan-event: leaves the other WAN events alone" {
+    setup_merlin_hook_env
+    run_hook "$MERLIN_HOOKS/wan-event" 0 disconnected
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/apply.log" ]
 }
 
 # ------------------------------------------------------------------- common

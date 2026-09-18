@@ -1,10 +1,16 @@
 #!/bin/sh
+# Asuswrt-Merlin runs this after every firewall start, without waiting for it.
+# The firewall start empties every mangle chain and deletes none - TUN_DIR and
+# XRAY_TPROXY included - so the apply after the last one has to run. A plain
+# apply exits at once while another instance holds the lock, and one still
+# running from an earlier start (or wan-event, or the watch) then left the
+# chains empty until the next event; --wait queues behind it instead.
 
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
-VPD_SCRIPT="/opt/vpn-director/vpn-director.sh"
+VPD_SCRIPT="${VPD_SCRIPT:-/opt/vpn-director/vpn-director.sh}"
 
 if [ -x "$VPD_SCRIPT" ]; then
-    "$VPD_SCRIPT" apply
+    "$VPD_SCRIPT" --wait apply
 else
     logger -t "firewall-start" "vpn-director not found at $VPD_SCRIPT"
 fi
