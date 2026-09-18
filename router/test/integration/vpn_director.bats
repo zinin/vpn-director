@@ -18,6 +18,9 @@ setup() {
     # be repeated here: without it platform_tunnels reads the real
     # /etc/iproute2/rt_tables, which the machine running the suite need not have.
     export RT_TABLES_FILE="$TEST_ROOT/fixtures/rt_tables"
+    # And the ready marker: tproxy_apply would otherwise write the machine's own
+    # /tmp/xray_tproxy/ready.
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
     : > "$LOG_FILE"
 }
 
@@ -195,6 +198,62 @@ run_stubbed_cli() {
     export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
     printf '1\n' > "$VPD_STOPPED_FILE"
     run_stubbed_cli --unless-stopped restart xray
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# Turning one component back on - a Web UI server switch restarts xray - does
+# not undo the stop of the rest. With the marker gone the watch would read the
+# router as running, and its next failover apply would bring everything back.
+@test "vpn-director: apply or restart of one component keeps the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli apply tunnel
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    run_stubbed_cli restart xray
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+}
+
+# The watch checks the marker under the config lock before every write it
+# makes. A stop that only wrote it after the teardown left that whole teardown
+# as a window in which a watch write still went through - onto a router about
+# to be stopped, taking effect on its next manual apply.
+@test "vpn-director: stop leaves its marker before it tears anything down" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    run bash -c '
+        script=$1 calls=$2
+        shift 2
+        source "$script" --source-only "$@"
+        _load_modules
+        acquire_lock() { :; }
+        seen() { if [[ -e $VPD_STOPPED_FILE ]]; then echo "$1 after the marker"; else echo "$1"; fi; }
+        tproxy_stop() { seen tproxy_stop >> "$calls"; }
+        tunnel_stop() { seen tunnel_stop >> "$calls"; }
+        "cmd_$COMMAND"
+    ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" stop
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_stop after the marker\ntunnel_stop after the marker'
+}
+
+# The subscription watch writes config.json for each server it tries and needs
+# only the process to pick it up. "restart xray" takes the TPROXY rules down
+# and puts them back, and in between the Xray clients leave through the WAN -
+# once for every server tried.
+@test "vpn-director: restart xray-process restarts the Xray process and nothing else" {
+    run_stubbed_cli restart xray-process
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output "tproxy_restart_process"
+}
+
+@test "vpn-director: restart xray-process --unless-stopped leaves a stopped router alone" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli --unless-stopped restart xray-process
     assert_success
     [ -f "$VPD_STOPPED_FILE" ]
     [ ! -e "$BATS_TEST_TMPDIR/calls" ]

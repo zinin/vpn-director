@@ -36,6 +36,10 @@ setup() {
     export HOSTS_FILE="$TEST_ROOT/fixtures/hosts"
     export RT_TABLES_FILE="$TEST_ROOT/fixtures/rt_tables"
 
+    # tproxy_apply writes its ready marker to /tmp/xray_tproxy/ready unless told
+    # otherwise - the file the bot on the machine running the suite would read.
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
+
     # Clean log file
     : > "$LOG_FILE"
 

@@ -30,7 +30,8 @@ paths: "**/*.sh, jffs/**/*"
 | `get_script_name [-n]` | Script filename; `-n` strips extension |
 | `resolve_ip [-6] [-q] [-g] [-a] <host>` | DNS/hosts resolution |
 | `resolve_lan_ip [-6] [-q] [-a] <host>` | Resolve only private/LAN addresses |
-| `is_lan_ip [-6] <ip>` | Check if IP is in RFC1918/ULA range |
+| `is_lan_ip [-6] <ip>` | Check if IP is in RFC1918/ULA range (prefix only) |
+| `is_ipv4_net <addr>` | IPv4 address or CIDR that iptables and ipset read as written (no leading zeros) |
 | `is_pos_int <value>` | Check if value is positive integer (>=1) |
 | `strip_comments [text]` | Remove blank lines and # comments |
 | `platform_wan_if` | Active WAN interface (platform contract; `get_active_wan_if` is a wrapper) |
@@ -180,6 +181,27 @@ table=$(printf '%s' "$line" | sed -n 's/.*lookup \([^ ]*\).*/\1/p')
 
 `ip rule del` removes one rule per call and fails when none is left, so a
 teardown deletes by preference in a loop rather than once.
+
+### `cmd | grep -q` under pipefail reports a match as a failure
+
+**Problem**: `grep -q` exits at its first match. If the command on the left still
+has output to write, that write gets SIGPIPE, the command dies with 141, and
+`pipefail` makes the pipeline report the 141 instead of grep's 0. iproute2 writes
+each rule as it prints it, so `ip rule show | grep -q "^16384:"` read an installed
+rule as missing now and then - measured 35 of 500 applies on one CPU - and the
+caller deleted and re-added a live rule, a window in which marked packets fell
+through to `main`. It is timing-dependent, so it passes every test that does not
+force it.
+
+**Solution**: read the whole output first, then search it:
+
+```bash
+rules=$(ip rule show 2>/dev/null) || true
+[[ $'\n'$rules == *$'\n'"$pref:"* ]]
+```
+
+`grep` without `-q` (or `grep -c`) reads its whole input and is not affected;
+neither is `grep -q` on a here-string.
 
 ### A dual-family DNS lookup on the router often never answers
 

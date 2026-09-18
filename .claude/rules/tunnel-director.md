@@ -112,7 +112,23 @@ removes `failover_ready` without a rebuild. Re-installing the rules is what make
 this branch, and a rule that is only checked here would stay missing until the configuration
 changed — the clients of that tunnel falling through to `main`, and the watch waiting on a
 `failover_ready` nothing would write. A rule that is in place is left alone; deleting and
-re-adding it is a window in which marked packets reach `main`.
+re-adding it is a window in which marked packets reach `main`. Whether a rule is there is read from
+the whole `ip rule show` listing (`_tunnel_rule_listed`), never piped into `grep -q` — see the
+pipefail pitfall in `shell-conventions.md`.
+
+A client entry that is no IPv4 address or CIDR (`is_ipv4_net`: `192.168.1.1000`, an octet with a
+leading zero, IPv6) or lies outside RFC1918 is skipped with a WARN, and the rest applies: `is_lan_ip`
+looks at the prefix only, and the failover copies `xray.clients` into a tunnel. A chain rule the
+kernel refuses costs that client only — `_tunnel_emit_client` checks every rule itself and runs
+under `||`, because under errexit one refused MARK used to end the apply after `tunnel_stop` had
+purged the jumps and the ip rules of every tunnel. Such a rebuild is not recorded as up-to-date, so
+the next apply rebuilds and retries it; the up-to-date branch cannot see a missing chain rule.
+
+The PREROUTING jumps are different: a rebuild whose jump did not go in keeps its hash, and the
+up-to-date branch puts a missing jump back (`_tunnel_jumps_ensure`), leaving one that is there where
+it is. `failover_ready` needs the jumps, and every failover client still on the failover tunnel
+marked — one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it
+would leave through the WAN.
 
 The rebuild loop also releases each tunnel's table right before it ensures the route
 (`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that dies after

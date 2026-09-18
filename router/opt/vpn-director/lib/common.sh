@@ -616,6 +616,35 @@ is_lan_ip() {
 }
 
 ###################################################################################################
+# is_ipv4_net - returns 0 for an IPv4 address or IPv4 CIDR the kernel tools read as written
+# -------------------------------------------------------------------------------------------------
+# Usage:
+#   is_ipv4_net <addr>
+#
+# Behavior:
+#   * Four decimal octets 0-255, optionally "/0" to "/32"; no spaces.
+#   * A leading zero is refused, in an octet and in the prefix: iptables parses
+#     numbers with base 0, so "08" is no number at all and "010" is 8, while
+#     ipset takes neither. Go's net.ParseIP refuses them the same way, so what
+#     the daemons accept and what this accepts agree.
+#   * is_lan_ip only looks at the prefix; this is what makes "iptables -s" and
+#     "ipset add" take the value.
+#
+# Examples:
+#   is_ipv4_net 192.168.1.5       -> returns 0
+#   is_ipv4_net 192.168.50.0/24   -> returns 0
+#   is_ipv4_net 192.168.1.1000    -> returns 1
+#   is_ipv4_net 192.168.1.08      -> returns 1
+###################################################################################################
+is_ipv4_net() {
+    local addr="${1:-}"
+    local re_octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])'
+    local re_prefix='(3[0-2]|[12][0-9]|[0-9])'
+    [[ $addr =~ ^$re_octet\.$re_octet\.$re_octet\.$re_octet(/$re_prefix)?$ ]] || return 1
+    return 0
+}
+
+###################################################################################################
 # resolve_ip - resolve host/IP to one or more IPs
 # -------------------------------------------------------------------------------------------------
 # Usage:

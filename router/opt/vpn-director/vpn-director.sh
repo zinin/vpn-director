@@ -26,6 +26,7 @@ fi
 #   vpn-director apply [tunnel|xray]         - Apply configuration
 #   vpn-director stop [tunnel|xray]          - Stop components
 #   vpn-director restart [tunnel|xray]       - Restart components
+#   vpn-director restart xray-process        - Restart the Xray process only (TPROXY rules kept)
 #   vpn-director update                      - Update ipsets and reapply all
 #   vpn-director platform                    - Print platform facts as JSON (for the daemons)
 #   vpn-director cron install|remove         - Schedule or drop the daily ipset update
@@ -116,6 +117,7 @@ Commands:
   apply [tunnel|xray]         Apply configuration
   stop [tunnel|xray]          Stop components
   restart [tunnel|xray]       Restart (stop + apply)
+  restart xray-process        Restart the Xray process only, TPROXY rules kept
   update                      Download fresh ipsets and reapply all
   platform                    Print platform facts as JSON
   cron install|remove         Schedule or drop the daily "update" job
@@ -248,8 +250,14 @@ cmd_apply() {
     fi
 
     # stop's marker pauses the Telegram bot's subscription watch, and an apply
-    # hands routing back to it - a real one only, so not above the dry run.
-    rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
+    # of everything hands routing back to it - a real one only, so not above
+    # the dry run. One component turned back on leaves the stop of the rest in
+    # force: a Web UI server switch restarts xray alone, and a watch that read
+    # the router as running again would bring everything back with its next
+    # failover apply.
+    case "$COMPONENT" in
+        ""|all) rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}" ;;
+    esac
 
     # Wait for network if system just booted (before any downloads)
     _ipset_boot_wait
@@ -310,6 +318,16 @@ cmd_stop() {
     acquire_lock "vpn-director"
     _load_modules
 
+    # The marker first. The watch checks it under the config lock before every
+    # write it makes, and a marker written after the teardown left that whole
+    # teardown open to a failover write - one that takes effect on the next
+    # manual apply of a router the user stopped.
+    case "$COMPONENT" in
+        ""|all)
+            mkdir -p "$(dirname "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}")"
+            printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
+            ;;
+    esac
     case "$COMPONENT" in
         ""|all)
             tproxy_stop
@@ -324,12 +342,6 @@ cmd_stop() {
         *)
             echo "Unknown component: $COMPONENT" >&2
             exit 1
-            ;;
-    esac
-    case "$COMPONENT" in
-        ""|all)
-            mkdir -p "$(dirname "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}")"
-            printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
             ;;
     esac
 }
@@ -360,6 +372,15 @@ cmd_restart() {
             tproxy_restart_process
             COMPONENT=xray cmd_stop
             COMPONENT=xray cmd_apply
+            ;;
+        xray-process)
+            # config.json changed and nothing else: the Telegram bot's
+            # subscription watch writes one per server it tries. The stop and
+            # apply of "xray" take the TPROXY jump away and put it back, and in
+            # between the Xray clients leave through the WAN - once per server.
+            # With the rules in place, a client meets a restarting Xray and
+            # waits instead.
+            tproxy_restart_process
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2

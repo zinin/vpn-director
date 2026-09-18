@@ -1035,3 +1035,162 @@ load_tunnel_module_with() {
     assert_line --index 1 'iptables -t mangle -A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
     assert_equal "${#lines[@]}" 2
 }
+
+# ============================================================================
+# Client addresses, the PREROUTING jumps and failover_ready
+# ============================================================================
+
+# is_lan_ip looks at the prefix only, so an address iptables refuses reached
+# "iptables -A TUN_DIR -s ..." - after tunnel_stop had purged the jumps and the
+# ip rules - and errexit ended the apply right there: every client of every
+# tunnel went out through the WAN, and so did every later apply. The failover
+# copies xray.clients into a tunnel, which turns a typo that used to cost one
+# ipset WARN into exactly that. Called without "run": errexit is what
+# vpn-director.sh has on.
+@test "tunnel_apply: a client address iptables would refuse is skipped, and the rest applies" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.1000","192.168.1.5"]}}'
+    iptables() {
+        if [[ $* == *"-s 192.168.1.1000 "* ]]; then
+            echo "iptables $*" >> /tmp/bats_iptables_calls.log
+            return 2
+        fi
+        command iptables "$@"
+    }
+    : > /tmp/bats_iptables_calls.log
+
+    tunnel_apply
+
+    grep -q -- '-A TUN_DIR -s 192.168.1.5 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    refute grep -q -- '-A TUN_DIR -s 192.168.1.1000' /tmp/bats_iptables_calls.log
+    grep -q "WARN.*192.168.1.1000" "$LOG_FILE"
+    # A bad address is a state of the configuration, not a failure to retry.
+    [ -f "$TUN_DIR_HASH" ]
+}
+
+# One rule the kernel refused - a busy xtables lock - is one client off its
+# tunnel. It used to be the whole chain, the jump and every later apply.
+@test "tunnel_apply: a MARK rule that does not go in costs that client only" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    iptables() {
+        if [[ $* == *"-A TUN_DIR -s 192.168.1.5 "*"-j MARK"* ]]; then
+            echo "iptables $*" >> /tmp/bats_iptables_calls.log
+            return 4
+        fi
+        command iptables "$@"
+    }
+    : > /tmp/bats_iptables_calls.log
+
+    tunnel_apply
+
+    grep -q -- '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    grep -q "ERROR.*192.168.1.5" "$LOG_FILE"
+    # Not recorded as up-to-date: the next apply rebuilds and retries the rule.
+    [ ! -f "$TUN_DIR_HASH" ]
+}
+
+# The watch drops Xray membership on failover_ready. A failover client TUN_DIR
+# does not mark - outside RFC1918, say - then has neither TPROXY nor the tunnel,
+# and leaves through the WAN.
+@test "tunnel_apply: no failover_ready while a failover client is not RFC1918" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.3","100.64.0.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=100.64.0.8
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+@test "tunnel_apply: no failover_ready when a failover client's MARK rule did not go in" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    iptables() {
+        [[ $* == *"-A TUN_DIR -s 192.168.1.8 "*"-j MARK"* ]] && return 4
+        command iptables "$@"
+    }
+
+    tunnel_apply
+
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# sync_fw_rule used to report an insert the kernel refused as success, so the
+# marker went out for a chain nothing jumped to, and the watch dropped Xray
+# membership onto it.
+@test "tunnel_apply: a PREROUTING jump that did not go in withholds failover_ready" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    iptables() {
+        [[ $* == *" -I PREROUTING "* ]] && return 4
+        command iptables "$@"
+    }
+
+    tunnel_apply
+
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+    grep -q "ERROR.*PREROUTING" "$LOG_FILE"
+}
+
+# The rebuild records its hash anyway - dropping it would send the next apply
+# through tunnel_stop - so the up-to-date path is the only one left to put a
+# missing jump back. It used to look at the routes and rules only.
+@test "tunnel_apply: the up-to-date path puts a missing PREROUTING jump back" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    iptables() {
+        [[ $* == *" -I PREROUTING "* ]] && return 4
+        command iptables "$@"
+    }
+    tunnel_apply
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+
+    unset -f iptables
+    fw_chain_exists() { return 0; }
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "up-to-date"
+    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# grep -q leaves as soon as it has its line, and iproute2 writes each rule as it
+# prints it: with output still to come, "ip rule show" dies of SIGPIPE, and under
+# pipefail the pipeline reports that 141 instead of grep's match. A rule that
+# was in place then read as missing - deleted and re-added, a window in which
+# marked packets fall through to main. The listing below writes its rest after
+# grep has gone; "|| return 141" stands in for SIGPIPE where the shell was
+# started with the signal ignored.
+ip_rule_show_cut_short() {
+    if [[ $1 == rule && $2 == show ]]; then
+        printf '0:\tfrom all lookup local\n16384:\tfrom all fwmark 0x10000/0xff0000 lookup ovpnc2\n' || return 141
+        sleep 0.3
+        printf '32766:\tfrom all lookup main\n32767:\tfrom all lookup default\n' || return 141
+        return 0
+    fi
+    echo "ip $*" >> "$BATS_TEST_TMPDIR/ip_writes.log"
+}
+
+@test "_tunnel_rule_ensure: a rule that is in place stays in place when grep cuts the listing short" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    _tunnel_init
+    ip() { ip_rule_show_cut_short "$@"; }
+    run _tunnel_rule_ensure 0 ovpnc2
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/ip_writes.log" ]
+}
+
+@test "_tunnel_failover_rule_present: finds the rule when grep cuts the listing short" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    _tunnel_init
+    export XRAY_FAILOVER_TUNNEL=ovpnc2
+    mkdir -p "$(dirname "$TUN_DIR_TABLES")"
+    printf '0 ovpnc2\n' > "$TUN_DIR_TABLES"
+    ip() { ip_rule_show_cut_short "$@"; }
+    run _tunnel_failover_rule_present
+    assert_success
+}

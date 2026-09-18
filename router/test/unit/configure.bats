@@ -330,6 +330,24 @@ write_daemon_config() {
     assert_output "ovpnc1"
 }
 
+# Only the prefix used to be checked, so 192.168.1.1000 went into the config
+# and then into "iptables -s", which refuses it, and 192.168.1.08 into iptables,
+# which reads a leading zero as octal. Tunnel Director carries Xray clients
+# during a failover, and one such address used to end the whole apply.
+@test "step_configure_clients: an address iptables would refuse or misread is asked again" {
+    run bash -c '
+        set -euo pipefail
+        VPD_DIR="$SCRIPTS_DIR"
+        . "$VPD_DIR/configure.sh" --source-only
+        printf "192.168.1.08\n192.168.1.1000\ndone\n" | step_configure_clients
+        printf "clients=[%s]\n" "$XRAY_CLIENTS_LIST"
+    '
+    assert_success
+    assert_output --partial "Invalid LAN IP: 192.168.1.08"
+    assert_output --partial "Invalid LAN IP: 192.168.1.1000"
+    assert_output --partial "clients=[]"
+}
+
 # The prompt asks again on bad input. It must never abort: an aborted step 3
 # loses every answer the user gave in steps 1-3. Its own shell, because bats
 # clears errexit around "run" and the wizard's "set -e" is the whole point here.

@@ -13,8 +13,14 @@ Module location: `lib/tproxy.sh`
 ```bash
 vpn-director.sh status xray       # Show Xray TPROXY status
 vpn-director.sh restart xray      # Restart Xray TPROXY
+vpn-director.sh restart xray-process  # Restart the Xray process only, TPROXY rules kept
 vpn-director.sh apply             # Apply all (including TPROXY)
 ```
+
+`restart xray` is the process restart plus a stop and an apply of the TPROXY rules, and between the
+two the jump is gone and the Xray clients leave through the WAN. `restart xray-process` restarts the
+process alone: a client meets a restarting Xray and waits. It is for a caller whose only change is
+`config.json` — the subscription watch trying one server after another.
 
 ## How It Works
 
@@ -178,10 +184,18 @@ every rule went in, the platform's own included, and removes it on any soft-fail
 bot's subscription watch waits for it before Xray clients leave the fallback tunnel. A failed
 `platform_tproxy_extra_rules apply` (Keenetic's mangle INPUT accept) fails `_tproxy_setup_iptables`
 only after the PREROUTING jumps are in place, so interception stays as it was and only the marker
-is withheld. The chain flush or a RETURN rule that does not go in (clients, bypass, the private
-ranges, an exclusion) ends it before the TPROXY targets instead, on a flushed chain that intercepts
-nothing: without those rules the targets would take every LAN client or LAN-to-LAN traffic.
+is withheld. The chain flush, rule 1 (`! XRAY_CLIENTS`) or a private-range RETURN that does not go
+in ends it before the TPROXY targets instead, on a flushed chain that intercepts nothing: without
+those rules the targets would take every LAN client, or traffic to the router and the rest of the
+LAN. Every other RETURN (bypass, loopback, link-local, multicast, broadcast, an exclusion) only
+decides what a client reaches directly instead of through the proxy: its failure is logged, the
+targets and the jumps still go in, and only the marker is withheld — ending the setup there left
+every Xray client on the WAN over one busy xtables lock. A PREROUTING jump that does not go in
+withholds the marker as well: `sync_fw_rule` returns 1 for an insert the kernel refused.
 `XRAY_CLIENTS` has to be complete too: nothing validates `xray.clients`, and an address the set
 does not take is RETURNed by rule 1 and left unproxied, so `_tproxy_setup_clients_ipset` reports it
 and the marker is withheld although the chain itself is in place. The adds pass `-exist`, so a
-repeated address is not a failure.
+repeated address is not a failure, and an entry that is no IPv4 address or CIDR (`is_ipv4_net`: an
+IPv6 address an older Web UI saved, a typo like `192.168.1.1000`) is skipped with a WARN and does
+not count — no set takes it, no tunnel carries it, and waiting for it held every restore of the
+LAN on the fallback tunnel.
