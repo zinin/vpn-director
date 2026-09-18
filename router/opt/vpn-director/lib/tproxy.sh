@@ -8,7 +8,7 @@
 #   Migrated from xray_tproxy.sh to provide independent, testable functions.
 #
 # Dependencies:
-#   - common.sh (log, tmp_file, is_ipv4_net) and, through it, the platform contract
+#   - common.sh (log, tmp_file, is_ipv4_net, rt_table_label) and, through it, the platform contract
 #     (platform_load_module, platform_vpn_endpoints, platform_tproxy_extra_rules,
 #      platform_lan_ifaces)
 #   - firewall.sh (create_fw_chain, delete_fw_chain, ensure_fw_rule, sync_fw_rule, purge_fw_rules)
@@ -29,7 +29,6 @@
 #   _tproxy_check_required_ipsets() - fail-safe check for required ipsets
 #   _tproxy_rule_is_ours()          - does an ip rule on our preference belong to us?
 #   _tproxy_setup_routing()         - setup routing table and ip rule
-#   _tproxy_table_label()           - the name the kernel prints for a table
 #   _tproxy_teardown_routing()      - remove routing table and ip rule
 #   _tproxy_setup_clients_ipset()   - setup clients ipset
 #   _tproxy_validate_ipv4_cidr()    - validate IPv4 address or CIDR notation
@@ -219,7 +218,7 @@ _tproxy_setup_routing() {
     fi
 
     want_mark="$XRAY_FWMARK/$XRAY_FWMARK_MASK"
-    want_table=$(_tproxy_table_label "$XRAY_ROUTE_TABLE")
+    want_table=$(rt_table_label "$XRAY_ROUTE_TABLE")
 
     # Reconcile the rules on our preference: keep one that carries the
     # configured mark and table, drop the other copies of ours - the ones an
@@ -227,7 +226,7 @@ _tproxy_setup_routing() {
     # route_table or fwmark_mask, which would otherwise count as ours and keep
     # the new setting from ever being installed. Rules that are not ours stay
     # (_tproxy_rule_is_ours). Comparing what the kernel prints - not the table
-    # number - is the whole point; see _tproxy_table_label.
+    # number - is the whole point; see rt_table_label in common.sh.
     while IFS= read -r line; do
         [[ -n $line ]] || continue
         mark=$(printf '%s' "$line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')
@@ -261,24 +260,11 @@ _tproxy_setup_routing() {
 }
 
 # -------------------------------------------------------------------------------------------------
-# _tproxy_table_label - the name the kernel prints for a routing table
-# -------------------------------------------------------------------------------------------------
-# iproute2 renders a routing table by its rt_tables name and falls back to the
-# number, so table 100 reads back as "lookup wan0" on Asuswrt-Merlin. When
-# rt_tables is missing both sides fall back to the number and still agree.
-_tproxy_table_label() {
-    local name
-    name=$(awk -v id="$1" '$0 !~ /^#/ && $1 == id { print $2; exit }' \
-        "${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" 2>/dev/null)
-    printf '%s' "${name:-$1}"
-}
-
-# -------------------------------------------------------------------------------------------------
 # _tproxy_teardown_routing - remove routing table and ip rule
 # -------------------------------------------------------------------------------------------------
 _tproxy_teardown_routing() {
     local want_table line mark table
-    want_table=$(_tproxy_table_label "$XRAY_ROUTE_TABLE")
+    want_table=$(rt_table_label "$XRAY_ROUTE_TABLE")
 
     # Every rule on our preference that is ours (_tproxy_rule_is_ours): the
     # copies an older version left on every apply, and rules from an earlier

@@ -604,6 +604,80 @@ load '../test_helper'
     refute grep -q "rule add pref .* lookup ovpnc2" /tmp/bats_ip_calls.log
 }
 
+# Another rule can sit on the failover tunnel's preference - a firmware's, a
+# user's, one an older layout left. Looking at the preference alone took it for
+# ours: the up-to-date path never put ours back, and failover_ready went out
+# with the failover clients' marks routed by that rule or by main.
+@test "tunnel_apply: up-to-date path puts the failover rule back over another rule on its preference" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-rule-foreign.json"
+    jq '.tunnel_director.tunnels = {
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+            return 1
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_success
+    printf '16384:\tfrom all fwmark 0x20000/0xff0000 lookup ovpnc1\n' >> "${BATS_IP_RULES_FILE:-/tmp/bats_test_ip_rules}"
+
+    unset -f ip
+    fw_chain_exists() { return 0; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "up-to-date"
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup ovpnc2'
+    refute_line --partial "lookup ovpnc1"
+    local ready="${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}"
+    grep -qx ovpnc2 "$ready"
+}
+
+# failover_ready is what the watch takes the clients off Xray on. A rule that
+# routes other marks, or into another table, carries none of theirs.
+@test "tunnel_apply: another rule on the failover preference does not make the fallback ready" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-rule-not-ours.json"
+    jq '.tunnel_director.tunnels = {
+            "ovpnc2": {"clients":["192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    platform_tunnel_route_ensure() { return 0; }
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+            return 1
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_success
+    printf '16384:\tfrom all fwmark 0x20000/0xff0000 lookup ovpnc1\n' >> "${BATS_IP_RULES_FILE:-/tmp/bats_test_ip_rules}"
+
+    fw_chain_exists() { return 0; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "up-to-date"
+    local ready="${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}"
+    [ ! -e "$ready" ]
+}
+
 @test "tunnel_apply: records failover ready when the route and ip rule are installed" {
     load_common
     source "$LIB_DIR/firewall.sh"
@@ -1193,4 +1267,42 @@ ip_rule_show_cut_short() {
     ip() { ip_rule_show_cut_short "$@"; }
     run _tunnel_failover_rule_present
     assert_success
+}
+
+# iproute2 4.4 - Entware's ip-full on KeeneticOS - ends every rule with a space
+# and prints a table rt_tables does not name by its number. A rule of ours read
+# as another would be deleted and added back on every apply: a window in which
+# marked packets reach main.
+@test "_tunnel_rule_ensure: recognises its rule as iproute2 4.4 prints it" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    _tunnel_init
+    platform_tunnel_table() { printf '2000\n'; }
+    ip() {
+        if [[ $1 == rule && $2 == show ]]; then
+            printf '0:\tfrom all lookup local \n16384:\tfrom all fwmark 0x10000/0xff0000 lookup 2000 \n'
+            return 0
+        fi
+        echo "ip $*" >> "$BATS_TEST_TMPDIR/ip_writes.log"
+    }
+    run _tunnel_rule_ensure 0 ovpnc2
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/ip_writes.log" ]
+}
+
+# iproute2 leaves a mask of all ones out of the listing - "fwmark 0x10000", not
+# "fwmark 0x10000/0xffffffff" - and the rule is ours all the same.
+@test "_tunnel_rule_ensure: recognises its rule under a full mark mask" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export TUN_DIR_MARK_MASK=0xffffffff
+    _tunnel_init
+    ip() {
+        if [[ $1 == rule && $2 == show ]]; then
+            printf '0:\tfrom all lookup local\n16384:\tfrom all fwmark 0x10000 lookup ovpnc2\n'
+            return 0
+        fi
+        echo "ip $*" >> "$BATS_TEST_TMPDIR/ip_writes.log"
+    }
+    run _tunnel_rule_ensure 0 ovpnc2
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/ip_writes.log" ]
 }

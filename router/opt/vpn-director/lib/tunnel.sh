@@ -8,8 +8,8 @@
 #   Routes LAN client traffic through VPN tunnels with exclusion-based routing.
 #
 # Dependencies:
-#   - common.sh (log, tmp_file, compute_hash, is_lan_ip, is_ipv4_net) and, through
-#     it, the platform contract (platform_tunnels, platform_tunnel_table,
+#   - common.sh (log, tmp_file, compute_hash, is_lan_ip, is_ipv4_net, rt_table_label)
+#     and, through it, the platform contract (platform_tunnels, platform_tunnel_table,
 #     platform_tunnel_route_ensure, platform_tunnel_table_release,
 #     platform_prerouting_base_pos, platform_lan_ifaces)
 #   - firewall.sh (create_fw_chain, delete_fw_chain, ensure_fw_rule, sync_fw_rule,
@@ -188,17 +188,19 @@ _tunnel_ensure_routes() {
 # Xray clients on a dead outbound.
 #
 # A rule that is in place is left alone. Deleting and re-adding it would open a
-# window in which marked packets fall through to main.
+# window in which marked packets fall through to main. Another rule on the
+# preference makes way for it: the range is this module's, as the rebuild and
+# tunnel_stop treat it.
 # -------------------------------------------------------------------------------------------------
 _tunnel_rule_ensure() {
     local idx="$1" tunnel="$2"
     local pref=$((TUN_DIR_PREF_BASE + idx))
-    if _tunnel_rule_listed "$pref"; then
+    local mark_hex table
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    table="$(platform_tunnel_table "$tunnel" "$idx")"
+    if _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
         return 0
     fi
-    local mark_hex table
-    mark_hex=$(printf '0x%x' $(( (idx + 1) << _tunnel_mark_shift_val )))
-    table="$(platform_tunnel_table "$tunnel" "$idx")"
     ip rule del pref "$pref" 2>/dev/null || true
     if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
         log -l ERROR "Tunnel '$tunnel': ip rule still not installed: pref=$pref fwmark=$mark_hex lookup=$table"
@@ -208,27 +210,50 @@ _tunnel_rule_ensure() {
     return 0
 }
 
-# _tunnel_rule_listed <pref> - is there an ip rule at this preference?
+# _tunnel_mark_hex <idx> - the fwmark of the tunnel in slot idx, as ip prints it
+_tunnel_mark_hex() {
+    printf '0x%x' $(( ($1 + 1) << _tunnel_mark_shift_val ))
+}
+
+# _tunnel_rule_listed <pref> <mark> <table> - is this module's rule at that
+# preference: "from all fwmark <mark>/<mask> lookup <table>"? Another rule can
+# hold the same preference - a firmware's, a user's, one an older layout left -
+# and a look at the preference alone took it for ours: the up-to-date path never
+# put ours back, and failover_ready went out with the failover clients' marks
+# routed by that rule or by main. The table is compared as the kernel prints it
+# (rt_table_label) and every part as a whole word: iproute2 4.4 ends each rule
+# with a space, and a mask of all ones is left out of the listing.
+#
 # "ip rule show pref N" is refused by iproute2 4.4 (Entware's ip-full), so the
 # unfiltered listing is searched here - read whole first. Piped into "grep -q"
 # it was wrong under pipefail: grep leaves at its match, iproute2 writes each
 # rule as it prints it, and the SIGPIPE that ends "ip" made the pipeline report
 # 141, so a rule in place read as missing.
 _tunnel_rule_listed() {
-    local rules
+    local pref="$1" fwmark="fwmark $2/$_tunnel_mark_mask_hex" lookup rules line
+    [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || fwmark="fwmark $2"
+    lookup="lookup $(rt_table_label "$3")"
     rules=$(ip rule show 2>/dev/null) || true
-    [[ $'\n'$rules == *$'\n'"$1:"* ]]
+    while IFS= read -r line; do
+        [[ $line == "$pref:"* ]] || continue
+        line=" ${line#*:} "
+        line=${line//$'\t'/ }
+        if [[ $line == *" from all "* && $line == *" $fwmark "* && $line == *" $lookup "* ]]; then
+            return 0
+        fi
+    done <<< "$rules"
+    return 1
 }
 
-# True when the failover tunnel has an ip rule at pref TUN_DIR_PREF_BASE+idx.
+# True when the failover tunnel's own ip rule is at pref TUN_DIR_PREF_BASE+idx.
 _tunnel_failover_rule_present() {
-    local idx pref
+    local idx table
     [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] || return 0
     [[ -f $TUN_DIR_TABLES ]] || return 1
     idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$TUN_DIR_TABLES")
     [[ -n $idx ]] || return 1
-    pref=$((TUN_DIR_PREF_BASE + idx))
-    _tunnel_rule_listed "$pref"
+    table=$(platform_tunnel_table "$XRAY_FAILOVER_TUNNEL" "$idx") || return 1
+    _tunnel_rule_listed $((TUN_DIR_PREF_BASE + idx)) "$(_tunnel_mark_hex "$idx")" "$table"
 }
 
 # _tunnel_failover_carried - does TUN_DIR mark every failover client still on

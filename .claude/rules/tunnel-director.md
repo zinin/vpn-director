@@ -114,7 +114,12 @@ changed — the clients of that tunnel falling through to `main`, and the watch 
 `failover_ready` nothing would write. A rule that is in place is left alone; deleting and
 re-adding it is a window in which marked packets reach `main`. Whether a rule is there is read from
 the whole `ip rule show` listing (`_tunnel_rule_listed`), never piped into `grep -q` — see the
-pipefail pitfall in `shell-conventions.md`.
+pipefail pitfall in `shell-conventions.md`. "There" means this module's rule, not a rule on the
+preference: `from all fwmark <mark>/<mask> lookup <table>`, the table as the kernel prints it
+(`rt_table_label`) and every part a whole word, since iproute2 4.4 ends each rule with a space. A
+look at the preference alone took another owner's rule for ours, so ours was never put back and
+`failover_ready` went out with the failover marks routed by that rule or by `main`; such a rule now
+makes way, as it does on a rebuild.
 
 A client entry that is no IPv4 address or CIDR (`is_ipv4_net`: `192.168.1.1000`, an octet with a
 leading zero, IPv6) or lies outside RFC1918 is skipped with a WARN, and the rest applies: `is_lan_ip`

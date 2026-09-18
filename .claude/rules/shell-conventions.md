@@ -33,6 +33,7 @@ paths: "**/*.sh, jffs/**/*"
 | `is_lan_ip [-6] <ip>` | Check if IP is in RFC1918/ULA range (prefix only) |
 | `is_ipv4_net <addr>` | IPv4 address or CIDR that iptables and ipset read as written (no leading zeros) |
 | `is_pos_int <value>` | Check if value is positive integer (>=1) |
+| `rt_table_label <table>` | A routing table as `ip rule show` prints it: its rt_tables name, else as given |
 | `strip_comments [text]` | Remove blank lines and # comments |
 | `platform_wan_if` | Active WAN interface (platform contract; `get_active_wan_if` is a wrapper) |
 | `platform_ipv6_enabled` | 1 when IPv6 is enabled (platform contract; `get_ipv6_enabled` is a wrapper) |
@@ -159,7 +160,7 @@ ip rule show | grep -c "fwmark 0x100.*lookup 100"
 ```
 
 KeeneticOS has no `/etc/iproute2/rt_tables`; `ip rule show` prints table numbers,
-and `_tproxy_table_label` falls back to the number so both sides still agree.
+and `rt_table_label` (common.sh) falls back to the number so both sides still agree.
 
 `_tproxy_setup_routing` did exactly this and re-added its rule on every apply —
 seven copies on a router with 23 days of uptime, and auto-apply from the Web UI
@@ -168,13 +169,13 @@ made each click add another.
 **Solution**: the preference belongs to the module, so reconcile everything
 sitting on it instead of looking for one tuple. Keep a rule that carries the
 configured mark and table — comparing what the kernel *prints*, via
-`_tproxy_table_label` — and delete the rest, including rules an earlier
+`rt_table_label` — and delete the rest, including rules an earlier
 `route_table` or `fwmark_mask` left behind. Matching only the configured tuple
 has the mirror-image failure: a stale rule counts as ours, and the new setting
 never gets installed.
 
 ```bash
-want_table=$(_tproxy_table_label "$TABLE")     # 100 -> wan0
+want_table=$(rt_table_label "$TABLE")          # 100 -> wan0
 mark=$(printf '%s' "$line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')
 table=$(printf '%s' "$line" | sed -n 's/.*lookup \([^ ]*\).*/\1/p')
 ```

@@ -60,6 +60,9 @@
 #   get_active_wan_if
 #       Prints the active WAN interface name, or nothing. Wrapper over platform_wan_if.
 #
+#   rt_table_label <table>
+#       Prints a routing table the way "ip rule show" names it: its rt_tables name, else as given.
+#
 #   platform_* (see lib/platform.sh)
 #       The platform contract; common.sh sources lib/platform.sh at the end, so every script that
 #       sources common.sh can call it.
@@ -778,6 +781,21 @@ get_ipv6_enabled() {
 ###################################################################################################
 get_active_wan_if() {
     platform_wan_if || true
+}
+
+###################################################################################################
+# rt_table_label - the name the kernel prints for a routing table
+# -------------------------------------------------------------------------------------------------
+# iproute2 renders a routing table by its rt_tables name and falls back to the number, so table
+# 100 reads back as "lookup wan0" on Asuswrt-Merlin. When rt_tables is missing (KeeneticOS) both
+# sides fall back to the number and still agree, and a name is printed as it is. Anything that
+# looks for its own rule in "ip rule show" compares against this, not the number it passed.
+###################################################################################################
+rt_table_label() {
+    local name
+    name=$(awk -v id="$1" '$0 !~ /^#/ && $1 == id { print $2; exit }' \
+        "${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" 2>/dev/null)
+    printf '%s' "${name:-$1}"
 }
 
 ###################################################################################################
