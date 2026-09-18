@@ -1977,6 +1977,107 @@ func TestTick_CommittedFailoverRestoresWhenSOCKSHealthy(t *testing.T) {
 	}
 }
 
+// selectManual is what a Web UI or /xray selection leaves in the config:
+// another server named, and the write counter moved on.
+func selectManual(f *fake) {
+	f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, vpnconfig.Server{Name: "Manual", Address: "manual.example", Port: 443})
+}
+
+// selectOnWrite is an UpdateVPN whose first write after the walk picked a
+// server waits for the config lock while a selection commits: by the time the
+// callback runs, active_server names the user's server.
+func selectOnWrite(f *fake) func(func(*vpnconfig.VPNDirectorConfig) error) error {
+	selected := false
+	return func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		if f.picked && !selected {
+			selected = true
+			selectManual(f)
+		}
+		return fn(f.cfg)
+	}
+}
+
+// selectDuringTheStageApply has a selection commit while the apply after the
+// restore's stage runs - the first apply with the client back in xray.clients.
+func selectDuringTheStageApply(w *Watch, f *fake) {
+	selected := false
+	apply := w.Apply
+	w.Apply = func() error {
+		if !selected && contains(f.cfg.Xray.Clients, "192.168.1.8") {
+			selected = true
+			selectManual(f)
+		}
+		return apply()
+	}
+}
+
+// The walk looked at active_server before the restore, and the restore wrote
+// without looking again. A selection that committed while its stage waited for
+// the config lock put another server in place of the one the walk had just
+// probed - one still starting, or dead - and the restore took the clients off a
+// working tunnel onto it, announcing the walk's server.
+func TestTick_ASelectionWhileTheRestoreWaitsKeepsTheClientsOnTheTunnel(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), plat: connected("ovpnc2"), now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(liveImportWatch(f))
+	w.UpdateVPN = selectOnWrite(f)
+
+	w.Tick(context.Background())
+
+	if f.cfg.Xray.Failover == nil || contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v; restored onto a server nobody probed", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("the client must stay on the tunnel")
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+// The selection can land between the restore's two writes as well, while the
+// apply of the stage runs. The clients the stage handed back to Xray leave it
+// again; the next tick probes the server that runs now.
+func TestTick_ASelectionBetweenTheRestoreWritesTakesTheClientsOffXrayAgain(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), plat: connected("ovpnc2"), now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(liveImportWatch(f))
+	selectDuringTheStageApply(w, f)
+
+	w.Tick(context.Background())
+
+	if f.cfg.Xray.Failover == nil || contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v; restored onto a server nobody probed", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("the client must stay on the tunnel")
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+// The tick's own restore had the same gap: its probe tested the server
+// active_server named when the tick read the config. A selection since is the
+// next tick's to probe, and to restore on.
+func TestTick_ASelectionAfterTheProbeIsTheNextTicksToRestoreOn(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	selectDuringTheStageApply(w, f)
+
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover == nil || contains(f.cfg.Xray.Clients, "192.168.1.8") || len(f.notes) != 0 {
+		t.Fatalf("failover %+v, xray.clients %v, notes %v; restored on the probe of the server before", f.cfg.Xray.Failover, f.cfg.Xray.Clients, f.notes)
+	}
+
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil || !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v; the next probe is of the server selected", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+	if countNotes(f.notes, "LAN clients back on Xray; server Manual") != 1 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
 func TestPickOrder_SameNameFirst(t *testing.T) {
 	in := []vpnconfig.Server{
 		{Name: "A", Address: "1.example"},
