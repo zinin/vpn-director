@@ -192,14 +192,19 @@ func EffectiveXrayClients(cfg *VPNDirectorConfig) []string {
 	return out
 }
 
+// Armed reports whether the subscription watch has work. A saved link and Xray
+// clients to protect arm it for a failover of its own. A failover record arms it
+// with or without a link: import_server_list.sh clears the link for a list from
+// a file or a plain-http link, and the clients the record took off Xray still
+// have to come back.
 func Armed(cfg *VPNDirectorConfig) bool {
-	if cfg == nil || cfg.Xray.SubscriptionURL == "" {
+	if cfg == nil {
 		return false
 	}
 	if cfg.Xray.Failover != nil {
 		return true
 	}
-	return len(EffectiveXrayClients(cfg)) > 0
+	return cfg.Xray.SubscriptionURL != "" && len(EffectiveXrayClients(cfg)) > 0
 }
 
 func TDExits(cfg *VPNDirectorConfig, plat PlatformInfo) []string {

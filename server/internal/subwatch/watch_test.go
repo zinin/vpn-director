@@ -1141,6 +1141,104 @@ func TestTick_UnarmedTickResetsTimer(t *testing.T) {
 	}
 }
 
+// import_server_list.sh clears the saved link for a list from a file or a
+// plain-http link - an import a user makes over SSH while Xray is down. The
+// watch went idle with the link, and the failover it left behind kept its
+// clients on the tunnel for good.
+func TestTick_AFailoverOutlivesItsLinkAndStillRestores(t *testing.T) {
+	f := &fake{cfg: committedCfg(), plat: connected("ovpnc2"), now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.SubscriptionURL = ""
+	w := runningWatch(f.watch())
+
+	w.Tick(context.Background())
+
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v; a live outbound ends it, link or no link", f.cfg.Xray.Failover)
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") || contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatalf("xray.clients %v, ovpnc2 %v", f.cfg.Xray.Clients, f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients)
+	}
+	if n := countNotes(f.notes, "LAN clients back on Xray"); n != 1 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+// A failover with no link still follows its tunnel: gone for a minute with no
+// other exit, the clients go back to Xray as they do with one, and are told.
+// The message came from the next tick's death path, which a watch without a
+// link never reaches.
+func TestTick_AFailoverWithoutALinkStillLeavesATunnelThatWentDown(t *testing.T) {
+	f := &fake{cfg: committedCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.SubscriptionURL = ""
+	f.plat = vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: false}}}
+	w := runningWatch(f.watch())
+
+	tickFor(w, f, time.Minute)
+
+	if f.cfg.Xray.Failover != nil || !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+	if n := countNotes(f.notes, "Xray outbound is down; no Tunnel Director fallback"); n != 1 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+// With no link there is nothing to refresh: a dead outbound neither downloads
+// "" nor reports a refresh that failed, and the failover goes on.
+func TestTick_AFailoverWithoutALinkRefreshesNothing(t *testing.T) {
+	f := &fake{cfg: committedCfg(), plat: connected("ovpnc2"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.SubscriptionURL = ""
+	w := runningWatch(f.watch())
+	fetches := 0
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		fetches++
+		return nil, errors.New("unsupported protocol scheme")
+	}
+
+	tickFor(w, f, 2*ImportRetry)
+
+	if fetches != 0 {
+		t.Fatalf("fetches %d with no saved link", fetches)
+	}
+	if n := countNotes(f.notes, "Subscription refresh failed"); n != 0 {
+		t.Fatalf("notes %v", f.notes)
+	}
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("the failover ended while the outbound is down and its tunnel up")
+	}
+}
+
+// A restore whose last apply failed is retried on the next tick. The JSON
+// already says restored, so nothing but a hook or the daily update would apply
+// it otherwise, and a retry that loses TPROXY is the one that puts the clients
+// back on the tunnel: a link cleared in between must not end it.
+func TestTick_ARestoreLeftPendingIsFinishedWithoutALink(t *testing.T) {
+	f := &fake{cfg: committedCfg(), plat: connected("ovpnc2"), now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	w.Apply = func() error {
+		f.applies++
+		if f.applies == 2 {
+			return errApply
+		}
+		return nil
+	}
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil || countNotes(f.notes, "LAN clients back on Xray") != 0 {
+		t.Fatalf("failover %+v, notes %v; the restore's last apply failed", f.cfg.Xray.Failover, f.notes)
+	}
+
+	f.cfg.Xray.SubscriptionURL = ""
+	f.now = f.now.Add(ProbeInterval)
+	w.Tick(context.Background())
+
+	if f.applies != 3 {
+		t.Fatalf("applies %d; the failed apply was not retried", f.applies)
+	}
+	if n := countNotes(f.notes, "LAN clients back on Xray"); n != 1 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
 func TestTick_TunnelGoneAtMoveSkipsApplyAndNotify(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),

@@ -103,9 +103,16 @@ func TestArmed(t *testing.T) {
 	if !Armed(cfg) {
 		t.Fatal("failover arms even with empty xray.clients")
 	}
+	// import_server_list.sh clears the link for a list from a file; the
+	// failover it lands on still has to end.
 	cfg.Xray.SubscriptionURL = ""
+	if !Armed(cfg) {
+		t.Fatal("failover arms even with no url")
+	}
+	cfg.Xray.Failover = nil
+	cfg.Xray.Clients = []string{"192.168.1.8"}
 	if Armed(cfg) {
-		t.Fatal("no url")
+		t.Fatal("clients but no url and no failover")
 	}
 }
 

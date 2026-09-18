@@ -143,7 +143,9 @@ func (w *Watch) Tick(ctx context.Context) {
 		slog.Warn("Failed to load VPN Director config for the subscription watch", "error", err)
 		return
 	}
-	if !vpnconfig.Armed(cfg) {
+	// A restore whose last apply failed is work the watch has started, as a
+	// failover is: neither waits for a saved link or for Xray clients.
+	if !vpnconfig.Armed(cfg) && !w.pendingApply {
 		w.failSince = time.Time{}
 		return
 	}
@@ -247,6 +249,12 @@ func (w *Watch) Tick(ctx context.Context) {
 				}
 			}
 		}
+	}
+	// A pending restore is all an unarmed watch finishes: a failover of its own
+	// needs a link to refresh and Xray clients to move.
+	if !vpnconfig.Armed(cfg) {
+		w.failSince = time.Time{}
+		return
 	}
 
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
@@ -509,6 +517,9 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		w.lastRouteKind = noteNone
 	} else {
 		slog.Warn("Failover tunnel is no longer a Tunnel Director exit and there is no other; the Xray clients go back to Xray", "tunnel", id)
+		// Announced here, not by the death path on the next tick: a watch
+		// whose link is gone does not reach it.
+		w.notify(noteNoTunnel, msgNoTunnel)
 	}
 	w.resetFallbackState()
 	if err := w.apply(); err != nil {
@@ -700,6 +711,15 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	if w.Fetch == nil || w.stopped() {
 		return
 	}
+	rawURL := ""
+	if cfg != nil {
+		rawURL = cfg.Xray.SubscriptionURL
+	}
+	if rawURL == "" {
+		// A failover outlives its link - import_server_list.sh clears it for a
+		// list from a file - and is still seen through, but nothing refreshes.
+		return
+	}
 	now := w.Now()
 	if !w.lastImport.IsZero() && now.Sub(w.lastImport) < w.importInterval() {
 		return
@@ -707,10 +727,6 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	prevImport := w.lastImport
 	w.lastImport = now
 
-	rawURL := ""
-	if cfg != nil {
-		rawURL = cfg.Xray.SubscriptionURL
-	}
 	fetchCtx, cancel := context.WithTimeout(ctx, FetchTimeout)
 	servers, err := w.Fetch(fetchCtx, rawURL)
 	cancel()
