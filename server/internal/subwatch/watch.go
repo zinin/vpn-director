@@ -591,6 +591,30 @@ func pickOrder(servers []vpnconfig.Server, chosen *vpnconfig.ActiveServer) []vpn
 	return append(order, servers[i+1:]...)
 }
 
+// perAddress lists each server once for every address it resolved to, each copy
+// with that address alone, so the walk dials them one after another; a server
+// with none is listed as it is. An endpoint ban takes an address, not the name:
+// a host can resolve to one the router cannot reach and another it can, and
+// dialing only the first rejected the whole server.
+func perAddress(servers []vpnconfig.Server) []vpnconfig.Server {
+	out := make([]vpnconfig.Server, 0, len(servers))
+	for _, s := range servers {
+		n := len(out)
+		for _, ip := range s.IPs {
+			if ip == "" {
+				continue
+			}
+			c := s
+			c.IPs = []string{ip}
+			out = append(out, c)
+		}
+		if len(out) == n {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 func (w *Watch) fallbackReady(cfg *vpnconfig.VPNDirectorConfig) bool {
 	if w.FallbackReady == nil {
 		return true
@@ -815,7 +839,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	// lastSeq is the counter of the walk's own last record, or the one it
 	// started from: any other value in the config is someone else's write.
 	lastSeq := startedSeq
-	for _, s := range order {
+	for _, s := range perAddress(order) {
 		if ctx.Err() != nil || w.stopped() {
 			return
 		}
@@ -847,10 +871,10 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		}
 		w.AfterRestart(SettleAfterRestart)
 		if err := w.Probe(ctx, socks); err != nil {
-			slog.Debug("Subscription server probe failed", "server", s.Name, "error", err)
+			slog.Debug("Subscription server probe failed", "server", s.Name, "ips", s.IPs, "error", err)
 			continue
 		}
-		slog.Info("Subscription server picked", "server", s.Name)
+		slog.Info("Subscription server picked", "server", s.Name, "ips", s.IPs)
 		if w.walkEnded(w.walkOwnsNow(rawURL, started, lastRecorded, lastSeq), prevImport) {
 			return
 		}

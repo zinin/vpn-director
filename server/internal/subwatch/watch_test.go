@@ -406,6 +406,50 @@ func TestServerForDial_LeavesARealitySNIEmpty(t *testing.T) {
 	}
 }
 
+// An endpoint ban takes an address, not the name: a provider's host can resolve
+// to one the router cannot reach and another it can. The walk dialed only the
+// first, and a server whose first address was banned was rejected whole.
+func TestTick_WalkTriesEveryAddressOfAServer(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), plat: connected("ovpnc2"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	var dialed []string
+	current := ""
+	w := runningWatch(f.watch())
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443, IPs: []string{"203.0.113.10", "", "203.0.113.11"}},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		if err := f.checkGuard(guard); err != nil {
+			return false, f.seq(), err
+		}
+		current = ServerForDial(s).Address
+		dialed = append(dialed, current)
+		return true, f.seq(), nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+	w.Probe = func(context.Context, int) error {
+		if current == "203.0.113.11" {
+			return nil
+		}
+		return errProbe
+	}
+
+	w.Tick(context.Background())
+
+	if !reflect.DeepEqual(dialed, []string{"203.0.113.10", "203.0.113.11"}) {
+		t.Fatalf("dialed %v; every address of the server, in order", dialed)
+	}
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v; the server's second address works", f.cfg.Xray.Failover)
+	}
+	if n := countNotes(f.notes, "LAN clients back on Xray; server Oslo"); n != 1 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
 func TestTick_NoTunnelStillNotifiesOnce(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
