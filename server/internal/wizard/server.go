@@ -74,7 +74,7 @@ func (s *ServerStep) HandleCallback(cb *tgbotapi.CallbackQuery, state *State) {
 		return
 	}
 
-	state.SetServerIndex(idx)
+	state.PickServer(idx, servers[idx])
 	state.SetStep(StepExclusions)
 	// Default: include ru in exclusions
 	state.SetExclusion("ru", true)

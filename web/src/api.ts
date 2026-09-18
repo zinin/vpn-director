@@ -10,6 +10,7 @@ import type {
   LogResponse,
   OkResponse,
   PlatformInfo,
+  Server,
   ServersResponse,
   StatusResponse,
   UpdateCheckResponse,
@@ -70,8 +71,15 @@ export default {
   // Servers
   getServers: () =>
     api.get<ServersResponse>('/api/servers'),
-  selectServer: (index: number) =>
-    api.post<OkResponse>('/api/servers/active', { index }),
+  // The server as the page shows it at that index: the list can change before
+  // the click, and the router answers 409 when the index names another server.
+  selectServer: (index: number, server: Server) =>
+    api.post<OkResponse>('/api/servers/active', {
+      index,
+      name: server.name,
+      address: server.address,
+      port: server.port,
+    }),
   // Empty url reuses xray.subscription_url on the server.
   importServers: (url: string) =>
     api.post<ImportResponse>('/api/servers/import', { url }),

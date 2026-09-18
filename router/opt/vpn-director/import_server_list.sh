@@ -36,9 +36,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib/common.sh
 . "$SCRIPT_DIR/lib/common.sh"
 
-# Paths
-VPD_DIR="/opt/vpn-director"
-VPD_CONFIG="$VPD_DIR/vpn-director.json"
+# Paths; VPD_DIR and VPD_CONFIG can be set by the caller, as configure.sh's can
+VPD_DIR="${VPD_DIR:-/opt/vpn-director}"
+VPD_CONFIG="${VPD_CONFIG:-$VPD_DIR/vpn-director.json}"
 VPD_TEMPLATE="$VPD_DIR/vpn-director.json.template"
 
 ###############################################################################
@@ -398,6 +398,57 @@ step_parse_and_save_servers() {
 }
 
 ###############################################################################
+# Step 3: Remember where the list came from
+###############################################################################
+
+# The Telegram bot's subscription watch re-imports xray.subscription_url when the
+# Xray outbound dies, and the Web UI and /import re-import it on request. A list
+# imported here from another link would be replaced by the old link's on the next
+# refresh, so an https link is saved with it. Anything else clears the saved
+# link: neither fetches a file or a plain-http link, and the old link no longer
+# produced the list. The write goes under the lock the daemons and configure.sh
+# take. Before configure.sh has run there is no config, and nothing refreshes.
+step_save_subscription_url() {
+    [[ -f $VPD_CONFIG ]] || return 0
+
+    local filter='del(.xray.subscription_url)'
+    if [[ $VLESS_INPUT == https://* ]]; then
+        # shellcheck disable=SC2016  # $url is jq's, set with --arg below
+        filter='.xray.subscription_url = $url'
+    fi
+
+    # BusyBox flock has no -w, hence the loop.
+    exec 9>"${VPD_CONFIG%/*}/.${VPD_CONFIG##*/}.lock"
+    local waited=0
+    until flock -n 9; do
+        if [[ $waited -ge ${VPD_CONFIG_LOCK_WAIT:-30} ]]; then
+            exec 9>&-
+            log -l ERROR "Config is locked by the Web UI or the bot; the subscription link was not updated. Run the import again"
+            return 1
+        fi
+        [[ $waited -eq 0 ]] && log "Waiting for the config lock..."
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    # A temp file and a rename: a '>' redirect would truncate the live config
+    # before jq has read it.
+    local tmp
+    tmp=$(mktemp "$VPD_CONFIG.XXXXXX")
+    if ! jq --arg url "$VLESS_INPUT" "$filter" "$VPD_CONFIG" > "$tmp"; then
+        rm -f "$tmp"
+        flock -u 9
+        exec 9>&-
+        log -l ERROR "Failed to update the subscription link in $VPD_CONFIG"
+        return 1
+    fi
+    chmod 600 "$tmp"
+    mv -f "$tmp" "$VPD_CONFIG"
+    flock -u 9
+    exec 9>&-
+}
+
+###############################################################################
 # Main
 ###############################################################################
 
@@ -407,6 +458,7 @@ main() {
 
     step_get_vless_file
     step_parse_and_save_servers
+    step_save_subscription_url
 
     log -l TRACE "Import Complete"
     printf "Server list saved. Run /opt/vpn-director/configure.sh to continue setup.\n"

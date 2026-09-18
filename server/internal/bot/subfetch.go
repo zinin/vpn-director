@@ -72,24 +72,27 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 	return fetchServers(ctx, rawURL, wan, tunnel, wanLookup, tunnelLookup)
 }
 
-// fetchServers GETs via wan, then tunnel. Each body is resolved with the lookup
-// of the path that fetched it, so VLESS hostnames follow that path. A context
-// that ends during the resolution fails every lookup after it at once, and what
-// resolved before that is not the subscription: the context's error comes back
-// instead of a list cut short.
+// fetchServers GETs via wan, then tunnel. A body the tunnel fetched resolves
+// over the tunnel. One the WAN fetched resolves each host with the WAN lookup,
+// and with the tunnel's for a host the WAN resolver does not answer: one WAN
+// answer used to make the whole list count as resolved, and the servers only
+// the tunnel's resolver knew were dropped from it. A context that ends during
+// the resolution fails every lookup after it at once, and what resolved before
+// that is not the subscription: the context's error comes back instead of a
+// list cut short.
 func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
 	body, err := getSubscription(ctx, wan, rawURL)
 	if err == nil {
-		servers, rerr := serversFromSubscriptionLookup(body, wanLookup)
+		servers, rerr := serversFromSubscriptionLookup(body, eitherLookup(ctx, wanLookup, tunnelLookup))
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
 		if rerr == nil {
 			return servers, nil
 		}
-		// A body that arrived while none of its hostnames answered is the WAN
-		// resolver's failure, not the subscription's: the tunnel asks 8.8.8.8
-		// over its own interface and may well get an answer.
+		// A body none of whose hostnames answered, on the WAN resolver or the
+		// tunnel's, is the resolvers' failure rather than the subscription's:
+		// the tunnel's own download gets the last try.
 		if tunnel == nil || !errors.Is(rerr, errNoResolved) {
 			return nil, rerr
 		}
@@ -113,6 +116,32 @@ func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, 
 		return nil, cerr
 	}
 	return servers, err
+}
+
+// eitherLookup asks first, and second for a host first does not answer with an
+// IPv4 address. A nil first is the default resolver, bound to ctx.
+func eitherLookup(ctx context.Context, first, second func(host string) ([]net.IP, error)) func(host string) ([]net.IP, error) {
+	if first == nil {
+		first = vless.LookupIPv4(ctx)
+	}
+	if second == nil {
+		return first
+	}
+	return func(host string) ([]net.IP, error) {
+		if ips, err := first(host); err == nil && hasIPv4(ips) {
+			return ips, nil
+		}
+		return second(host)
+	}
+}
+
+func hasIPv4(ips []net.IP) bool {
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // serversFromSubscriptionLookup decodes a fetched subscription body for the

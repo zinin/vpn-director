@@ -40,13 +40,22 @@ function isActive(server: Server): boolean {
 }
 
 async function selectServer(index: number) {
+  const server = servers.value[index]
+  if (!server) return
   selectLoading.value = index
   try {
-    await api.selectServer(index)
-    alert('Server selected: ' + (servers.value[index]?.name ?? index))
+    await api.selectServer(index, server)
+    alert('Server selected: ' + server.name)
     await loadServers()
   } catch (e: any) {
-    alert('Error: ' + (e.response?.data?.error || e.message))
+    if (e.response?.status === 409) {
+      // A refresh on the router - the bot's subscription watch, an import in
+      // another tab - moved the list since it was shown.
+      alert('The server list changed; it has been reloaded. Select the server again.')
+      await loadServers()
+    } else {
+      alert('Error: ' + (e.response?.data?.error || e.message))
+    }
   } finally {
     selectLoading.value = -1
   }

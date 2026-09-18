@@ -83,10 +83,16 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Limit body size
-	body, err := io.ReadAll(io.LimitReader(resp.Body, h.maxBodySize))
+	// One byte past the cap tells a list that is too long from one that fits
+	// exactly: cut at the cap, base64 decodes to a shorter list, and that would
+	// be published as the subscription.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, h.maxBodySize+1))
 	if err != nil {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Read error: %v", err)))
+		return
+	}
+	if int64(len(body)) > h.maxBodySize {
+		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("Error: subscription exceeds 1 MiB; nothing was imported"))
 		return
 	}
 
@@ -115,19 +121,29 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	// beside one of theirs. A missing vpn-director.json is not an error here:
 	// /import works before the first configure, and the wizard writes
 	// xray.servers itself.
+	// "Imported" is said only for a list that was written. The lock, a config
+	// a re-import cannot read and a refusal all fail before it.
 	err = service.PublishImport(h.deps.Config, result.Servers, args, fetchURL)
-	if errors.Is(err, vpnconfig.ErrSubscriptionChanged) {
+	switch {
+	case err == nil:
+	case errors.Is(err, vpnconfig.ErrServersSaved):
+		// Only the config beside the list is missing. With no config at all
+		// there is nothing to keep in step with.
+		if !errors.Is(err, service.ErrConfigLoad) {
+			h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
+				fmt.Sprintf("Warning: servers imported but xray.servers sync failed: %v", err)))
+		}
+	case errors.Is(err, vpnconfig.ErrSubscriptionChanged):
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
 			"The saved subscription changed while downloading; nothing was imported. Run /import again."))
 		return
-	}
-	if errors.Is(err, vpnconfig.ErrSaveServers) {
+	case errors.Is(err, vpnconfig.ErrSaveServers):
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Save error: %v", err)))
 		return
-	}
-	if err != nil && !errors.Is(err, service.ErrConfigLoad) {
+	default:
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
-			fmt.Sprintf("Warning: servers imported but xray.servers sync failed: %v", err)))
+			fmt.Sprintf("Import failed, nothing was imported: %v", err)))
+		return
 	}
 
 	// Build response with grouped stats

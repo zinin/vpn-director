@@ -332,6 +332,50 @@ func TestFetchServers_WANSuccessUsesTheWANLookup(t *testing.T) {
 	}
 }
 
+// A subscription can list hosts one resolver answers and the other does not. One
+// WAN answer made the whole list count as resolved, and every host only the
+// tunnel's 8.8.8.8 knew was dropped from it without a word. Each host now falls
+// back to the tunnel lookup on its own.
+func TestFetchServers_EachHostResolvesWhereItCan(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte(
+		"vless://uuid-1@a.example.invalid:443#A\nvless://uuid-2@b.example.invalid:443#B"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	tunnelAsked := []string{}
+
+	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(wan),
+		func(host string) ([]net.IP, error) {
+			if host == "a.example.invalid" {
+				return []net.IP{net.ParseIP("203.0.113.10")}, nil
+			}
+			return nil, errors.New("no answer")
+		},
+		func(host string) ([]net.IP, error) {
+			tunnelAsked = append(tunnelAsked, host)
+			if host == "b.example.invalid" {
+				return []net.IP{net.ParseIP("203.0.113.20")}, nil
+			}
+			return nil, errors.New("no answer")
+		})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][]string{}
+	for _, s := range servers {
+		got[s.Name] = s.IPs
+	}
+	want := map[string][]string{"A": {"203.0.113.10"}, "B": {"203.0.113.20"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("servers %v, want %v", got, want)
+	}
+	if !reflect.DeepEqual(tunnelAsked, []string{"b.example.invalid"}) {
+		t.Fatalf("tunnel asked for %v; a host the WAN answered is not asked again", tunnelAsked)
+	}
+}
+
 // A stop or the fetch deadline can end the context while the hostnames are
 // still being resolved. Every lookup after that fails at once, and the servers
 // that resolved before it would come back as the whole subscription: the watch

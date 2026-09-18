@@ -279,10 +279,15 @@ func TestXrayHandler_FullFlow(t *testing.T) {
 	if len(sender.lastKeyboard.InlineKeyboard[0]) != 2 {
 		t.Errorf("expected 2 buttons in first row, got %d", len(sender.lastKeyboard.InlineKeyboard[0]))
 	}
-	// Verify callback data format
+	// Verify callback data format: the index, and the first 8 hex digits of
+	// sha256("Germany, Berlin|de.example.com|443")
 	btn := sender.lastKeyboard.InlineKeyboard[0][0]
-	if btn.CallbackData == nil || *btn.CallbackData != "xray:select:0" {
-		t.Errorf("expected callback data 'xray:select:0', got %v", btn.CallbackData)
+	if btn.CallbackData == nil || *btn.CallbackData != "xray:select:0:f3dbd26d" {
+		got := "<nil>"
+		if btn.CallbackData != nil {
+			got = *btn.CallbackData
+		}
+		t.Errorf("expected callback data 'xray:select:0:f3dbd26d', got %q", got)
 	}
 
 	// Step 2: User clicks on USA server (index 1)
@@ -401,5 +406,63 @@ func TestXrayHandler_HandleCallback_RecordsNothingWhenGenerationFails(t *testing
 
 	if active := config.cfg.Xray.ActiveServer; active != nil {
 		t.Errorf("recorded %+v after the config failed to generate", *active)
+	}
+}
+
+// A button names its server as well as its place in the list. The list can
+// change between /xray and the tap - the subscription watch rotates endpoints,
+// an import replaces it - and the index then points at another server.
+func TestXrayHandler_HandleCallback_SwitchesToTheServerItsButtonNamed(t *testing.T) {
+	sender := &mockSenderWithKeyboard{}
+	config := &trackingXrayConfigStore{
+		mockConfigStore: mockConfigStore{servers: []vpnconfig.Server{
+			{Name: "Germany, Berlin", Address: "de.example.com", Port: 443, UUID: "uuid1"},
+			{Name: "USA, New York", Address: "us.example.com", Port: 443, UUID: "uuid2"},
+		}},
+		cfg: &vpnconfig.VPNDirectorConfig{},
+	}
+	xray := &mockXrayGenerator{}
+	h := NewXrayHandler(&Deps{Sender: sender, Config: config, Xray: xray, VPN: &mockVPNDirectorWithXray{}})
+
+	// b41c75e3: sha256("USA, New York|us.example.com|443")
+	h.HandleCallback(&tgbotapi.CallbackQuery{
+		ID:      "cb",
+		Data:    "xray:select:1:b41c75e3",
+		Message: &tgbotapi.Message{MessageID: 42, Chat: &tgbotapi.Chat{ID: 100}},
+	})
+
+	if xray.lastServer.Name != "USA, New York" {
+		t.Fatalf("generated %q, want the server the button named; last message %q", xray.lastServer.Name, sender.lastText)
+	}
+}
+
+func TestXrayHandler_HandleCallback_RefusesAButtonTheListNoLongerMatches(t *testing.T) {
+	sender := &mockSenderWithKeyboard{}
+	config := &trackingXrayConfigStore{
+		mockConfigStore: mockConfigStore{servers: []vpnconfig.Server{
+			{Name: "Germany, Berlin", Address: "de.example.com", Port: 443, UUID: "uuid1"},
+			{Name: "Japan, Tokyo", Address: "jp.example.com", Port: 443, UUID: "uuid3"},
+		}},
+		cfg: &vpnconfig.VPNDirectorConfig{},
+	}
+	xray := &mockXrayGenerator{}
+	// No VPN on purpose: a refused switch must not reach RestartXray.
+	h := NewXrayHandler(&Deps{Sender: sender, Config: config, Xray: xray})
+
+	// The keyboard was drawn when index 1 was USA, New York.
+	h.HandleCallback(&tgbotapi.CallbackQuery{
+		ID:      "cb",
+		Data:    "xray:select:1:b41c75e3",
+		Message: &tgbotapi.Message{MessageID: 42, Chat: &tgbotapi.Chat{ID: 100}},
+	})
+
+	if xray.lastServer.Name != "" {
+		t.Fatalf("generated %q; the button named a server the list no longer has there", xray.lastServer.Name)
+	}
+	if config.cfg.Xray.ActiveServer != nil {
+		t.Fatalf("recorded %+v", *config.cfg.Xray.ActiveServer)
+	}
+	if !strings.Contains(sender.lastText, "changed") {
+		t.Fatalf("message %q; the user must learn why nothing switched", sender.lastText)
 	}
 }

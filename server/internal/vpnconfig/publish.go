@@ -25,9 +25,24 @@ func SubscriptionUnchanged(url string) func(*VPNDirectorConfig) error {
 }
 
 // ErrSaveServers marks a PublishServers failure that came from servers.json
-// itself, which leaves the bypass list alone. Any other error means the list
-// is published and only the config it is read against is not.
+// itself, which leaves the bypass list alone.
 var ErrSaveServers = errors.New("save servers")
+
+// ErrServersSaved marks a PublishServers failure that came after servers.json
+// was written: the list is published and only the config it is read against is
+// not. Every other failure published nothing, so an importer says "imported"
+// for this one only.
+var ErrServersSaved = errors.New("servers saved")
+
+// savedError is a failure after servers.json was written. It is ErrServersSaved
+// to errors.Is and reads as its cause, which is what the importers show.
+type savedError struct{ cause error }
+
+func (e *savedError) Error() string   { return e.cause.Error() }
+func (e *savedError) Unwrap() []error { return []error{ErrServersSaved, e.cause} }
+
+// ServersSaved marks err as a failure that came after servers.json was written.
+func ServersSaved(err error) error { return &savedError{cause: err} }
 
 // PublishServers publishes one imported subscription: servers.json, which the
 // UI and the watch walk read, and xray.servers, the bypass set the proxy's own
@@ -46,6 +61,7 @@ var ErrSaveServers = errors.New("save servers")
 // lock protects: a publisher whose download is no longer the one the config
 // asks for refuses there rather than writing over a newer one.
 func PublishServers(update func(func(*VPNDirectorConfig) error) error, save func([]Server) error, servers []Server, subscriptionURL string, guard func(*VPNDirectorConfig) error) error {
+	saved := false
 	publish := func(cfg *VPNDirectorConfig) error {
 		if guard != nil {
 			if err := guard(cfg); err != nil {
@@ -56,6 +72,7 @@ func PublishServers(update func(func(*VPNDirectorConfig) error) error, save func
 			if err := save(servers); err != nil {
 				return fmt.Errorf("%w: %w", ErrSaveServers, err)
 			}
+			saved = true
 		}
 		if cfg == nil {
 			return nil
@@ -69,5 +86,14 @@ func PublishServers(update func(func(*VPNDirectorConfig) error) error, save func
 	if update == nil {
 		return publish(nil)
 	}
-	return update(publish)
+	if err := update(publish); err != nil {
+		// The write of the config the list went into can fail after the list
+		// is out, and an importer that called that "nothing saved" would send
+		// the user to redo an import that happened.
+		if saved {
+			return ServersSaved(err)
+		}
+		return err
+	}
+	return nil
 }

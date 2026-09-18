@@ -51,6 +51,51 @@ func TestPublishServers_LockFailureDoesNotWriteTheList(t *testing.T) {
 	if saved {
 		t.Fatal("servers.json must not be published when the config lock was not taken")
 	}
+	if errors.Is(err, ErrServersSaved) {
+		t.Fatalf("err %v says the list was saved", err)
+	}
+}
+
+// The importers tell the user the list was imported only when servers.json was
+// written. A config write that fails after it leaves the list published and the
+// bypass set beside it stale, and the error has to say which of the two it is.
+func TestPublishServers_AConfigWriteThatFailsAfterTheListSaysTheListIsSaved(t *testing.T) {
+	errWrite := errors.New("save config: no space left on device")
+	update := func(fn func(*VPNDirectorConfig) error) error {
+		if err := fn(&VPNDirectorConfig{}); err != nil {
+			return err
+		}
+		return errWrite
+	}
+	saved := false
+	save := func([]Server) error {
+		saved = true
+		return nil
+	}
+
+	err := PublishServers(update, save, []Server{{IPs: []string{"1.1.1.1"}}}, "", nil)
+
+	if !saved {
+		t.Fatal("the list was not saved")
+	}
+	if !errors.Is(err, ErrServersSaved) || !errors.Is(err, errWrite) {
+		t.Fatalf("err %v, want ErrServersSaved around the write error", err)
+	}
+}
+
+// Neither a refused guard nor a failed save of servers.json leaves a list behind.
+func TestPublishServers_OnlyASavedListSaysSo(t *testing.T) {
+	update := func(fn func(*VPNDirectorConfig) error) error { return fn(&VPNDirectorConfig{}) }
+	refused := errors.New("refused")
+
+	err := PublishServers(update, func([]Server) error { return nil }, nil, "", func(*VPNDirectorConfig) error { return refused })
+	if !errors.Is(err, refused) || errors.Is(err, ErrServersSaved) {
+		t.Fatalf("guard refusal: err %v", err)
+	}
+	err = PublishServers(update, func([]Server) error { return errors.New("disk full") }, nil, "", nil)
+	if !errors.Is(err, ErrSaveServers) || errors.Is(err, ErrServersSaved) {
+		t.Fatalf("save failure: err %v", err)
+	}
 }
 
 func TestPublishServers_SaveFailureLeavesTheBypassList(t *testing.T) {

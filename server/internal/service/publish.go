@@ -37,9 +37,9 @@ func publishServers(store ConfigStore, servers []vpnconfig.Server, subscriptionU
 	// There is no vpn-director.json to keep the list in step with: /import runs
 	// before the first configure, and until it exists no other writer can be
 	// publishing either. Keep the download and report the sync that did not
-	// happen.
+	// happen, as a failure after the list was saved.
 	if serr := store.SaveServers(servers); serr != nil {
 		return fmt.Errorf("%w: %w", vpnconfig.ErrSaveServers, serr)
 	}
-	return err
+	return vpnconfig.ServersSaved(err)
 }

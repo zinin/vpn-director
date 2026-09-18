@@ -29,7 +29,7 @@ func (s *ConfirmStep) Render(chatID int64, state *State) {
 		return
 	}
 
-	serverIndex := state.GetServerIndex()
+	serverIndex := state.PickedIndex(servers)
 	exclusions := state.GetExclusions()
 	clients := state.GetClients()
 
@@ -37,9 +37,12 @@ func (s *ConfirmStep) Render(chatID int64, state *State) {
 	sb.WriteString(telegram.EscapeMarkdownV2("Step 4/4: Confirmation") + "\n\n")
 
 	// Show selected server
-	if serverIndex >= 0 && serverIndex < len(servers) {
+	if serverIndex >= 0 {
 		srv := servers[serverIndex]
 		sb.WriteString(telegram.EscapeMarkdownV2(fmt.Sprintf("Xray server: %s (%s)", srv.Name, strings.Join(srv.IPs, ", "))) + "\n")
+	} else if name := state.PickedName(); name != "" {
+		// A refresh dropped it: the apply will leave the running server alone.
+		sb.WriteString(telegram.EscapeMarkdownV2(fmt.Sprintf("Xray server: %s (no longer in the server list; not switched)", name)) + "\n")
 	}
 
 	// Show exclusions (sorted alphabetically)

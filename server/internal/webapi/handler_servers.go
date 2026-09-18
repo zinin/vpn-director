@@ -48,6 +48,12 @@ func handleListServers(deps *Deps) http.HandlerFunc {
 // selectServerRequest is the expected JSON body for POST /api/servers/active.
 type selectServerRequest struct {
 	Index *int `json:"index"`
+	// The server the page showed at that index. The list can change between the
+	// page load and the click - the bot's subscription watch rotates endpoints,
+	// an import in another tab replaces it - and the index then names another.
+	Name    string `json:"name"`
+	Address string `json:"address"`
+	Port    int    `json:"port"`
 }
 
 // handleSelectServer returns a handler that selects a server by index,
@@ -85,6 +91,10 @@ func handleSelectServer(deps *Deps) http.HandlerFunc {
 		}
 
 		server := servers[*req.Index]
+		if server.Name != req.Name || server.Address != req.Address || server.Port != req.Port {
+			jsonError(w, http.StatusConflict, "server list changed")
+			return
+		}
 
 		// Persist xray.servers before rewriting config.json. Generating first
 		// left a new outbound on disk if the save then failed, and the next
@@ -181,7 +191,10 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		}
 
 		// Fetch the subscription with the SSRF-hardened client.
-		client := ssrf.NewClient(10 * time.Second)
+		client := deps.ImportClient
+		if client == nil {
+			client = ssrf.NewClient(10 * time.Second)
+		}
 
 		resp, err := client.Get(fetchURL)
 		if err != nil {
@@ -195,10 +208,17 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 			return
 		}
 
+		// One byte past the cap tells a list that is too long from one that fits
+		// exactly: cut at the cap, base64 decodes to a shorter list, and that
+		// would be published as the subscription.
 		const maxBody = 1 << 20 // 1MB
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
 		if err != nil {
 			jsonError(w, http.StatusBadGateway, fmt.Sprintf("read body: %s", err))
+			return
+		}
+		if len(body) > maxBody {
+			jsonError(w, http.StatusBadGateway, "subscription exceeds 1 MiB")
 			return
 		}
 
@@ -226,9 +246,13 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		// failure instead of returning 200 with a stale xray.servers on disk,
 		// and say which half landed - the client must not read a 500 that left
 		// servers.json published as "nothing changed", nor one that published
-		// nothing as "servers saved".
+		// nothing as "servers saved". Only vpnconfig.ErrServersSaved says the
+		// list was written.
 		if err := service.PublishImport(deps.Config, result.Servers, req.URL, fetchURL); err != nil {
 			switch {
+			case errors.Is(err, vpnconfig.ErrServersSaved):
+				jsonError(w, http.StatusInternalServerError,
+					fmt.Sprintf("servers saved, but xray.servers sync failed: %s", err))
 			case errors.Is(err, vpnconfig.ErrSubscriptionChanged):
 				jsonError(w, http.StatusConflict, "the saved subscription changed while downloading; nothing was imported")
 			case errors.Is(err, vpnconfig.ErrSaveServers):
@@ -236,8 +260,7 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 			case errors.Is(err, service.ErrConfigLockTimeout):
 				jsonError(w, http.StatusInternalServerError, "config is busy, servers not saved")
 			default:
-				jsonError(w, http.StatusInternalServerError,
-					fmt.Sprintf("servers saved, but xray.servers sync failed: %s", err))
+				jsonError(w, http.StatusInternalServerError, fmt.Sprintf("servers not saved: %s", err))
 			}
 			return
 		}

@@ -368,3 +368,87 @@ vless://uuid2@server2:443#Name2"
     [ "$(jq -r '.[0].address' "$out")" = "5.6.7.8" ]
     [ "$(jq -r '.[0].port' "$out")" -eq 443 ]
 }
+
+# ============================================================================
+# step_save_subscription_url: the link a refresh fetches
+# ============================================================================
+
+# load_import_into sources the importer with VPD_DIR and VPD_CONFIG pointed at
+# a scratch directory, the way a caller that overrides them does.
+load_import_into() {
+    export VPD_DIR="$BATS_TEST_TMPDIR/vpn-director"
+    export VPD_CONFIG="$VPD_DIR/vpn-director.json"
+    mkdir -p "$VPD_DIR"
+    load_import_server_list
+}
+
+# write_saved_link stands in for a config the Web UI saved a link into.
+write_saved_link() {
+    printf '%s\n' '{"webui":{"jwt_secret":"secret"},"xray":{"clients":["192.168.50.10"],"subscription_url":"https://old.example/s/a"}}' \
+        > "$VPD_CONFIG"
+}
+
+# The bot's subscription watch re-imports xray.subscription_url when the Xray
+# outbound dies, and the Web UI and /import re-import it on request. A list
+# imported here from another link was replaced by the old link's on the next
+# refresh: the link now goes with the list.
+@test "step_save_subscription_url: an https link is saved with the list" {
+    load_import_into
+    write_saved_link
+    VLESS_INPUT="https://cdn.example/s/b"
+
+    run step_save_subscription_url
+
+    assert_success
+    run jq -c '[.xray.subscription_url, .xray.clients, .webui.jwt_secret]' "$VPD_CONFIG"
+    assert_output '["https://cdn.example/s/b",["192.168.50.10"],"secret"]'
+    run stat -c %a "$VPD_CONFIG"
+    assert_output "600"
+}
+
+# Neither the watch nor the Web UI fetches a file or a plain-http link, and the
+# saved link is no longer what the list came from.
+@test "step_save_subscription_url: a file or an http link clears the saved one" {
+    load_import_into
+    for input in "$BATS_TEST_TMPDIR/servers.txt" "http://cdn.example/s/b"; do
+        write_saved_link
+        VLESS_INPUT="$input"
+
+        run step_save_subscription_url
+
+        assert_success
+        run jq -c '.xray | has("subscription_url")' "$VPD_CONFIG"
+        assert_output "false"
+    done
+}
+
+# Before configure.sh has run there is no config, and nothing refreshes a list.
+@test "step_save_subscription_url: creates no config" {
+    load_import_into
+    VLESS_INPUT="https://cdn.example/s/b"
+
+    run step_save_subscription_url
+
+    assert_success
+    [[ ! -e $VPD_CONFIG ]]
+}
+
+# The Web UI, the bot and configure.sh write this file under one lock; a write
+# outside it is lost to theirs, or theirs to it.
+@test "step_save_subscription_url: refuses while another writer holds the config lock" {
+    load_import_into
+    write_saved_link
+    flock "$VPD_DIR/.vpn-director.json.lock" sleep 30 &
+    local holder=$!
+    sleep 0.5
+    VLESS_INPUT="https://cdn.example/s/b"
+
+    VPD_CONFIG_LOCK_WAIT=1
+    run step_save_subscription_url
+    kill "$holder" 2>/dev/null || true
+
+    assert_failure
+    assert_output --partial "locked"
+    run jq -r '.xray.subscription_url' "$VPD_CONFIG"
+    assert_output "https://old.example/s/a"
+}

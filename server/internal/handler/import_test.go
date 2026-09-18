@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -22,6 +23,8 @@ type mockConfigStoreForImport struct {
 	savedServers []vpnconfig.Server
 	dataDirVal   string
 	cfg          *vpnconfig.VPNDirectorConfig
+	updateErr    error // returned by UpdateVPNConfig before fn runs, as a lock or load failure is
+	saveErr      error // returned by UpdateVPNConfig after fn ran, as a failed write of the config is
 }
 
 func (m *mockConfigStoreForImport) SaveServers(servers []vpnconfig.Server) error {
@@ -44,13 +47,171 @@ func (m *mockConfigStoreForImport) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig
 }
 
 func (m *mockConfigStoreForImport) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	if m.updateErr != nil {
+		return m.updateErr
+	}
 	if m.cfg == nil {
 		return m.mockConfigStore.UpdateVPNConfig(fn)
 	}
 	if err := fn(m.cfg); err != nil {
 		return err
 	}
-	return nil
+	return m.saveErr
+}
+
+// allTextSender keeps every message, for a handler that sends more than one.
+type allTextSender struct {
+	mockSender
+	texts []string
+}
+
+func (m *allTextSender) Send(chatID int64, text string) error {
+	m.texts = append(m.texts, text)
+	return m.mockSender.Send(chatID, text)
+}
+
+func importCommand(text string) *tgbotapi.Message {
+	return &tgbotapi.Message{
+		Chat:     &tgbotapi.Chat{ID: 123},
+		Text:     text,
+		Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 7}},
+	}
+}
+
+// subscriptionServer answers every request with body.
+func subscriptionServer(t *testing.T, body string) *httptest.Server {
+	t.Helper()
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+var osloSubscription = base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443?type=tcp#Oslo"))
+
+// A publication that never got the config lock wrote nothing, servers.json
+// included. Reporting it as "servers imported" left the user believing the new
+// list was in place.
+func TestImportHandler_HandleImport_ALockTimeoutImportsNothing(t *testing.T) {
+	server := subscriptionServer(t, osloSubscription)
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{
+		dataDirVal: t.TempDir(),
+		cfg:        &vpnconfig.VPNDirectorConfig{},
+		updateErr:  service.ErrConfigLockTimeout,
+	}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import " + server.URL))
+
+	if config.savedServers != nil {
+		t.Fatalf("saved %v without the config lock", config.savedServers)
+	}
+	if strings.Contains(sender.lastText, "Imported") || !strings.Contains(sender.lastText, "nothing was imported") {
+		t.Fatalf("message %q; the user must learn the list was not saved", sender.lastText)
+	}
+}
+
+// A re-import of the saved link publishes only against a config it can read: an
+// unreadable one cannot say the link is still the saved one, and nothing is
+// written. It was reported as imported all the same.
+func TestImportHandler_HandleImport_AReImportThatCannotReadTheConfigImportsNothing(t *testing.T) {
+	server := subscriptionServer(t, osloSubscription)
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{
+		dataDirVal: t.TempDir(),
+		cfg:        &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{SubscriptionURL: server.URL}},
+		updateErr:  fmt.Errorf("%w: %w", service.ErrConfigLoad, errors.New("invalid character 'x' looking for beginning of value")),
+	}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import"))
+
+	if config.savedServers != nil {
+		t.Fatalf("saved %v", config.savedServers)
+	}
+	if strings.Contains(sender.lastText, "Imported") || !strings.Contains(sender.lastText, "nothing was imported") {
+		t.Fatalf("message %q; the user must learn the list was not saved", sender.lastText)
+	}
+}
+
+// servers.json is written and only the config beside it is not: the list is
+// imported, and the user is told what is missing.
+func TestImportHandler_HandleImport_AConfigWriteThatFailsAfterTheListWarns(t *testing.T) {
+	server := subscriptionServer(t, osloSubscription)
+	sender := &allTextSender{}
+	config := &mockConfigStoreForImport{
+		dataDirVal: t.TempDir(),
+		cfg:        &vpnconfig.VPNDirectorConfig{},
+		saveErr:    errors.New("save config: no space left on device"),
+	}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import " + server.URL))
+
+	if len(config.savedServers) != 1 {
+		t.Fatalf("saved %v", config.savedServers)
+	}
+	warned := false
+	for _, text := range sender.texts {
+		if strings.Contains(text, "sync failed") {
+			warned = true
+		}
+	}
+	if !warned || !strings.Contains(sender.lastText, "Imported") {
+		t.Fatalf("messages %q; want the import and a warning about the config", sender.texts)
+	}
+}
+
+// Before the first configure there is no vpn-director.json to keep in step:
+// the list is saved and reported as imported, with nothing to warn about.
+func TestImportHandler_HandleImport_BeforeTheFirstConfigureSavesTheList(t *testing.T) {
+	server := subscriptionServer(t, osloSubscription)
+	sender := &allTextSender{}
+	config := &mockConfigStoreForImport{dataDirVal: t.TempDir()}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import " + server.URL))
+
+	if len(config.savedServers) != 1 {
+		t.Fatalf("saved %v; the list must survive a missing config", config.savedServers)
+	}
+	for _, text := range sender.texts {
+		if strings.Contains(text, "sync failed") || strings.Contains(text, "nothing was imported") {
+			t.Fatalf("messages %q; a router before configure has nothing to warn about", sender.texts)
+		}
+	}
+	if !strings.Contains(sender.lastText, "Imported") {
+		t.Fatalf("message %q", sender.lastText)
+	}
+}
+
+// A subscription over the 1 MiB cap was cut at the cap and decoded anyway:
+// base64 cut there decodes to a shorter list, which the import then published
+// as the subscription. The watch refuses such a body, and so does /import.
+func TestImportHandler_HandleImport_RefusesASubscriptionOverTheCap(t *testing.T) {
+	line := "vless://uuid-1@203.0.113.10:443?type=tcp#Oslo\n"
+	// Base64 makes a MiB of lines a third longer again.
+	server := subscriptionServer(t, base64.StdEncoding.EncodeToString([]byte(strings.Repeat(line, (1<<20)/len(line)))))
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{dataDirVal: t.TempDir(), cfg: &vpnconfig.VPNDirectorConfig{}}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import " + server.URL))
+
+	if config.savedServers != nil {
+		t.Fatalf("saved %d servers out of a list cut at the cap", len(config.savedServers))
+	}
+	if !strings.Contains(sender.lastText, "exceeds 1 MiB") {
+		t.Fatalf("message %q", sender.lastText)
+	}
 }
 
 func TestImportHandler_HandleImport_NoURL(t *testing.T) {

@@ -1,6 +1,10 @@
 package wizard
 
-import "sync"
+import (
+	"sync"
+
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+)
 
 type Step string
 
@@ -25,6 +29,7 @@ type State struct {
 	ChatID      int64
 	Step        Step
 	ServerIndex int
+	Picked      *vpnconfig.ActiveServer // the server step 1 picked, as the list read then
 	Exclusions  map[string]bool
 	ExcludeIPs  []string
 	Clients     []ClientRoute
@@ -42,6 +47,55 @@ func (s *State) SetServerIndex(idx int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ServerIndex = idx
+}
+
+// PickServer records the server step 1 picked and where the list had it. Steps
+// 2 to 4 take minutes, and meanwhile a refresh - the subscription watch, another
+// importer - can move it or drop it: its index then names a server the user
+// never chose.
+func (s *State) PickServer(idx int, srv vpnconfig.Server) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ServerIndex = idx
+	s.Picked = vpnconfig.NewActiveServer(srv)
+}
+
+// PickedIndex is where servers has the server step 1 picked, by name, address
+// and port, or -1 when servers no longer has it. A state with no pick recorded
+// has only its index to go by.
+func (s *State) PickedIndex(servers []vpnconfig.Server) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	inRange := s.ServerIndex >= 0 && s.ServerIndex < len(servers)
+	if s.Picked == nil {
+		if inRange {
+			return s.ServerIndex
+		}
+		return -1
+	}
+	if inRange && s.picks(servers[s.ServerIndex]) {
+		return s.ServerIndex
+	}
+	for i, srv := range servers {
+		if s.picks(srv) {
+			return i
+		}
+	}
+	return -1
+}
+
+// PickedName is the name of the server step 1 picked, empty with no pick.
+func (s *State) PickedName() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.Picked == nil {
+		return ""
+	}
+	return s.Picked.Name
+}
+
+func (s *State) picks(srv vpnconfig.Server) bool {
+	return srv.Name == s.Picked.Name && srv.Address == s.Picked.Address && srv.Port == s.Picked.Port
 }
 
 func (s *State) SetExclusion(key string, value bool) {

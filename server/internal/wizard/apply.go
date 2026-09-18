@@ -63,7 +63,7 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 	// Get state data with thread-safe getters
 	clients := state.GetClients()
 	exclusions := state.GetExclusions()
-	serverIndex := state.GetServerIndex()
+	serverIndex := state.PickedIndex(servers)
 
 	// Build exclusion list (sorted for deterministic config)
 	var excl []string
@@ -205,8 +205,8 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 	}
 	a.sender.SendPlain(chatID, "vpn-director.json updated")
 
-	// Generate Xray config if server index is valid
-	if serverIndex >= 0 && serverIndex < len(servers) {
+	// Generate Xray config for the server step 1 picked, wherever it is now
+	if serverIndex >= 0 {
 		s := servers[serverIndex]
 		// Generation and the record of it under one lock, so a switch from the
 		// Web UI or /xray cannot land between them; the record follows only a
@@ -223,6 +223,8 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 			}
 			a.sender.SendPlain(chatID, "xray/config.json updated")
 		}
+	} else if name := state.PickedName(); name != "" {
+		a.sender.SendPlain(chatID, fmt.Sprintf("Warning: %s is no longer in the server list, Xray config not updated", name))
 	} else {
 		a.sender.SendPlain(chatID, "Warning: Invalid server selection, Xray config not updated")
 	}

@@ -48,7 +48,7 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET | `/api/version` | Build version and commit |
 | GET | `/api/platform` | `vpn-director.sh platform`: firmware, password file, LAN/WAN interfaces, tunnels; 503 when the script cannot answer |
 | GET | `/api/servers` | Xray server list plus `active`, the recorded server, and `subscription_saved` |
-| POST | `/api/servers/active`, `/api/servers/import` | Select the active server; import a subscription (`url` empty reuses the saved URL) |
+| POST | `/api/servers/active`, `/api/servers/import` | Select the active server (`index` plus the `name`, `address` and `port` the page showed there; 409 "server list changed" when the list has another server at that index); import a subscription (`url` empty reuses the saved URL; a body over 1 MiB is refused) |
 | GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config |
 | POST | `/api/clients/pause`, `/api/clients/resume` | Pause and resume a client |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |
@@ -104,6 +104,22 @@ another importer may save a different subscription meanwhile, and the list would
 then sit beside a link that did not produce it. The refusal is a 409 and writes
 nothing; the bot's `/import` without arguments does the same.
 All of them serialize on `Deps.OpMutex`.
+
+An import says the servers were saved only when `servers.json` was written. A
+failure after that point carries `vpnconfig.ErrServersSaved` — the write of the
+config beside the list failed (`vpnconfig.PublishServers`), or there is no
+config yet and `service.PublishServers` kept the list anyway — and every other
+failure published nothing: the config lock, a re-import against a config that
+does not load, a refusal, the write of `servers.json` itself. A subscription body over 1 MiB is refused before it is
+decoded, as the bot's `/import` and the subscription watch refuse it: cut at the
+cap, base64 decodes to a shorter list, which would be published as the
+subscription.
+
+`POST /api/servers/active` names the server as well as its index. The bot's
+subscription watch or an import in another tab can refresh the list between the
+page load and the click, and the index then names another server: the route
+answers 409 "server list changed" and switches nothing, and the Servers tab
+reloads the list.
 
 ## Authentication
 

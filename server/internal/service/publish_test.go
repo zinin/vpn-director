@@ -38,8 +38,26 @@ func TestPublishServers_KeepsTheListWithoutAConfig(t *testing.T) {
 	if !errors.Is(err, ErrConfigLoad) {
 		t.Fatalf("err %v, want ErrConfigLoad", err)
 	}
+	if !errors.Is(err, vpnconfig.ErrServersSaved) {
+		t.Fatalf("err %v; the list is saved, and the error has to say so", err)
+	}
 	if len(store.savedServers) != 1 {
 		t.Fatalf("savedServers %v; an imported list must survive a missing config", store.savedServers)
+	}
+}
+
+// A re-import of the saved link needs the config to compare the link against.
+// One it cannot read publishes nothing, and says so.
+func TestPublishImport_AConfigItCannotReadPublishesNothing(t *testing.T) {
+	store := &stubStore{err: fmt.Errorf("%w: %w", ErrConfigLoad, errors.New("invalid character"))}
+
+	err := PublishImport(store, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "", "https://cdn.example/s/a")
+
+	if !errors.Is(err, ErrConfigLoad) || errors.Is(err, vpnconfig.ErrServersSaved) {
+		t.Fatalf("err %v, want a load failure that saved nothing", err)
+	}
+	if store.savedServers != nil {
+		t.Fatalf("savedServers %v", store.savedServers)
 	}
 }
 
