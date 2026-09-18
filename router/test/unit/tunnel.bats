@@ -179,6 +179,22 @@ load '../test_helper'
 # tunnel_apply - apply rules from config (idempotent)
 # ============================================================================
 
+# marks_in_place [client...] - the TUN_DIR MARK rules of these clients, of every
+# client when none is named, read as installed. The iptables mock answers every
+# -C with "no such rule", and the up-to-date path reads that as a chain the
+# firewall emptied; a test that means to take that path says what is still there.
+marks_in_place() {
+    MARKED_CLIENTS="$*"
+    iptables() {
+        if [[ ${3:-} == -C && ${4:-} == "$TUN_DIR_CHAIN" && $* == *" -j MARK "* ]]; then
+            echo "iptables $*" >> /tmp/bats_iptables_calls.log
+            [[ -z $MARKED_CLIENTS || " $MARKED_CLIENTS " == *" ${6:-} "* ]]
+            return
+        fi
+        command iptables "$@"
+    }
+}
+
 @test "tunnel_apply: returns success" {
     load_tunnel_module
     run tunnel_apply
@@ -487,6 +503,7 @@ load '../test_helper'
     [ -f "$TUN_DIR_HASH" ]
     [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
 
+    marks_in_place
     : > /tmp/bats_iptables_calls.log
     : > /tmp/bats_ip_calls.log
     run tunnel_apply
@@ -527,6 +544,7 @@ load '../test_helper'
     [ -f "$TUN_DIR_HASH" ]
     [ ! -e "${TUN_DIR_FAILOVER_READY:-$TUN_DIRECTOR_DIR/failover_ready}" ]
 
+    marks_in_place
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
@@ -570,6 +588,7 @@ load '../test_helper'
     # has to put the rule back rather than report it missing forever.
     unset -f ip
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
@@ -598,6 +617,7 @@ load '../test_helper'
 
     : > /tmp/bats_ip_calls.log
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
@@ -634,6 +654,7 @@ load '../test_helper'
 
     unset -f ip
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
@@ -671,6 +692,7 @@ load '../test_helper'
     printf '16384:\tfrom all fwmark 0x20000/0xff0000 lookup ovpnc1\n' >> "${BATS_IP_RULES_FILE:-/tmp/bats_test_ip_rules}"
 
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
@@ -741,6 +763,7 @@ load '../test_helper'
     mv "$TUN_DIR_TABLES.tmp" "$TUN_DIR_TABLES"
     platform_tunnel_route_ensure() { echo "ensure $1 $2" >> "$BATS_TEST_TMPDIR/ensure.log"; return 0; }
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
@@ -754,6 +777,7 @@ load '../test_helper'
     platform_tunnel_route_ensure() { echo "ensure $1 $2" >> "$BATS_TEST_TMPDIR/ensure.log"; return 0; }
     # The chain exists as far as the mock is concerned once the hash matches
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
@@ -766,6 +790,7 @@ load '../test_helper'
     assert_success
     rm -f "$TUN_DIR_TABLES"
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     refute_output --partial "up-to-date"
@@ -809,6 +834,7 @@ load_tunnel_module_with() {
     # The chain exists as far as the mock is concerned; only a recorded hash
     # could take the second apply down the up-to-date branch.
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
     # Not the bare "up-to-date": the warning above carries that phrase itself.
@@ -1070,8 +1096,10 @@ load_tunnel_module_with() {
     grep -qF "ensure wgc1 0 [10.8.0.1]" "$BATS_TEST_TMPDIR/ensure.log"
     # The up-to-date path passes it too.
     fw_chain_exists() { return 0; }
+    marks_in_place
     run tunnel_apply
     assert_success
+    assert_output --partial "up-to-date"
     assert_equal "$(grep -cF 'ensure wgc1 0 [10.8.0.1]' "$BATS_TEST_TMPDIR/ensure.log")" 2
 }
 
@@ -1224,12 +1252,91 @@ load_tunnel_module_with() {
 
     unset -f iptables
     fw_chain_exists() { return 0; }
+    marks_in_place
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
     grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
     [ -f "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# Merlin's firewall start runs "iptables -t mangle -F": every chain of the table
+# is emptied and none is deleted, TUN_DIR included, and firewall-start applies
+# again. The hash, the chain and TUN_DIR_TABLES all still read as applied, so
+# the up-to-date path put the jumps back into an empty chain and wrote
+# failover_ready, and the watch took the failover clients off Xray onto a MARK
+# rule that was no longer there: they left through the WAN.
+@test "tunnel_apply: a failover client whose MARK rule is gone is marked again before failover_ready" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+
+    # The chain is still there and holds nothing: the mock finds no rule in it.
+    fw_chain_exists() { return 0; }
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "rebuilding"
+    grep -q -- '-A TUN_DIR -s 192.168.1.8 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# The same flush takes the MARK rule of every other client, and each of them
+# left through the WAN until the configuration changed.
+@test "tunnel_apply: a chain that lost a client's MARK rule is rebuilt" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
+
+    fw_chain_exists() { return 0; }
+    marks_in_place 192.168.1.5
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "rebuilding"
+    grep -q -- '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000' /tmp/bats_iptables_calls.log
+}
+
+# A chain that still holds every MARK rule is left alone: a rebuild starts with
+# tunnel_stop, a window in which no client of any tunnel is marked.
+@test "tunnel_apply: the up-to-date path leaves a chain with every MARK rule alone" {
+    load_tunnel_module
+    run tunnel_apply
+    assert_success
+
+    fw_chain_exists() { return 0; }
+    iptables() {
+        if [[ $* == "-t mangle -C TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000" ]]; then
+            return 0
+        fi
+        command iptables "$@"
+    }
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    refute grep -q -- '-X TUN_DIR' /tmp/bats_iptables_calls.log
+}
+
+# A client the rebuild does not mark - no IPv4 address, or one outside RFC1918 -
+# has no MARK rule to find. Looking for one would rebuild the chain on every
+# apply, each time a window in which no client is marked.
+@test "tunnel_apply: a client the rebuild skips does not rebuild the chain on every apply" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","100.64.0.8","192.168.1.1000"]}}'
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
+
+    fw_chain_exists() { return 0; }
+    marks_in_place 192.168.1.5
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
 }
 
 # grep -q leaves as soon as it has its line, and iproute2 writes each rule as it

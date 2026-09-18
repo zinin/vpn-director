@@ -127,13 +127,25 @@ looks at the prefix only, and the failover copies `xray.clients` into a tunnel. 
 kernel refuses costs that client only — `_tunnel_emit_client` checks every rule itself and runs
 under `||`, because under errexit one refused MARK used to end the apply after `tunnel_stop` had
 purged the jumps and the ip rules of every tunnel. Such a rebuild is not recorded as up-to-date, so
-the next apply rebuilds and retries it; the up-to-date branch cannot see a missing chain rule.
+the next apply rebuilds and retries it: the up-to-date branch looks for the MARK rules only, not
+for an exclusion or offload rule.
 
 The PREROUTING jumps are different: a rebuild whose jump did not go in keeps its hash, and the
 up-to-date branch puts a missing jump back (`_tunnel_jumps_ensure`), leaving one that is there where
 it is. `failover_ready` needs the jumps, and every failover client still on the failover tunnel
 marked — one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it
 would leave through the WAN.
+
+A chain can also lose rules a recorded rebuild put in. Merlin's firewall start runs
+`iptables -t mangle -F`, which empties `TUN_DIR` without deleting it (the pitfall in
+`shell-conventions.md`), and `firewall-start` then applies again with the hash, the chain and
+`TUN_DIR_TABLES` all reading as applied. The up-to-date path used to put the jumps back into the
+empty chain and write `failover_ready`; every client, the failover clients the watch then took off
+Xray among them, left through the WAN until the configuration changed. It now asks `iptables -C`
+for the MARK rule of every client of every row of `TUN_DIR_TABLES` (`_tunnel_marks_present`) and
+rebuilds when one is gone. The failover clients are clients of their tunnel under its mark, so they
+are among them. A client the rebuild skips (no IPv4 address, outside RFC1918) is skipped there
+too: looking for its rule would rebuild the chain on every apply.
 
 The rebuild loop also releases each tunnel's table right before it ensures the route
 (`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that dies after
@@ -145,6 +157,7 @@ send its clients through the previous owner's tunnel.
 - Config hash changed
 - Chain does not exist
 - `TUN_DIR_TABLES` is missing
+- A client's MARK rule is missing from the chain (`_tunnel_marks_present`)
 
 ## Key Functions
 
@@ -164,6 +177,7 @@ send its clients through the previous owner's tunnel.
 | `_tunnel_init()` | Initialize module state (valid tables from `platform_tunnels`, fwmark helpers) |
 | `_tunnel_table_allowed(id)` | Check the tunnel id is one `platform_tunnels` lists |
 | `_tunnel_ensure_routes()` | Re-install the routes of the applied tunnels (used when nothing needs rebuilding) |
+| `_tunnel_marks_present()` | Does `TUN_DIR` still hold every client's MARK rule; one that is gone makes the apply a rebuild |
 
 **Module state variables**:
 - `_tunnel_valid_tables` - space-separated tunnel ids from `platform_tunnels`

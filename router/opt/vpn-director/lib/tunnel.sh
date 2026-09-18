@@ -30,6 +30,7 @@
 #   _tunnel_gateway()            - the configured gateway of a tunnel, or nothing
 #   _tunnel_ensure_routes()      - re-install the routes and ip rules of every applied tunnel
 #   _tunnel_jumps_ensure()       - put back a missing PREROUTING jump without a rebuild
+#   _tunnel_marks_present()      - is every client's MARK rule still in TUN_DIR
 #   _tunnel_init()               - initialize module state
 #
 # Usage:
@@ -261,7 +262,9 @@ _tunnel_failover_rule_present() {
 # here: dropped from Xray on failover_ready, it would leave through the WAN.
 # An entry that is no IPv4 address at all is neither TPROXY's nor ours and does
 # not count. A MARK rule the kernel refused is the rebuild's to see - that
-# rebuild is not recorded, so the up-to-date path never runs on one.
+# rebuild is not recorded, so the up-to-date path never runs on one - and one
+# that went missing since sends the apply back through a rebuild before this is
+# asked (_tunnel_marks_present).
 _tunnel_failover_carried() {
     local fo_client fo_on_tunnel
     fo_on_tunnel=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "${XRAY_FAILOVER_TUNNEL:-}" '.[$t].clients // [] | .[]')
@@ -270,6 +273,43 @@ _tunnel_failover_carried() {
         is_ipv4_net "$fo_client" || continue
         is_lan_ip "${fo_client%%/*}" || return 1
     done
+    return 0
+}
+
+# _tunnel_marks_present - does TUN_DIR still hold the MARK rule of every client
+# the recorded rebuild marked? The hash, the chain and TUN_DIR_TABLES say that a
+# rebuild ran, not that its rules are still there: Merlin's firewall start runs
+# "iptables -t mangle -F", which empties every chain of the table and deletes
+# none, and firewall-start then applies again. The up-to-date path used to put
+# the jumps back into the empty chain and write failover_ready, and every Tunnel
+# Director client - the failover clients the watch then took off Xray among
+# them - left through the WAN until the configuration changed.
+#
+# Each client of each recorded tunnel is looked up with "iptables -C", as
+# ensure_fw_rule looks before it adds; the failover clients are clients of their
+# tunnel under its mark, so they are among them. A client the rebuild skips - no
+# IPv4 address, outside RFC1918 - has no rule to find, and looking for one would
+# rebuild the chain on every apply. The exclusion and offload rules are not
+# looked for: a flush takes the MARK rules with them.
+_tunnel_marks_present() {
+    local idx tunnel mark_hex clients client
+    [[ -f $TUN_DIR_TABLES ]] || return 1
+    while read -r idx tunnel; do
+        [[ -n $tunnel ]] || continue
+        mark_hex=$(_tunnel_mark_hex "$idx")
+        clients=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients // [] | .[]')
+        while IFS= read -r client; do
+            [[ -n $client ]] || continue
+            is_ipv4_net "$client" || continue
+            is_lan_ip "${client%%/*}" || continue
+            if ! iptables -t mangle -C "$TUN_DIR_CHAIN" -s "$client" \
+                -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
+                -j MARK --set-xmark "$mark_hex/$_tunnel_mark_mask_hex" 2>/dev/null; then
+                log -l WARN "Tunnel '$tunnel': client '$client' has no MARK rule in $TUN_DIR_CHAIN any more (the firewall flushed the chain?)"
+                return 1
+            fi
+        done <<< "$clients"
+    done < "$TUN_DIR_TABLES"
     return 0
 }
 
@@ -617,6 +657,8 @@ tunnel_apply() {
         rebuild=1
     elif [[ ! -f $TUN_DIR_TABLES ]]; then
         rebuild=1
+    elif ! _tunnel_marks_present; then
+        rebuild=1
     fi
 
     if [[ $rebuild -eq 0 ]]; then
@@ -850,7 +892,8 @@ tunnel_apply() {
     # routing until the next rebuild wipes the chain - a silent fail-open. On
     # Merlin the only case is a typo in the tunnel id, which then warns on every
     # apply instead of once. A chain rule the kernel refused is the same: the
-    # up-to-date branch cannot tell it is missing, and only a rebuild retries it.
+    # up-to-date branch looks for the MARK rules alone, so a refused exclusion or
+    # offload rule would stay missing, and only a rebuild retries it.
     mkdir -p "$(dirname "$TUN_DIR_HASH")"
     cp -f "$tables_tmp" "$TUN_DIR_TABLES"
 

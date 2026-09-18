@@ -204,6 +204,34 @@ rules=$(ip rule show 2>/dev/null) || true
 `grep` without `-q` (or `grep -c`) reads its whole input and is not affected;
 neither is `grep -q` on a here-string.
 
+### Merlin's firewall start empties every mangle chain and deletes none
+
+**Problem**: `mangle_setting()` in the firmware's `rc/firewall.c` runs
+`iptables -t mangle -F` on every firewall start unless traditional QoS, the
+bandwidth limiter or GeForce NOW QoS is on (those go through `add_iQosRules`),
+and `del_iQosRules()` in `qos.c` does the same when QoS stops. `-F` without a
+chain name empties every chain of the table, `TUN_DIR` and `XRAY_TPROXY`
+included, and deletes none of them - mangle is not reloaded with
+`iptables-restore`, which would have. `firewall-start` then runs
+`vpn-director.sh apply`, and a chain that exists no longer says its rules do:
+
+```bash
+# succeeds for an empty chain
+iptables -t mangle -S TUN_DIR >/dev/null 2>&1
+```
+
+On the RT-AX86U (388.11, `qos_enable=0`, no `/tmp/mangle_rules`) that is every
+firewall start. The up-to-date path of `tunnel_apply` took the empty chain for
+applied: it put the PREROUTING jumps back into it and wrote `failover_ready`,
+and every Tunnel Director client left through the WAN until the configuration
+changed.
+
+**Solution**: refill the chain on every apply (`_tproxy_setup_iptables` flushes
+and rebuilds `XRAY_TPROXY`), or look for the rules themselves before calling it
+applied - `_tunnel_marks_present` asks `iptables -C` for every client's MARK
+rule and rebuilds when one is gone. KeeneticOS deletes our chains on every NDM
+rebuild, so there the missing chain is what sends the apply through a rebuild.
+
 ### A dual-family DNS lookup on the router often never answers
 
 **Problem**: `/etc/resolv.conf` points the router's own processes straight at
