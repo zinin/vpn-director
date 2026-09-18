@@ -733,6 +733,89 @@ func TestTick_StopDuringTheSubscriptionFetchWritesNothing(t *testing.T) {
 	}
 }
 
+// Generate can wait for the config lock, and a /stop can finish while it does.
+// The write that follows would put a new config.json and active_server on a
+// stopped router - taking effect on the next manual apply - so the marker is
+// checked under that lock, where the write happens.
+func TestTick_StopWhileGenerateWaitsForTheLockWritesNothing(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	stopped := false
+	generated, restarts := 0, 0
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		stopped = true // lands while this call waits for the config lock
+		if err := f.checkGuard(guard); err != nil {
+			return false, f.seq(), err
+		}
+		generated++
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		return true, f.seq(), nil
+	}
+	w.RestartXray = func() error {
+		restarts++
+		return nil
+	}
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background())
+
+	if generated != 0 || restarts != 0 {
+		t.Fatalf("generated %d, restarts %d after /stop", generated, restarts)
+	}
+	if got := vpnconfig.ActiveSeq(f.cfg.Xray.ActiveServer); got != 0 {
+		t.Fatalf("active_server %+v rewritten on a stopped router", f.cfg.Xray.ActiveServer)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v after /stop", f.notes)
+	}
+}
+
+// The same wait comes before the return to the preferred server after an
+// all-dead walk: a stop that lands there leaves the walk's last write in place
+// and writes nothing more.
+func TestTick_StopWhileTheReturnToPreferredWaitsWritesNothing(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	stopped := false
+	generated := []string{}
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.SaveServers = func([]vpnconfig.Server) error { return nil }
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{
+			{Name: "Oslo", Address: "oslo.example", Port: 443},
+			{Name: "Backup", Address: "backup.example", Port: 443},
+		}, nil
+	}
+	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		if len(generated) == 2 {
+			stopped = true // the return to Oslo waits for the lock
+		}
+		if err := f.checkGuard(guard); err != nil {
+			return false, f.seq(), err
+		}
+		generated = append(generated, s.Name)
+		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+		return true, f.seq(), nil
+	}
+	w.RestartXray = func() error { return nil }
+	w.AfterRestart = func(time.Duration) {}
+
+	w.Tick(context.Background())
+
+	if !reflect.DeepEqual(generated, []string{"Oslo", "Backup"}) {
+		t.Fatalf("generated %v; the return to the preferred server must not write after /stop", generated)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v after /stop", f.notes)
+	}
+}
+
 func TestTick_PlatformErrorDoesNotAnnounceNoTunnel(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),

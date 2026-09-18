@@ -444,6 +444,21 @@ func supersededGuard(started, lastRecorded string, expectedSeq int) func(*vpncon
 	}
 }
 
+// walkGuard is the guard every write of the walk carries. It runs under the
+// config lock Generate takes, after whatever wait that lock cost: a /stop that
+// finished meanwhile refuses the write there - a new config.json and
+// active_server on a stopped router would take effect on the next manual
+// apply - and a newer selection does as before.
+func (w *Watch) walkGuard(started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
+	superseded := supersededGuard(started, lastRecorded, expectedSeq)
+	return func(cfg *vpnconfig.VPNDirectorConfig) error {
+		if w.stopped() {
+			return errStopped
+		}
+		return superseded(cfg)
+	}
+}
+
 // superseded reports whether cfg names a server the walk did not record: one
 // selected since the walk started (lastRecorded empty) or since the last
 // Generate whose record saved.
@@ -570,7 +585,10 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		if ctx.Err() != nil || w.stopped() {
 			return
 		}
-		generated, seq, err := w.Generate(s, supersededGuard(started, lastRecorded, lastSeq))
+		generated, seq, err := w.Generate(s, w.walkGuard(started, lastRecorded, lastSeq))
+		if errors.Is(err, errStopped) {
+			return
+		}
 		if errors.Is(err, errSuperseded) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
@@ -629,7 +647,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
-		if w.returnToPreferred(*preferred, supersededGuard(started, lastRecorded, lastSeq)) {
+		if w.returnToPreferred(*preferred, w.walkGuard(started, lastRecorded, lastSeq)) {
 			slog.Info("Subscription walk abandoned; a newer server was selected")
 			return
 		}
@@ -664,6 +682,10 @@ func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPND
 	generated, _, err := w.Generate(s, guard)
 	if errors.Is(err, errSuperseded) {
 		return true
+	}
+	if errors.Is(err, errStopped) {
+		// Nothing was written; the caller ends the tick on the marker.
+		return false
 	}
 	if err != nil || !generated {
 		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
