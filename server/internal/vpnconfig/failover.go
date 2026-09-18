@@ -80,6 +80,24 @@ func FailoverCommitted(cfg *VPNDirectorConfig) bool {
 	return len(snapshotOnTunnel(cfg)) > 0 && !FailoverStaged(cfg)
 }
 
+// FailoverCarries reports whether the failover has a client Tunnel Director is
+// to carry: a snapshot address still on the fallback tunnel and not paused. One
+// with nobody to carry needs no failover_ready - tunnel_apply writes none for a
+// tunnel left without clients - and a missing marker then says nothing about
+// the tunnel.
+func FailoverCarries(cfg *VPNDirectorConfig) bool {
+	if cfg == nil || cfg.Xray.Failover == nil {
+		return false
+	}
+	paused := pausedSet(cfg)
+	for _, ip := range snapshotOnTunnel(cfg) {
+		if _, skip := paused[ip]; !skip {
+			return true
+		}
+	}
+	return false
+}
+
 // XrayClientsOutsideFailover is the Xray clients a failover would carry but
 // does not: added, re-added or resumed since the snapshot was taken. A client
 // is inside once it is both in the snapshot and on the fallback tunnel.

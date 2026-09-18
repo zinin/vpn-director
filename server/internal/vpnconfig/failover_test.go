@@ -533,6 +533,37 @@ func TestFailoverCommitted(t *testing.T) {
 	}
 }
 
+// tunnel_apply writes no failover_ready for a failover tunnel with nobody to
+// carry, so a missing marker says the tunnel does not carry the failover's
+// clients only while one of them is on it and not paused.
+func TestFailoverCarries(t *testing.T) {
+	onTunnel := func(clients ...string) *VPNDirectorConfig {
+		cfg := sample()
+		cfg.Xray.Failover = &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}, Committed: true}
+		cfg.TunnelDirector.Tunnels["ovpnc2"] = TunnelConfig{Clients: clients}
+		return cfg
+	}
+	paused := onTunnel("192.168.1.3", "192.168.1.8")
+	paused.PausedClients = append(paused.PausedClients, "192.168.1.8")
+	gone := onTunnel("192.168.1.8")
+	gone.Xray.Failover.Tunnel = "ovpnc9"
+	for _, tc := range []struct {
+		name string
+		cfg  *VPNDirectorConfig
+		want bool
+	}{
+		{"no failover", sample(), false},
+		{"a snapshot address on the tunnel", onTunnel("192.168.1.3", "192.168.1.8"), true},
+		{"every snapshot address paused", paused, false},
+		{"the snapshot address deleted from the tunnel", onTunnel("192.168.1.3"), false},
+		{"the tunnel key gone", gone, false},
+	} {
+		if got := FailoverCarries(tc.cfg); got != tc.want {
+			t.Errorf("%s: FailoverCarries = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 // A record from before the Committed field is committed only while its
 // snapshot is off Xray - and the restore stage puts it back on. Past that
 // stage, a restore whose last apply failed read the record as a stage that

@@ -25,9 +25,9 @@ const (
 	// host, and the tick - every probe behind it - would wait all of them out.
 	FetchTimeout = 3 * time.Minute
 	// FallbackCheck is how often a committed failover asks the platform about
-	// its tunnel, and FallbackDownAfter how long that tunnel has to be gone
-	// before the clients leave it: a reconnecting tunnel shows as down for a
-	// moment.
+	// its tunnel and looks for failover_ready, and FallbackDownAfter how long
+	// that tunnel has to be gone, or not carry the clients, before they leave
+	// it: a reconnecting tunnel shows as down for a moment.
 	FallbackCheck     = time.Minute
 	FallbackDownAfter = time.Minute
 	defaultSOCKSPort  = 12346
@@ -461,7 +461,11 @@ func (w *Watch) extendFailover(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPND
 
 // watchFallback looks at the tunnel of a committed failover while Xray stays
 // down. Nothing else did once the clients were off Xray, and a tunnel that went
-// down sent them out through the WAN until Xray came back. Gone for
+// down sent them out through the WAN until Xray came back. So did one the
+// platform still listed while Tunnel Director no longer sent the clients into
+// it - a firewall restart took the rules, and the apply after it could not put
+// them back and withheld failover_ready - which counts as gone too once an
+// apply of the watch's own has not brought it back. Gone for
 // FallbackDownAfter, it is replaced by another exit; with none left the clients
 // go back to Xray, where a dead outbound takes them nowhere - what a death with
 // no fallback does too. An empty tunnel list is no answer (Keenetic prints one
@@ -484,11 +488,21 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		return cfg
 	}
 	id := failoverTunnel(cfg)
+	gone := "is no longer a Tunnel Director exit"
 	for _, exit := range vpnconfig.TDExits(cfg, plat) {
-		if exit == id {
+		if exit != id {
+			continue
+		}
+		if w.fallbackCarries(cfg) {
 			w.fallbackDownSince = time.Time{}
 			return cfg
 		}
+		gone = "does not carry its clients"
+		break
+	}
+	// The apply fallbackCarries runs can wait for the script lock.
+	if w.stopped() {
+		return cfg
 	}
 	if w.fallbackDownSince.IsZero() {
 		w.fallbackDownSince = now
@@ -511,12 +525,12 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		return cfg
 	}
 	if next != "" {
-		slog.Warn("Failover tunnel is no longer a Tunnel Director exit; moving the Xray clients", "from", id, "to", next)
+		slog.Warn("Failover tunnel "+gone+"; moving the Xray clients to another exit", "from", id, "to", next)
 		// They are told where they went once that tunnel carries them, and the
 		// message is the one that told them about this tunnel.
 		w.lastRouteKind = noteNone
 	} else {
-		slog.Warn("Failover tunnel is no longer a Tunnel Director exit and there is no other; the Xray clients go back to Xray", "tunnel", id)
+		slog.Warn("Failover tunnel "+gone+" and there is no other exit; the Xray clients go back to Xray", "tunnel", id)
 		// Announced here, not by the death path on the next tick: a watch
 		// whose link is gone does not reach it.
 		w.notify(noteNoTunnel, msgNoTunnel)
@@ -530,6 +544,24 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		return reloaded
 	}
 	return cfg
+}
+
+// fallbackCarries reports whether Tunnel Director carries a committed
+// failover's clients: tunnel_apply wrote failover_ready for its tunnel, or the
+// failover has nobody left to carry. The marker says what the last apply found,
+// and an apply is what puts back the rules a firewall restart took, so one runs
+// before the tunnel counts as not carrying them.
+func (w *Watch) fallbackCarries(cfg *vpnconfig.VPNDirectorConfig) bool {
+	if !vpnconfig.FailoverCarries(cfg) || w.fallbackReady(cfg) {
+		return true
+	}
+	if err := w.apply(); err != nil {
+		if !errors.Is(err, errStopped) {
+			slog.Warn("Apply retry while the failover tunnel does not carry the Xray clients failed", "error", err)
+		}
+		return false
+	}
+	return w.fallbackReady(cfg)
 }
 
 func sameServer(s vpnconfig.Server, a *vpnconfig.ActiveServer) bool {

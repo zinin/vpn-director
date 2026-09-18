@@ -3692,6 +3692,76 @@ func TestTick_AnEmptyPlatformAnswerIsNotADeadFallback(t *testing.T) {
 	}
 }
 
+// The platform listing its tunnel was all a committed failover was checked for.
+// A firewall restart can take the rules that send the clients into the tunnel
+// while it stays connected, and an apply that cannot put them back withholds
+// failover_ready: off Xray, the clients left through the WAN until Xray came
+// back. Another exit takes them.
+func TestTick_CommittedFailoverMovesOnWhenItsTunnelStopsCarrying(t *testing.T) {
+	cfg := committedCfg()
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.4"}}
+	f := &fake{cfg: cfg, plat: connected("ovpnc2", "wgc1"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	w.FallbackReady = func(id string) bool { return id == "wgc1" }
+
+	tickFor(w, f, 2*time.Minute)
+
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "wgc1" {
+		t.Fatalf("failover %+v, want the clients on wgc1", f.cfg.Xray.Failover)
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("the client must leave the tunnel that does not carry it")
+	}
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") || !contains(f.cfg.TunnelDirector.Tunnels["wgc1"].Clients, "192.168.1.8") {
+		t.Fatalf("xray.clients %v, wgc1 %v; committed on wgc1", f.cfg.Xray.Clients, f.cfg.TunnelDirector.Tunnels["wgc1"].Clients)
+	}
+	if countNotes(f.notes, "Xray outbound is down; LAN clients moved to tunnel:wgc1") != 1 {
+		t.Fatalf("notes %v", f.notes)
+	}
+}
+
+// Most of the time an apply is all it takes - tunnel_apply rebuilds a chain the
+// firewall emptied - and the clients stay where they are.
+func TestTick_AnApplyThatBringsTheFallbackBackKeepsTheClients(t *testing.T) {
+	cfg := committedCfg()
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.4"}}
+	f := &fake{cfg: cfg, plat: connected("ovpnc2", "wgc1"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	carried := false
+	apply := w.Apply
+	w.Apply = func() error {
+		carried = true
+		return apply()
+	}
+	w.FallbackReady = func(string) bool { return carried }
+
+	tickFor(w, f, 5*time.Minute)
+
+	if f.applies == 0 {
+		t.Fatal("no apply: nothing put the rules back")
+	}
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" || contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v; the clients belong on ovpnc2", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+}
+
+// tunnel_apply writes no failover_ready for a tunnel it has nobody to carry
+// into - every failover client paused - and that says nothing about the tunnel.
+func TestTick_AFailoverWithNobodyToCarryKeepsItsTunnel(t *testing.T) {
+	cfg := committedCfg()
+	cfg.PausedClients = append(cfg.PausedClients, "192.168.1.8")
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.4"}}
+	f := &fake{cfg: cfg, plat: connected("ovpnc2", "wgc1"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	w.FallbackReady = func(string) bool { return false }
+
+	tickFor(w, f, 5*time.Minute)
+
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Fatalf("failover %+v; moved for a marker nobody needed", f.cfg.Xray.Failover)
+	}
+}
+
 func stagedOn(tunnel string, extra ...string) *vpnconfig.VPNDirectorConfig {
 	cfg := baseCfg()
 	for _, id := range extra {
