@@ -1,7 +1,11 @@
 package vless
 
 import (
+	"context"
 	"encoding/base64"
+	"net"
+	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -497,5 +501,81 @@ func TestDecodeSubscription_WhitespaceInput(t *testing.T) {
 
 	if servers[0].Name != "WhitespaceTest" {
 		t.Errorf("expected server name 'WhitespaceTest', got '%s'", servers[0].Name)
+	}
+}
+
+func TestDecodeAndResolve(t *testing.T) {
+	// IP literals resolve without DNS.
+	subscription := strings.Join([]string{
+		"vless://uuid-1@203.0.113.10:443?security=reality#Oslo",
+		"vless://missing-at-sign:443#Broken",
+		"vless://uuid-2@198.51.100.7:8443#Paris",
+	}, "\n")
+
+	result := DecodeAndResolve(base64.StdEncoding.EncodeToString([]byte(subscription)))
+
+	if result.Parsed != 2 {
+		t.Errorf("Parsed = %d, want 2", result.Parsed)
+	}
+	if len(result.ParseErrors) != 1 {
+		t.Errorf("ParseErrors = %v, want one", result.ParseErrors)
+	}
+	if result.ResolveErrors != 0 {
+		t.Errorf("ResolveErrors = %d, want 0", result.ResolveErrors)
+	}
+	if len(result.Servers) != 2 {
+		t.Fatalf("Servers = %+v, want both parsed servers", result.Servers)
+	}
+	if got := result.Servers[0]; got.Name != "Oslo" || !reflect.DeepEqual(got.IPs, []string{"203.0.113.10"}) {
+		t.Errorf("first server %+v, want Oslo on 203.0.113.10", got)
+	}
+	if got := result.Servers[1]; got.Name != "Paris" || !reflect.DeepEqual(got.IPs, []string{"198.51.100.7"}) {
+		t.Errorf("second server %+v, want Paris on 198.51.100.7", got)
+	}
+}
+
+func TestDecodeAndResolveLookup(t *testing.T) {
+	subscription := "vless://uuid-1@oslo.example.invalid:443#Oslo"
+	looked := []string{}
+	result := DecodeAndResolveLookup(base64.StdEncoding.EncodeToString([]byte(subscription)), func(host string) ([]net.IP, error) {
+		looked = append(looked, host)
+		if host != "oslo.example.invalid" {
+			t.Fatalf("lookup host %q", host)
+		}
+		return []net.IP{net.ParseIP("203.0.113.50")}, nil
+	})
+	if result.Parsed != 1 || result.ResolveErrors != 0 || len(result.Servers) != 1 {
+		t.Fatalf("%+v", result)
+	}
+	if got := result.Servers[0]; got.Name != "Oslo" || !reflect.DeepEqual(got.IPs, []string{"203.0.113.50"}) {
+		t.Fatalf("%+v", got)
+	}
+	if !reflect.DeepEqual(looked, []string{"oslo.example.invalid"}) {
+		t.Fatalf("lookup %v", looked)
+	}
+}
+
+func TestLookupIPv4_ReturnsOnlyIPv4(t *testing.T) {
+	ips, err := LookupIPv4(context.Background())("localhost")
+	if err != nil {
+		t.Skipf("no local resolver for localhost: %v", err)
+	}
+	if len(ips) == 0 {
+		t.Fatal("localhost resolved to nothing")
+	}
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			t.Fatalf("resolved %v; an AF_UNSPEC lookup is what waits out the AAAA half", ip)
+		}
+	}
+}
+
+// The subscription of a router can name tens of hosts, resolved one after the
+// other inside a watch tick. A stop or a shutdown has to be able to end that.
+func TestLookupIPv4_HonoursTheContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := LookupIPv4(ctx)("localhost"); err == nil {
+		t.Fatal("a canceled context must end the lookup")
 	}
 }

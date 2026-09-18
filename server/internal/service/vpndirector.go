@@ -94,6 +94,22 @@ func (s *VPNDirectorService) RestartXray() error {
 	return s.runChecked(ApplyTimeout, "restart xray", "restart", "xray")
 }
 
+// ApplyUnlessStopped is Apply for an automatic caller, the subscription watch.
+// Under its lock the script skips it, exit 0 and the marker kept, when stop has
+// run since the last apply: a stop the watch queued behind stays in force.
+func (s *VPNDirectorService) ApplyUnlessStopped() error {
+	return s.runChecked(ApplyTimeout, "apply", "--unless-stopped", "apply")
+}
+
+// RestartXrayProcessUnlessStopped restarts the Xray process for the same
+// caller, skipped the same way, and leaves the TPROXY rules alone. The walk
+// writes one config.json per server it tries; the stop and apply of "restart
+// xray" would take the TPROXY jump away and put it back each time, and the
+// Xray clients leave through the WAN in between.
+func (s *VPNDirectorService) RestartXrayProcessUnlessStopped() error {
+	return s.runChecked(ApplyTimeout, "restart xray-process", "--unless-stopped", "restart", "xray-process")
+}
+
 // Stop stops VPN Director
 func (s *VPNDirectorService) Stop() error { return s.runChecked(ApplyTimeout, "stop", "stop") }
 

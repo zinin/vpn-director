@@ -8,12 +8,12 @@
 #   Routes LAN client traffic through VPN tunnels with exclusion-based routing.
 #
 # Dependencies:
-#   - common.sh (log, tmp_file, compute_hash, is_lan_ip) and, through it, the
-#     platform contract (platform_tunnels, platform_tunnel_table,
+#   - common.sh (log, tmp_file, compute_hash, is_lan_ip, is_ipv4_net, rt_table_label)
+#     and, through it, the platform contract (platform_tunnels, platform_tunnel_table,
 #     platform_tunnel_route_ensure, platform_tunnel_table_release,
 #     platform_prerouting_base_pos, platform_lan_ifaces)
 #   - firewall.sh (create_fw_chain, delete_fw_chain, ensure_fw_rule, sync_fw_rule,
-#                  purge_fw_rules, fw_chain_exists)
+#                  purge_fw_rules, find_fw_rules, fw_chain_exists)
 #   - config.sh (TUN_DIR_TUNNELS_JSON, TUN_DIR_CHAIN, TUN_DIR_PREF_BASE,
 #                TUN_DIR_MARK_MASK, TUN_DIR_MARK_SHIFT; XRAY_CHAIN, to keep the
 #                PREROUTING jump behind the Xray jumps)
@@ -28,7 +28,9 @@
 # Internal functions (for testing):
 #   _tunnel_table_allowed()      - check if a tunnel id is one the platform lists
 #   _tunnel_gateway()            - the configured gateway of a tunnel, or nothing
-#   _tunnel_ensure_routes()      - re-install the routes of every applied tunnel
+#   _tunnel_ensure_routes()      - re-install the routes and ip rules of every applied tunnel
+#   _tunnel_jumps_ensure()       - put back a missing PREROUTING jump without a rebuild
+#   _tunnel_marks_present()      - is every client's MARK rule still in TUN_DIR
 #   _tunnel_init()               - initialize module state
 #
 # Usage:
@@ -157,14 +159,338 @@ _tunnel_gateway() {
 # keeps the tunnel tables; on Keenetic the route follows the interface state.
 # -------------------------------------------------------------------------------------------------
 _tunnel_ensure_routes() {
-    local idx tunnel
+    local idx tunnel rc=0
     [[ -f $TUN_DIR_TABLES ]] || return 0
     while read -r idx tunnel; do
         [[ -n $tunnel ]] || continue
         if ! platform_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
             log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
+            if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
+                rc=1
+            fi
         fi
+        # The rule outlives an interface flap, but one that never went in at
+        # rebuild time is retried nowhere else. The failover check below reads
+        # the result; a rule that cannot be installed has logged its own error.
+        _tunnel_rule_ensure "$idx" "$tunnel" || true
     done < "$TUN_DIR_TABLES"
+    return "$rc"
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tunnel_rule_ensure - put back the ip rule of a recorded tunnel
+# -------------------------------------------------------------------------------------------------
+# A rebuild records TUN_DIR_HASH even when an "ip rule add" failed - dropping the
+# hash would send the next apply through tunnel_stop and take TUN_DIR down for
+# every client - so every later apply lands in the up-to-date branch and this is
+# the only place left to retry. Without it a rule that never went in stays gone
+# until the configuration changes: those clients fall through to main, and for
+# the failover tunnel failover_ready is never written, so the watch keeps its
+# Xray clients on a dead outbound.
+#
+# A rule that is in place is left alone. Deleting and re-adding it would open a
+# window in which marked packets fall through to main. Another rule on the
+# preference makes way for it: the range is this module's, as the rebuild and
+# tunnel_stop treat it.
+# -------------------------------------------------------------------------------------------------
+_tunnel_rule_ensure() {
+    local idx="$1" tunnel="$2"
+    local pref=$((TUN_DIR_PREF_BASE + idx))
+    local mark_hex table
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    table="$(platform_tunnel_table "$tunnel" "$idx")"
+    if _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
+        return 0
+    fi
+    ip rule del pref "$pref" 2>/dev/null || true
+    if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
+        log -l ERROR "Tunnel '$tunnel': ip rule still not installed: pref=$pref fwmark=$mark_hex lookup=$table"
+        return 1
+    fi
+    log "Tunnel '$tunnel': re-installed the ip rule at pref $pref"
+    return 0
+}
+
+# _tunnel_mark_hex <idx> - the fwmark of the tunnel in slot idx, as ip prints it
+_tunnel_mark_hex() {
+    printf '0x%x' $(( ($1 + 1) << _tunnel_mark_shift_val ))
+}
+
+# _tunnel_rule_listed <pref> <mark> <table> - is this module's rule at that
+# preference: "from all fwmark <mark>/<mask> lookup <table>"? Another rule can
+# hold the same preference - a firmware's, a user's, one an older layout left -
+# and a look at the preference alone took it for ours: the up-to-date path never
+# put ours back, and failover_ready went out with the failover clients' marks
+# routed by that rule or by main. The table is compared as the kernel prints it
+# (rt_table_label) and every part as a whole word: iproute2 4.4 ends each rule
+# with a space, and a mask of all ones is left out of the listing.
+#
+# "ip rule show pref N" is refused by iproute2 4.4 (Entware's ip-full), so the
+# unfiltered listing is searched here - read whole first. Piped into "grep -q"
+# it was wrong under pipefail: grep leaves at its match, iproute2 writes each
+# rule as it prints it, and the SIGPIPE that ends "ip" made the pipeline report
+# 141, so a rule in place read as missing.
+_tunnel_rule_listed() {
+    local pref="$1" fwmark="fwmark $2/$_tunnel_mark_mask_hex" lookup rules line
+    [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || fwmark="fwmark $2"
+    lookup="lookup $(rt_table_label "$3")"
+    rules=$(ip rule show 2>/dev/null) || true
+    while IFS= read -r line; do
+        [[ $line == "$pref:"* ]] || continue
+        line=" ${line#*:} "
+        line=${line//$'\t'/ }
+        if [[ $line == *" from all "* && $line == *" $fwmark "* && $line == *" $lookup "* ]]; then
+            return 0
+        fi
+    done <<< "$rules"
+    return 1
+}
+
+# True when the failover tunnel's own ip rule is at pref TUN_DIR_PREF_BASE+idx.
+_tunnel_failover_rule_present() {
+    local idx table
+    [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] || return 0
+    [[ -f $TUN_DIR_TABLES ]] || return 1
+    idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$TUN_DIR_TABLES")
+    [[ -n $idx ]] || return 1
+    table=$(platform_tunnel_table "$XRAY_FAILOVER_TUNNEL" "$idx") || return 1
+    _tunnel_rule_listed $((TUN_DIR_PREF_BASE + idx)) "$(_tunnel_mark_hex "$idx")" "$table"
+}
+
+# _tunnel_failover_carried - does TUN_DIR mark every failover client still on
+# the failover tunnel? One outside RFC1918 is TPROXY's to take but never marked
+# here: dropped from Xray on failover_ready, it would leave through the WAN.
+# An entry that is no IPv4 address at all is neither TPROXY's nor ours and does
+# not count. A MARK rule the kernel refused is the rebuild's to see - that
+# rebuild is not recorded, so the up-to-date path never runs on one - and one
+# that went missing since sends the apply back through a rebuild before this is
+# asked (_tunnel_marks_present).
+_tunnel_failover_carried() {
+    local fo_client fo_on_tunnel
+    fo_on_tunnel=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "${XRAY_FAILOVER_TUNNEL:-}" '.[$t].clients // [] | .[]')
+    for fo_client in ${XRAY_FAILOVER_CLIENTS:-}; do
+        grep -qxF -- "$fo_client" <<< "$fo_on_tunnel" || continue
+        is_ipv4_net "$fo_client" || continue
+        is_lan_ip "${fo_client%%/*}" || return 1
+    done
+    return 0
+}
+
+# _tunnel_marks_present - does TUN_DIR still hold the MARK rule of every client
+# the recorded rebuild marked? The hash, the chain and TUN_DIR_TABLES say that a
+# rebuild ran, not that its rules are still there: Merlin's firewall start runs
+# "iptables -t mangle -F", which empties every chain of the table and deletes
+# none, and firewall-start then applies again. The up-to-date path used to put
+# the jumps back into the empty chain and write failover_ready, and every Tunnel
+# Director client - the failover clients the watch then took off Xray among
+# them - left through the WAN until the configuration changed.
+#
+# Each client of each recorded tunnel is looked up with "iptables -C", as
+# ensure_fw_rule looks before it adds; the failover clients are clients of their
+# tunnel under its mark, so they are among them. A client the rebuild skips - no
+# IPv4 address, outside RFC1918 - has no rule to find, and looking for one would
+# rebuild the chain on every apply. The exclusion and offload rules are not
+# looked for: a flush takes the MARK rules with them.
+_tunnel_marks_present() {
+    local idx tunnel mark_hex clients client
+    [[ -f $TUN_DIR_TABLES ]] || return 1
+    while read -r idx tunnel; do
+        [[ -n $tunnel ]] || continue
+        mark_hex=$(_tunnel_mark_hex "$idx")
+        clients=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients // [] | .[]')
+        while IFS= read -r client; do
+            [[ -n $client ]] || continue
+            is_ipv4_net "$client" || continue
+            is_lan_ip "${client%%/*}" || continue
+            if ! iptables -t mangle -C "$TUN_DIR_CHAIN" -s "$client" \
+                -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
+                -j MARK --set-xmark "$mark_hex/$_tunnel_mark_mask_hex" 2>/dev/null; then
+                log -l WARN "Tunnel '$tunnel': client '$client' has no MARK rule in $TUN_DIR_CHAIN any more (the firewall flushed the chain?)"
+                return 1
+            fi
+        done <<< "$clients"
+    done < "$TUN_DIR_TABLES"
+    return 0
+}
+
+# True when the failover tunnel still has clients after pause filtering.
+_tunnel_failover_needed() {
+    [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]] || return 1
+    local c
+    c=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].clients // [] | .[]')
+    [[ -n $c ]]
+}
+
+# Prints "idx tunnel" for every tunnel that will get a slot. warnings and
+# skipped_unknown are tunnel_apply's locals (bash dynamic scope). One pass so
+# failover MARK slots cannot drift from the apply loop.
+_tunnel_collect_applied() {
+    local idx=0 tunnel tunnel_type clients_type clients slot
+    local tunnels
+    tunnels=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[]')
+    while IFS= read -r tunnel; do
+        [[ -n $tunnel ]] || continue
+        if ! _tunnel_table_allowed "$tunnel"; then
+            log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
+            warnings=1
+            skipped_unknown=1
+            continue
+        fi
+        tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
+        if [[ $tunnel_type != "object" ]]; then
+            log -l WARN "Tunnel '$tunnel' has invalid config (expected object, got $tunnel_type); skipping"
+            warnings=1
+            continue
+        fi
+        clients_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients | type')
+        if [[ $clients_type != "array" ]] && [[ $clients_type != "null" ]]; then
+            log -l WARN "Tunnel '$tunnel' has invalid clients (expected array, got $clients_type); skipping"
+            warnings=1
+            continue
+        fi
+        clients=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients // [] | .[]')
+        if [[ -z $clients ]]; then
+            log -l WARN "Tunnel '$tunnel' has no clients; skipping"
+            warnings=1
+            continue
+        fi
+        slot=$((idx + 1))
+        if [[ $slot -gt $_tunnel_mark_field_max ]]; then
+            log -l WARN "Too many tunnels (max $_tunnel_mark_field_max); skipping '$tunnel'"
+            warnings=1
+            continue
+        fi
+        printf '%s %s\n' "$idx" "$tunnel"
+        idx=$((idx + 1))
+    done <<< "$tunnels"
+}
+
+# One client's RETURN / offload / MARK in TUN_DIR. Offload sits immediately
+# before MARK with the same match so excluded destinations keep acceleration.
+# warnings, changes and incomplete are tunnel_apply's locals (bash dynamic
+# scope); incomplete says a rule did not go in, so the rebuild is not recorded.
+#
+# Returns 0 when the client is marked, 1 when it is skipped as no IPv4 address
+# or CIDR at all - nothing TPROXY can take either - 2 when it is skipped as
+# outside RFC1918, and 3 when its MARK rule did not go in. The callers run it
+# under "||", which turns errexit off here, so every rule is checked by hand:
+# before, a rule the kernel refused ended the whole apply under errexit, after
+# tunnel_stop had purged the jumps and the ip rules of every tunnel.
+_tunnel_emit_client() {
+    local client="$1" tunnel="$2" mark_hex="$3" excludes="$4"
+    local client_ip="${client%%/*}"
+    # is_lan_ip looks at the prefix only: 192.168.1.1000 passes it and then
+    # makes "iptables -s" fail, 192.168.1.010 would be read as .8.
+    if ! is_ipv4_net "$client"; then
+        log -l WARN "Client '$client' is not an IPv4 address or CIDR; skipping"
+        warnings=1
+        return 1
+    fi
+    if ! is_lan_ip "$client_ip"; then
+        log -l WARN "Client '$client' is not RFC1918; skipping"
+        warnings=1
+        return 2
+    fi
+
+    local excl excl_set
+    while IFS= read -r excl; do
+        [[ -n $excl ]] || continue
+        excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
+        if ! _ipset_exists "$excl_set"; then
+            log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
+            warnings=1
+            continue
+        fi
+        if ! ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
+            -s "$client" -m set --match-set "$excl_set" dst -j RETURN; then
+            warnings=1
+            incomplete=1
+        fi
+    done <<< "$excludes"
+
+    if [[ -n $offload_target ]]; then
+        if ! ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
+            -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
+            -j "$offload_target"; then
+            warnings=1
+            incomplete=1
+        fi
+    fi
+
+    if ! ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
+        -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
+        -j MARK --set-xmark "$mark_hex/$_tunnel_mark_mask_hex"; then
+        log -l ERROR "Client '$client' is not marked for tunnel '$tunnel'; its traffic falls through to main"
+        warnings=1
+        incomplete=1
+        return 3
+    fi
+
+    log "Added: client=$client tunnel=$tunnel mark=$mark_hex"
+    changes=1
+}
+
+# _tunnel_prerouting_pos - where the first TUN_DIR jump goes
+# The platform's base position, never ahead of the Xray jumps. XRAY_TPROXY
+# inserts from position 1 and runs before this chain by design (packet-flow.md);
+# on Merlin the base position is 1 as well when the firmware has no iface-mark
+# rules, so a rebuild put TUN_DIR first and the next apply found the Xray jump
+# off its position and purged and re-inserted it - a window with no TPROXY jump
+# on every apply. Count the jumps already there and go behind them. Returns 1
+# when the platform cannot say.
+_tunnel_prerouting_pos() {
+    local base_pos xray_jumps
+    base_pos=$(platform_prerouting_base_pos) || base_pos=""
+    [[ -n $base_pos ]] || return 1
+    xray_jumps=$(iptables -t mangle -S PREROUTING 2>/dev/null | grep -c -- "-j ${XRAY_CHAIN:-XRAY_TPROXY}\$" || true)
+    if (( base_pos <= xray_jumps )); then
+        base_pos=$((xray_jumps + 1))
+    fi
+    printf '%s\n' "$base_pos"
+}
+
+# _tunnel_sync_jumps <lan_ifaces> <pos> - the PREROUTING jump of every LAN
+# interface, each at its own position (pos, pos + 1, ...). One shared position
+# would make every interface displace the one before it, so sync_fw_rule would
+# find each jump off its position and purge-and-re-insert all of them on every
+# apply - and each rewrite is a window with no jump for that interface. Returns
+# 1 when a jump did not go in; sync_fw_rule has logged it.
+_tunnel_sync_jumps() {
+    local lan_ifaces="$1" pos="$2" lan_if rc=0
+    while IFS= read -r lan_if; do
+        [[ -n $lan_if ]] || continue
+        sync_fw_rule -q mangle PREROUTING "-i $lan_if .*-j ${TUN_DIR_CHAIN}\$" \
+            "-i $lan_if -m mark --mark 0x0/$_tunnel_mark_mask_hex -j $TUN_DIR_CHAIN" "$pos" || rc=1
+        pos=$((pos + 1))
+    done <<< "$lan_ifaces"
+    return "$rc"
+}
+
+# _tunnel_jumps_ensure - put back a PREROUTING jump that is missing
+# A rebuild records its hash even when a jump did not go in - dropping it would
+# send the next apply through tunnel_stop - so the up-to-date path is the only
+# place left to retry one. A jump that is there stays where it is: moving it is
+# a window with no jump. Returns 1 when a jump is still missing.
+_tunnel_jumps_ensure() {
+    local lan_ifaces lan_if pos="" idx=0 rc=0
+    lan_ifaces="$(platform_lan_ifaces)" || lan_ifaces=""
+    [[ -n $lan_ifaces ]] || return 1
+    while IFS= read -r lan_if; do
+        [[ -n $lan_if ]] || continue
+        if [[ -z $(find_fw_rules "mangle PREROUTING" "-i $lan_if .*-j ${TUN_DIR_CHAIN}\$") ]]; then
+            if [[ -z $pos ]]; then
+                pos=$(_tunnel_prerouting_pos) || return 1
+            fi
+            if sync_fw_rule -q mangle PREROUTING "-i $lan_if .*-j ${TUN_DIR_CHAIN}\$" \
+                "-i $lan_if -m mark --mark 0x0/$_tunnel_mark_mask_hex -j $TUN_DIR_CHAIN" "$((pos + idx))"; then
+                log "Tunnel Director: re-installed the PREROUTING jump for $lan_if"
+            else
+                rc=1
+            fi
+        fi
+        idx=$((idx + 1))
+    done <<< "$lan_ifaces"
+    return "$rc"
 }
 
 ###################################################################################################
@@ -271,7 +597,7 @@ tunnel_stop() {
     fi
 
     # Clear hash file
-    rm -f "$TUN_DIR_HASH"
+    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY"
 
     log "Tunnel Director stopped"
     return 0
@@ -288,6 +614,7 @@ tunnel_apply() {
     local changes=0
     local warnings=0
     local skipped_unknown=0
+    local incomplete=0
 
     # Check if tunnels config is empty. A leftover chain/jump/ip rule would
     # still force previously matched clients into the tunnel, so tear down.
@@ -310,9 +637,15 @@ tunnel_apply() {
         return 1
     fi
 
-    # Compute config hash for change detection
+    # Compute config hash for change detection. Failover snapshot clients are
+    # extra MARK rules, not a key reorder, so they belong in the hash. With no
+    # failover, hash only the tunnels JSON so an upgrade does not rebuild TUN_DIR.
     local new_hash old_hash empty_hash
-    new_hash=$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)
+    if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]]; then
+        new_hash=$(printf '%s\n%s\n%s' "$TUN_DIR_TUNNELS_JSON" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
+    else
+        new_hash=$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)
+    fi
     empty_hash=$(printf '' | compute_hash)
     old_hash=$(cat "$TUN_DIR_HASH" 2>/dev/null || printf '%s' "$empty_hash")
 
@@ -324,10 +657,34 @@ tunnel_apply() {
         rebuild=1
     elif [[ ! -f $TUN_DIR_TABLES ]]; then
         rebuild=1
+    elif ! _tunnel_marks_present; then
+        rebuild=1
     fi
 
     if [[ $rebuild -eq 0 ]]; then
-        _tunnel_ensure_routes
+        # Always re-install recorded routes first. Gating that on the failover
+        # row being in TUN_DIR_TABLES skipped Keenetic route repair for every
+        # other tunnel after an interface flap.
+        local route_rc=0 jumps_rc=0
+        _tunnel_ensure_routes || route_rc=$?
+        if ! _tunnel_jumps_ensure; then
+            log -l ERROR "Tunnel Director: a PREROUTING jump to $TUN_DIR_CHAIN is missing and did not go back in"
+            jumps_rc=1
+        fi
+        if _tunnel_failover_needed; then
+            if ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES" \
+                || [[ $route_rc -ne 0 ]] \
+                || [[ $jumps_rc -ne 0 ]] \
+                || ! _tunnel_failover_carried \
+                || ! _tunnel_failover_rule_present; then
+                rm -f "$TUN_DIR_FAILOVER_READY"
+                log -l WARN "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+            else
+                printf '%s\n' "$XRAY_FAILOVER_TUNNEL" > "$TUN_DIR_FAILOVER_READY"
+            fi
+        else
+            rm -f "$TUN_DIR_FAILOVER_READY"
+        fi
         log "Rules are applied and up-to-date"
         return 0
     fi
@@ -368,28 +725,16 @@ tunnel_apply() {
     # Create the single chain
     create_fw_chain -q -f mangle "$TUN_DIR_CHAIN"
 
-    # Get base position in PREROUTING. Unguarded, an rc 1 here would trip
-    # errexit and end the whole CLI run without a log line - after tunnel_stop
-    # and create_fw_chain, and before tproxy_apply. An empty base_pos would be
-    # worse than the abort: the first jump would keep append semantics, but the
-    # second would land at position 1, ahead of the firmware's iface-mark rules.
+    # Get base position in PREROUTING, behind the Xray jumps. Unguarded, an rc 1
+    # here would trip errexit and end the whole CLI run without a log line -
+    # after tunnel_stop and create_fw_chain, and before tproxy_apply. An empty
+    # base_pos would be worse than the abort: the first jump would keep append
+    # semantics, but the second would land at position 1, ahead of the
+    # firmware's iface-mark rules.
     local base_pos
-    base_pos=$(platform_prerouting_base_pos) || base_pos=""
-    if [[ -z $base_pos ]]; then
+    if ! base_pos=$(_tunnel_prerouting_pos); then
         log -l ERROR "Cannot determine the PREROUTING insert position; Tunnel Director rules not applied"
         return 1
-    fi
-
-    # Never ahead of the Xray jumps. XRAY_TPROXY inserts from position 1 and
-    # runs before this chain by design (packet-flow.md); on Merlin the base
-    # position is 1 as well when the firmware has no iface-mark rules, so a
-    # rebuild put TUN_DIR first and the next apply found the Xray jump off its
-    # position and purged and re-inserted it - a window with no TPROXY jump on
-    # every apply. Count the jumps already there and go behind them.
-    local xray_jumps
-    xray_jumps=$(iptables -t mangle -S PREROUTING 2>/dev/null | grep -c -- "-j ${XRAY_CHAIN:-XRAY_TPROXY}\$" || true)
-    if (( base_pos <= xray_jumps )); then
-        base_pos=$((xray_jumps + 1))
     fi
 
     # A platform whose firmware accelerates established forwarded flows past
@@ -402,40 +747,52 @@ tunnel_apply() {
 
     # Process each tunnel
     local tunnel_idx=0
-    local tables_tmp
+    local fo_applied=0 fo_route_ok=1 fo_rule_ok=1 fo_carried=1 fo_rc
+    local tables_tmp slots_tmp
     tables_tmp="$(tmp_file)"
-    local tunnels
-    # Use keys_unsorted to preserve JSON file order (not alphabetical sorting)
-    tunnels=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[]')
+    slots_tmp="$(tmp_file)"
+    _tunnel_collect_applied > "$slots_tmp"
 
-    while IFS= read -r tunnel; do
+    # Failover snapshot IPs get MARK first (first-match) with the failover
+    # tunnel's mark. Slots come from the same collect as the apply loop.
+    local fo_mark="" fo_on_tunnel=""
+    if [[ -n ${XRAY_FAILOVER_TUNNEL:-} && -n ${XRAY_FAILOVER_CLIENTS:-} ]]; then
+        local fo_idx
+        fo_idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$slots_tmp")
+        if [[ -n $fo_idx ]]; then
+            fo_mark=$(printf '0x%x' $(( (fo_idx + 1) << _tunnel_mark_shift_val )))
+            fo_on_tunnel=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].clients // [] | .[]')
+        fi
+    fi
+    if [[ -n $fo_mark ]]; then
+        local fo_excl_type fo_excludes="" fo_client
+        fo_excl_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].exclude | type')
+        if [[ $fo_excl_type == array ]]; then
+            fo_excludes=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$XRAY_FAILOVER_TUNNEL" '.[$t].exclude // [] | .[]')
+        fi
+        for fo_client in $XRAY_FAILOVER_CLIENTS; do
+            # DELETE /api/clients drops the address from the tunnel but leaves
+            # xray.failover. An override for an IP no longer on this tunnel
+            # would first-match it onto the old fallback.
+            local fo_still=0 fo_have
+            while IFS= read -r fo_have; do
+                if [[ $fo_have == "$fo_client" ]]; then
+                    fo_still=1
+                    break
+                fi
+            done <<< "$fo_on_tunnel"
+            [[ $fo_still -eq 1 ]] || continue
+            fo_rc=0
+            _tunnel_emit_client "$fo_client" "$XRAY_FAILOVER_TUNNEL" "$fo_mark" "$fo_excludes" || fo_rc=$?
+            # 1 is no address at all, which TPROXY cannot take either. 2 and 3
+            # are clients TPROXY takes and TUN_DIR does not mark: dropped from
+            # Xray on failover_ready, they would leave through the WAN.
+            [[ $fo_rc -lt 2 ]] || fo_carried=0
+        done
+    fi
+
+    while read -r tunnel_idx tunnel; do
         [[ -n $tunnel ]] || continue
-
-        # Validate the tunnel is one the platform knows
-        if ! _tunnel_table_allowed "$tunnel"; then
-            log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
-            warnings=1
-            skipped_unknown=1
-            continue
-        fi
-
-        # Validate tunnel config is an object (not string or other type)
-        local tunnel_type
-        tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
-        if [[ $tunnel_type != "object" ]]; then
-            log -l WARN "Tunnel '$tunnel' has invalid config (expected object, got $tunnel_type); skipping"
-            warnings=1
-            continue
-        fi
-
-        # Validate clients is an array
-        local clients_type
-        clients_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t].clients | type')
-        if [[ $clients_type != "array" ]] && [[ $clients_type != "null" ]]; then
-            log -l WARN "Tunnel '$tunnel' has invalid clients (expected array, got $clients_type); skipping"
-            warnings=1
-            continue
-        fi
 
         # Validate exclude is an array (if present)
         local exclude_type
@@ -455,70 +812,28 @@ tunnel_apply() {
             excludes=""
         fi
 
-        if [[ -z $clients ]]; then
-            log -l WARN "Tunnel '$tunnel' has no clients; skipping"
-            warnings=1
-            continue
-        fi
-
-        # Compute fwmark for this tunnel
         local slot=$((tunnel_idx + 1))
-        if [[ $slot -gt $_tunnel_mark_field_max ]]; then
-            log -l WARN "Too many tunnels (max $_tunnel_mark_field_max); skipping '$tunnel'"
-            warnings=1
-            continue
-        fi
 
         local mark_val=$(( slot << _tunnel_mark_shift_val ))
         local mark_hex
         mark_hex=$(printf '0x%x' "$mark_val")
 
-        # Add rules for each client
+        # Add rules for each client. Snapshot IPs were already emitted first.
         while IFS= read -r client; do
             [[ -n $client ]] || continue
-
-            # Validate client is RFC1918
-            local client_ip="${client%%/*}"
-            if ! is_lan_ip "$client_ip"; then
-                log -l WARN "Client '$client' is not RFC1918; skipping"
-                warnings=1
-                continue
+            if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" && -n ${XRAY_FAILOVER_CLIENTS:-} ]]; then
+                local fo_skip=0 fo_c
+                for fo_c in $XRAY_FAILOVER_CLIENTS; do
+                    if [[ $client == "$fo_c" ]]; then
+                        fo_skip=1
+                        break
+                    fi
+                done
+                [[ $fo_skip -eq 0 ]] || continue
             fi
-
-            # Add RETURN rules for each exclude ipset
-            while IFS= read -r excl; do
-                [[ -n $excl ]] || continue
-                local excl_set
-                excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
-
-                if ! _ipset_exists "$excl_set"; then
-                    log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
-                    warnings=1
-                    continue
-                fi
-
-                ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
-                    -s "$client" -m set --match-set "$excl_set" dst -j RETURN
-            done <<< "$excludes"
-
-            # Take the flow out of the firmware's fast path, with the same
-            # match as the MARK rule below and immediately before it. The
-            # exclusion RETURNs above fire first, so an excluded destination
-            # keeps its acceleration; after MARK the mark test would no longer
-            # match the packet MARK had just marked.
-            if [[ -n $offload_target ]]; then
-                ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
-                    -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
-                    -j "$offload_target"
-            fi
-
-            # Add MARK rule for this client (first-match: only if not already marked)
-            ensure_fw_rule -q mangle "$TUN_DIR_CHAIN" \
-                -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
-                -j MARK --set-xmark "$mark_hex/$_tunnel_mark_mask_hex"
-
-            log "Added: client=$client tunnel=$tunnel mark=$mark_hex"
-            changes=1
+            # A client that is skipped or not marked has said so; the rest of
+            # the tunnel, and every other tunnel, still goes in.
+            _tunnel_emit_client "$client" "$tunnel" "$mark_hex" "$excludes" || true
         done <<< "$clients"
 
         # Routing table for this tunnel: a firmware table on Merlin, one this
@@ -533,9 +848,11 @@ tunnel_apply() {
         # that fails now (interface down) would leave the previous owner's
         # route behind the ip rule installed below. No-op on Merlin.
         platform_tunnel_table_release "$tunnel" "$tunnel_idx" || true
+        local route_ok=1 rule_ok=1
         if ! platform_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
             log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
             warnings=1
+            route_ok=0
         fi
 
         local pref=$((TUN_DIR_PREF_BASE + tunnel_idx))
@@ -543,25 +860,27 @@ tunnel_apply() {
         if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
             log -l ERROR "Failed to add ip rule: pref=$pref fwmark=$mark_hex lookup=$table"
             warnings=1
+            rule_ok=0
         fi
 
         printf '%s %s\n' "$tunnel_idx" "$tunnel" >> "$tables_tmp"
-        tunnel_idx=$((tunnel_idx + 1))
-    done <<< "$tunnels"
+        if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
+            fo_applied=1
+            [[ $route_ok -eq 1 ]] || fo_route_ok=0
+            [[ $rule_ok -eq 1 ]] || fo_rule_ok=0
+        fi
+    done < "$slots_tmp"
 
-    # Jump from PREROUTING to TUN_DIR for traffic from every LAN interface, each
-    # at its own position (base_pos, base_pos + 1, ...). One shared position
-    # would make every interface displace the one before it, so sync_fw_rule
-    # would find each jump off its position and purge-and-re-insert all of them
-    # on every apply - and each rewrite is a window with no jump for that
-    # interface.
-    local lan_if pos="$base_pos"
-    while IFS= read -r lan_if; do
-        [[ -n $lan_if ]] || continue
-        sync_fw_rule -q mangle PREROUTING "-i $lan_if .*-j ${TUN_DIR_CHAIN}\$" \
-            "-i $lan_if -m mark --mark 0x0/$_tunnel_mark_mask_hex -j $TUN_DIR_CHAIN" "$pos"
-        pos=$((pos + 1))
-    done <<< "$lan_ifaces"
+    # Jump from PREROUTING to TUN_DIR for traffic from every LAN interface. One
+    # that does not go in is put back by the up-to-date path of the next apply,
+    # so it does not cost the hash - dropping that sends the next apply through
+    # tunnel_stop.
+    local jumps_ok=1
+    if ! _tunnel_sync_jumps "$lan_ifaces" "$base_pos"; then
+        log -l ERROR "Tunnel Director: a PREROUTING jump to $TUN_DIR_CHAIN did not go in; the next apply puts it back"
+        warnings=1
+        jumps_ok=0
+    fi
 
     # Save hash and the applied tunnel table. The hash is what makes the next
     # apply take the up-to-date branch, so it is recorded only when every
@@ -572,15 +891,38 @@ tunnel_apply() {
     # send every later apply down the up-to-date branch and never restore the
     # routing until the next rebuild wipes the chain - a silent fail-open. On
     # Merlin the only case is a typo in the tunnel id, which then warns on every
-    # apply instead of once.
+    # apply instead of once. A chain rule the kernel refused is the same: the
+    # up-to-date branch looks for the MARK rules alone, so a refused exclusion or
+    # offload rule would stay missing, and only a rebuild retries it.
     mkdir -p "$(dirname "$TUN_DIR_HASH")"
-    if [[ $skipped_unknown -eq 0 ]]; then
+    cp -f "$tables_tmp" "$TUN_DIR_TABLES"
+
+    if [[ $skipped_unknown -eq 0 && $incomplete -eq 0 ]]; then
         printf '%s\n' "$new_hash" > "$TUN_DIR_HASH"
-    else
+    elif [[ $skipped_unknown -ne 0 ]]; then
         rm -f "$TUN_DIR_HASH"
         log -l WARN "Tunnel Director: a configured tunnel is unknown to the platform (RCI down, or a typo in the id); this apply is not recorded as up-to-date and the next apply retries"
+    else
+        rm -f "$TUN_DIR_HASH"
+        log -l WARN "Tunnel Director: a client rule did not go in; this apply is not recorded as up-to-date and the next apply rebuilds"
     fi
-    cp -f "$tables_tmp" "$TUN_DIR_TABLES"
+
+    # Keep the hash when every configured tunnel was applied: deleting it
+    # forced the next apply through tunnel_stop. Do not return 1: S99 start,
+    # hooks and Web UI Apply would then skip cron and report failure while
+    # the fallback interface is still coming up. The watch reads
+    # TUN_DIR_FAILOVER_READY instead of the apply exit status, and drops Xray
+    # membership on it: every failover client has to be marked, and the jump
+    # that sends LAN traffic to those marks has to be there.
+    if _tunnel_failover_needed && [[ $fo_applied -eq 1 && $fo_route_ok -eq 1 && $fo_rule_ok -eq 1 \
+        && $fo_carried -eq 1 && $jumps_ok -eq 1 ]]; then
+        printf '%s\n' "$XRAY_FAILOVER_TUNNEL" > "$TUN_DIR_FAILOVER_READY"
+    else
+        rm -f "$TUN_DIR_FAILOVER_READY"
+        if _tunnel_failover_needed; then
+            log -l WARN "Failover tunnel '${XRAY_FAILOVER_TUNNEL}' is not carrying traffic; Xray membership stays"
+        fi
+    fi
 
     if [[ $changes -eq 0 ]]; then
         log "No changes applied"

@@ -23,6 +23,25 @@ type Server struct {
 	ALPN        []string `json:"alpn,omitempty"`
 }
 
+// ServerIPs returns every non-empty IP across servers, de-duplicated and
+// sorted. xray.servers feeds TPROXY_BYPASS, so every configured server endpoint
+// must be present (otherwise the proxy's own egress could be routed back through
+// itself). The result is never nil, so an empty list marshals to [] not null.
+func ServerIPs(servers []Server) []string {
+	seen := make(map[string]bool)
+	ips := make([]string, 0)
+	for _, s := range servers {
+		for _, ip := range s.IPs {
+			if ip != "" && !seen[ip] {
+				seen[ip] = true
+				ips = append(ips, ip)
+			}
+		}
+	}
+	sort.Strings(ips)
+	return ips
+}
+
 type WebUIConfig struct {
 	Port      int    `json:"port,omitempty"`
 	CertFile  string `json:"cert_file,omitempty"`
@@ -57,11 +76,16 @@ type TunnelDirectorConfig struct {
 }
 
 type XrayConfig struct {
-	Clients      []string      `json:"clients"`
-	Servers      []string      `json:"servers"`
-	ExcludeIPs   []string      `json:"exclude_ips"`
-	ExcludeSets  []string      `json:"exclude_sets"`
-	ActiveServer *ActiveServer `json:"active_server,omitempty"`
+	Clients         []string      `json:"clients"`
+	Servers         []string      `json:"servers"`
+	ExcludeIPs      []string      `json:"exclude_ips"`
+	ExcludeSets     []string      `json:"exclude_sets"`
+	ActiveServer    *ActiveServer `json:"active_server,omitempty"`
+	SubscriptionURL string        `json:"subscription_url,omitempty"`
+	Failover        *XrayFailover `json:"failover,omitempty"`
+	// PreferredServer is the server the user chose while the subscription walk
+	// has active_server on another one, and absent otherwise (RecordWalkedServer).
+	PreferredServer *ActiveServer `json:"preferred_server,omitempty"`
 }
 
 // ActiveServer records which server the generated Xray config was built from.
@@ -75,6 +99,10 @@ type ActiveServer struct {
 	Name    string `json:"name"`
 	Address string `json:"address"`
 	Port    int    `json:"port"`
+	// Seq counts the writes of this record. Two selections of the very same
+	// server differ in nothing else, so it is what lets the subscription walk
+	// tell a choice made while it was busy from the one it started out with.
+	Seq int `json:"seq,omitempty"`
 }
 
 // NewActiveServer records the fields of s that identify it to a reader. The
@@ -82,6 +110,44 @@ type ActiveServer struct {
 // out over /api/config.
 func NewActiveServer(s Server) *ActiveServer {
 	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port}
+}
+
+// ActiveSeq is the write counter a carries, and zero for no record at all or
+// one written before the counter existed.
+func ActiveSeq(a *ActiveServer) int {
+	if a == nil {
+		return 0
+	}
+	return a.Seq
+}
+
+// RecordActiveServer names s as the running server, one write on from prev.
+// Every writer of active_server goes through here, so a reader that remembers
+// the counter can tell that something was written even when the name, address
+// and port it reads are the ones it saw before.
+func RecordActiveServer(prev *ActiveServer, s Server) *ActiveServer {
+	a := NewActiveServer(s)
+	a.Seq = ActiveSeq(prev) + 1
+	return a
+}
+
+// RecordWalkedServer names s as the running server for the subscription walk.
+// The walk tries servers nobody chose, and one cut short - the bot restarted, a
+// stop - leaves active_server on one of them. So the server the user chose is
+// kept in preferred_server from the first record that leaves its name until one
+// comes back to it. A new address under the same name is no move away: a
+// subscription that rotates endpoints gives a name one every day.
+func RecordWalkedServer(cfg *VPNDirectorConfig, s Server) {
+	x := &cfg.Xray
+	switch {
+	case x.PreferredServer != nil && x.PreferredServer.Name == s.Name:
+		x.PreferredServer = nil
+	case x.PreferredServer == nil && x.ActiveServer != nil && x.ActiveServer.Name != s.Name:
+		chosen := *x.ActiveServer
+		chosen.Seq = 0
+		x.PreferredServer = &chosen
+	}
+	x.ActiveServer = RecordActiveServer(x.ActiveServer, s)
 }
 
 // ClientInfo represents a VPN client with its route and pause status.

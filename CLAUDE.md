@@ -20,10 +20,12 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 /opt/vpn-director/vpn-director.sh platform            # Platform facts as JSON (tunnels, WAN, password file)
 /opt/vpn-director/vpn-director.sh cron install        # Schedule the daily update (S99 does this)
 /opt/vpn-director/vpn-director.sh --wait apply        # Queue for a running instance (120 s) instead of skipping
+/opt/vpn-director/vpn-director.sh --unless-stopped apply  # Skip once "stop" has run (the bot's subscription watch)
 
 # Component-specific commands
 /opt/vpn-director/vpn-director.sh status tunnel       # Tunnel Director status only
 /opt/vpn-director/vpn-director.sh restart xray        # Restart Xray TPROXY only
+/opt/vpn-director/vpn-director.sh restart xray-process  # Restart the Xray process, TPROXY rules kept
 
 # Import servers
 /opt/vpn-director/import_server_list.sh

@@ -89,7 +89,11 @@ func buildOutbound(s vpnconfig.Server) xrayOutbound {
 		}
 	default: // legacy: empty security -> TLS to address with alpn h2, no flow
 		stream.Security = "tls"
-		stream.TLSSettings = &xrayTLS{ServerName: s.Address, ALPN: []string{"h2"}}
+		serverName := s.SNI
+		if serverName == "" {
+			serverName = s.Address
+		}
+		stream.TLSSettings = &xrayTLS{ServerName: serverName, ALPN: []string{"h2"}}
 	}
 	// Per spec, flow belongs only to tls/reality outbounds; a legacy record
 	// (empty security) must not carry it even if the field is populated.

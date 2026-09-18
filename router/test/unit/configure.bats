@@ -274,6 +274,23 @@ write_daemon_config() {
     assert_output "Осло, Норвегия, Extra|1.2.3.4|443"
 }
 
+# The subscription watch keeps the server the user chose while its walk has
+# active_server on another one. A wizard run is a new choice, as a Web UI or
+# /xray selection is: the next walk must start from it, not from the old one.
+@test "step_generate_configs: ends the server choice the watch remembered" {
+    load_wizard
+    write_daemon_config
+    jq '.xray.preferred_server = {"name":"Oslo","address":"oslo.example","port":443}' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+    mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.xray | has("preferred_server")' "$VPD_DIR/vpn-director.json"
+    assert_output "false"
+}
+
 # The Web UI serves this file over /api/config. The record names the server and
 # stops there; the subscription UUID and the REALITY material stay in
 # servers.json and in the Xray config, which nobody hands to a browser.
@@ -328,6 +345,24 @@ write_daemon_config() {
     assert_line --index 1 "  2) ovpnc1  Office OVPN (down)"
     run wizard_tunnel_by_number 2
     assert_output "ovpnc1"
+}
+
+# Only the prefix used to be checked, so 192.168.1.1000 went into the config
+# and then into "iptables -s", which refuses it, and 192.168.1.08 into iptables,
+# which reads a leading zero as octal. Tunnel Director carries Xray clients
+# during a failover, and one such address used to end the whole apply.
+@test "step_configure_clients: an address iptables would refuse or misread is asked again" {
+    run bash -c '
+        set -euo pipefail
+        VPD_DIR="$SCRIPTS_DIR"
+        . "$VPD_DIR/configure.sh" --source-only
+        printf "192.168.1.08\n192.168.1.1000\ndone\n" | step_configure_clients
+        printf "clients=[%s]\n" "$XRAY_CLIENTS_LIST"
+    '
+    assert_success
+    assert_output --partial "Invalid LAN IP: 192.168.1.08"
+    assert_output --partial "Invalid LAN IP: 192.168.1.1000"
+    assert_output --partial "clients=[]"
 }
 
 # The prompt asks again on bad input. It must never abort: an aborted step 3

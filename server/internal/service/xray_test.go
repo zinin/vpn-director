@@ -70,6 +70,28 @@ func TestGenerateConfig_Reality(t *testing.T) {
 	}
 }
 
+func vnextAddress(t *testing.T, cfg map[string]interface{}) string {
+	t.Helper()
+	vnext := outbound0(t, cfg)["settings"].(map[string]interface{})["vnext"].([]interface{})[0].(map[string]interface{})
+	addr, _ := vnext["address"].(string)
+	return addr
+}
+
+func TestGenerateConfig_DialsHostnameNotCachedIP(t *testing.T) {
+	cfg := generate(t, vpnconfig.Server{
+		Address: "oslo.example", Port: 443, UUID: "u",
+		IPs:      []string{"203.0.113.50", "203.0.113.51"},
+		Security: "tls",
+	})
+	if got := vnextAddress(t, cfg); got != "oslo.example" {
+		t.Fatalf("vnext.address = %q, want the hostname so CDN/DDNS updates still resolve", got)
+	}
+	tls := outbound0(t, cfg)["streamSettings"].(map[string]interface{})["tlsSettings"].(map[string]interface{})
+	if tls["serverName"] != "oslo.example" {
+		t.Fatalf("tls serverName = %v, want the hostname", tls["serverName"])
+	}
+}
+
 func TestGenerateConfig_TLS(t *testing.T) {
 	cfg := generate(t, vpnconfig.Server{
 		Address: "1.2.3.4", Port: 443, UUID: "u", Security: "tls", SNI: "host.example.com", Fingerprint: "chrome",

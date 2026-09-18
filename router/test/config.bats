@@ -198,6 +198,22 @@ load 'test_helper'
     grep -q "WARN.*invalid gateway 'not-an-ip'" "$LOG_FILE"
 }
 
+@test "config.sh: failover exports snapshot clients and keeps tunnel key order" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-order.json"
+    jq '.tunnel_director.tunnels = {
+            "main": {"clients":["192.168.1.20"],"exclude":[]},
+            "ovpnc2": {"clients":["192.168.1.0/24","192.168.1.8"],"exclude":[]}
+        } |
+        .xray.failover = {"tunnel":"ovpnc2","clients":["192.168.1.8"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ "$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[0]')" = "main" ]
+    [ "$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r 'keys_unsorted[1]')" = "ovpnc2" ]
+    [ "$XRAY_FAILOVER_TUNNEL" = "ovpnc2" ]
+    [[ "$XRAY_FAILOVER_CLIENTS" == *"192.168.1.8"* ]]
+}
+
 @test "config.sh: drops a gateway whose octet is above 255" {
     local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-gateway-octet.json"
     jq '.tunnel_director.tunnels.wgc1.gateway = "10.8.0.999"' \

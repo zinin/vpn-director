@@ -666,6 +666,39 @@ func TestXrayConfig_OmitsTheActiveServerUntilOneIsSelected(t *testing.T) {
 	}
 }
 
+func TestXrayConfig_PersistsSubscriptionURLAndFailover(t *testing.T) {
+	cfg := VPNDirectorConfig{
+		Xray: XrayConfig{
+			SubscriptionURL: "https://cdn.example/s/token",
+			Failover:        &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}},
+		},
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `"subscription_url":"https://cdn.example/s/token"`) {
+		t.Errorf("missing subscription_url: %s", s)
+	}
+	if !strings.Contains(s, `"failover"`) || !strings.Contains(s, `"ovpnc2"`) {
+		t.Errorf("missing failover: %s", s)
+	}
+	var got VPNDirectorConfig
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Xray.SubscriptionURL != cfg.Xray.SubscriptionURL {
+		t.Errorf("url %q", got.Xray.SubscriptionURL)
+	}
+	if got.Xray.Failover == nil || got.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Errorf("failover %+v", got.Xray.Failover)
+	}
+	if !reflect.DeepEqual(got.Xray.Failover.Clients, []string{"192.168.1.8"}) {
+		t.Errorf("failover clients %v", got.Xray.Failover.Clients)
+	}
+}
+
 // /api/config hands the whole file to the browser. The record identifies the
 // server to a reader and stops there: the UUID is the subscription credential
 // and has no business travelling with a display name.
@@ -726,5 +759,56 @@ func TestPlatformInfo_DecodesTheCLIDocumentAndFindsTunnels(t *testing.T) {
 	}
 	if !info.HasTunnel("OpenVPN0") || info.HasTunnel("wgc1") || info.HasTunnel("xray") {
 		t.Error("HasTunnel answers for the wrong ids")
+	}
+}
+
+func TestServerIPs_SortedAndDeduplicated(t *testing.T) {
+	cases := map[string]struct {
+		servers []Server
+		want    []string
+	}{
+		"duplicate-and-empty": {
+			servers: []Server{
+				{IPs: []string{"2.2.2.2", "1.1.1.1"}},
+				{IPs: []string{"1.1.1.1", "3.3.3.3"}}, // 1.1.1.1 is a duplicate
+				{IPs: []string{""}},                   // empty IP skipped
+			},
+			want: []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"},
+		},
+		"empty-between-ips": {
+			servers: []Server{
+				{IPs: []string{"2.2.2.2", "", "1.1.1.1"}},
+				{IPs: []string{"1.1.1.1", "3.3.3.3"}},
+			},
+			want: []string{"1.1.1.1", "2.2.2.2", "3.3.3.3"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := ServerIPs(tc.servers); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("ServerIPs = %v, want sorted deduped %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServerIPs_EmptyMarshalsToJSONArray(t *testing.T) {
+	// With no usable IPs the result must marshal to an empty JSON array, not
+	// null: it is persisted as xray.servers in vpn-director.json, where null
+	// reads differently than [] for consumers that don't apply a `// []` default.
+	cases := map[string][]Server{
+		"nil-slice": nil,
+		"empty-IPs": {{IPs: []string{""}}},
+	}
+	for name, servers := range cases {
+		t.Run(name, func(t *testing.T) {
+			b, err := json.Marshal(ServerIPs(servers))
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if string(b) != "[]" {
+				t.Errorf("ServerIPs(%s) marshals to %s, want []", name, b)
+			}
+		})
 	}
 }

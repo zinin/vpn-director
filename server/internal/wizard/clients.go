@@ -2,7 +2,6 @@ package wizard
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -181,38 +180,11 @@ func (s *ClientsStep) isValidRoute(route string) (bool, error) {
 	return info.HasTunnel(route), nil
 }
 
-// isValidLANIP validates that the IP is a valid LAN (private) IP address
+// isValidLANIP reports whether ip is a single private IPv4 address that Tunnel
+// Director can carry (vpnconfig.TDCarries). Checking the octets with Atoi let a
+// leading zero through: iptables reads such an octet as octal ("08" is no
+// number, "010" is 8) and ipset takes none, so the address took the whole
+// Tunnel Director apply down once a failover copied it into a tunnel.
 func isValidLANIP(ip string) bool {
-	parts := strings.Split(ip, ".")
-	if len(parts) != 4 {
-		return false
-	}
-
-	// Validate each part is a number 0-255
-	nums := make([]int, 4)
-	for i, p := range parts {
-		n, err := strconv.Atoi(p)
-		if err != nil || n < 0 || n > 255 {
-			return false
-		}
-		nums[i] = n
-	}
-
-	// Check for private IP ranges
-	// 192.168.0.0/16
-	if nums[0] == 192 && nums[1] == 168 {
-		return true
-	}
-
-	// 10.0.0.0/8
-	if nums[0] == 10 {
-		return true
-	}
-
-	// 172.16.0.0/12 (172.16-31.x.x)
-	if nums[0] == 172 && nums[1] >= 16 && nums[1] <= 31 {
-		return true
-	}
-
-	return false
+	return !strings.Contains(ip, "/") && vpnconfig.TDCarries(ip)
 }

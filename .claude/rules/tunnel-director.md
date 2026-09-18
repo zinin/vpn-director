@@ -99,6 +99,54 @@ file — keying it off the hash alone left those tables allocated while the next
 indices to other tunnels, and on Keenetic table `2000+idx` then still held the previous tunnel's
 route.
 
+A failover tunnel whose route or ip rule cannot be installed still writes the hash (when every
+configured tunnel was applied) and returns 0 with a WARN, so S99 start, hooks and Web UI Apply
+do not fail while the fallback interface is still coming up. Deleting the hash forced the next
+apply through `tunnel_stop`. The watch does not Commit Xray membership until
+`/tmp/tunnel_director/failover_ready` names that tunnel (route and ip rule installed);
+`TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path always re-installs
+recorded routes **and ip rules** (`_tunnel_rule_ensure`, one per row of `TUN_DIR_TABLES`), then
+re-checks the failover tunnel's row and its rule (`pref TUN_DIR_PREF_BASE+idx`) and rewrites or
+removes `failover_ready` without a rebuild. Re-installing the rules is what makes a failed
+`ip rule add` recoverable at all: the hash is recorded regardless, so every later apply lands in
+this branch, and a rule that is only checked here would stay missing until the configuration
+changed — the clients of that tunnel falling through to `main`, and the watch waiting on a
+`failover_ready` nothing would write. A rule that is in place is left alone; deleting and
+re-adding it is a window in which marked packets reach `main`. Whether a rule is there is read from
+the whole `ip rule show` listing (`_tunnel_rule_listed`), never piped into `grep -q` — see the
+pipefail pitfall in `shell-conventions.md`. "There" means this module's rule, not a rule on the
+preference: `from all fwmark <mark>/<mask> lookup <table>`, the table as the kernel prints it
+(`rt_table_label`) and every part a whole word, since iproute2 4.4 ends each rule with a space. A
+look at the preference alone took another owner's rule for ours, so ours was never put back and
+`failover_ready` went out with the failover marks routed by that rule or by `main`; such a rule now
+makes way, as it does on a rebuild.
+
+A client entry that is no IPv4 address or CIDR (`is_ipv4_net`: `192.168.1.1000`, an octet with a
+leading zero, IPv6) or lies outside RFC1918 is skipped with a WARN, and the rest applies: `is_lan_ip`
+looks at the prefix only, and the failover copies `xray.clients` into a tunnel. A chain rule the
+kernel refuses costs that client only — `_tunnel_emit_client` checks every rule itself and runs
+under `||`, because under errexit one refused MARK used to end the apply after `tunnel_stop` had
+purged the jumps and the ip rules of every tunnel. Such a rebuild is not recorded as up-to-date, so
+the next apply rebuilds and retries it: the up-to-date branch looks for the MARK rules only, not
+for an exclusion or offload rule.
+
+The PREROUTING jumps are different: a rebuild whose jump did not go in keeps its hash, and the
+up-to-date branch puts a missing jump back (`_tunnel_jumps_ensure`), leaving one that is there where
+it is. `failover_ready` needs the jumps, and every failover client still on the failover tunnel
+marked — one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it
+would leave through the WAN.
+
+A chain can also lose rules a recorded rebuild put in. Merlin's firewall start runs
+`iptables -t mangle -F`, which empties `TUN_DIR` without deleting it (the pitfall in
+`shell-conventions.md`), and `firewall-start` then applies again with the hash, the chain and
+`TUN_DIR_TABLES` all reading as applied. The up-to-date path used to put the jumps back into the
+empty chain and write `failover_ready`; every client, the failover clients the watch then took off
+Xray among them, left through the WAN until the configuration changed. It now asks `iptables -C`
+for the MARK rule of every client of every row of `TUN_DIR_TABLES` (`_tunnel_marks_present`) and
+rebuilds when one is gone. The failover clients are clients of their tunnel under its mark, so they
+are among them. A client the rebuild skips (no IPv4 address, outside RFC1918) is skipped there
+too: looking for its rule would rebuild the chain on every apply.
+
 The rebuild loop also releases each tunnel's table right before it ensures the route
 (`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that dies after
 ensuring a route but before writing `TUN_DIR_TABLES` leaves that route with no record at all, and
@@ -109,6 +157,7 @@ send its clients through the previous owner's tunnel.
 - Config hash changed
 - Chain does not exist
 - `TUN_DIR_TABLES` is missing
+- A client's MARK rule is missing from the chain (`_tunnel_marks_present`)
 
 ## Key Functions
 
@@ -128,6 +177,7 @@ send its clients through the previous owner's tunnel.
 | `_tunnel_init()` | Initialize module state (valid tables from `platform_tunnels`, fwmark helpers) |
 | `_tunnel_table_allowed(id)` | Check the tunnel id is one `platform_tunnels` lists |
 | `_tunnel_ensure_routes()` | Re-install the routes of the applied tunnels (used when nothing needs rebuilding) |
+| `_tunnel_marks_present()` | Does `TUN_DIR` still hold every client's MARK rule; one that is gone makes the apply a rebuild |
 
 **Module state variables**:
 - `_tunnel_valid_tables` - space-separated tunnel ids from `platform_tunnels`

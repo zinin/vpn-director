@@ -100,6 +100,39 @@ load 'test_helper'
 }
 
 # ============================================================================
+# is_ipv4_net
+# ============================================================================
+
+@test "is_ipv4_net: accepts an IPv4 address or an IPv4 CIDR" {
+    load_common
+    local good
+    for good in 192.168.1.5 10.0.0.0/8 172.16.0.0/12 192.168.50.10/24 0.0.0.0/0 255.255.255.255/32 192.168.1.0/9; do
+        run is_ipv4_net "$good"
+        if [[ $status -ne 0 ]]; then
+            echo "rejected $good"
+            return 1
+        fi
+    done
+}
+
+# is_lan_ip looks at the prefix only, so every one of these passed it and then
+# took an apply down: iptables refuses 192.168.1.1000 outright and reads an octet
+# with a leading zero as octal (08 is no number at all, 010 is 8), and ipset takes
+# none of them.
+@test "is_ipv4_net: rejects what iptables or ipset would refuse or misread" {
+    load_common
+    local bad
+    for bad in 192.168.1.1000 192.168.1.08 192.168.01.1 010.0.0.1 256.1.1.1 1.2.3 1.2.3.4.5 \
+        192.168.1.0/33 192.168.1.0/ 192.168.1.0/024 /24 fd00::10 "" " 192.168.1.5" "192.168.1.5 " 192.168.1.5/8/8; do
+        run is_ipv4_net "$bad"
+        if [[ $status -eq 0 ]]; then
+            echo "accepted '$bad'"
+            return 1
+        fi
+    done
+}
+
+# ============================================================================
 # resolve_ip
 # ============================================================================
 

@@ -92,6 +92,10 @@ func handleAddClient(deps *Deps) http.HandlerFunc {
 			if existing, found := findClient(cfg, ip); found {
 				return &httpError{status: http.StatusConflict, msg: fmt.Sprintf("client already configured for %s", existing.route)}
 			}
+			// Where the user puts an address during a failover is where it
+			// goes: a restore must not take it back to Xray. One added as
+			// xray while Xray is down joins the failover afresh.
+			vpnconfig.DetachFailoverClient(cfg, ip)
 			if req.Route == "xray" {
 				cfg.Xray.Clients = append(cfg.Xray.Clients, ip)
 				return nil
@@ -199,6 +203,9 @@ func handleDeleteClient(deps *Deps) http.HandlerFunc {
 				cfg.TunnelDirector.Tunnels[name] = tunnel
 			}
 			cfg.PausedClients = removeAddr(cfg.PausedClients, ip)
+			// Gone is gone: the restore must not bring it back, and an
+			// address added again later is a new client, not the snapshot.
+			vpnconfig.DetachFailoverClient(cfg, ip)
 			return nil
 		}))
 	}

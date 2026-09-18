@@ -50,6 +50,14 @@ func TestIsValidLANIP(t *testing.T) {
 		{"", "", false},
 		{"...", "...", false},
 		{"a.b.c.d", "a.b.c.d", false},
+
+		// A leading zero: iptables reads the octet as octal ("08" is no
+		// number, "010" is 8) and ipset takes neither, so such an address
+		// took the whole Tunnel Director apply down once a failover copied
+		// it into a tunnel.
+		{"leading zero in the last octet", "192.168.1.08", false},
+		{"leading zero in an inner octet", "192.168.01.1", false},
+		{"leading zero in the first octet", "010.0.0.1", false},
 	}
 
 	for _, tt := range tests {

@@ -336,6 +336,23 @@ add_client_to_tunnel() {
     fi
 }
 
+# wizard_lan_client_ok <addr> - an IPv4 address or CIDR in a private range,
+# written the way iptables and ipset read it. The prefix alone let
+# 192.168.1.1000 through, which "iptables -s" refuses, and 192.168.1.08, which
+# it reads as octal; Tunnel Director carries Xray clients during a failover,
+# and one such address used to end the whole apply. The same test as
+# is_ipv4_net and is_lan_ip in lib/common.sh, which this wizard does not source.
+wizard_lan_client_ok() {
+    local addr="${1:-}"
+    local re_octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])'
+    local re_prefix='(3[0-2]|[12][0-9]|[0-9])'
+    [[ $addr =~ ^$re_octet\.$re_octet\.$re_octet\.$re_octet(/$re_prefix)?$ ]] || return 1
+    case "${addr%%/*}" in
+        192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 step_configure_clients() {
     print_header "Step 3: Configure Clients"
 
@@ -353,16 +370,10 @@ step_configure_clients() {
             break
         fi
 
-        # Validate IP format (basic check for private ranges)
-        local ip_part="${client_ip%%/*}"
-        case "$ip_part" in
-            192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[0-1].*)
-                ;;
-            *)
-                print_error "Invalid LAN IP: $client_ip"
-                continue
-                ;;
-        esac
+        if ! wizard_lan_client_ok "$client_ip"; then
+            print_error "Invalid LAN IP: $client_ip"
+            continue
+        fi
 
         printf "\nWhere to route traffic for %s?\n" "$client_ip"
         printf "  1) Xray (VLESS proxy)\n"
@@ -580,6 +591,7 @@ step_generate_configs() {
          .xray.exclude_sets = $exclude |
          .xray.servers = $servers |
          .xray.active_server = $active |
+         del(.xray.preferred_server) |
          .tunnel_director.tunnels = (
              $tunnels
              | to_entries

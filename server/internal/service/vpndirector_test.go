@@ -88,6 +88,38 @@ func TestVPNDirectorService_RestartXray(t *testing.T) {
 	assertCall(t, mock.calls[0], "--wait", "restart", "xray")
 }
 
+// The subscription watch applies and restarts on its own. --unless-stopped has
+// the script check under its lock, so a stop that got there first stays in force.
+func TestVPNDirectorService_ApplyUnlessStopped(t *testing.T) {
+	mock := &mockExecutor{result: &shell.Result{Output: "applied", ExitCode: 0}}
+	svc := NewVPNDirectorService("/opt/vpn-director", mock)
+
+	if err := svc.ApplyUnlessStopped(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(mock.calls))
+	}
+	assertCall(t, mock.calls[0], "--wait", "--unless-stopped", "apply")
+}
+
+// The walk writes one config.json per server it tries, and only the Xray process
+// has to read it. The stop and apply of "restart xray" take the TPROXY jump away
+// and put it back, and in between the Xray clients leave through the WAN - once
+// per server tried.
+func TestVPNDirectorService_RestartXrayProcessUnlessStopped(t *testing.T) {
+	mock := &mockExecutor{result: &shell.Result{Output: "ok", ExitCode: 0}}
+	svc := NewVPNDirectorService("/opt/vpn-director", mock)
+
+	if err := svc.RestartXrayProcessUnlessStopped(); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(mock.calls) != 1 {
+		t.Fatalf("expected 1 call, got %d", len(mock.calls))
+	}
+	assertCall(t, mock.calls[0], "--wait", "--unless-stopped", "restart", "xray-process")
+}
+
 func TestVPNDirectorService_Apply(t *testing.T) {
 	mock := &mockExecutor{result: &shell.Result{Output: "applied", ExitCode: 0}}
 	svc := NewVPNDirectorService("/opt/vpn-director", mock)
@@ -178,6 +210,7 @@ func TestVPNDirectorService_Timeouts(t *testing.T) {
 		{"apply", (*VPNDirectorService).Apply, ApplyTimeout},
 		{"restart", (*VPNDirectorService).Restart, ApplyTimeout},
 		{"restart xray", (*VPNDirectorService).RestartXray, ApplyTimeout},
+		{"restart xray-process", (*VPNDirectorService).RestartXrayProcessUnlessStopped, ApplyTimeout},
 		{"stop", (*VPNDirectorService).Stop, ApplyTimeout},
 		{"update", (*VPNDirectorService).Update, UpdateTimeout},
 	}

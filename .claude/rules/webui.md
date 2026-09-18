@@ -47,14 +47,14 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET | `/api/ip` | External IP |
 | GET | `/api/version` | Build version and commit |
 | GET | `/api/platform` | `vpn-director.sh platform`: firmware, password file, LAN/WAN interfaces, tunnels; 503 when the script cannot answer |
-| GET | `/api/servers` | Xray server list plus `active`, the recorded server |
-| POST | `/api/servers/active`, `/api/servers/import` | Select the active server, import a subscription |
+| GET | `/api/servers` | Xray server list plus `active`, the recorded server, and `subscription_saved` |
+| POST | `/api/servers/active`, `/api/servers/import` | Select the active server (`index` plus the `name`, `address` and `port` the page showed there; 409 "server list changed" when the list has another server at that index); import a subscription (`url` empty reuses the saved URL; a body over 1 MiB is refused) |
 | GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config |
 | POST | `/api/clients/pause`, `/api/clients/resume` | Pause and resume a client |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |
 | GET/POST/DELETE | `/api/excludes/ips` | Excluded IPs and CIDRs |
 | GET | `/api/logs` | One source (`?source=`) or every source at once |
-| GET | `/api/config` | `vpn-director.json` with `jwt_secret` blanked |
+| GET | `/api/config` | `vpn-director.json` with `jwt_secret` and `subscription_url` blanked |
 | GET | `/api/update/check` | Latest release; `?force=1` pierces the 30-minute cache |
 | POST | `/api/update` | Starts the unified update, answers 202 |
 | GET | `/api/update/status` | Whether an update is running |
@@ -85,13 +85,43 @@ The record holds name, address and port only: `/api/config` hands this file to
 the browser, so the UUID and the REALITY material stay out. It is absent, and
 `active` is `null`, until something selects a server.
 
+`xray.preferred_server`, in the same three fields, is the server the user chose
+while the bot's subscription walk has `active_server` on another one (see
+`telegram-bot.md`). A selection is a new choice, so all three Go paths clear it
+and `configure.sh` deletes it.
+
 Client and exclusion mutations go through `updateAndApply`: the change is
 written under the config lock and `vpn-director.sh apply` runs immediately
 after, as the bot does. The two server routes are the exception —
 `/api/servers/active` regenerates `config.json`, rewrites `xray.servers` under
 the lock and restarts Xray instead of applying, and `/api/servers/import` only
-writes `servers.json` and `xray.servers`. All of them serialize on
-`Deps.OpMutex`.
+writes `servers.json` and `xray.servers`, both inside one config-lock update
+(`vpnconfig.PublishServers`), because `SaveServers` takes no lock of its own and
+`Deps.OpMutex` does not reach the bot's `/import` or the subscription watch.
+A re-import from the saved link (empty `url`) goes through `service.PublishImport`,
+which publishes only while `xray.subscription_url` is still the link it downloaded:
+another importer may save a different subscription meanwhile, and the list would
+then sit beside a link that did not produce it. The refusal is a 409 and writes
+nothing; the bot's `/import` without arguments does the same.
+All of them serialize on `Deps.OpMutex`.
+
+An import says the servers were saved only when `servers.json` was written. A
+failure after that point carries `vpnconfig.ErrServersSaved` — the write of the
+config beside the list failed (`vpnconfig.PublishServers`), or there is no
+`vpn-director.json` at all and `service.PublishServers` kept the list anyway —
+and every other failure published nothing: the config lock, a config that is
+there but does not load (it names the data directory the list belongs in, so an
+import that named its link refuses too), a refusal, the write of `servers.json`
+itself. A subscription body over 1 MiB is refused before it is
+decoded, as the bot's `/import` and the subscription watch refuse it: cut at the
+cap, base64 decodes to a shorter list, which would be published as the
+subscription.
+
+`POST /api/servers/active` names the server as well as its index. The bot's
+subscription watch or an import in another tab can refresh the list between the
+page load and the click, and the index then names another server: the route
+answers 409 "server list changed" and switches nothing, and the Servers tab
+reloads the list.
 
 ## Authentication
 
@@ -111,7 +141,8 @@ writes `servers.json` and `xray.servers`. All of them serialize on
   lockout.
 - `jwt_secret` is generated on first start when empty and written back under
   the config lock. It is never rewritten, which is what lets a login session
-  survive an update.
+  survive an update. `GET /api/config` blanks `jwt_secret` and `subscription_url`
+  (the latter is a secret: the subscription token sits in the path).
 - The file paths in `vpn-director.json` — `data_dir`, `webui.cert_file`,
   `webui.key_file` — are read against **the config file's own directory** when
   they are relative (`paths.Resolve`). They cannot be read against the working

@@ -8,7 +8,7 @@
 #   Migrated from xray_tproxy.sh to provide independent, testable functions.
 #
 # Dependencies:
-#   - common.sh (log, tmp_file) and, through it, the platform contract
+#   - common.sh (log, tmp_file, is_ipv4_net, rt_table_label) and, through it, the platform contract
 #     (platform_load_module, platform_vpn_endpoints, platform_tproxy_extra_rules,
 #      platform_lan_ifaces)
 #   - firewall.sh (create_fw_chain, delete_fw_chain, ensure_fw_rule, sync_fw_rule, purge_fw_rules)
@@ -29,7 +29,6 @@
 #   _tproxy_check_required_ipsets() - fail-safe check for required ipsets
 #   _tproxy_rule_is_ours()          - does an ip rule on our preference belong to us?
 #   _tproxy_setup_routing()         - setup routing table and ip rule
-#   _tproxy_table_label()           - the name the kernel prints for a table
 #   _tproxy_teardown_routing()      - remove routing table and ip rule
 #   _tproxy_setup_clients_ipset()   - setup clients ipset
 #   _tproxy_validate_ipv4_cidr()    - validate IPv4 address or CIDR notation
@@ -67,6 +66,12 @@ fi
 
 # Initialization flag
 _tproxy_initialized=0
+
+# Written only when TPROXY rules were actually installed, the platform's own
+# rules outside the chain included. Soft-fail skips (no module, missing
+# ipsets, iptables setup) remove it so the watch does not drop fallback
+# membership on a SOCKS-only success.
+XRAY_TPROXY_READY="${XRAY_TPROXY_READY:-/tmp/xray_tproxy/ready}"
 
 ###################################################################################################
 # Internal helper functions (defined before --source-only for testability)
@@ -213,7 +218,7 @@ _tproxy_setup_routing() {
     fi
 
     want_mark="$XRAY_FWMARK/$XRAY_FWMARK_MASK"
-    want_table=$(_tproxy_table_label "$XRAY_ROUTE_TABLE")
+    want_table=$(rt_table_label "$XRAY_ROUTE_TABLE")
 
     # Reconcile the rules on our preference: keep one that carries the
     # configured mark and table, drop the other copies of ours - the ones an
@@ -221,7 +226,7 @@ _tproxy_setup_routing() {
     # route_table or fwmark_mask, which would otherwise count as ours and keep
     # the new setting from ever being installed. Rules that are not ours stay
     # (_tproxy_rule_is_ours). Comparing what the kernel prints - not the table
-    # number - is the whole point; see _tproxy_table_label.
+    # number - is the whole point; see rt_table_label in common.sh.
     while IFS= read -r line; do
         [[ -n $line ]] || continue
         mark=$(printf '%s' "$line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')
@@ -255,24 +260,11 @@ _tproxy_setup_routing() {
 }
 
 # -------------------------------------------------------------------------------------------------
-# _tproxy_table_label - the name the kernel prints for a routing table
-# -------------------------------------------------------------------------------------------------
-# iproute2 renders a routing table by its rt_tables name and falls back to the
-# number, so table 100 reads back as "lookup wan0" on Asuswrt-Merlin. When
-# rt_tables is missing both sides fall back to the number and still agree.
-_tproxy_table_label() {
-    local name
-    name=$(awk -v id="$1" '$0 !~ /^#/ && $1 == id { print $2; exit }' \
-        "${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" 2>/dev/null)
-    printf '%s' "${name:-$1}"
-}
-
-# -------------------------------------------------------------------------------------------------
 # _tproxy_teardown_routing - remove routing table and ip rule
 # -------------------------------------------------------------------------------------------------
 _tproxy_teardown_routing() {
     local want_table line mark table
-    want_table=$(_tproxy_table_label "$XRAY_ROUTE_TABLE")
+    want_table=$(rt_table_label "$XRAY_ROUTE_TABLE")
 
     # Every rule on our preference that is ours (_tproxy_rule_is_ours): the
     # copies an older version left on every apply, and rules from an earlier
@@ -304,32 +296,56 @@ _tproxy_teardown_routing() {
 # _tproxy_setup_clients_ipset - setup clients ipset
 # -------------------------------------------------------------------------------------------------
 # Always creates the ipset (even if empty) so iptables rules can reference it.
+#
+# Returns 1 when any effective client is missing from the set. The chain RETURNs
+# every source it does not list, so a missing client is not proxied at all, and
+# the watch drops its fallback tunnel on the ready marker tproxy_apply writes.
+# An entry that is no IPv4 address or CIDR is skipped with a WARN and does not
+# count: an IPv6 address an older Web UI saved, a typo like 192.168.1.1000. No
+# kernel set takes it and no tunnel carries it, and waiting for it withheld the
+# marker for the whole LAN - every restore held on the fallback tunnel for good.
 # -------------------------------------------------------------------------------------------------
 _tproxy_setup_clients_ipset() {
     local ip
+    local rc=0
     local -a clients_array=()
 
     # Create ipset if not exists
     if ! ipset list "$XRAY_CLIENTS_IPSET" >/dev/null 2>&1; then
-        ipset create "$XRAY_CLIENTS_IPSET" hash:net
-        log "Created ipset: $XRAY_CLIENTS_IPSET"
+        if ipset create "$XRAY_CLIENTS_IPSET" hash:net; then
+            log "Created ipset: $XRAY_CLIENTS_IPSET"
+        else
+            log -l ERROR "Failed to create $XRAY_CLIENTS_IPSET"
+            return 1
+        fi
     fi
 
     # Flush and repopulate
-    ipset flush "$XRAY_CLIENTS_IPSET"
+    ipset flush "$XRAY_CLIENTS_IPSET" || {
+        log -l ERROR "Failed to flush $XRAY_CLIENTS_IPSET"
+        return 1
+    }
 
     # Handle empty XRAY_CLIENTS gracefully
     if [[ -n ${XRAY_CLIENTS:-} ]]; then
         read -ra clients_array <<< "$XRAY_CLIENTS"
         for ip in "${clients_array[@]}"; do
             [[ -n $ip ]] || continue
-            ipset add "$XRAY_CLIENTS_IPSET" "$ip" 2>/dev/null || {
+            if ! is_ipv4_net "$ip"; then
+                log -l WARN "Xray client '$ip' is not an IPv4 address or CIDR; skipping"
+                continue
+            fi
+            # -exist: xray.clients is never validated, and a repeated address
+            # is the one failure that means nothing - the client is in the set.
+            ipset add -exist "$XRAY_CLIENTS_IPSET" "$ip" 2>/dev/null || {
                 log -l WARN "Failed to add $ip to $XRAY_CLIENTS_IPSET"
+                rc=1
             }
         done
     fi
 
     log "Populated $XRAY_CLIENTS_IPSET ipset (${#clients_array[@]} entries)"
+    return $rc
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -453,85 +469,110 @@ _tproxy_setup_iptables() {
 
     read -ra exclude_sets_array <<< "$(_tproxy_exclude_sets -q)"
 
-    # Create chain
-    create_fw_chain -f mangle "$XRAY_CHAIN"
+    # This function runs under "if !", which turns errexit off for the whole
+    # body; a failed ensure_fw_rule would otherwise fall through to the log and
+    # look like success, and the watch publishes TPROXY ready from that. The
+    # rules ahead of the targets are of two kinds. Rule 1 and the private ranges
+    # of rule 4 bound what the targets take - without rule 1 every LAN client,
+    # without rule 4 traffic to the router and the rest of the LAN - so a
+    # failure there ends the setup before the targets exist, on a flushed chain
+    # that intercepts nothing. The others only decide what a client reaches
+    # directly instead of through the proxy: a failure there is logged, the
+    # setup goes on, and the status keeps the ready marker back. Ending the
+    # setup at those as well left every Xray client going out through the WAN
+    # over one busy xtables lock.
+    local narrow_rc=0
+    create_fw_chain -f mangle "$XRAY_CHAIN" || return 1
 
     # Rule 1: Skip if source is not in our clients ipset
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -m set ! --match-set "$XRAY_CLIENTS_IPSET" src -j RETURN
+        -m set ! --match-set "$XRAY_CLIENTS_IPSET" src -j RETURN || return 1
 
     # Rule 2: Skip traffic to bypass destinations (Xray servers, user excludes, OpenVPN endpoints)
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -m set --match-set "$XRAY_BYPASS_IPSET" dst -j RETURN
+        -m set --match-set "$XRAY_BYPASS_IPSET" dst -j RETURN || narrow_rc=1
 
     # Rule 3: Skip local destinations (loopback)
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 127.0.0.0/8 -j RETURN
+        -d 127.0.0.0/8 -j RETURN || narrow_rc=1
 
     # Rule 4: Skip private network destinations (RFC1918)
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 10.0.0.0/8 -j RETURN
+        -d 10.0.0.0/8 -j RETURN || return 1
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 172.16.0.0/12 -j RETURN
+        -d 172.16.0.0/12 -j RETURN || return 1
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 192.168.0.0/16 -j RETURN
+        -d 192.168.0.0/16 -j RETURN || return 1
 
     # Rule 5: Skip link-local
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 169.254.0.0/16 -j RETURN
+        -d 169.254.0.0/16 -j RETURN || narrow_rc=1
 
     # Rule 6: Skip multicast
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 224.0.0.0/4 -j RETURN
+        -d 224.0.0.0/4 -j RETURN || narrow_rc=1
 
     # Rule 7: Skip broadcast
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-        -d 255.255.255.255/32 -j RETURN
+        -d 255.255.255.255/32 -j RETURN || narrow_rc=1
 
     # Rule 8: Skip excluded country/custom ipsets
     for exclude_set in "${exclude_sets_array[@]}"; do
         [[ -n $exclude_set ]] || continue
-        resolved_set="$(_tproxy_resolve_exclude_set "$exclude_set")" || {
-            # Should not happen due to _tproxy_check_required_ipsets, but just in case
-            log -l ERROR "Exclusion ipset '$exclude_set' not found; aborting"
-            return 1
-        }
-        ensure_fw_rule -q mangle "$XRAY_CHAIN" \
-            -m set --match-set "$resolved_set" dst -j RETURN
-        log "Added exclusion for ipset: $resolved_set"
+        if ! resolved_set="$(_tproxy_resolve_exclude_set "$exclude_set")"; then
+            # _tproxy_check_required_ipsets has just seen it; the set went away since.
+            log -l ERROR "Exclusion ipset '$exclude_set' not found; its destinations are proxied"
+            narrow_rc=1
+            continue
+        fi
+        if ensure_fw_rule -q mangle "$XRAY_CHAIN" \
+            -m set --match-set "$resolved_set" dst -j RETURN; then
+            log "Added exclusion for ipset: $resolved_set"
+        else
+            narrow_rc=1
+        fi
     done
+    if [[ $narrow_rc -ne 0 ]]; then
+        log -l WARN "A TPROXY exclusion did not go in; its destinations are proxied until the next apply"
+    fi
 
-    # Rule 9: Apply TPROXY for remaining traffic
-    # TCP
+    # Rule 9: Apply TPROXY for remaining traffic.
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
         -p tcp -j TPROXY --on-port "$XRAY_TPROXY_PORT" \
-        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK"
-
-    # UDP
+        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK" || return 1
     ensure_fw_rule -q mangle "$XRAY_CHAIN" \
         -p udp -j TPROXY --on-port "$XRAY_TPROXY_PORT" \
-        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK"
+        --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK" || return 1
 
     # Rules the platform needs outside our chain (Keenetic: mangle INPUT accept).
     # The status is ours to report: this function runs under "if !", which turns
     # errexit off for its whole body, and it ends in a log - so a failure here
     # would otherwise be an apply that says "successfully" while the firmware
-    # drops the proxied traffic.
-    platform_tproxy_extra_rules apply "$XRAY_FWMARK/$XRAY_FWMARK_MASK" ||
+    # drops the proxied traffic. It fails the function only after the jumps below,
+    # which still go in: a router without the subscription watch keeps the
+    # interception it had, and what changes is the ready marker tproxy_apply
+    # writes - the watch waits for it before Xray clients leave the fallback tunnel.
+    local extra_rc=0
+    if ! platform_tproxy_extra_rules apply "$XRAY_FWMARK/$XRAY_FWMARK_MASK"; then
         log -l WARN "Failed to apply platform TPROXY rules; proxied traffic may be dropped"
+        extra_rc=1
+    fi
 
     # Jump from PREROUTING to our chain for every LAN interface, each at its own
     # position (the first = before Tunnel Director). One shared position would
     # make every interface displace the one before it, so sync_fw_rule would
     # find each jump off its position and purge-and-re-insert all of them on
     # every apply - and each rewrite is a window with no jump for that interface.
-    local lan_if pos=1
+    local lan_if pos=1 jump_rc=0
     while IFS= read -r lan_if; do
         [[ -n $lan_if ]] || continue
-        sync_fw_rule -q mangle PREROUTING "-i $lan_if -j $XRAY_CHAIN\$" \
-            "-i $lan_if -j $XRAY_CHAIN" "$pos"
+        if ! sync_fw_rule -q mangle PREROUTING "-i $lan_if -j $XRAY_CHAIN\$" \
+            "-i $lan_if -j $XRAY_CHAIN" "$pos"; then
+            jump_rc=1
+        fi
         pos=$((pos + 1))
     done <<< "$lan_ifaces"
+    [[ $jump_rc -eq 0 && $extra_rc -eq 0 && $narrow_rc -eq 0 ]] || return 1
 
     log "Applied TPROXY iptables rules"
 }
@@ -669,6 +710,7 @@ tproxy_stop() {
     log "Stopping Xray TPROXY routing..."
     _tproxy_teardown_iptables
     _tproxy_teardown_routing
+    rm -f "$XRAY_TPROXY_READY"
     log "Xray TPROXY routing removed"
 
     return 0
@@ -688,6 +730,7 @@ tproxy_apply() {
     # Soft-fail: if xt_TPROXY module not available, return 0 without applying
     if ! _tproxy_check_module; then
         log -l WARN "xt_TPROXY module not available; skipping TPROXY setup"
+        rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
 
@@ -695,19 +738,36 @@ tproxy_apply() {
     if ! _tproxy_check_required_ipsets; then
         log -l WARN "Required ipsets not ready; exiting without applying rules"
         log -l WARN "Run 'vpn-director.sh apply' first to build required ipsets"
+        rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
 
     _tproxy_setup_routing
-    _tproxy_setup_clients_ipset
+    local clients_ok=1
+    if ! _tproxy_setup_clients_ipset; then
+        clients_ok=0
+    fi
     _tproxy_setup_bypass_ipset
 
     # Soft-fail if iptables setup fails
     if ! _tproxy_setup_iptables; then
         log -l WARN "Failed to setup iptables rules; TPROXY may not be active"
+        rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
 
+    # The watch reads the marker as "every Xray client is intercepted" and drops
+    # their fallback-tunnel membership on it. Rules that RETURN a client the
+    # ipset never took send it to the WAN instead, so an incomplete client set
+    # withholds the marker even though the chain itself is in place.
+    if [[ $clients_ok -eq 0 ]]; then
+        log -l WARN "Not every Xray client is in $XRAY_CLIENTS_IPSET; TPROXY readiness withheld"
+        rm -f "$XRAY_TPROXY_READY"
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$XRAY_TPROXY_READY")"
+    printf 'ok\n' > "$XRAY_TPROXY_READY"
     log "Xray TPROXY routing applied successfully"
 
     return 0

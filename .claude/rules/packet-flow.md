@@ -340,4 +340,5 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | `lib/tunnel.sh` | PREROUTING jump with mark check | First-match-wins |
 | `lib/tunnel.sh` | ip rule creation | Fwmark → `platform_tunnel_table` |
 | `lib/tunnel.sh` | `_tunnel_ensure_routes()` | Re-install tunnel routes on an apply with no rebuild |
+| `lib/tunnel.sh` | `_tunnel_marks_present()` | Rebuild when a client's MARK rule is gone (Merlin's firewall start flushes every mangle chain) |
 | `lib/platform/keenetic.sh` | `platform_tunnel_offload_target()` | `PPE` — takes a marked flow out of the firmware fast path |

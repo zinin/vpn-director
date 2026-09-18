@@ -86,6 +86,7 @@ func handleConfig(deps *Deps) http.HandlerFunc {
 		// Make a shallow copy to avoid mutating the original.
 		redacted := *cfg
 		redacted.WebUI.JWTSecret = ""
+		redacted.Xray.SubscriptionURL = ""
 
 		jsonOK(w, &redacted)
 	}

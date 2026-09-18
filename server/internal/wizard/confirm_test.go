@@ -409,3 +409,36 @@ func TestConfirmStep_ExclusionsSorted(t *testing.T) {
 		}
 	})
 }
+
+// Step 4 is where the user checks what is about to be applied, and it must name
+// the server step 1 picked, wherever a refresh has moved it since.
+func TestConfirmStep_Render_NamesThePickedServerAfterTheListMoved(t *testing.T) {
+	store := &mockConfigStore{servers: wizardServers("Oslo", "Paris")}
+	state := pickedServer(t, store, 1)
+	store.servers = wizardServers("Berlin", "Oslo", "Paris")
+	sender := &mockSender{}
+
+	NewConfirmStep(&StepDeps{Sender: sender, Config: store}).Render(123, state)
+
+	if !strings.Contains(sender.lastText, "Xray server: Paris") {
+		t.Fatalf("confirmation %q, want the server picked in step 1", sender.lastText)
+	}
+}
+
+// And one a refresh dropped is named as gone, so the user is not surprised when
+// the apply leaves the running server alone.
+func TestConfirmStep_Render_SaysThePickedServerIsGone(t *testing.T) {
+	store := &mockConfigStore{servers: wizardServers("Oslo", "Paris")}
+	state := pickedServer(t, store, 1)
+	store.servers = wizardServers("Oslo", "Berlin")
+	sender := &mockSender{}
+
+	NewConfirmStep(&StepDeps{Sender: sender, Config: store}).Render(123, state)
+
+	if strings.Contains(sender.lastText, "Berlin") {
+		t.Fatalf("confirmation %q names a server the user never picked", sender.lastText)
+	}
+	if !strings.Contains(sender.lastText, "Paris") || !strings.Contains(sender.lastText, "no longer in the server list") {
+		t.Fatalf("confirmation %q, want Paris named as gone", sender.lastText)
+	}
+}

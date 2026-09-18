@@ -5,7 +5,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -26,6 +25,9 @@ const defaultSOCKSPort = 12346
 const defaultMarkShift = 16
 
 const defaultTunnelTablesPath = "/tmp/tunnel_director/tun_dir_tables"
+const defaultFailoverReadyPath = "/tmp/tunnel_director/failover_ready"
+const defaultTproxyReadyPath = "/tmp/xray_tproxy/ready"
+const defaultStoppedPath = "/tmp/vpn-director/stopped"
 
 type Path struct {
 	kind      pathKind
@@ -119,6 +121,36 @@ func loadTunnelIdxFile(path string) map[string]int {
 	return parseTunnelTables(f)
 }
 
+// failoverTunnelReady is true when TUN_DIR_TABLES lists id and tunnel_apply
+// wrote failover_ready for that id (route and ip rule installed). TABLES
+// alone is not enough: it is written even when the route or rule failed.
+func failoverTunnelReady(id string) bool {
+	if id == "" {
+		return false
+	}
+	if _, ok := loadTunnelIdxFile(defaultTunnelTablesPath)[id]; !ok {
+		return false
+	}
+	b, err := os.ReadFile(defaultFailoverReadyPath)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(b)) == id
+}
+
+func vpnDirectorStopped() bool {
+	_, err := os.Stat(defaultStoppedPath)
+	return err == nil
+}
+
+func tproxyRulesReady() bool {
+	b, err := os.ReadFile(defaultTproxyReadyPath)
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(b)) != ""
+}
+
 func candidates(cfg *vpnconfig.VPNDirectorConfig, plat vpnconfig.PlatformInfo, socksUp bool, idxByID map[string]int) []Path {
 	out := []Path{{kind: kindDirect}}
 	if socksUp {
@@ -131,27 +163,12 @@ func candidates(cfg *vpnconfig.VPNDirectorConfig, plat vpnconfig.PlatformInfo, s
 		idxByID = map[string]int{}
 	}
 	shift := markShift(cfg)
-	ids := make([]string, 0, len(cfg.TunnelDirector.Tunnels))
-	for id := range cfg.TunnelDirector.Tunnels {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
 	byID := make(map[string]vpnconfig.PlatformTunnel, len(plat.Tunnels))
 	for _, t := range plat.Tunnels {
 		byID[t.ID] = t
 	}
-	for _, id := range ids {
-		if id == "main" {
-			continue
-		}
-		tun := cfg.TunnelDirector.Tunnels[id]
-		if len(tun.Clients) == 0 {
-			continue
-		}
-		pt, ok := byID[id]
-		if !ok || !pt.Connected || pt.Iface == "" {
-			continue
-		}
+	for _, id := range vpnconfig.TDExits(cfg, plat) {
+		pt := byID[id]
 		var mark uint32
 		if idx, ok := idxByID[id]; ok {
 			mark = tunnelMark(idx, shift)

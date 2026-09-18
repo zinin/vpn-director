@@ -35,6 +35,7 @@ type Deps struct {
 	Version      string
 	Commit       string
 	OpMutex      *sync.Mutex  // serializes mutating shell operations
+	ImportClient *http.Client // subscription downloads; nil means ssrf.NewClient
 	loginLimiter *rateLimiter // rate limiter for login endpoint
 }
 

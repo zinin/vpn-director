@@ -51,6 +51,7 @@
 #   sync_fw_rule [-6] [-q] [--count] <table> <chain> "<pattern>" "<desired args>" [insert_pos]
 #       Replace all rules matching <pattern> with a single desired rule (append by default
 #       or insert at [insert_pos]). No change if exactly one match equals the desired rule.
+#       Fails (1) when the desired rule could not be added.
 #       With --count, print the number of changes (deleted + inserted) to stdout.
 #       -6 uses ip6tables; -q suppresses informational logs (errors still logged).
 #
@@ -746,7 +747,8 @@ ensure_fw_rule() {
 # Behavior:
 #   * If exactly one matching rule exists AND equals "-A <chain> <desired>", no change.
 #   * Otherwise, purge all matching rules and add the desired one (append or insert at position).
-#   * Returns 0 on success; 1 on misuse.
+#   * Returns 0 on success; 1 on misuse, or when the desired rule could not be added - the
+#     matches are purged by then, so the caller is left without the rule and has to know.
 ###################################################################################################
 sync_fw_rule() {
     local cmd="iptables" fam_label="IPv4" quiet=0 print_count=0
@@ -833,11 +835,12 @@ sync_fw_rule() {
     local -a desired_args
     read -ra desired_args <<< "$desired"
     cmd_array+=("${desired_args[@]}")
-    n="$(ensure_fw_rule "${cmd_array[@]}")" || n=0
+    local rc=0
+    n="$(ensure_fw_rule "${cmd_array[@]}")" || rc=$?
     cnt=$((cnt + ${n:-0}))
 
     [[ $print_count -eq 1 ]] && printf '%s\n' "$cnt"
-    return 0
+    return "$rc"
 }
 
 ###################################################################################################

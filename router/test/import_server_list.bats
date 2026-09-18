@@ -296,14 +296,15 @@ vless://uuid2@server2:443#Name2"
 }
 
 # ============================================================================
-# step_parse_and_save_servers: JSON output
+# step_parse_servers: JSON output
 # ============================================================================
 
-@test "step_parse_and_save_servers: saves ips array instead of ip" {
+# step_parse_servers leaves the list in $SERVERS_TMP for step_publish_servers,
+# so these call it directly: "run" would keep the variable in its subshell.
+@test "step_parse_servers: saves ips array instead of ip" {
     load_import_server_list
 
     DATA_DIR="/tmp/bats_test_import_data"
-    SERVERS_FILE="$DATA_DIR/servers.json"
     mkdir -p "$DATA_DIR"
 
     # Override VPD_CONFIG to a temp config with our data_dir
@@ -312,24 +313,24 @@ vless://uuid2@server2:443#Name2"
 
     VLESS_SERVERS="vless://test-uuid@example.com:443?type=tcp#TestServer"
 
-    step_parse_and_save_servers
+    step_parse_servers
 
-    # Check that servers.json has "ips" array, not "ip" string
-    result=$(jq -r '.[0].ips | type' "$SERVERS_FILE")
+    # Check that the list has "ips" array, not "ip" string
+    result=$(jq -r '.[0].ips | type' "$SERVERS_TMP")
     [ "$result" = "array" ]
 
     # Check that "ip" field does not exist
-    result=$(jq -r '.[0] | has("ip")' "$SERVERS_FILE")
+    result=$(jq -r '.[0] | has("ip")' "$SERVERS_TMP")
     [ "$result" = "false" ]
 
     # Check the resolved IP is in the ips array
-    result=$(jq -r '.[0].ips[0]' "$SERVERS_FILE")
+    result=$(jq -r '.[0].ips[0]' "$SERVERS_TMP")
     [ "$result" = "93.184.216.34" ]
 
     rm -rf "$DATA_DIR"
 }
 
-@test "step_parse_and_save_servers writes reality params to servers.json" {
+@test "step_parse_servers writes reality params to the list" {
     load_import_server_list
 
     tmp_data="$BATS_TEST_TMPDIR/data"
@@ -339,9 +340,8 @@ vless://uuid2@server2:443#Name2"
     printf '{"data_dir":"%s"}' "$tmp_data" > "$cfg"
     VPD_CONFIG="$cfg"
     VLESS_SERVERS='vless://uuid@1.2.3.4:443?security=reality&flow=xtls-rprx-vision&sni=cdn.example.com&pbk=PBK&sid=sid1&type=tcp#NL'
-    run step_parse_and_save_servers
-    [ "$status" -eq 0 ]
-    out="$tmp_data/servers.json"
+    step_parse_servers
+    out="$SERVERS_TMP"
     [ "$(jq -r '.[0].security' "$out")" = "reality" ]
     [ "$(jq -r '.[0].flow' "$out")" = "xtls-rprx-vision" ]
     [ "$(jq -r '.[0].public_key' "$out")" = "PBK" ]
@@ -350,7 +350,7 @@ vless://uuid2@server2:443#Name2"
     [ "$(jq -r '.[0] | has("alpn")' "$out")" = "false" ]
 }
 
-@test "step_parse_and_save_servers skips out-of-range port, keeps valid server" {
+@test "step_parse_servers skips out-of-range port, keeps valid server" {
     load_import_server_list
 
     tmp_data="$BATS_TEST_TMPDIR/data"
@@ -361,10 +361,185 @@ vless://uuid2@server2:443#Name2"
     # First URI has an out-of-range port (must be skipped); the second is valid
     # and must still be saved (one bad entry does not drop the rest).
     VLESS_SERVERS=$'vless://uuid@1.2.3.4:99999?type=tcp#Bad\nvless://uuid@5.6.7.8:443?type=tcp#Good'
-    run step_parse_and_save_servers
-    [ "$status" -eq 0 ]
-    out="$tmp_data/servers.json"
+    step_parse_servers
+    out="$SERVERS_TMP"
     [ "$(jq length "$out")" -eq 1 ]
     [ "$(jq -r '.[0].address' "$out")" = "5.6.7.8" ]
     [ "$(jq -r '.[0].port' "$out")" -eq 443 ]
+}
+
+# ============================================================================
+# Publishing: servers.json, xray.servers and the link a refresh fetches
+# ============================================================================
+
+# load_import_into points VPD_DIR and VPD_CONFIG at a scratch directory, the way
+# a caller that overrides them does, and sources the importer there.
+load_import_into() {
+    export VPD_DIR="$BATS_TEST_TMPDIR/vpn-director"
+    export VPD_CONFIG="$VPD_DIR/vpn-director.json"
+    mkdir -p "$VPD_DIR"
+    load_import_server_list
+}
+
+# write_imported_state stands in for a router with an earlier import: its list,
+# the bypass set built from it and the link the Web UI saved it from.
+write_imported_state() {
+    mkdir -p "$VPD_DIR/data"
+    printf '%s\n' '[{"address":"9.9.9.9","port":443,"uuid":"old","name":"Old","ips":["9.9.9.9"]}]' \
+        > "$VPD_DIR/data/servers.json"
+    jq -n --arg data "$VPD_DIR/data" '{
+        data_dir: $data,
+        webui: {jwt_secret: "secret"},
+        xray: {clients: ["192.168.50.10"], servers: ["9.9.9.9"], subscription_url: "https://old.example/s/a"}
+    }' > "$VPD_CONFIG"
+}
+
+# write_list_file writes the subscription an import is given: three servers,
+# two of them on one address.
+write_list_file() {
+    printf '%s\n' \
+        'vless://uuid-a@5.6.7.8:443?type=tcp&security=tls#A' \
+        'vless://uuid-b@1.2.3.4:443?type=tcp&security=tls#B' \
+        'vless://uuid-c@5.6.7.8:8443?type=tcp&security=tls#C' \
+        > "$BATS_TEST_TMPDIR/servers.txt"
+}
+
+# serve_list_file puts a curl first on PATH that answers any link with that
+# list, the way a subscription host would.
+serve_list_file() {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    printf '#!/bin/sh\ncat "%s"\n' "$BATS_TEST_TMPDIR/servers.txt" > "$BATS_TEST_TMPDIR/bin/curl"
+    chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+}
+
+# run_import runs import_server_list.sh the way a user does, the answer to its
+# prompt on stdin.
+run_import() {
+    run env IMPORT_TEST_MODE=0 bash "$SCRIPTS_DIR/import_server_list.sh" <<< "$1"
+}
+
+# hold_config_lock takes the lock the daemons and configure.sh take, the way
+# another writer would, until release_config_lock. FD 3 is closed, or bats
+# would wait for the holder.
+hold_config_lock() {
+    flock "$VPD_DIR/.vpn-director.json.lock" sleep 30 3>&- &
+    LOCK_HOLDER=$!
+    sleep 0.5
+}
+
+release_config_lock() {
+    pkill -P "$LOCK_HOLDER" 2>/dev/null || true
+    kill "$LOCK_HOLDER" 2>/dev/null || true
+}
+
+# The watch, the Web UI and /import publish a list with the bypass set built
+# from it; a list imported here left TPROXY bypassing the previous list's
+# addresses until configure.sh ran. servers.json holds every server's UUID, and
+# the daemons write it 0600.
+@test "import_server_list.sh publishes the list with its bypass set" {
+    load_import_into
+    write_imported_state
+    write_list_file
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt"
+
+    assert_success
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["A","B","C"]'
+    run jq -c '[.xray.servers, .xray.clients, .webui.jwt_secret]' "$VPD_CONFIG"
+    assert_output '[["1.2.3.4","5.6.7.8"],["192.168.50.10"],"secret"]'
+    run stat -c %a "$VPD_DIR/data/servers.json" "$VPD_CONFIG"
+    assert_output $'600\n600'
+    run ls -A "$VPD_DIR/data"
+    assert_output "servers.json"
+}
+
+# The bot's subscription watch re-imports xray.subscription_url when the Xray
+# outbound dies, and the Web UI and /import re-import it on request. A list
+# imported here from another link was replaced by the old link's on the next
+# refresh: the link goes with the list.
+@test "import_server_list.sh saves an https link with its list" {
+    load_import_into
+    write_imported_state
+    write_list_file
+    serve_list_file
+
+    run_import "https://cdn.example/s/b"
+
+    assert_success
+    run jq -r '.xray.subscription_url' "$VPD_CONFIG"
+    assert_output "https://cdn.example/s/b"
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["A","B","C"]'
+}
+
+# Neither the watch nor the Web UI fetches a file or a plain-http link, and the
+# saved link is no longer what the list came from.
+@test "import_server_list.sh clears the saved link for a file or an http link" {
+    load_import_into
+    write_list_file
+    serve_list_file
+    for input in "$BATS_TEST_TMPDIR/servers.txt" "http://cdn.example/s/b"; do
+        write_imported_state
+
+        run_import "$input"
+
+        assert_success
+        run jq -c '.xray | has("subscription_url")' "$VPD_CONFIG"
+        assert_output "false"
+    done
+}
+
+# Before configure.sh has run there is no config, and nothing refreshes a list.
+@test "import_server_list.sh creates no config" {
+    load_import_into
+    mkdir -p "$VPD_DIR/data"
+    jq -n --arg data "$VPD_DIR/data" '{data_dir: $data}' > "$VPD_DIR/vpn-director.json.template"
+    write_list_file
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt"
+
+    assert_success
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["A","B","C"]'
+    [[ ! -e $VPD_CONFIG ]]
+}
+
+# The Web UI, the bot and configure.sh write under one lock, and the watch
+# publishes a refreshed list under it. A list written before the lock was held
+# could land beside another import's bypass set or link, and one written ahead
+# of a lock that never came was left beside the old link, whose list the next
+# refresh brought back.
+@test "import_server_list.sh publishes nothing while another writer holds the config lock" {
+    load_import_into
+    write_imported_state
+    write_list_file
+    hold_config_lock
+    export VPD_CONFIG_LOCK_WAIT=1
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt"
+    release_config_lock
+
+    assert_failure
+    assert_output --partial "nothing was imported"
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["Old"]'
+    run jq -c '[.xray.servers, .xray.subscription_url]' "$VPD_CONFIG"
+    assert_output '[["9.9.9.9"],"https://old.example/s/a"]'
+    run ls -A "$VPD_DIR/data"
+    assert_output "servers.json"
+}
+
+# A failed import keeps the list the router has, as the Web UI and /import do.
+@test "import_server_list.sh keeps the previous list when the new one has no usable server" {
+    load_import_into
+    write_imported_state
+    printf '%s\n' 'vless://uuid@5.6.7.8:99999?type=tcp#Bad' > "$BATS_TEST_TMPDIR/servers.txt"
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt"
+
+    assert_failure
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["Old"]'
 }

@@ -243,6 +243,8 @@ func (h *ClientsHandler) handleRemove(chatID int64, msgID int, ip string) {
 			c.TunnelDirector.Tunnels[route] = tunnel
 		}
 		c.PausedClients = removeString(c.PausedClients, ip)
+		// Gone is gone: a failover restore must not bring it back.
+		vpnconfig.DetachFailoverClient(c, ip)
 		cfg = c
 		return nil
 	})
@@ -430,6 +432,10 @@ func (h *ClientsHandler) handleAddRoute(chatID int64, msgID int, route string) {
 	}
 
 	err = h.deps.Config.UpdateVPNConfig(func(c *vpnconfig.VPNDirectorConfig) error {
+		// Where the user puts an address during a failover is where it goes:
+		// a restore must not take it back to Xray. One added as xray while
+		// Xray is down joins the failover afresh.
+		vpnconfig.DetachFailoverClient(c, ip)
 		if route == "xray" {
 			c.Xray.Clients = append(c.Xray.Clients, ip)
 			cfg = c

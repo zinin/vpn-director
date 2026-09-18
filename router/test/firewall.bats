@@ -176,6 +176,44 @@ load 'test_helper'
     assert_output --partial "WAN interface name is empty"
 }
 
+# ============================================================================
+# sync_fw_rule
+# ============================================================================
+
+# The PREROUTING jumps of XRAY_TPROXY and TUN_DIR go in through here, and both
+# callers publish a ready marker the subscription watch acts on. An insert the
+# kernel refused - a busy xtables lock, say - used to come back as success, so
+# the marker went out for a chain nothing jumped to.
+@test "sync_fw_rule: fails when the rule cannot be inserted" {
+    load_firewall
+    iptables() {
+        if [[ $* == *" -I PREROUTING "* ]]; then
+            echo "iptables $*" >> /tmp/bats_iptables_calls.log
+            return 4
+        fi
+        command iptables "$@"
+    }
+    run sync_fw_rule -q mangle PREROUTING "-i br0 -j XRAY_TPROXY\$" "-i br0 -j XRAY_TPROXY" 1
+    assert_failure
+}
+
+@test "sync_fw_rule: succeeds without a change when the rule is already in place" {
+    load_firewall
+    iptables() {
+        echo "iptables $*" >> /tmp/bats_iptables_calls.log
+        if [[ $* == "-t mangle -S PREROUTING" ]]; then
+            printf -- '-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -j XRAY_TPROXY\n'
+            return 0
+        fi
+        command iptables "$@"
+    }
+    : > /tmp/bats_iptables_calls.log
+    run sync_fw_rule -q mangle PREROUTING "-i br0 -j XRAY_TPROXY\$" "-i br0 -j XRAY_TPROXY" 1
+    assert_success
+    refute grep -q -- '-I PREROUTING' /tmp/bats_iptables_calls.log
+    refute grep -q -- '-D PREROUTING' /tmp/bats_iptables_calls.log
+}
+
 @test "allow_wan_for_host: looks the rules up on the platform WAN interface" {
     load_firewall
     platform_ipv6_enabled() { printf '0\n'; }

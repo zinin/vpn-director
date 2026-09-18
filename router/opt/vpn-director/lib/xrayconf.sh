@@ -56,8 +56,12 @@ xrayconf_build_outbound() {
                 | { network: $net, security: "tls",
                     tlsSettings: ( { serverName: $sn, fingerprint: .fingerprint, alpn: .alpn } | trimempty ) } )
             else
-              { network: $net, security: "tls",
-                tlsSettings: { alpn: ["h2"], serverName: .address } }
+              # Legacy: the sni when the server names one, as the Go generator
+              # does - the subscription watch dials a resolved IP and keeps the
+              # hostname there.
+              ( (if (.sni // "") != "" then .sni else .address end) as $sn
+                | { network: $net, security: "tls",
+                    tlsSettings: { alpn: ["h2"], serverName: $sn } } )
             end
           ),
           tag: "proxy-out"

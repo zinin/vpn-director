@@ -1061,3 +1061,122 @@ func TestApplier_Apply_RefusesToSaveWhenThePlatformCannotValidateARoute(t *testi
 		t.Errorf("user was told %q, want the platform-unavailable message", sender.messages)
 	}
 }
+
+// The wizard's save is the user's whole assignment. An address it puts on a
+// tunnel during a failover is where the user wants it - the restore used to take
+// it off that tunnel and back to Xray - and one it drops is gone. Only what it
+// keeps on Xray stays with the failover.
+func TestApplier_Apply_DetachesFromTheFailoverWhatItDoesNotKeepOnXray(t *testing.T) {
+	configStore := &trackingConfigStore{
+		servers: []vpnconfig.Server{{Name: "Server1", IPs: []string{"1.2.3.4"}, Address: "srv1.example.com", Port: 443}},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{
+			Xray: vpnconfig.XrayConfig{
+				Failover: &vpnconfig.XrayFailover{
+					Tunnel:    "wgc1",
+					Clients:   []string{"192.168.1.8", "192.168.1.9", "192.168.1.7"},
+					Added:     []string{"192.168.1.8", "192.168.1.9", "192.168.1.7"},
+					Committed: true,
+				},
+			},
+			TunnelDirector: vpnconfig.TunnelDirectorConfig{Tunnels: map[string]vpnconfig.TunnelConfig{
+				"wgc1": {Clients: []string{"192.168.1.8", "192.168.1.9", "192.168.1.7"}},
+			}},
+		},
+	}
+	applier := NewApplier(&trackingManager{}, &trackingSender{}, configStore, &mockVPNDirector{platform: platformWith("wgc1")}, &mockXrayGenerator{})
+	state := &State{
+		ChatID:      123,
+		Step:        StepConfirm,
+		ServerIndex: 0,
+		Exclusions:  map[string]bool{"ru": true},
+		Clients: []ClientRoute{
+			{IP: "192.168.1.8", Route: "wgc1"},
+			{IP: "192.168.1.9", Route: "xray"},
+		},
+	}
+	if err := applier.Apply(123, state); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	fo := configStore.savedConfig.Xray.Failover
+	if fo == nil || strings.Join(fo.Clients, ",") != "192.168.1.9" || strings.Join(fo.Added, ",") != "192.168.1.9" {
+		t.Fatalf("failover %+v, want only the address kept on Xray", fo)
+	}
+}
+
+// pickedServer runs the server step on servers and picks the one at idx, as a
+// user does in step 1.
+func pickedServer(t *testing.T, store service.ConfigStore, idx int) *State {
+	t.Helper()
+	state := &State{ChatID: 123, Step: StepSelectServer, Exclusions: map[string]bool{}}
+	NewServerStep(&StepDeps{Sender: &mockSender{}, Config: store}, nil).HandleCallback(&tgbotapi.CallbackQuery{
+		Data:    fmt.Sprintf("server:%d", idx),
+		Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}},
+	}, state)
+	return state
+}
+
+func wizardServers(names ...string) []vpnconfig.Server {
+	var out []vpnconfig.Server
+	for i, n := range names {
+		out = append(out, vpnconfig.Server{
+			Name: n, Address: strings.ToLower(n) + ".example", Port: 443,
+			IPs: []string{fmt.Sprintf("203.0.113.%d", 10+i)},
+		})
+	}
+	return out
+}
+
+// Steps 2 to 4 take the user minutes, and meanwhile a refresh - the subscription
+// watch, another importer - can put other servers in front of the one picked in
+// step 1. Its old index then names a server the user never chose.
+func TestApplier_Apply_GeneratesThePickedServerAfterTheListMoved(t *testing.T) {
+	store := &trackingConfigStore{
+		servers: wizardServers("Oslo", "Paris"),
+		vpnConfig: &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{
+			Tunnels: map[string]vpnconfig.TunnelConfig{},
+		}},
+	}
+	state := pickedServer(t, store, 1)
+	store.servers = wizardServers("Berlin", "Oslo", "Paris")
+	xrayGen := &mockXrayGenerator{}
+
+	_ = NewApplier(&trackingManager{}, &trackingSender{}, store, &mockVPNDirector{}, xrayGen).Apply(123, state)
+
+	if !xrayGen.generateCalled || xrayGen.generatedServer.Name != "Paris" {
+		t.Fatalf("generated %q (called %v), want Paris, the server picked in step 1", xrayGen.generatedServer.Name, xrayGen.generateCalled)
+	}
+}
+
+// A refresh that dropped the picked server leaves nothing to generate: the
+// server at its old index is one the user never chose.
+func TestApplier_Apply_SkipsAPickedServerTheListNoLongerHas(t *testing.T) {
+	store := &trackingConfigStore{
+		servers: wizardServers("Oslo", "Paris"),
+		vpnConfig: &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{
+			Tunnels: map[string]vpnconfig.TunnelConfig{},
+		}},
+	}
+	state := pickedServer(t, store, 1)
+	store.servers = wizardServers("Oslo", "Berlin")
+	xrayGen := &mockXrayGenerator{}
+	sender := &trackingSender{}
+	vpn := &mockVPNDirector{}
+
+	_ = NewApplier(&trackingManager{}, sender, store, vpn, xrayGen).Apply(123, state)
+
+	if xrayGen.generateCalled {
+		t.Fatalf("generated %q; Paris is gone from the list", xrayGen.generatedServer.Name)
+	}
+	if !vpn.applyCalled {
+		t.Error("the rest of the configuration must still be applied")
+	}
+	warned := false
+	for _, msg := range sender.messages {
+		if strings.Contains(msg, "no longer in the server list") {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("messages %v; the user must learn the server was not switched", sender.messages)
+	}
+}

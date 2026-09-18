@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 
 	"github.com/zinin/vpn-director/server/internal/service"
@@ -62,7 +63,7 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 	// Get state data with thread-safe getters
 	clients := state.GetClients()
 	exclusions := state.GetExclusions()
-	serverIndex := state.GetServerIndex()
+	serverIndex := state.PickedIndex(servers)
 
 	// Build exclusion list (sorted for deterministic config)
 	var excl []string
@@ -172,6 +173,17 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 			}
 		}
 		vpnCfg.TunnelDirector.Tunnels = tunnels
+		// The save is the user's whole assignment. During a failover an
+		// address put on a tunnel is where the user wants it - a restore used
+		// to take it off that tunnel and back to Xray - and one left out is
+		// gone. Only what stays on Xray stays with the failover.
+		if fo := vpnCfg.Xray.Failover; fo != nil {
+			for _, addr := range append([]string(nil), fo.Clients...) {
+				if !slices.Contains(xrayClients, addr) {
+					vpnconfig.DetachFailoverClient(vpnCfg, addr)
+				}
+			}
+		}
 		// The wizard stores addresses as entered, so a client the old wizard
 		// wrote as 1.2.3.4/32 comes back as 1.2.3.4. paused_clients is matched
 		// literally, so its entry has to follow or the client resumes on its
@@ -193,8 +205,8 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 	}
 	a.sender.SendPlain(chatID, "vpn-director.json updated")
 
-	// Generate Xray config if server index is valid
-	if serverIndex >= 0 && serverIndex < len(servers) {
+	// Generate Xray config for the server step 1 picked, wherever it is now
+	if serverIndex >= 0 {
 		s := servers[serverIndex]
 		// Generation and the record of it under one lock, so a switch from the
 		// Web UI or /xray cannot land between them; the record follows only a
@@ -211,6 +223,8 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 			}
 			a.sender.SendPlain(chatID, "xray/config.json updated")
 		}
+	} else if name := state.PickedName(); name != "" {
+		a.sender.SendPlain(chatID, fmt.Sprintf("Warning: %s is no longer in the server list, Xray config not updated", name))
 	} else {
 		a.sender.SendPlain(chatID, "Warning: Invalid server selection, Xray config not updated")
 	}

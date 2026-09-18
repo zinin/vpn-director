@@ -2,6 +2,8 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -39,7 +41,7 @@ func (h *XrayHandler) HandleXray(msg *tgbotapi.Message) {
 	kb := telegram.NewKeyboard()
 	for i, srv := range servers {
 		btnText := fmt.Sprintf("%d. %s", i+1, srv.Name)
-		kb.Button(btnText, fmt.Sprintf("xray:select:%d", i))
+		kb.Button(btnText, fmt.Sprintf("xray:select:%d:%s", i, serverFingerprint(srv)))
 	}
 	kb.Columns(2)
 
@@ -47,7 +49,17 @@ func (h *XrayHandler) HandleXray(msg *tgbotapi.Message) {
 	h.deps.Sender.SendWithKeyboard(msg.Chat.ID, text, kb.Build())
 }
 
-// HandleCallback handles xray:select:{index} callbacks
+// serverFingerprint names a server in a button: the first 8 hex digits of
+// sha256("name|address|port"). The list can change between /xray and the tap -
+// the subscription watch rotates endpoints, an import replaces it - and the
+// index alone then names another server.
+func serverFingerprint(s vpnconfig.Server) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%d", s.Name, s.Address, s.Port)))
+	return hex.EncodeToString(sum[:4])
+}
+
+// HandleCallback handles xray:select:{index}:{fingerprint} callbacks, and the
+// xray:select:{index} of a keyboard sent before buttons carried a fingerprint.
 func (h *XrayHandler) HandleCallback(cb *tgbotapi.CallbackQuery) {
 	if cb.Message == nil {
 		return
@@ -61,7 +73,7 @@ func (h *XrayHandler) HandleCallback(cb *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	idxStr := strings.TrimPrefix(data, "xray:select:")
+	idxStr, fingerprint, _ := strings.Cut(strings.TrimPrefix(data, "xray:select:"), ":")
 	idx, err := strconv.Atoi(idxStr)
 	if err != nil {
 		h.deps.Sender.Send(chatID, telegram.EscapeMarkdownV2("Ошибка: неверный индекс"))
@@ -81,6 +93,13 @@ func (h *XrayHandler) HandleCallback(cb *tgbotapi.CallbackQuery) {
 	}
 
 	server := servers[idx]
+	if fingerprint != "" && fingerprint != serverFingerprint(server) {
+		// The keyboard is stale: replace it rather than leave more taps on it.
+		text := telegram.EscapeMarkdownV2("The server list has changed since these buttons were sent; run /xray again")
+		empty := tgbotapi.InlineKeyboardMarkup{InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{}}
+		h.deps.Sender.EditMessage(chatID, cb.Message.MessageID, text, empty)
+		return
+	}
 
 	// The generated inbound has to listen where the TPROXY rules send traffic,
 	// so the ports come from advanced.xray rather than from the template.

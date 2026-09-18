@@ -77,6 +77,12 @@ TUN_DIR_TUNNELS_JSON=$(jq --argjson p "$_PAUSED_CLIENTS_JSON" \
            else . end)
      | from_entries' "$VPD_CONFIG_FILE")
 
+# Snapshot clients only: tunnel.sh emits their MARK first so a covering
+# earlier rule (often main) does not send them to WAN, without reordering
+# the other tunnels' clients.
+XRAY_FAILOVER_TUNNEL=$(_cfg '.xray.failover.tunnel')
+XRAY_FAILOVER_CLIENTS=$(_cfg_arr_active '.xray.failover.clients')
+
 # Spec 12: drop a tunnel.gateway that is not a dotted IPv4. Validate in bash
 # (jq on Keenetic has no regex). Do not abort the load; _tunnel_gateway is
 # the apply-time belt for callers that skip this file.
@@ -136,6 +142,7 @@ BOOT_WAIT_DELAY=$(_cfg '.advanced.boot.wait_delay')
 readonly \
     VPD_CONFIG_FILE \
     TUN_DIR_TUNNELS_JSON IPS_BDR_DIR \
+    XRAY_FAILOVER_TUNNEL XRAY_FAILOVER_CLIENTS \
     XRAY_CLIENTS XRAY_SERVERS XRAY_EXCLUDE_IPS XRAY_EXCLUDE_SETS \
     XRAY_TPROXY_PORT XRAY_ROUTE_TABLE XRAY_RULE_PREF \
     XRAY_FWMARK XRAY_FWMARK_MASK XRAY_CHAIN \

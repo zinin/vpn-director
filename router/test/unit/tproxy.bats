@@ -195,6 +195,120 @@ load '../test_helper'
     assert_success
 }
 
+@test "tproxy_apply: does not record ready when TPROXY targets cannot be installed" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    # The targets only: every rule of the chain names XRAY_TPROXY, and matching
+    # on that stopped the setup at rule 1 before a target was ever tried.
+    iptables() {
+        if [[ $* == *"-j TPROXY"* && $* == *" -A "* ]]; then
+            echo "iptables $*" >> /tmp/bats_iptables_calls.log
+            return 1
+        fi
+        command iptables "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+# On Keenetic the platform's mangle INPUT accept is what lets proxied HTTPS past
+# _NDM_HTTP_INPUT_TLS_. The subscription watch reads ready as "Xray clients can
+# leave the fallback tunnel", so an apply without that rule must not publish it.
+@test "tproxy_apply: does not record ready when the platform cannot apply its extra rules" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    platform_tproxy_extra_rules() { return 1; }
+    run tproxy_apply
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+# The watch reads the marker as "every Xray client is intercepted" and drops
+# their fallback-tunnel membership on it. A client the ipset did not take is not
+# intercepted, and with the tunnel gone its traffic leaves through the WAN.
+@test "tproxy_apply: does not record ready when a client cannot be added to the ipset" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    ipset() {
+        if [[ $1 == add && $* == *"$XRAY_CLIENTS_IPSET"* ]]; then
+            return 1
+        fi
+        command ipset "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+# xray.clients is not validated anywhere, and a repeated address is the one add
+# failure that means nothing: the client is already in the set. The adds ask for
+# -exist, so a duplicate does not cost the whole LAN its marker.
+@test "tproxy_apply: records ready when a client is already in the ipset" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    ipset() {
+        if [[ $1 == add && $* != *-exist* ]]; then
+            return 1
+        fi
+        command ipset "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+}
+
+# Nothing validates xray.clients: an IPv6 address from an older Web UI, a typo
+# like 192.168.1.1000. The set never takes such an entry, no router client can
+# carry it, and withholding the marker for it held every restore of the LAN on
+# the fallback tunnel for good.
+@test "tproxy_apply: an xray.clients entry that is not an IPv4 address does not withhold ready" {
+    load_common
+    jq '.xray.clients = ["192.168.1.5", "fd00::10", "192.168.1.1000"]' "$TEST_ROOT/fixtures/vpn-director.json" \
+        > "$BATS_TEST_TMPDIR/vpn-director.json"
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/tproxy.sh" --source-only
+    # The kernel takes neither: hash:net is IPv4, and 1000 is no octet.
+    ipset() {
+        if [[ $1 == add && ( $* == *fd00::10* || $* == *192.168.1.1000* ) ]]; then
+            return 1
+        fi
+        command ipset "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+    grep -q "WARN.*fd00::10" "$LOG_FILE"
+    grep -q "WARN.*192.168.1.1000" "$LOG_FILE"
+}
+
+# sync_fw_rule used to report an insert the kernel refused as success: the
+# marker then went out for a chain nothing jumped to.
+@test "tproxy_apply: a PREROUTING jump that did not go in withholds ready" {
+    load_tproxy_module
+    iptables() {
+        [[ $* == *" -I PREROUTING "* ]] && return 4
+        command iptables "$@"
+    }
+    run tproxy_apply
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+@test "tproxy_apply: records ready when rules are installed" {
+    load_tproxy_module
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+}
+
 @test "tproxy_apply: logs application message" {
     load_tproxy_module
     run tproxy_apply
@@ -222,9 +336,12 @@ EOF
     export PATH="/tmp/bats_mock_fail:$PATH"
 
     source "$LIB_DIR/tproxy.sh" --source-only
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
     run tproxy_apply
     # Should soft-fail (return 0, not fail)
     assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
 
     rm -rf /tmp/bats_mock_fail
 }
@@ -565,12 +682,89 @@ duplicate_last_rule() {
 # _tproxy_setup_iptables runs as "if ! _tproxy_setup_iptables", which turns
 # errexit off for its whole body, and its last command is a log - so a platform
 # that cannot install its own rules would otherwise be reported as a clean apply.
-@test "_tproxy_setup_iptables: warns when the platform cannot apply its extra rules" {
+# The jumps still go in: a router without the subscription watch keeps the
+# interception it had, and only the status - and so the ready marker - changes.
+@test "_tproxy_setup_iptables: fails after installing the jumps when the platform cannot apply its extra rules" {
     load_tproxy_module
     platform_tproxy_extra_rules() { return 1; }
+    : > /tmp/bats_iptables_calls.log
     run _tproxy_setup_iptables
-    assert_success
+    assert_failure
     assert_output --partial "Failed to apply platform TPROXY rules"
+    grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log
+}
+
+# Two rules decide who the targets take at all: without the "! XRAY_CLIENTS"
+# return TPROXY takes every LAN client, without the private ranges traffic to
+# the router and the rest of the LAN. errexit is off under "if !", so a failed
+# one has to stop the setup itself - before the targets, and without a status
+# that lets tproxy_apply publish ready.
+@test "_tproxy_setup_iptables: fails before the TPROXY targets when a rule that bounds them fails" {
+    load_tproxy_module
+    local failing
+    iptables() {
+        [[ $* == *"$FAILING"* ]] && return 1
+        command iptables "$@"
+    }
+    for failing in \
+        "-F XRAY_TPROXY" \
+        "-A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN" \
+        "-A XRAY_TPROXY -d 10.0.0.0/8 -j RETURN" \
+        "-A XRAY_TPROXY -d 172.16.0.0/12 -j RETURN" \
+        "-A XRAY_TPROXY -d 192.168.0.0/16 -j RETURN"
+    do
+        FAILING="$failing"
+        : > /tmp/bats_iptables_calls.log
+        run _tproxy_setup_iptables
+        if [[ $status -eq 0 ]]; then
+            echo "succeeded although \"$failing\" failed"
+            return 1
+        fi
+        if grep -q -- "-j TPROXY" /tmp/bats_iptables_calls.log; then
+            echo "reached the TPROXY targets although \"$failing\" failed"
+            return 1
+        fi
+    done
+}
+
+# The other RETURNs only decide what a client reaches directly instead of
+# through the proxy: a server of the subscription, the loopback and link-local
+# ranges, multicast, broadcast, an excluded country. Leaving the setup at a
+# missing one - a busy xtables lock was enough - left a flushed chain that took
+# nothing while the jumps stayed, and every Xray client went out through the
+# WAN. The targets go in; only the marker waits for a clean apply.
+@test "_tproxy_setup_iptables: a RETURN that only narrows the proxy keeps the TPROXY targets" {
+    load_tproxy_module
+    local failing
+    iptables() {
+        [[ $* == *"$FAILING"* ]] && return 4
+        command iptables "$@"
+    }
+    for failing in \
+        "-A XRAY_TPROXY -m set --match-set TPROXY_BYPASS dst -j RETURN" \
+        "-A XRAY_TPROXY -d 127.0.0.0/8 -j RETURN" \
+        "-A XRAY_TPROXY -d 169.254.0.0/16 -j RETURN" \
+        "-A XRAY_TPROXY -d 224.0.0.0/4 -j RETURN" \
+        "-A XRAY_TPROXY -d 255.255.255.255/32 -j RETURN" \
+        "-A XRAY_TPROXY -m set --match-set ru dst -j RETURN"
+    do
+        FAILING="$failing"
+        : > /tmp/bats_iptables_calls.log
+        run _tproxy_setup_iptables
+        if [[ $status -eq 0 ]]; then
+            echo "reported success although \"$failing\" failed"
+            return 1
+        fi
+        if ! grep -q -- "-A XRAY_TPROXY -p tcp -j TPROXY" /tmp/bats_iptables_calls.log ||
+            ! grep -q -- "-A XRAY_TPROXY -p udp -j TPROXY" /tmp/bats_iptables_calls.log; then
+            echo "no TPROXY targets after \"$failing\" failed"
+            return 1
+        fi
+        if ! grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log; then
+            echo "no PREROUTING jump after \"$failing\" failed"
+            return 1
+        fi
+    done
 }
 
 @test "_tproxy_teardown_iptables: removes platform extra rules with the configured mark" {

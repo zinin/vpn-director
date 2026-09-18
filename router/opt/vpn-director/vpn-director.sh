@@ -26,6 +26,7 @@ fi
 #   vpn-director apply [tunnel|xray]         - Apply configuration
 #   vpn-director stop [tunnel|xray]          - Stop components
 #   vpn-director restart [tunnel|xray]       - Restart components
+#   vpn-director restart xray-process        - Restart the Xray process only (TPROXY rules kept)
 #   vpn-director update                      - Update ipsets and reapply all
 #   vpn-director platform                    - Print platform facts as JSON (for the daemons)
 #   vpn-director cron install|remove         - Schedule or drop the daily ipset update
@@ -56,6 +57,7 @@ FORCE=0
 QUIET=0
 VERBOSE=0
 DRY_RUN=0
+UNLESS_STOPPED=0
 COMMAND=""
 COMPONENT=""
 
@@ -65,6 +67,7 @@ parse_option() {
         -q|--quiet)   QUIET=1; return 0 ;;
         -v|--verbose) VERBOSE=1; export DEBUG=1; return 0 ;;
         --dry-run)    DRY_RUN=1; return 0 ;;
+        --unless-stopped) UNLESS_STOPPED=1; return 0 ;;
         --wait)       export VPD_LOCK_WAIT=120; return 0 ;;
         --wait=*)
             local secs="${1#--wait=}"
@@ -114,17 +117,19 @@ Commands:
   apply [tunnel|xray]         Apply configuration
   stop [tunnel|xray]          Stop components
   restart [tunnel|xray]       Restart (stop + apply)
+  restart xray-process        Restart the Xray process only, TPROXY rules kept
   update                      Download fresh ipsets and reapply all
   platform                    Print platform facts as JSON
   cron install|remove         Schedule or drop the daily "update" job
 
 Options:
-  -f, --force    Force operation (ignore hash checks)
-  -q, --quiet    Minimal output
-  -v, --verbose  Debug output
-  --dry-run      Show what would be done
-  --wait[=SEC]   Wait up to SEC seconds (default 120) for a running instance instead of exiting
-  -h, --help     Show this help
+  -f, --force       Force operation (ignore hash checks)
+  -q, --quiet       Minimal output
+  -v, --verbose     Debug output
+  --dry-run         Show what would be done
+  --wait[=SEC]      Wait up to SEC seconds (default 120) for a running instance instead of exiting
+  --unless-stopped  Skip apply or restart if "stop" has run since (for automatic callers)
+  -h, --help        Show this help
 
 Examples:
   vpn-director status              # Show all status
@@ -169,6 +174,16 @@ _ensure_ipsets() {
         [[ -z $set ]] && continue
         ipset_ensure "$set" || return 1
     done
+}
+
+###################################################################################################
+# --unless-stopped is for automatic callers - the Telegram bot's subscription watch. Once stop has
+# left its marker, only an apply without it turns routing back on. The commands check right after
+# taking the lock, so an apply that queued behind that stop still sees the marker it left.
+###################################################################################################
+_skip_when_stopped() {
+    [[ $UNLESS_STOPPED -eq 1 && -e ${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped} ]] || return 1
+    log "VPN Director is stopped; skipping $1 (--unless-stopped)"
 }
 
 ###################################################################################################
@@ -230,6 +245,20 @@ cmd_apply() {
         return 0
     fi
 
+    if _skip_when_stopped apply; then
+        return 0
+    fi
+
+    # stop's marker pauses the Telegram bot's subscription watch, and an apply
+    # of everything hands routing back to it - a real one only, so not above
+    # the dry run. One component turned back on leaves the stop of the rest in
+    # force: a Web UI server switch restarts xray alone, and a watch that read
+    # the router as running again would bring everything back with its next
+    # failover apply.
+    case "$COMPONENT" in
+        ""|all) rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}" ;;
+    esac
+
     # Wait for network if system just booted (before any downloads)
     _ipset_boot_wait
 
@@ -289,6 +318,16 @@ cmd_stop() {
     acquire_lock "vpn-director"
     _load_modules
 
+    # The marker first. The watch checks it under the config lock before every
+    # write it makes, and a marker written after the teardown left that whole
+    # teardown open to a failover write - one that takes effect on the next
+    # manual apply of a router the user stopped.
+    case "$COMPONENT" in
+        ""|all)
+            mkdir -p "$(dirname "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}")"
+            printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
+            ;;
+    esac
     case "$COMPONENT" in
         ""|all)
             tproxy_stop
@@ -313,6 +352,12 @@ cmd_restart() {
     _load_common
     acquire_lock "vpn-director"
     _load_modules
+    if _skip_when_stopped restart; then
+        return 0
+    fi
+    # A full restart leaves the marker in its own stop half; the apply half must
+    # not take that for a stop someone else made.
+    UNLESS_STOPPED=0
     case "$COMPONENT" in
         ""|all)
             tproxy_restart_process
@@ -328,6 +373,15 @@ cmd_restart() {
             COMPONENT=xray cmd_stop
             COMPONENT=xray cmd_apply
             ;;
+        xray-process)
+            # config.json changed and nothing else: the Telegram bot's
+            # subscription watch writes one per server it tries. The stop and
+            # apply of "xray" take the TPROXY jump away and put it back, and in
+            # between the Xray clients leave through the WAN - once per server.
+            # With the rules in place, a client meets a restarting Xray and
+            # waits instead.
+            tproxy_restart_process
+            ;;
         *)
             echo "Unknown component: $COMPONENT" >&2
             exit 1
@@ -339,6 +393,7 @@ cmd_update() {
     _load_common
     acquire_lock "vpn-director"
     _load_modules
+    rm -f "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
 
     # Wait for network if system just booted (before any downloads)
     _ipset_boot_wait

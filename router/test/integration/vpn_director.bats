@@ -18,6 +18,9 @@ setup() {
     # be repeated here: without it platform_tunnels reads the real
     # /etc/iproute2/rt_tables, which the machine running the suite need not have.
     export RT_TABLES_FILE="$TEST_ROOT/fixtures/rt_tables"
+    # And the ready marker: tproxy_apply would otherwise write the machine's own
+    # /tmp/xray_tproxy/ready.
+    export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
     : > "$LOG_FILE"
 }
 
@@ -128,6 +131,143 @@ setup() {
     assert_success
     assert_output --partial "DRY-RUN"
     assert_output --partial "tproxy ipsets"
+}
+
+# stop leaves a marker the Telegram bot's subscription watch honours, and apply
+# hands routing back to the watch by removing it. A dry run changes nothing, so
+# the watch must stay paused: otherwise it could apply a failover on a router
+# the user stopped.
+@test "vpn-director: apply --dry-run keeps the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run "$SCRIPTS_DIR/vpn-director.sh" apply --dry-run
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+}
+
+# run_stubbed_cli <arguments...> runs the command the CLI parses from its
+# arguments with the lock, the boot wait and the ipsets stubbed. Each module call
+# that would change routing appends its name to $BATS_TEST_TMPDIR/calls instead.
+run_stubbed_cli() {
+    run bash -c '
+        script=$1 calls=$2
+        shift 2
+        source "$script" --source-only "$@"
+        _load_modules
+        acquire_lock() { :; }
+        _ipset_boot_wait() { :; }
+        _ensure_ipsets() { :; }
+        tproxy_restart_process() { echo tproxy_restart_process >> "$calls"; }
+        tproxy_stop() { echo tproxy_stop >> "$calls"; }
+        tunnel_stop() { echo tunnel_stop >> "$calls"; }
+        tproxy_apply() { echo tproxy_apply >> "$calls"; }
+        tunnel_apply() { echo tunnel_apply >> "$calls"; }
+        "cmd_$COMMAND"
+    ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" "$@"
+}
+
+@test "vpn-director: apply removes the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli apply
+    assert_success
+    [ ! -e "$VPD_STOPPED_FILE" ]
+}
+
+# The subscription watch applies with --unless-stopped. A stop that took the lock
+# ahead of it - or finished while the watch was still probing - must survive: the
+# check runs under the lock, where the marker that stop left is visible.
+@test "vpn-director: apply --unless-stopped leaves a stopped router stopped" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli --unless-stopped apply
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+@test "vpn-director: apply --unless-stopped applies a running router" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    run_stubbed_cli --unless-stopped apply
+    assert_success
+    grep -qx tproxy_apply "$BATS_TEST_TMPDIR/calls"
+    grep -qx tunnel_apply "$BATS_TEST_TMPDIR/calls"
+}
+
+@test "vpn-director: restart xray --unless-stopped leaves a stopped router stopped" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli --unless-stopped restart xray
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# Turning one component back on - a Web UI server switch restarts xray - does
+# not undo the stop of the rest. With the marker gone the watch would read the
+# router as running, and its next failover apply would bring everything back.
+@test "vpn-director: apply or restart of one component keeps the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli apply tunnel
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    run_stubbed_cli restart xray
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+}
+
+# The watch checks the marker under the config lock before every write it
+# makes. A stop that only wrote it after the teardown left that whole teardown
+# as a window in which a watch write still went through - onto a router about
+# to be stopped, taking effect on its next manual apply.
+@test "vpn-director: stop leaves its marker before it tears anything down" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    run bash -c '
+        script=$1 calls=$2
+        shift 2
+        source "$script" --source-only "$@"
+        _load_modules
+        acquire_lock() { :; }
+        seen() { if [[ -e $VPD_STOPPED_FILE ]]; then echo "$1 after the marker"; else echo "$1"; fi; }
+        tproxy_stop() { seen tproxy_stop >> "$calls"; }
+        tunnel_stop() { seen tunnel_stop >> "$calls"; }
+        "cmd_$COMMAND"
+    ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" stop
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_stop after the marker\ntunnel_stop after the marker'
+}
+
+# The subscription watch writes config.json for each server it tries and needs
+# only the process to pick it up. "restart xray" takes the TPROXY rules down
+# and puts them back, and in between the Xray clients leave through the WAN -
+# once for every server tried.
+@test "vpn-director: restart xray-process restarts the Xray process and nothing else" {
+    run_stubbed_cli restart xray-process
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output "tproxy_restart_process"
+}
+
+@test "vpn-director: restart xray-process --unless-stopped leaves a stopped router alone" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli --unless-stopped restart xray-process
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# A full restart leaves the marker in its own stop half. Its apply half must not
+# take that for a stop someone else made.
+@test "vpn-director: restart --unless-stopped re-applies a running router" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    run_stubbed_cli --unless-stopped restart
+    assert_success
+    grep -qx tproxy_apply "$BATS_TEST_TMPDIR/calls"
+    grep -qx tunnel_apply "$BATS_TEST_TMPDIR/calls"
+    [ ! -e "$VPD_STOPPED_FILE" ]
 }
 
 # ============================================================================

@@ -30,8 +30,10 @@ paths: "**/*.sh, jffs/**/*"
 | `get_script_name [-n]` | Script filename; `-n` strips extension |
 | `resolve_ip [-6] [-q] [-g] [-a] <host>` | DNS/hosts resolution |
 | `resolve_lan_ip [-6] [-q] [-a] <host>` | Resolve only private/LAN addresses |
-| `is_lan_ip [-6] <ip>` | Check if IP is in RFC1918/ULA range |
+| `is_lan_ip [-6] <ip>` | Check if IP is in RFC1918/ULA range (prefix only) |
+| `is_ipv4_net <addr>` | IPv4 address or CIDR that iptables and ipset read as written (no leading zeros) |
 | `is_pos_int <value>` | Check if value is positive integer (>=1) |
+| `rt_table_label <table>` | A routing table as `ip rule show` prints it: its rt_tables name, else as given |
 | `strip_comments [text]` | Remove blank lines and # comments |
 | `platform_wan_if` | Active WAN interface (platform contract; `get_active_wan_if` is a wrapper) |
 | `platform_ipv6_enabled` | 1 when IPv6 is enabled (platform contract; `get_ipv6_enabled` is a wrapper) |
@@ -158,7 +160,7 @@ ip rule show | grep -c "fwmark 0x100.*lookup 100"
 ```
 
 KeeneticOS has no `/etc/iproute2/rt_tables`; `ip rule show` prints table numbers,
-and `_tproxy_table_label` falls back to the number so both sides still agree.
+and `rt_table_label` (common.sh) falls back to the number so both sides still agree.
 
 `_tproxy_setup_routing` did exactly this and re-added its rule on every apply —
 seven copies on a router with 23 days of uptime, and auto-apply from the Web UI
@@ -167,19 +169,75 @@ made each click add another.
 **Solution**: the preference belongs to the module, so reconcile everything
 sitting on it instead of looking for one tuple. Keep a rule that carries the
 configured mark and table — comparing what the kernel *prints*, via
-`_tproxy_table_label` — and delete the rest, including rules an earlier
+`rt_table_label` — and delete the rest, including rules an earlier
 `route_table` or `fwmark_mask` left behind. Matching only the configured tuple
 has the mirror-image failure: a stale rule counts as ours, and the new setting
 never gets installed.
 
 ```bash
-want_table=$(_tproxy_table_label "$TABLE")     # 100 -> wan0
+want_table=$(rt_table_label "$TABLE")          # 100 -> wan0
 mark=$(printf '%s' "$line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')
 table=$(printf '%s' "$line" | sed -n 's/.*lookup \([^ ]*\).*/\1/p')
 ```
 
 `ip rule del` removes one rule per call and fails when none is left, so a
 teardown deletes by preference in a loop rather than once.
+
+### `cmd | grep -q` under pipefail reports a match as a failure
+
+**Problem**: `grep -q` exits at its first match. If the command on the left still
+has output to write, that write gets SIGPIPE, the command dies with 141, and
+`pipefail` makes the pipeline report the 141 instead of grep's 0. iproute2 writes
+each rule as it prints it, so `ip rule show | grep -q "^16384:"` read an installed
+rule as missing now and then - measured 35 of 500 applies on one CPU - and the
+caller deleted and re-added a live rule, a window in which marked packets fell
+through to `main`. It is timing-dependent, so it passes every test that does not
+force it.
+
+**Solution**: read the whole output first, then search it:
+
+```bash
+rules=$(ip rule show 2>/dev/null) || true
+[[ $'\n'$rules == *$'\n'"$pref:"* ]]
+```
+
+`grep` without `-q` (or `grep -c`) reads its whole input and is not affected;
+neither is `grep -q` on a here-string.
+
+### Merlin's firewall start empties every mangle chain and deletes none
+
+**Problem**: `mangle_setting()` in the firmware's `rc/firewall.c` runs
+`iptables -t mangle -F` on every firewall start unless traditional QoS, the
+bandwidth limiter or GeForce NOW QoS is on (those go through `add_iQosRules`),
+and `del_iQosRules()` in `qos.c` does the same when QoS stops. `-F` without a
+chain name empties every chain of the table, `TUN_DIR` and `XRAY_TPROXY`
+included, and deletes none of them - mangle is not reloaded with
+`iptables-restore`, which would have. `firewall-start` then runs
+`vpn-director.sh --wait apply`, and a chain that exists no longer says its rules do:
+
+```bash
+# succeeds for an empty chain
+iptables -t mangle -S TUN_DIR >/dev/null 2>&1
+```
+
+On the RT-AX86U (388.11, `qos_enable=0`, no `/tmp/mangle_rules`) that is every
+firewall start. The up-to-date path of `tunnel_apply` took the empty chain for
+applied: it put the PREROUTING jumps back into it and wrote `failover_ready`,
+and every Tunnel Director client left through the WAN until the configuration
+changed.
+
+**Solution**: refill the chain on every apply (`_tproxy_setup_iptables` flushes
+and rebuilds `XRAY_TPROXY`), or look for the rules themselves before calling it
+applied - `_tunnel_marks_present` asks `iptables -C` for every client's MARK
+rule and rebuilds when one is gone. KeeneticOS deletes our chains on every NDM
+rebuild, so there the missing chain is what sends the apply through a rebuild.
+
+Either way the apply after the last firewall start has to run. The firmware
+starts `firewall-start` and `wan-event` without waiting for them
+(`run_custom_script` with no timeout), a WAN coming up does both, and a plain
+`apply` exits at once while another instance holds the lock - so the chains of
+a flush that landed during a running apply stayed empty until the next event.
+Both hooks pass `--wait`, as the KeeneticOS hooks do.
 
 ### A dual-family DNS lookup on the router often never answers
 
