@@ -603,3 +603,58 @@ func TestClientsHandler_HandleAddRoute_PlatformErrorIsReported(t *testing.T) {
 		t.Errorf("the list was not refreshed: editMsgID = %d", sender.editMsgID)
 	}
 }
+
+// failedOverClientsCfg is a committed failover of 192.168.50.8 onto wgc1.
+func failedOverClientsCfg() *vpnconfig.VPNDirectorConfig {
+	return &vpnconfig.VPNDirectorConfig{
+		Xray: vpnconfig.XrayConfig{
+			Failover: &vpnconfig.XrayFailover{
+				Tunnel: "wgc1", Clients: []string{"192.168.50.8"}, Added: []string{"192.168.50.8"}, Committed: true,
+			},
+		},
+		TunnelDirector: vpnconfig.TunnelDirectorConfig{
+			Tunnels: map[string]vpnconfig.TunnelConfig{
+				"wgc1": {Clients: []string{"192.168.50.3", "192.168.50.8"}, Exclude: []string{"ru"}},
+			},
+		},
+	}
+}
+
+// Removing an address during a failover is a decision about it: the restore
+// must not bring it back.
+func TestClientsHandler_HandleRemoveYes_DetachesTheAddressFromTheFailover(t *testing.T) {
+	config := &mockConfigClients{vpnConfig: failedOverClientsCfg()}
+	h := NewClientsHandler(&Deps{Sender: &mockSenderClients{}, Config: config, VPN: &mockVPNClients{}})
+	h.HandleCallback(&tgbotapi.CallbackQuery{
+		Data:    "clients:rm_yes:192.168.50.8",
+		Message: &tgbotapi.Message{MessageID: 42, Chat: &tgbotapi.Chat{ID: 100}},
+	})
+	if config.savedConfig == nil {
+		t.Fatal("expected config to be saved")
+	}
+	if fo := config.savedConfig.Xray.Failover; fo == nil || len(fo.Clients) != 0 || len(fo.Added) != 0 {
+		t.Fatalf("failover %+v; the removed address is still one the restore brings back", fo)
+	}
+}
+
+// Putting an address on a tunnel during a failover is where the user wants it;
+// the restore used to take it back to Xray.
+func TestClientsHandler_HandleAddRoute_DetachesTheAddressFromTheFailover(t *testing.T) {
+	cfg := failedOverClientsCfg()
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.50.3"}, Exclude: []string{"ru"}}
+	config := &mockConfigClients{vpnConfig: cfg}
+	h := NewClientsHandler(&Deps{Sender: &mockSenderClients{}, Config: config, VPN: &mockVPNClients{}})
+	h.mu.Lock()
+	h.addState[100] = "192.168.50.8"
+	h.mu.Unlock()
+	h.HandleCallback(&tgbotapi.CallbackQuery{
+		Data:    "clients:route:wgc1",
+		Message: &tgbotapi.Message{MessageID: 42, Chat: &tgbotapi.Chat{ID: 100}},
+	})
+	if config.savedConfig == nil {
+		t.Fatal("expected config to be saved")
+	}
+	if fo := config.savedConfig.Xray.Failover; fo == nil || len(fo.Clients) != 0 || len(fo.Added) != 0 {
+		t.Fatalf("failover %+v; the restore would take the address off the tunnel it was just put on", fo)
+	}
+}

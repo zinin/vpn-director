@@ -1006,3 +1006,63 @@ func TestHandleAddClient_PlatformUnavailableIs503(t *testing.T) {
 		t.Error("nothing may be saved when the route could not be validated")
 	}
 }
+
+// failedOverClients is a committed failover of 192.168.50.8 onto wgc1.
+func failedOverClients() *vpnconfig.VPNDirectorConfig {
+	return &vpnconfig.VPNDirectorConfig{
+		Xray: vpnconfig.XrayConfig{
+			Failover: &vpnconfig.XrayFailover{
+				Tunnel: "wgc1", Clients: []string{"192.168.50.8"}, Added: []string{"192.168.50.8"}, Committed: true,
+			},
+		},
+		TunnelDirector: vpnconfig.TunnelDirectorConfig{
+			Tunnels: map[string]vpnconfig.TunnelConfig{
+				"wgc1": {Clients: []string{"192.168.50.3", "192.168.50.8"}, Exclude: []string{"ru"}},
+			},
+		},
+	}
+}
+
+// Deleting an address during a failover is a decision about it: the restore
+// must not bring it back, and an address added again later is a new client,
+// not the old snapshot.
+func TestHandleDeleteClient_DetachesTheAddressFromTheFailover(t *testing.T) {
+	mc := &mockConfig{cfg: failedOverClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+
+	rec := httptest.NewRecorder()
+	handleDeleteClient(deps).ServeHTTP(rec, httptest.NewRequest("DELETE", "/api/clients?ip=192.168.50.8", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	fo := mc.savedCfg.Xray.Failover
+	if fo == nil || len(fo.Clients) != 0 || len(fo.Added) != 0 {
+		t.Fatalf("failover %+v; the deleted address is still one the restore brings back", fo)
+	}
+}
+
+// Putting an address on a tunnel during a failover is where the user wants it.
+// Left in the failover record, the restore took it off that tunnel and back to
+// Xray.
+func TestHandleAddClient_DetachesTheAddressFromTheFailover(t *testing.T) {
+	cfg := failedOverClients()
+	// Deleted by an earlier build, which left the record as it was.
+	cfg.TunnelDirector.Tunnels["wgc1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.50.3"}, Exclude: []string{"ru"}}
+	mc := &mockConfig{cfg: cfg}
+	deps := newTestDeps(t)
+	deps.Config = mc
+
+	rec := httptest.NewRecorder()
+	handleAddClient(deps).ServeHTTP(rec, httptest.NewRequest("POST", "/api/clients", strings.NewReader(`{"ip": "192.168.50.8", "route": "wgc1"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	fo := mc.savedCfg.Xray.Failover
+	if fo == nil || len(fo.Clients) != 0 || len(fo.Added) != 0 {
+		t.Fatalf("failover %+v; the restore would take the address off the tunnel it was just put on", fo)
+	}
+	if !strings.Contains(strings.Join(mc.savedCfg.TunnelDirector.Tunnels["wgc1"].Clients, ","), "192.168.50.8") {
+		t.Fatalf("wgc1 %v", mc.savedCfg.TunnelDirector.Tunnels["wgc1"].Clients)
+	}
+}

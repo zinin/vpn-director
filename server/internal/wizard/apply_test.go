@@ -1061,3 +1061,44 @@ func TestApplier_Apply_RefusesToSaveWhenThePlatformCannotValidateARoute(t *testi
 		t.Errorf("user was told %q, want the platform-unavailable message", sender.messages)
 	}
 }
+
+// The wizard's save is the user's whole assignment. An address it puts on a
+// tunnel during a failover is where the user wants it - the restore used to take
+// it off that tunnel and back to Xray - and one it drops is gone. Only what it
+// keeps on Xray stays with the failover.
+func TestApplier_Apply_DetachesFromTheFailoverWhatItDoesNotKeepOnXray(t *testing.T) {
+	configStore := &trackingConfigStore{
+		servers: []vpnconfig.Server{{Name: "Server1", IPs: []string{"1.2.3.4"}, Address: "srv1.example.com", Port: 443}},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{
+			Xray: vpnconfig.XrayConfig{
+				Failover: &vpnconfig.XrayFailover{
+					Tunnel:    "wgc1",
+					Clients:   []string{"192.168.1.8", "192.168.1.9", "192.168.1.7"},
+					Added:     []string{"192.168.1.8", "192.168.1.9", "192.168.1.7"},
+					Committed: true,
+				},
+			},
+			TunnelDirector: vpnconfig.TunnelDirectorConfig{Tunnels: map[string]vpnconfig.TunnelConfig{
+				"wgc1": {Clients: []string{"192.168.1.8", "192.168.1.9", "192.168.1.7"}},
+			}},
+		},
+	}
+	applier := NewApplier(&trackingManager{}, &trackingSender{}, configStore, &mockVPNDirector{platform: platformWith("wgc1")}, &mockXrayGenerator{})
+	state := &State{
+		ChatID:      123,
+		Step:        StepConfirm,
+		ServerIndex: 0,
+		Exclusions:  map[string]bool{"ru": true},
+		Clients: []ClientRoute{
+			{IP: "192.168.1.8", Route: "wgc1"},
+			{IP: "192.168.1.9", Route: "xray"},
+		},
+	}
+	if err := applier.Apply(123, state); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	fo := configStore.savedConfig.Xray.Failover
+	if fo == nil || strings.Join(fo.Clients, ",") != "192.168.1.9" || strings.Join(fo.Added, ",") != "192.168.1.9" {
+		t.Fatalf("failover %+v, want only the address kept on Xray", fo)
+	}
+}

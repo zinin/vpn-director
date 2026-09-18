@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 
 	"github.com/zinin/vpn-director/server/internal/service"
@@ -172,6 +173,17 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 			}
 		}
 		vpnCfg.TunnelDirector.Tunnels = tunnels
+		// The save is the user's whole assignment. During a failover an
+		// address put on a tunnel is where the user wants it - a restore used
+		// to take it off that tunnel and back to Xray - and one left out is
+		// gone. Only what stays on Xray stays with the failover.
+		if fo := vpnCfg.Xray.Failover; fo != nil {
+			for _, addr := range append([]string(nil), fo.Clients...) {
+				if !slices.Contains(xrayClients, addr) {
+					vpnconfig.DetachFailoverClient(vpnCfg, addr)
+				}
+			}
+		}
 		// The wizard stores addresses as entered, so a client the old wizard
 		// wrote as 1.2.3.4/32 comes back as 1.2.3.4. paused_clients is matched
 		// literally, so its entry has to follow or the client resumes on its
