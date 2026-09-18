@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
@@ -39,5 +40,41 @@ func TestPublishServers_KeepsTheListWithoutAConfig(t *testing.T) {
 	}
 	if len(store.savedServers) != 1 {
 		t.Fatalf("savedServers %v; an imported list must survive a missing config", store.savedServers)
+	}
+}
+
+// A re-import from the saved link publishes only while that link is still the
+// saved one: another importer may have saved a different subscription while
+// this download ran, and its list must not be replaced by one the saved link no
+// longer produces.
+func TestPublishImport_RefusesAListFromALinkNoLongerSaved(t *testing.T) {
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		SubscriptionURL: "https://cdn.example/s/b",
+		Servers:         []string{"198.51.100.1"},
+	}}}
+
+	err := PublishImport(store, []vpnconfig.Server{{IPs: []string{"203.0.113.10"}}}, "", "https://cdn.example/s/a")
+	if !errors.Is(err, vpnconfig.ErrSubscriptionChanged) {
+		t.Fatalf("err %v, want ErrSubscriptionChanged", err)
+	}
+	if store.savedServers != nil {
+		t.Fatalf("savedServers %v; servers.json must keep the newer subscription's list", store.savedServers)
+	}
+	if !reflect.DeepEqual(store.cfg.Xray.Servers, []string{"198.51.100.1"}) {
+		t.Fatalf("Xray.Servers %v", store.cfg.Xray.Servers)
+	}
+}
+
+// An import that named its link writes that link together with its list, so
+// there is nothing to compare: the pair is consistent by construction.
+func TestPublishImport_StoresTheLinkItWasGiven(t *testing.T) {
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://cdn.example/s/b"}}}
+
+	err := PublishImport(store, []vpnconfig.Server{{IPs: []string{"203.0.113.10"}}}, "https://cdn.example/s/a", "https://cdn.example/s/a")
+	if err != nil {
+		t.Fatalf("PublishImport: %v", err)
+	}
+	if store.cfg.Xray.SubscriptionURL != "https://cdn.example/s/a" || len(store.savedServers) != 1 {
+		t.Fatalf("url %q, saved %v", store.cfg.Xray.SubscriptionURL, store.savedServers)
 	}
 }

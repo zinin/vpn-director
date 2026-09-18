@@ -227,8 +227,10 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 		// and say which half landed - the client must not read a 500 that left
 		// servers.json published as "nothing changed", nor one that published
 		// nothing as "servers saved".
-		if err := service.PublishServers(deps.Config, result.Servers, req.URL); err != nil {
+		if err := service.PublishImport(deps.Config, result.Servers, req.URL, fetchURL); err != nil {
 			switch {
+			case errors.Is(err, vpnconfig.ErrSubscriptionChanged):
+				jsonError(w, http.StatusConflict, "the saved subscription changed while downloading; nothing was imported")
 			case errors.Is(err, vpnconfig.ErrSaveServers):
 				jsonError(w, http.StatusInternalServerError, "failed to save servers")
 			case errors.Is(err, service.ErrConfigLockTimeout):

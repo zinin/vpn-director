@@ -93,6 +93,11 @@ the lock and restarts Xray instead of applying, and `/api/servers/import` only
 writes `servers.json` and `xray.servers`, both inside one config-lock update
 (`vpnconfig.PublishServers`), because `SaveServers` takes no lock of its own and
 `Deps.OpMutex` does not reach the bot's `/import` or the subscription watch.
+A re-import from the saved link (empty `url`) goes through `service.PublishImport`,
+which publishes only while `xray.subscription_url` is still the link it downloaded:
+another importer may save a different subscription meanwhile, and the list would
+then sit beside a link that did not produce it. The refusal is a 409 and writes
+nothing; the bot's `/import` without arguments does the same.
 All of them serialize on `Deps.OpMutex`.
 
 ## Authentication

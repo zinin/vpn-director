@@ -115,7 +115,12 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	// beside one of theirs. A missing vpn-director.json is not an error here:
 	// /import works before the first configure, and the wizard writes
 	// xray.servers itself.
-	err = service.PublishServers(h.deps.Config, result.Servers, args)
+	err = service.PublishImport(h.deps.Config, result.Servers, args, fetchURL)
+	if errors.Is(err, vpnconfig.ErrSubscriptionChanged) {
+		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
+			"The saved subscription changed while downloading; nothing was imported. Run /import again."))
+		return
+	}
 	if errors.Is(err, vpnconfig.ErrSaveServers) {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Save error: %v", err)))
 		return

@@ -93,3 +93,16 @@ func TestRecordActiveServer_CountsWrites(t *testing.T) {
 		t.Fatalf("record %+v", again)
 	}
 }
+
+func TestSubscriptionUnchanged(t *testing.T) {
+	guard := SubscriptionUnchanged("https://cdn.example/s/a")
+	if err := guard(&VPNDirectorConfig{Xray: XrayConfig{SubscriptionURL: "https://cdn.example/s/a"}}); err != nil {
+		t.Fatalf("same link refused: %v", err)
+	}
+	if err := guard(&VPNDirectorConfig{Xray: XrayConfig{SubscriptionURL: "https://cdn.example/s/b"}}); !errors.Is(err, ErrSubscriptionChanged) {
+		t.Fatalf("err %v, want ErrSubscriptionChanged", err)
+	}
+	if err := guard(nil); err != nil {
+		t.Fatalf("no config has no saved link to disagree with: %v", err)
+	}
+}

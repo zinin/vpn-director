@@ -5,6 +5,25 @@ import (
 	"fmt"
 )
 
+// ErrSubscriptionChanged is a publication its guard refused: the saved link is no
+// longer the one the list was downloaded from.
+var ErrSubscriptionChanged = errors.New("the saved subscription changed while the list was downloading")
+
+// SubscriptionUnchanged is the guard for a list downloaded from the saved link
+// rather than one its importer named. A download takes long enough for another
+// importer to save a different subscription meanwhile; publishing then would
+// leave this list beside a link that did not produce it, and every later
+// refresh would fetch that link against the wrong list. With no config there is
+// no saved link to disagree with.
+func SubscriptionUnchanged(url string) func(*VPNDirectorConfig) error {
+	return func(cfg *VPNDirectorConfig) error {
+		if cfg != nil && cfg.Xray.SubscriptionURL != url {
+			return ErrSubscriptionChanged
+		}
+		return nil
+	}
+}
+
 // ErrSaveServers marks a PublishServers failure that came from servers.json
 // itself, which leaves the bypass list alone. Any other error means the list
 // is published and only the config it is read against is not.

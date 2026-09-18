@@ -816,6 +816,110 @@ func TestTick_StopWhileTheReturnToPreferredWaitsWritesNothing(t *testing.T) {
 	}
 }
 
+// stopWhileWriting is an UpdateVPN whose write waits for the config lock while
+// a /stop finishes: by the time the callback runs, the marker is there.
+func stopWhileWriting(f *fake, stopped *bool) func(func(*vpnconfig.VPNDirectorConfig) error) error {
+	return func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		*stopped = true
+		return fn(f.cfg)
+	}
+}
+
+// Every config write of the watch can wait for the lock, and the check made
+// before that wait says nothing about the router after it. A write that lands
+// on a stopped router takes effect on its next manual apply.
+func TestTick_StopWhileTheRestoreStageWaitsWritesNothing(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	stopped := false
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.UpdateVPN = stopWhileWriting(f, &stopped)
+
+	w.Tick(context.Background())
+
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("staged onto Xray after /stop")
+	}
+	if f.cfg.Xray.Failover == nil {
+		t.Fatal("the failover record must stay as the stop found it")
+	}
+	if f.applies != 0 || len(f.notes) != 0 {
+		t.Fatalf("applies %d, notes %v after /stop", f.applies, f.notes)
+	}
+}
+
+func TestTick_StopWhileTheMoveWaitsForTheLockStagesNothing(t *testing.T) {
+	f := &fake{
+		cfg:      baseCfg(),
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	stopped := false
+	w := f.watch()
+	w.Stopped = func() bool { return stopped }
+	w.UpdateVPN = stopWhileWriting(f, &stopped)
+
+	tickUntilDead(w, f)
+
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v staged after /stop", f.cfg.Xray.Failover)
+	}
+	if f.applies != 0 || len(f.notes) != 0 {
+		t.Fatalf("applies %d, notes %v after /stop", f.applies, f.notes)
+	}
+}
+
+func TestTick_StopWhileTheCommitWaitsKeepsTheStage(t *testing.T) {
+	cfg := baseCfg()
+	vpnconfig.StageXrayClientsToTunnel(cfg, "ovpnc2")
+	f := &fake{
+		cfg:      cfg,
+		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+		probeErr: errProbe,
+		now:      time.Unix(1_700_000_000, 0),
+	}
+	stopped := false
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.UpdateVPN = stopWhileWriting(f, &stopped)
+
+	w.Tick(context.Background())
+
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("committed the failover after /stop")
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v after /stop", f.notes)
+	}
+}
+
+func TestTick_StopWhileThePublicationWaitsWritesNothing(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	stopped := false
+	saves := 0
+	w := runningWatch(f.watch())
+	w.Stopped = func() bool { return stopped }
+	w.UpdateVPN = stopWhileWriting(f, &stopped)
+	w.SaveServers = func([]vpnconfig.Server) error {
+		saves++
+		return nil
+	}
+	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443, IPs: []string{"203.0.113.10"}}}, nil
+	}
+	w.Generate = f.generateAll
+
+	w.Tick(context.Background())
+
+	if saves != 0 || len(f.cfg.Xray.Servers) != 0 {
+		t.Fatalf("saves %d, xray.servers %v published after /stop", saves, f.cfg.Xray.Servers)
+	}
+	if len(f.notes) != 0 {
+		t.Fatalf("notes %v after /stop", f.notes)
+	}
+}
+
 func TestTick_PlatformErrorDoesNotAnnounceNoTunnel(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
@@ -1180,6 +1284,62 @@ func TestTick_RestoreStagesOnceTPROXYIsReady(t *testing.T) {
 	}
 	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatal("fallback membership must be dropped once the clients are on Xray")
+	}
+	restored := 0
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "LAN clients back on Xray") {
+			restored++
+		}
+	}
+	if restored != 1 {
+		t.Fatalf("notes %v, want one restore announcement", f.notes)
+	}
+}
+
+// The apply that drops the fallback membership is also the one that has to keep
+// TPROXY up. When it soft-fails - exit 0, marker gone - the clients have neither
+// the proxy nor the tunnel, and after a finished restore nothing would try
+// again: the failover goes back in, committed, until TPROXY can carry them.
+func TestTick_RestoreReinstatesTheFailoverWhenTheFinalApplyLosesTPROXY(t *testing.T) {
+	f := &fake{cfg: failedOverCfg(), probeErr: nil, now: time.Unix(1_700_000_000, 0)}
+	ready := true
+	w := runningWatch(f.watch())
+	w.TPROXYReady = func() bool { return ready }
+	w.Apply = func() error {
+		f.applies++
+		if f.applies == 2 {
+			ready = false // the apply after the membership drop loses TPROXY
+		}
+		return nil
+	}
+
+	w.Tick(context.Background())
+
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" {
+		t.Fatalf("failover %+v; a restore that lost TPROXY must go back onto the fallback tunnel", f.cfg.Xray.Failover)
+	}
+	if contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatal("the client must leave xray.clients while TPROXY cannot carry it, or TUN_DIR never sees it")
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("the client must be back on the fallback tunnel")
+	}
+	for _, n := range f.notes {
+		if strings.HasPrefix(n, "LAN clients back on Xray") {
+			t.Fatalf("announced a restore that did not hold: %v", f.notes)
+		}
+	}
+
+	// TPROXY comes back: the next attempt finishes the restore and says so once.
+	ready = true
+	w.Apply = func() error {
+		f.applies++
+		return nil
+	}
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil || !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v; the restore must finish once TPROXY is back", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
 	}
 	restored := 0
 	for _, n := range f.notes {

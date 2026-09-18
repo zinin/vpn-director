@@ -109,6 +109,42 @@ func TestImportHandler_HandleImport_NoArgsUsesSavedURL(t *testing.T) {
 	}
 }
 
+// A /import without a link re-downloads the saved one. If another importer saves
+// a different subscription while that download runs, publishing would leave the
+// old list beside the new link, and every later refresh would fetch the new link
+// against a list it did not produce.
+func TestImportHandler_HandleImport_SavedLinkChangedDuringDownload(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443?type=tcp#Oslo"))
+	config := &mockConfigStoreForImport{dataDirVal: t.TempDir()}
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Another import saves a different subscription while this one downloads.
+		config.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(encoded))
+	}))
+	defer server.Close()
+
+	sender := &mockSender{}
+	config.cfg = &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{SubscriptionURL: server.URL}}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+	msg := &tgbotapi.Message{
+		Chat:     &tgbotapi.Chat{ID: 123},
+		Text:     "/import",
+		Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 7}},
+	}
+
+	h.HandleImport(msg)
+
+	if config.savedServers != nil || len(config.cfg.Xray.Servers) != 0 {
+		t.Fatalf("published a list the saved link no longer produces: saved %v, xray.servers %v; last message %q",
+			config.savedServers, config.cfg.Xray.Servers, sender.lastText)
+	}
+	if !strings.Contains(sender.lastText, "changed while downloading") {
+		t.Fatalf("message %q; the user must learn why nothing was imported", sender.lastText)
+	}
+}
+
 // failingTransport fails every request the way an unreachable host does.
 type failingTransport struct{ err error }
 

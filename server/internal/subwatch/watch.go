@@ -163,6 +163,9 @@ func (w *Watch) Tick(ctx context.Context) {
 		wasPending := w.pendingApply || staged
 		var ok bool
 		cfg, ok = w.applyFailover(cfg)
+		if w.stopped() {
+			return
+		}
 		if ok && wasPending {
 			if id := failoverTunnel(cfg); id != "" {
 				n := 0
@@ -276,7 +279,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		return
 	}
 	movedClients := 0
-	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+	if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
 		vpnconfig.StageXrayClientsToTunnel(current, id)
 		if current.Xray.Failover == nil {
 			return fmt.Errorf("tunnel %s no longer configured", id)
@@ -284,7 +287,9 @@ func (w *Watch) Tick(ctx context.Context) {
 		movedClients = len(current.Xray.Failover.Clients)
 		return nil
 	}); err != nil {
-		slog.Warn("Failed to move Xray clients to Tunnel Director", "tunnel", id, "error", err)
+		if !errors.Is(err, errStopped) {
+			slog.Warn("Failed to move Xray clients to Tunnel Director", "tunnel", id, "error", err)
+		}
 		return
 	}
 	if err := w.apply(); err != nil {
@@ -301,6 +306,11 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	var ok bool
 	cfg, ok = w.applyFailover(cfg)
+	// The commit inside can wait for the config lock; a stop that finished
+	// meanwhile refused it, and nothing below may announce or retry it.
+	if w.stopped() {
+		return
+	}
 	if !ok {
 		if !w.pendingApply {
 			w.notify(noteFallbackNotReady, msgFallbackNotReady)
@@ -335,11 +345,13 @@ func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPND
 		return cfg, false
 	}
 	if w.UpdateVPN != nil {
-		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+		if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
 			vpnconfig.CommitXrayFailover(current)
 			return nil
 		}); err != nil {
-			slog.Warn("Failed to drop staged Xray clients after the tunnel apply", "error", err)
+			if !errors.Is(err, errStopped) {
+				slog.Warn("Failed to drop staged Xray clients after the tunnel apply", "error", err)
+			}
 			return cfg, false
 		}
 	}
@@ -416,10 +428,6 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 // errSuperseded is a Generate its guard refused: xray.active_server names a
 // server the walk did not put there.
 var errSuperseded = errors.New("a newer server was selected")
-
-// errSubscriptionChanged is a publication its guard refused: the saved link is
-// no longer the one this wave downloaded.
-var errSubscriptionChanged = errors.New("the subscription URL changed")
 
 func (w *Watch) walkSuperseded(started, lastRecorded string, expectedSeq int) bool {
 	if w.LoadVPN == nil {
@@ -530,14 +538,17 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	// The same lock is where the saved link is checked: a download takes longer
 	// than it takes someone to paste another subscription, and publishing this
 	// list then leaves it beside a link that did not produce it.
-	sameURL := func(current *vpnconfig.VPNDirectorConfig) error {
-		if current.Xray.SubscriptionURL != rawURL {
-			return errSubscriptionChanged
-		}
-		return nil
+	var update func(func(*vpnconfig.VPNDirectorConfig) error) error
+	if w.UpdateVPN != nil {
+		update = w.update
 	}
-	if err := vpnconfig.PublishServers(w.UpdateVPN, w.SaveServers, servers, "", sameURL); err != nil {
-		if errors.Is(err, errSubscriptionChanged) {
+	if err := vpnconfig.PublishServers(update, w.SaveServers, servers, "", vpnconfig.SubscriptionUnchanged(rawURL)); err != nil {
+		if errors.Is(err, errStopped) {
+			// Refused under the lock: the wave did not happen.
+			w.lastImport = prevImport
+			return
+		}
+		if errors.Is(err, vpnconfig.ErrSubscriptionChanged) {
 			slog.Info("Subscription refresh abandoned; the saved link is no longer the one that was downloaded")
 			// The link that replaced it deserves a wave of its own rather than
 			// the wait left over from the one thrown away.
@@ -717,6 +728,19 @@ func (w *Watch) stopped() bool {
 	return w.Stopped != nil && w.Stopped()
 }
 
+// update is UpdateVPN with the stop marker checked inside the locked callback,
+// after whatever the wait for the config lock cost. The check made before that
+// wait says nothing about the router after it, and a write that lands on a
+// stopped router takes effect on its next manual apply.
+func (w *Watch) update(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	return w.UpdateVPN(func(cfg *vpnconfig.VPNDirectorConfig) error {
+		if w.stopped() {
+			return errStopped
+		}
+		return fn(cfg)
+	})
+}
+
 func (w *Watch) apply() error {
 	if w.Apply == nil {
 		return nil
@@ -816,11 +840,13 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	startedCommitted := !vpnconfig.FailoverStaged(cfg)
 	if w.UpdateVPN != nil {
-		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+		if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
 			vpnconfig.EnsureFailoverStaged(current)
 			return nil
 		}); err != nil {
-			slog.Warn("Failed to stage Xray clients for restore", "error", err)
+			if !errors.Is(err, errStopped) {
+				slog.Warn("Failed to stage Xray clients for restore", "error", err)
+			}
 			return false
 		}
 	}
@@ -841,12 +867,20 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 		return false
 	}
 	w.lastTPROXYFail = time.Time{}
+	var removed *vpnconfig.XrayFailover
+	var restored []string
 	if w.UpdateVPN != nil {
-		if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
-			vpnconfig.RestoreXrayClientsFromFailover(current)
+		if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
+			if current.Xray.Failover != nil {
+				fo := *current.Xray.Failover
+				removed = &fo
+			}
+			restored = vpnconfig.RestoreXrayClientsFromFailover(current)
 			return nil
 		}); err != nil {
-			slog.Warn("Failed to restore Xray clients from the failover", "error", err)
+			if !errors.Is(err, errStopped) {
+				slog.Warn("Failed to restore Xray clients from the failover", "error", err)
+			}
 			return false
 		}
 	}
@@ -856,12 +890,68 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig) bool {
 		w.pendingRestoreNotify = true
 		return false
 	}
+	if !w.tproxyReady() {
+		// The apply that dropped the fallback membership is also the one that
+		// had to keep TPROXY up. It soft-failed - exit 0, marker gone - so these
+		// clients have neither the proxy nor the tunnel, and a finished restore
+		// would leave nothing to try again. They go back on the tunnel as a
+		// committed failover; the ready gate above restores them once the
+		// marker returns.
+		slog.Warn("TPROXY stopped intercepting during the restore; putting the clients back on the fallback tunnel")
+		w.lastTPROXYFail = w.Now()
+		w.reinstateFailover(removed, restored)
+		return false
+	}
 	w.pendingApply = false
 	w.pendingRestoreNotify = false
 	w.failSince = time.Time{}
 	w.lastImport = time.Time{}
 	w.importRetry = 0
 	return true
+}
+
+// reinstateFailover puts a restore that did not hold back as a committed
+// failover: the restored addresses leave xray.clients, where a TPROXY that
+// cannot carry them would keep TUN_DIR from seeing them, and go back onto the
+// tunnel under the record that was removed. Only what the restore moved goes
+// back - an address the user took off the tunnel meanwhile stays off.
+func (w *Watch) reinstateFailover(removed *vpnconfig.XrayFailover, restored []string) {
+	if removed == nil || len(restored) == 0 || w.UpdateVPN == nil {
+		return
+	}
+	snapshot := &vpnconfig.XrayFailover{Tunnel: removed.Tunnel, Clients: restored, Added: keepOnly(removed.Added, restored)}
+	if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
+		vpnconfig.ApplyFailoverSnapshot(current, snapshot)
+		return nil
+	}); err != nil {
+		if !errors.Is(err, errStopped) {
+			slog.Warn("Failed to put the Xray clients back on the fallback tunnel", "error", err)
+		}
+		return
+	}
+	if err := w.apply(); err != nil {
+		slog.Warn("Apply after putting the Xray clients back on the fallback tunnel failed", "error", err)
+		w.pendingApply = true
+	}
+}
+
+// keepOnly is list without the entries keep does not name. A nil list stays
+// nil: a failover record without Added is the older kind, whose restore drops
+// every snapshot address from the tunnel, and an empty one would drop none.
+func keepOnly(list, keep []string) []string {
+	if list == nil {
+		return nil
+	}
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		for _, k := range keep {
+			if s == k {
+				out = append(out, s)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func committedFailover(cfg *vpnconfig.VPNDirectorConfig) bool {
@@ -919,12 +1009,14 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 	if next == "" || w.UpdateVPN == nil {
 		return cfg
 	}
-	if err := w.UpdateVPN(func(current *vpnconfig.VPNDirectorConfig) error {
+	if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
 		vpnconfig.RestoreXrayClientsFromFailover(current)
 		vpnconfig.StageXrayClientsToTunnel(current, next)
 		return nil
 	}); err != nil {
-		slog.Warn("Failed to retarget the Xray failover", "from", skip, "to", next, "error", err)
+		if !errors.Is(err, errStopped) {
+			slog.Warn("Failed to retarget the Xray failover", "from", skip, "to", next, "error", err)
+		}
 		return cfg
 	}
 	if err := w.apply(); err != nil {
