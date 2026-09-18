@@ -309,17 +309,18 @@ step_get_vless_file() {
 }
 
 ###############################################################################
-# Step 2: Parse and save servers
+# Step 2: Parse servers
 ###############################################################################
 
-step_parse_and_save_servers() {
+# The list goes to a temp file, and step 3 publishes it. Resolving takes
+# seconds per host, and servers.json written in place sat empty for all of
+# them - and was gone when none resolved.
+step_parse_servers() {
     log -l TRACE "Step 2: Parsing Servers"
 
     DATA_DIR=$(get_data_dir)
     SERVERS_FILE="$DATA_DIR/servers.json"
-
-    # Ensure data directory exists
-    mkdir -p "$DATA_DIR"
+    SERVERS_TMP=$(tmp_file)
 
     # Parse servers, resolve IPs, emit one JSON object per server, slurp to array
     printf '%s\n' "$VLESS_SERVERS" | grep '^vless://' | while IFS= read -r uri; do
@@ -377,45 +378,50 @@ step_parse_and_save_servers() {
               security:$security, network:$network, flow:$flow, sni:$sni,
               fingerprint:$fingerprint, public_key:$public_key, short_id:$short_id, alpn:$alpn}
              | with_entries(select(.value != null and .value != "" and .value != []))'
-    done | jq -s '.' > "$SERVERS_FILE"
+    done | jq -s '.' > "$SERVERS_TMP"
 
     # Validate JSON
-    if ! jq empty "$SERVERS_FILE" 2>/dev/null; then
+    if ! jq empty "$SERVERS_TMP" 2>/dev/null; then
         log -l ERROR "Generated invalid JSON"
-        cat "$SERVERS_FILE"
+        cat "$SERVERS_TMP"
         exit 1
     fi
 
-    SERVER_COUNT=$(jq length "$SERVERS_FILE")
+    SERVER_COUNT=$(jq length "$SERVERS_TMP")
 
     if [[ "$SERVER_COUNT" -eq 0 ]]; then
         log -l ERROR "No servers could be resolved"
-        rm -f "$SERVERS_FILE"
         exit 1
     fi
-
-    log "Saved $SERVER_COUNT servers to $SERVERS_FILE"
 }
 
 ###############################################################################
-# Step 3: Remember where the list came from
+# Step 3: Publish the list with the link it came from
 ###############################################################################
 
-# The Telegram bot's subscription watch re-imports xray.subscription_url when the
-# Xray outbound dies, and the Web UI and /import re-import it on request. A list
-# imported here from another link would be replaced by the old link's on the next
-# refresh, so an https link is saved with it. Anything else clears the saved
-# link: neither fetches a file or a plain-http link, and the old link no longer
-# produced the list. The write goes under the lock the daemons and configure.sh
-# take. Before configure.sh has run there is no config, and nothing refreshes.
-step_save_subscription_url() {
-    [[ -f $VPD_CONFIG ]] || return 0
-
-    local filter='del(.xray.subscription_url)'
+# servers.json, xray.servers (the proxy's own addresses, which TPROXY bypasses)
+# and xray.subscription_url go out together, under the lock the daemons and
+# configure.sh take. The bot's subscription watch, the Web UI and /import
+# publish the same three under it; a list written outside it could land beside
+# another import's bypass set or link. Nothing is written before the lock is
+# held, so an import that cannot get it leaves the previous one whole.
+#
+# The watch re-imports xray.subscription_url when the Xray outbound dies, and
+# the Web UI and /import re-import it on request. A list imported here from
+# another link would be replaced by the old link's on the next refresh, so an
+# https link is saved with it. Anything else clears the saved link: neither
+# fetches a file or a plain-http link, and the old link no longer produced the
+# list. Before configure.sh has run there is no config: the list alone is
+# published, and nothing refreshes it.
+step_publish_servers() {
+    local link='del(.xray.subscription_url)'
     if [[ $VLESS_INPUT == https://* ]]; then
         # shellcheck disable=SC2016  # $url is jq's, set with --arg below
-        filter='.xray.subscription_url = $url'
+        link='.xray.subscription_url = $url'
     fi
+    local ips
+    ips=$(jq -c '[.[].ips[]?] | unique' "$SERVERS_TMP")
+    mkdir -p "$DATA_DIR"
 
     # BusyBox flock has no -w, hence the loop.
     exec 9>"${VPD_CONFIG%/*}/.${VPD_CONFIG##*/}.lock"
@@ -423,7 +429,7 @@ step_save_subscription_url() {
     until flock -n 9; do
         if [[ $waited -ge ${VPD_CONFIG_LOCK_WAIT:-30} ]]; then
             exec 9>&-
-            log -l ERROR "Config is locked by the Web UI or the bot; the subscription link was not updated. Run the import again"
+            log -l ERROR "Config is locked by the Web UI or the bot; nothing was imported. Run the import again"
             return 1
         fi
         [[ $waited -eq 0 ]] && log "Waiting for the config lock..."
@@ -431,21 +437,31 @@ step_save_subscription_url() {
         waited=$((waited + 1))
     done
 
-    # A temp file and a rename: a '>' redirect would truncate the live config
-    # before jq has read it.
-    local tmp
-    tmp=$(mktemp "$VPD_CONFIG.XXXXXX")
-    if ! jq --arg url "$VLESS_INPUT" "$filter" "$VPD_CONFIG" > "$tmp"; then
-        rm -f "$tmp"
-        flock -u 9
-        exec 9>&-
-        log -l ERROR "Failed to update the subscription link in $VPD_CONFIG"
-        return 1
+    # Temp files beside their targets and renames: a '>' redirect would
+    # truncate a live file before its new content is there, and jq would read
+    # the config it had just truncated.
+    local list config=""
+    list=$(mktemp "$SERVERS_FILE.XXXXXX")
+    cp "$SERVERS_TMP" "$list"
+    chmod 600 "$list"
+    if [[ -f $VPD_CONFIG ]]; then
+        config=$(mktemp "$VPD_CONFIG.XXXXXX")
+        if ! jq --argjson ips "$ips" --arg url "$VLESS_INPUT" ".xray.servers = \$ips | $link" \
+            "$VPD_CONFIG" > "$config"; then
+            rm -f "$list" "$config"
+            flock -u 9
+            exec 9>&-
+            log -l ERROR "Failed to update $VPD_CONFIG; nothing was imported"
+            return 1
+        fi
+        chmod 600 "$config"
     fi
-    chmod 600 "$tmp"
-    mv -f "$tmp" "$VPD_CONFIG"
+    mv -f "$list" "$SERVERS_FILE"
+    [[ -z $config ]] || mv -f "$config" "$VPD_CONFIG"
     flock -u 9
     exec 9>&-
+
+    log "Saved $SERVER_COUNT servers to $SERVERS_FILE"
 }
 
 ###############################################################################
@@ -457,8 +473,8 @@ main() {
     printf "This will download and parse VLESS servers.\n\n"
 
     step_get_vless_file
-    step_parse_and_save_servers
-    step_save_subscription_url
+    step_parse_servers
+    step_publish_servers
 
     log -l TRACE "Import Complete"
     printf "Server list saved. Run /opt/vpn-director/configure.sh to continue setup.\n"
