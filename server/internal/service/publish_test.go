@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 
@@ -43,6 +44,26 @@ func TestPublishServers_KeepsTheListWithoutAConfig(t *testing.T) {
 	}
 	if len(store.savedServers) != 1 {
 		t.Fatalf("savedServers %v; an imported list must survive a missing config", store.savedServers)
+	}
+}
+
+// Only a missing vpn-director.json is the router before its first configure. One
+// that is there but does not parse was taken for it too: the list went to the
+// default data directory, whatever data_dir the file names, while the bypass
+// list and the saved link stayed as they were.
+func TestPublishServers_AConfigThatDoesNotParsePublishesNothing(t *testing.T) {
+	dir := t.TempDir()
+	defaultData := filepath.Join(dir, "data")
+	writeTestConfig(t, dir, `{"data_dir": "`+filepath.Join(dir, "usb")+`",}`)
+	svc := NewConfigService(dir, defaultData)
+
+	err := PublishServers(svc, []vpnconfig.Server{{IPs: []string{"203.0.113.10"}}}, "https://cdn.example/s/token")
+
+	if !errors.Is(err, ErrConfigLoad) || errors.Is(err, vpnconfig.ErrServersSaved) {
+		t.Fatalf("err %v, want a load failure that saved nothing", err)
+	}
+	if _, serr := os.Stat(filepath.Join(defaultData, "servers.json")); !errors.Is(serr, os.ErrNotExist) {
+		t.Fatalf("servers.json in the default data directory: %v", serr)
 	}
 }
 

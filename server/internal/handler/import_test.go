@@ -192,6 +192,29 @@ func TestImportHandler_HandleImport_BeforeTheFirstConfigureSavesTheList(t *testi
 	}
 }
 
+// A vpn-director.json that is there but does not load is not the router before
+// its first configure. It was taken for one: the list was written, the link and
+// the bypass list were not, and the answer was "Imported" without a warning.
+func TestImportHandler_HandleImport_AConfigThatDoesNotLoadImportsNothing(t *testing.T) {
+	server := subscriptionServer(t, osloSubscription)
+	sender := &allTextSender{}
+	config := &mockConfigStoreForImport{
+		dataDirVal: t.TempDir(),
+		updateErr:  fmt.Errorf("%w: %w", service.ErrConfigLoad, errors.New("invalid character '}' looking for beginning of object key string")),
+	}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import " + server.URL))
+
+	if config.savedServers != nil {
+		t.Fatalf("saved %v beside a config that does not load", config.savedServers)
+	}
+	if strings.Contains(sender.lastText, "Imported") || !strings.Contains(sender.lastText, "nothing was imported") {
+		t.Fatalf("messages %q; the user must learn the list was not saved", sender.texts)
+	}
+}
+
 // A subscription over the 1 MiB cap was cut at the cap and decoded anyway:
 // base64 cut there decodes to a shorter list, which the import then published
 // as the subscription. The watch refuses such a body, and so does /import.

@@ -690,8 +690,8 @@ func TestHandleImportServers_RefusesASubscriptionOverTheCap(t *testing.T) {
 }
 
 // "servers saved" is said only when servers.json was written. A publication that
-// failed before it - a lock that could not be opened, a re-import against a
-// config it could not read - wrote nothing, and was reported as saved.
+// failed before it - a lock that could not be opened, an import or a re-import
+// against a config it could not read - wrote nothing, and was reported as saved.
 func TestHandleImportServers_SaysSavedOnlyWhenTheListWasWritten(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -711,6 +711,14 @@ func TestHandleImportServers_SaysSavedOnlyWhenTheListWasWritten(t *testing.T) {
 				err: errors.New("invalid character 'x' looking for beginning of value"),
 			},
 			body: `{"url":""}`,
+		},
+		{
+			name: "import against a config that does not load",
+			mc: &mockConfig{
+				cfg:       &vpnconfig.VPNDirectorConfig{},
+				updateErr: fmt.Errorf("%w: %w", service.ErrConfigLoad, errors.New("invalid character '}' looking for beginning of object key string")),
+			},
+			body: `{"url":"https://93.184.216.34/s/token"}`,
 		},
 		{
 			name:  "config write that fails after the list",

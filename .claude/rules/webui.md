@@ -108,9 +108,11 @@ All of them serialize on `Deps.OpMutex`.
 An import says the servers were saved only when `servers.json` was written. A
 failure after that point carries `vpnconfig.ErrServersSaved` — the write of the
 config beside the list failed (`vpnconfig.PublishServers`), or there is no
-config yet and `service.PublishServers` kept the list anyway — and every other
-failure published nothing: the config lock, a re-import against a config that
-does not load, a refusal, the write of `servers.json` itself. A subscription body over 1 MiB is refused before it is
+`vpn-director.json` at all and `service.PublishServers` kept the list anyway —
+and every other failure published nothing: the config lock, a config that is
+there but does not load (it names the data directory the list belongs in, so an
+import that named its link refuses too), a refusal, the write of `servers.json`
+itself. A subscription body over 1 MiB is refused before it is
 decoded, as the bot's `/import` and the subscription watch refuse it: cut at the
 cap, base64 decodes to a shorter list, which would be published as the
 subscription.

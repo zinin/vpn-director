@@ -4,6 +4,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
@@ -30,8 +31,11 @@ func PublishServers(store ConfigStore, servers []vpnconfig.Server, subscriptionU
 func publishServers(store ConfigStore, servers []vpnconfig.Server, subscriptionURL string, guard func(*vpnconfig.VPNDirectorConfig) error) error {
 	err := vpnconfig.PublishServers(store.UpdateVPNConfig, store.SaveServers, servers, subscriptionURL, guard)
 	// A guarded publication has a config to compare against, and one it cannot
-	// read cannot say the list is still wanted.
-	if guard != nil || !errors.Is(err, ErrConfigLoad) {
+	// read cannot say the list is still wanted. Only a config that is not there
+	// at all lets the list out alone: one that is there and does not load still
+	// names the data directory the list belongs in, and the link and the bypass
+	// list that go with it.
+	if guard != nil || !errors.Is(err, ErrConfigLoad) || !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	// There is no vpn-director.json to keep the list in step with: /import runs
