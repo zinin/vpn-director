@@ -1,0 +1,191 @@
+package subscription
+
+import (
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"io"
+	"strings"
+)
+
+// asciiSpace is the whitespace Decode trims: the shell importer's set.
+const asciiSpace = " \t\r\n\v\f"
+
+var (
+	errBadEscape = errors.New("bad percent escape")
+	errNUL       = errors.New("NUL byte")
+)
+
+// unescape decodes %XX escapes strictly: a % without two hex digits after it
+// is an error, and so is %00, since the shell importer cannot hold a NUL in a
+// variable. plus turns + into a space, as a query does and userinfo does not.
+func unescape(s string, plus bool) (string, error) {
+	if !strings.ContainsRune(s, '%') && !(plus && strings.ContainsRune(s, '+')) {
+		return s, nil
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '%':
+			if i+2 >= len(s) || !isHex(s[i+1]) || !isHex(s[i+2]) {
+				return "", errBadEscape
+			}
+			v := unhex(s[i+1])<<4 | unhex(s[i+2])
+			if v == 0 {
+				return "", errNUL
+			}
+			b.WriteByte(v)
+			i += 2
+		case c == '+' && plus:
+			b.WriteByte(' ')
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String(), nil
+}
+
+// unescapeName decodes a name leniently: a valid escape becomes its byte, %00
+// becomes nothing, anything else stays as written, and + is a space. A name
+// is only shown, so a stray % costs nothing.
+func unescapeName(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '%' && i+2 < len(s) && isHex(s[i+1]) && isHex(s[i+2]):
+			if v := unhex(s[i+1])<<4 | unhex(s[i+2]); v != 0 {
+				b.WriteByte(v)
+			}
+			i += 2
+		case c == '+':
+			b.WriteByte(' ')
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func unhex(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	default:
+		return c - 'A' + 10
+	}
+}
+
+// decodeBase64 reads either alphabet, padded or not, and ignores whitespace -
+// the shell importer maps the URL-safe characters onto the standard ones the
+// same way, so a text mixing the two decodes on both sides. NUL bytes are
+// dropped, as bash drops them.
+func decodeBase64(s string) (string, bool) {
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case strings.ContainsRune(asciiSpace, r):
+			return -1
+		case r == '-':
+			return '+'
+		case r == '_':
+			return '/'
+		}
+		return r
+	}, s)
+	s = strings.TrimRight(s, "=")
+	if s == "" || len(s)%4 == 1 || strings.Trim(s, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/") != "" {
+		return "", false
+	}
+	s += strings.Repeat("=", (4-len(s)%4)%4)
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return "", false
+	}
+	return strings.ReplaceAll(string(b), "\x00", ""), true
+}
+
+// decodeJSON reads exactly one JSON value, numbers as json.Number.
+func decodeJSON(s string) (interface{}, error) {
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v interface{}
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, errors.New("trailing data after JSON value")
+	}
+	return v, nil
+}
+
+// decodeObject reads a JSON object.
+func decodeObject(s string) (map[string]interface{}, error) {
+	v, err := decodeJSON(s)
+	if err != nil {
+		return nil, err
+	}
+	obj, ok := v.(map[string]interface{})
+	if !ok {
+		return nil, errors.New("not a JSON object")
+	}
+	return obj, nil
+}
+
+// splitList splits a comma list, trims spaces around each item and drops the
+// empty ones.
+func splitList(s string) []interface{} {
+	out := []interface{}{}
+	for _, item := range strings.Split(s, ",") {
+		if item = strings.Trim(item, " "); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+// truthy is how share links spell a set flag.
+func truthy(v string) bool { return v == "1" || v == "true" }
+
+// prune removes empty strings, arrays and objects, innermost first, so an
+// object that only held empty values goes too (spec 6.3). It changes v in
+// place and returns it.
+func prune(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, e := range t {
+			if e = prune(e); isEmpty(e) {
+				delete(t, k)
+			} else {
+				t[k] = e
+			}
+		}
+	case []interface{}:
+		out := make([]interface{}, 0, len(t))
+		for _, e := range t {
+			if e = prune(e); !isEmpty(e) {
+				out = append(out, e)
+			}
+		}
+		return out
+	}
+	return v
+}
+
+func isEmpty(v interface{}) bool {
+	switch t := v.(type) {
+	case string:
+		return t == ""
+	case []interface{}:
+		return len(t) == 0
+	case map[string]interface{}:
+		return len(t) == 0
+	}
+	return false
+}

@@ -1,0 +1,72 @@
+#!/usr/bin/env bats
+load '../test_helper'
+
+# The cases testdata/subscription holds are the Go importer's as well
+# (server/internal/subscription/fixtures_test.go): an entry the two decoders
+# read differently fails one of the two suites.
+FIXTURES="$PROJECT_ROOT/../testdata/subscription"
+
+setup() {
+    source "$LIB_DIR/subscription.sh"
+}
+
+# Entware's jq is built without oniguruma: a regex builtin works on a
+# workstation and fails on the router. _sub_clean_names is gawk, where sub and
+# gsub are native.
+@test "lib/subscription.sh: its jq uses no regex builtin" {
+    run bash -c "sed '/^_sub_clean_names() {/,/^}/d' '$LIB_DIR/subscription.sh' |
+        grep -nE '(^|[^a-zA-Z_])(test|match|capture|scan|splits|sub|gsub)\\(|split\\([^)]*;'"
+    assert_failure
+}
+
+@test "_sub_unescape: strict %XX, + as a space only in a query" {
+    _sub_unescape 'h2%2Chttp%2F1.1' 1
+    [ "$_SUB_U" = "h2,http/1.1" ]
+    _sub_unescape 'a+b%2B' 1
+    [ "$_SUB_U" = "a b+" ]
+    _sub_unescape 'a+b%2B' 0
+    [ "$_SUB_U" = "a+b+" ]
+    _sub_unescape 'back\slash%0A' 0
+    [ "$_SUB_U" = $'back\\slash\n' ]
+    run _sub_unescape '50%' 1
+    assert_failure
+    run _sub_unescape 'x%2y' 1
+    assert_failure
+    run _sub_unescape '%%41' 1
+    assert_failure
+    run _sub_unescape 'a%00b' 1
+    assert_failure
+}
+
+@test "_sub_b64: either alphabet, padding optional, whitespace ignored" {
+    [ "$(_sub_b64 'Pz8/Pw==')" = "????" ]
+    [ "$(_sub_b64 'Pz8_Pw')" = "????" ]
+    [ "$(_sub_b64 'Pj4-Pz8_')" = ">>>???" ]
+    [ "$(_sub_b64 $'Pj4+\nPz8/\r\n')" = ">>>???" ]
+    [ "$(_sub_b64 'YQBi')" = "ab" ]
+    run _sub_b64 'a'
+    assert_failure
+    run _sub_b64 'ab=c'
+    assert_failure
+    run _sub_b64 '@@@'
+    assert_failure
+}
+
+# The byte machine of cleanName (server/internal/subscription/names.go).
+@test "_sub_clean_names: keeps two-byte letters, drops the rest, as the Go side does" {
+    run _sub_clean_names <<< $'0\t\xF0\x9F\x87\xB3\xF0\x9F\x87\xB1 Амстердам, Нидерланды
+0\t  Türkiye   Istanbul , 
+0\tΕλλάδα
+0\t\xC3|evil
+0\t\xE2AB
+0\t\xF0ABC
+1\t100%25%20off%2%zz+plus%00!'
+    assert_success
+    assert_output '"Амстердам, Нидерланды"
+"Türkiye Istanbul"
+"Ελλάδα"
+"evil"
+"AB"
+"ABC"
+"100 off2zz plus!"'
+}
