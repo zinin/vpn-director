@@ -63,10 +63,22 @@ func (w *Watch) reachable(ctx context.Context, copies []vpnconfig.Server) []vpnc
 	return out
 }
 
+// reachControls are dialed when a look finds the active server down. A WAN that
+// works reaches one of them - Cloudflare and Google answered all through the
+// outages the fast rule is for - so when neither accepts, the look says nothing
+// about the server: the WAN itself is down, and a tunnel over it would carry
+// nothing either.
+var reachControls = []vpnconfig.Server{
+	{Address: "1.1.1.1", Port: 443},
+	{Address: "8.8.8.8", Port: 443},
+}
+
 // activeServerDown reports whether the server active_server names accepts no
-// TCP connection on any address its servers.json entry lists. Every look
-// without an answer is false: no record, no entry, no IPv4 address to dial, a
-// look a stop cut short, or a watch without LoadServers or Reachable.
+// TCP connection on any address its servers.json entry lists while the WAN
+// reaches a control address. Every look without an answer is false: no record,
+// no entry, no IPv4 address to dial, no control accepting either, a look a
+// stop cut short, or a watch without LoadServers or Reachable. The controls
+// are dialed only once the server's addresses have all failed.
 func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
 	if w.LoadServers == nil || w.Reachable == nil || cfg == nil || cfg.Xray.ActiveServer == nil {
 		return false
@@ -83,8 +95,10 @@ func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirector
 	if len(copies) == 0 {
 		return false
 	}
-	up := w.reachable(ctx, copies)
-	return len(up) == 0 && ctx.Err() == nil
+	if len(w.reachable(ctx, copies)) > 0 {
+		return false
+	}
+	return len(w.reachable(ctx, reachControls)) > 0 && ctx.Err() == nil
 }
 
 // checkReach adds this tick's look at the active server to the streak of the

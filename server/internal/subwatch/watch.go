@@ -25,8 +25,9 @@ const (
 	// host, and the tick - every probe behind it - would wait all of them out.
 	FetchTimeout = 3 * time.Minute
 	// FastDeadAfter is how long the probe has to fail before an outbound whose
-	// server accepts no TCP connection counts as dead; every other failure
-	// waits DeadAfter. ReachTimeout bounds one look at a server's addresses.
+	// server accepts no TCP connection while the WAN works counts as dead;
+	// every other failure, a WAN outage included, waits DeadAfter. ReachTimeout
+	// bounds one look at a server's addresses.
 	FastDeadAfter = time.Minute
 	ReachTimeout  = 3 * time.Second
 	// FallbackCheck is how often a committed failover asks the platform about
@@ -1494,9 +1495,9 @@ func (w *Watch) resetFail() {
 }
 
 // deadReason is why an outbound failing since failSince counts as dead at now,
-// and "" while it does not yet. A server that accepted no TCP connection at any
-// check since the first miss - two at least - dies after FastDeadAfter; every
-// other failure after DeadAfter.
+// and "" while it does not yet. A server that every check since the first miss
+// found down - two at least, each with the WAN reaching a control address -
+// dies after FastDeadAfter; every other failure after DeadAfter.
 func (w *Watch) deadReason(now time.Time) string {
 	failing := now.Sub(w.failSince)
 	switch {

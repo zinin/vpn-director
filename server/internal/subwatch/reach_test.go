@@ -39,12 +39,23 @@ func deadFake() *fake {
 	return &fake{cfg: osloActiveCfg(), plat: connected("ovpnc2"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 }
 
+// controlUp is a WAN that works: it reaches Cloudflare and Google.
+func controlUp(ip string) bool {
+	return ip == "1.1.1.1" || ip == "8.8.8.8"
+}
+
 // reachWatch is f's watch with servers as servers.json and a TCP check that
-// finds the addresses up names reachable.
+// finds the addresses up names reachable, and the control addresses too unless
+// up names them.
 func reachWatch(f *fake, servers []vpnconfig.Server, up map[string]bool) *Watch {
 	w := f.watch()
 	w.LoadServers = func() ([]vpnconfig.Server, error) { return servers, nil }
-	w.Reachable = func(_ context.Context, ip string, _ int) bool { return up[ip] }
+	w.Reachable = func(_ context.Context, ip string, _ int) bool {
+		if ok, named := up[ip]; named {
+			return ok
+		}
+		return controlUp(ip)
+	}
 	return w
 }
 
@@ -136,7 +147,10 @@ func TestTick_OneReachableCheckKeepsThreeMinutes(t *testing.T) {
 	f := deadFake()
 	w := reachWatch(f, osloServers(), nil)
 	checks := 0
-	w.Reachable = func(context.Context, string, int) bool {
+	w.Reachable = func(_ context.Context, ip string, _ int) bool {
+		if ip != "203.0.113.10" {
+			return controlUp(ip)
+		}
 		checks++
 		return checks == 2
 	}
@@ -172,6 +186,40 @@ func TestTick_NoReachAnswerKeepsThreeMinutes(t *testing.T) {
 	}
 }
 
+// A WAN that reaches neither control address says nothing about the server:
+// the outage is the WAN's, and a tunnel over it would carry nothing either.
+func TestTick_WANOutageKeepsThreeMinutes(t *testing.T) {
+	logs := captureLog(t)
+	f := deadFake()
+	w := reachWatch(f, osloServers(), map[string]bool{"1.1.1.1": false, "8.8.8.8": false})
+	assertDiesAt(t, w, f, DeadAfter)
+	if !strings.Contains(logs.String(), "reason=probe") {
+		t.Fatalf("log %q, want the death's reason", logs.String())
+	}
+}
+
+// A look the WAN failed has no answer, and like any such look it ends the
+// streak for this run of misses.
+func TestTick_OneLookWithoutTheWANKeepsThreeMinutes(t *testing.T) {
+	f := deadFake()
+	up := map[string]bool{}
+	w := reachWatch(f, osloServers(), up)
+	w.Tick(context.Background()) // the first miss: Oslo down, the WAN up
+	f.now = f.now.Add(ProbeInterval)
+	up["1.1.1.1"], up["8.8.8.8"] = false, false
+	w.Tick(context.Background()) // the WAN is down for this look
+	f.now = f.now.Add(ProbeInterval)
+	delete(up, "1.1.1.1")
+	delete(up, "8.8.8.8")
+	assertDiesAt(t, w, f, DeadAfter-2*ProbeInterval)
+}
+
+// Either control address answering is a WAN that works.
+func TestTick_OneControlAddressIsEnough(t *testing.T) {
+	f := deadFake()
+	assertDiesAt(t, reachWatch(f, osloServers(), map[string]bool{"1.1.1.1": false}), f, FastDeadAfter)
+}
+
 // A working probe ends the run of misses, and the next run's streak starts
 // from nothing: a look that found the server up in the last run does not keep
 // the next one at three minutes.
@@ -199,7 +247,9 @@ func TestTick_NoTCPCheckPastThreeMinutes(t *testing.T) {
 	checks := 0
 	dial := w.Reachable
 	w.Reachable = func(ctx context.Context, ip string, port int) bool {
-		checks++
+		if ip == "203.0.113.10" {
+			checks++
+		}
 		return dial(ctx, ip, port)
 	}
 	tickFor(w, f, DeadAfter)

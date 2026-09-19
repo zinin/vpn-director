@@ -41,7 +41,7 @@ func awayCfg() *vpnconfig.VPNDirectorConfig {
 type returnRig struct {
 	f       *fake
 	w       *Watch
-	up      map[string]bool // addresses that accept TCP
+	up      map[string]bool // addresses that accept TCP besides the control addresses
 	live    map[string]bool // addresses the SOCKS probe passes on
 	running string
 	events  []string
@@ -56,7 +56,7 @@ func newReturnRig(servers []vpnconfig.Server) *returnRig {
 	}
 	w := runningWatch(r.f.watch())
 	w.LoadServers = func() ([]vpnconfig.Server, error) { return servers, nil }
-	w.Reachable = func(_ context.Context, ip string, _ int) bool { return r.up[ip] }
+	w.Reachable = func(_ context.Context, ip string, _ int) bool { return r.up[ip] || controlUp(ip) }
 	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := r.f.checkGuard(guard); err != nil {
 			return false, r.f.seq(), err
