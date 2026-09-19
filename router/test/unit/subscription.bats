@@ -10,6 +10,47 @@ setup() {
     source "$LIB_DIR/subscription.sh"
 }
 
+# decode_fixture <in>: what a .want.json holds - the error, or the total, the
+# servers and the skips by name and reason. A skip's detail is prose and is
+# not compared.
+decode_fixture() {
+    local out rc=0
+    out=$(subscription_decode < "$1" 2>"$BATS_TEST_TMPDIR/err") || rc=$?
+    if (( rc != 0 )); then
+        jq -Sn --arg e "$(cat "$BATS_TEST_TMPDIR/err")" '{error: $e}'
+    else
+        printf '%s' "$out" | jq -S '{total, servers, skipped: [.skipped[] | {name, reason}]}'
+    fi
+}
+
+check_fixtures() {
+    local in want got failed=0
+    for in in "$FIXTURES"/*.in; do
+        want=$(jq -S . "${in%.in}.want.json")
+        got=$(decode_fixture "$in")
+        if [[ $got != "$want" ]]; then
+            printf '== %s decoded differently from its .want.json:\n' "${in##*/}"
+            diff <(printf '%s\n' "$want") <(printf '%s\n' "$got") || true
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+@test "subscription_decode: every shared case decodes as its .want.json says" {
+    run check_fixtures
+    assert_success
+}
+
+# The routers run with no UTF-8 locale or with one; a byte-wise name filter
+# and ASCII patterns must not care which.
+@test "subscription_decode: the cases decode the same under a UTF-8 locale" {
+    local utf8
+    utf8=$(locale -a 2>/dev/null | grep -i -m1 -E '^(C|en_US)\.utf-?8$') || skip "no UTF-8 locale here"
+    LC_ALL=$utf8 run check_fixtures
+    assert_success
+}
+
 # Entware's jq is built without oniguruma: a regex builtin works on a
 # workstation and fails on the router. _sub_clean_names is gawk, where sub and
 # gsub are native.

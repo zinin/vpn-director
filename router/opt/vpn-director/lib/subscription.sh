@@ -23,6 +23,43 @@
 
 _SUB_SPACE=$' \t\r\n\v\f'
 
+declare -gA _SUB_Q=() _SUB_V=()
+declare -ga _SUB_RECORDS=() _SUB_RAWNAMES=()
+
+# The jq variables a record is built from. jq refuses a program that names a
+# variable it was not given, so every one of them is always passed.
+_SUB_VARS="net sec sni fp alpn pcs vcn pbk sid spx pqv path host serviceName authority mode extra
+flow user enc addr method password pin obfs obfspw"
+
+# The query keys a converter reads; the rest of a query is never stored.
+_SUB_KEYS=" type security encryption flow sni fp alpn pbk sid spx pqv host path
+headerType serviceName mode authority extra pcs vcn allowInsecure insecure
+plugin obfs obfs-password pinSHA256 "
+
+# jq shared by every converter and by the final assembly.
+# shellcheck disable=SC2016  # $vars are jq's, set with --arg
+_SUB_JQ_LIB='
+def trimsp: if startswith(" ") then .[1:] | trimsp elif endswith(" ") then .[:-1] | trimsp else . end;
+def list: split(",") | map(trimsp);
+def prune: walk(if type == "object" then with_entries(select(.value != "" and .value != [] and .value != {}))
+                elif type == "array" then map(select(. != "" and . != [] and . != {}))
+                else . end);
+def stream:
+  {network: $net, security: $sec}
+  + (if $sec == "tls" then {tlsSettings: {serverName: $sni, fingerprint: $fp, alpn: ($alpn | list),
+                                          pinnedPeerCertSha256: $pcs, verifyPeerCertByName: $vcn}}
+     elif $sec == "reality" then {realitySettings: {serverName: $sni, fingerprint: $fp, publicKey: $pbk,
+                                                    shortId: $sid, spiderX: $spx, mldsa65Verify: $pqv}}
+     else {} end)
+  + (if $net == "ws" then {wsSettings: {path: $path, host: $host}}
+     elif $net == "httpupgrade" then {httpupgradeSettings: {path: $path, host: $host}}
+     elif $net == "grpc" then {grpcSettings: ({serviceName: $serviceName, authority: $authority}
+                                              + (if $mode == "multi" then {multiMode: true} else {} end))}
+     elif $net == "xhttp" then {xhttpSettings: ({path: $path, host: $host, mode: $mode}
+                                                + (if $extra == "" then {} else {extra: ($extra | fromjson)} end))}
+     else {} end);
+'
+
 # _sub_unescape <value> <plus>: decodes %XX into _SUB_U; + is a space when plus
 # is 1. A % without two hex digits after it, or %00, returns 1 - unescape in
 # server/internal/subscription/text.go.
@@ -115,4 +152,306 @@ _sub_clean_names() {
             gsub(/ +/, " ", out); sub(/^[ ,]+/, "", out); sub(/[ ,]+$/, "", out)
             printf "\"%s\"\n", out
         }'
+}
+
+# _sub_skip <reason> <detail>: marks the entry skipped.
+_sub_skip() {
+    _SUB_REASON=$1
+    _SUB_DETAIL=$2
+}
+
+# _sub_query <query>: fills _SUB_Q with the keys a converter reads, the first
+# value of a key winning; returns 1 on a bad escape anywhere in the query.
+_sub_query() {
+    _SUB_Q=()
+    local q=$1 part key val
+    while [[ -n $q ]]; do
+        part=${q%%&*}
+        if [[ $part == "$q" ]]; then
+            q=""
+        else
+            q=${q#*&}
+        fi
+        [[ -n $part ]] || continue
+        key=${part%%=*}
+        val=""
+        if [[ $part == *=* ]]; then
+            val=${part#*=}
+        fi
+        _sub_unescape "$key" 1 || return 1
+        key=$_SUB_U
+        _sub_unescape "$val" 1 || return 1
+        val=$_SUB_U
+        if [[ $_SUB_KEYS == *[[:space:]]"$key"[[:space:]]* && -z ${_SUB_Q[$key]+set} ]]; then
+            _SUB_Q[$key]=$val
+        fi
+    done
+}
+
+# _sub_hostport <host[:port]|[ipv6][:port]>: sets _SUB_HOST (brackets
+# removed), _SUB_RAWPORT and _SUB_HASPORT.
+_sub_hostport() {
+    local hp=$1 tail
+    _SUB_HOST="" _SUB_RAWPORT="" _SUB_HASPORT=0
+    if [[ $hp == \[* ]]; then
+        if [[ $hp != *\]* ]]; then
+            _sub_skip invalid "bad IPv6 address"
+            return 1
+        fi
+        _SUB_HOST=${hp#\[}
+        _SUB_HOST=${_SUB_HOST%%\]*}
+        tail=${hp#*\]}
+        if [[ -n $tail ]]; then
+            if [[ $tail != :* ]]; then
+                _sub_skip invalid "bad address"
+                return 1
+            fi
+            _SUB_RAWPORT=${tail#:}
+            _SUB_HASPORT=1
+        fi
+    elif [[ $hp == *:* ]]; then
+        _SUB_HOST=${hp%:*}
+        _SUB_RAWPORT=${hp##*:}
+        _SUB_HASPORT=1
+    else
+        _SUB_HOST=$hp
+    fi
+    if [[ -z $_SUB_HOST ]]; then
+        _sub_skip invalid "missing host"
+        return 1
+    fi
+}
+
+# _sub_port <raw>: one to five digits, 1-65535, into _SUB_PORT.
+_sub_port() {
+    if [[ $1 =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); then
+        _SUB_PORT=$((10#$1))
+        return 0
+    fi
+    _sub_skip invalid "bad port \"$1\""
+    return 1
+}
+
+# _sub_link <rest>: the grammar of spec 6.2 up to the host -
+# scheme://userinfo@host[:port][/][?query][#fragment]. Sets _SUB_RAWNAME,
+# _SUB_USER (decoded, + kept), the host fields and _SUB_RAWQUERY.
+_sub_link() {
+    local rest=$1 body main authority
+    body=${rest%%#*}
+    if [[ $body != "$rest" ]]; then
+        _SUB_RAWNAME=${rest#*#}
+    fi
+    main=${body%%\?*}
+    _SUB_RAWQUERY=""
+    if [[ $main != "$body" ]]; then
+        _SUB_RAWQUERY=${body#*\?}
+    fi
+    authority=${main%%/*}
+    if [[ $authority != *@* ]]; then
+        _sub_skip invalid "missing userinfo"
+        return 1
+    fi
+    if ! _sub_unescape "${authority%@*}" 0; then
+        _sub_skip invalid "userinfo: bad percent escape"
+        return 1
+    fi
+    _SUB_USER=$_SUB_U
+    if [[ -z $_SUB_USER ]]; then
+        _sub_skip invalid "missing userinfo"
+        return 1
+    fi
+    _sub_hostport "${authority##*@}"
+}
+
+# _sub_port_query: the port a scheme requires, then the query.
+_sub_port_query() {
+    if [[ $_SUB_HASPORT != 1 ]]; then
+        _sub_skip invalid "missing port"
+        return 1
+    fi
+    _sub_port "$_SUB_RAWPORT" || return 1
+    if ! _sub_query "$_SUB_RAWQUERY"; then
+        _sub_skip invalid "query: bad percent escape"
+        return 1
+    fi
+}
+
+_sub_truthy() {
+    [[ $1 == 1 || $1 == true ]]
+}
+
+# _sub_stream <default security>: the checks of spec 6.3, in its order. Sets
+# the _SUB_V entries the jq stream function reads.
+_sub_stream() {
+    local net=${_SUB_Q[type]:-} sec=${_SUB_Q[security]:-} ht=${_SUB_Q[headerType]:-} k
+    case $net in
+        ''|tcp|raw) net=tcp ;;
+        ws|websocket) net=ws ;;
+        grpc|httpupgrade) ;;
+        xhttp|splithttp) net=xhttp ;;
+        *)
+            _sub_skip unsupported "transport $net"
+            return 1
+            ;;
+    esac
+    if [[ $net == tcp && -n $ht && $ht != none ]]; then
+        _sub_skip unsupported "tcp header $ht"
+        return 1
+    fi
+    [[ -n $sec ]] || sec=$1
+    case $sec in
+        none) ;;
+        tls)
+            if { _sub_truthy "${_SUB_Q[allowInsecure]:-}" || _sub_truthy "${_SUB_Q[insecure]:-}"; } &&
+                [[ -z ${_SUB_Q[pcs]:-} ]]; then
+                _sub_skip unsupported "insecure TLS"
+                return 1
+            fi
+            ;;
+        reality)
+            if [[ -z ${_SUB_Q[pbk]:-} || -z ${_SUB_Q[sni]:-} || -z ${_SUB_Q[fp]:-} ]]; then
+                _sub_skip invalid "reality needs pbk, sni and fp"
+                return 1
+            fi
+            ;;
+        *)
+            _sub_skip unsupported "security $sec"
+            return 1
+            ;;
+    esac
+    if [[ $net == xhttp && -n ${_SUB_Q[extra]:-} ]] &&
+        ! jq -es 'length == 1 and (.[0] | type) == "object"' <<< "${_SUB_Q[extra]}" >/dev/null 2>&1; then
+        _sub_skip invalid "xhttp extra is not a JSON object"
+        return 1
+    fi
+    _SUB_V[net]=$net
+    _SUB_V[sec]=$sec
+    for k in sni fp alpn pcs vcn pbk sid spx pqv path host serviceName authority mode extra flow; do
+        _SUB_V[$k]=${_SUB_Q[$k]:-}
+    done
+}
+
+# _sub_record <jq outbound>: _SUB_REC, the record of a converted server.
+_sub_record() {
+    local -a args=()
+    local k
+    _SUB_V[addr]=$_SUB_HOST
+    for k in $_SUB_VARS; do
+        args+=(--arg "$k" "${_SUB_V[$k]:-}")
+    done
+    _SUB_REC=$(jq -cn "${args[@]}" --argjson port "$_SUB_PORT" \
+        "$_SUB_JQ_LIB"' {address: $addr, port: $port, outbound: ('"$1"' | prune)}')
+}
+
+_sub_vless() {
+    _sub_link "$1" || return 1
+    _sub_port_query || return 1
+    _sub_stream none || return 1
+    _SUB_V[user]=$_SUB_USER
+    _SUB_V[enc]=${_SUB_Q[encryption]:-none}
+    _sub_record '{protocol: "vless", settings: {vnext: [{address: $addr, port: $port,
+        users: [{id: $user, encryption: $enc, flow: $flow}]}]}, streamSettings: stream}'
+}
+
+# Trojan runs over TLS, so a link that names no security gets tls.
+_sub_trojan() {
+    _sub_link "$1" || return 1
+    _sub_port_query || return 1
+    _sub_stream tls || return 1
+    _SUB_V[user]=$_SUB_USER
+    _sub_record '{protocol: "trojan", settings: {servers: [{address: $addr, port: $port,
+        password: $user}]}, streamSettings: stream}'
+}
+
+# _sub_entry <scheme> <rest>: converts one link and keeps its record and raw
+# name for the assembly.
+_sub_entry() {
+    local scheme=${1,,} rest=$2
+    _SUB_RAWNAME="" _SUB_DECODE=1 _SUB_REASON="" _SUB_DETAIL="" _SUB_REC="" _SUB_USER=""
+    _SUB_V=()
+    case $scheme in
+        vless) _sub_vless "$rest" || : ;;
+        trojan) _sub_trojan "$rest" || : ;;
+        *)
+            if [[ $rest == *#* ]]; then
+                _SUB_RAWNAME=${rest#*#}
+            fi
+            _sub_skip unsupported "$scheme"
+            ;;
+    esac
+    if [[ -n $_SUB_REASON || -z $_SUB_REC ]]; then
+        _SUB_REC=$(jq -cn --arg reason "${_SUB_REASON:-invalid}" --arg detail "$_SUB_DETAIL" \
+            '{reason: $reason, detail: $detail}')
+    fi
+    _SUB_RECORDS+=("$_SUB_REC")
+    _SUB_RAWNAMES+=("$_SUB_DECODE"$'\t'"$_SUB_RAWNAME")
+}
+
+# _sub_links <text>: one link per line; other lines are ignored (spec 6.1).
+_sub_links() {
+    local line
+    while IFS= read -r line || [[ -n $line ]]; do
+        line=${line#"${line%%[!$_SUB_SPACE]*}"}
+        line=${line%"${line##*[!$_SUB_SPACE]}"}
+        [[ $line =~ ^([A-Za-z][A-Za-z0-9+.-]*):// ]] || continue
+        _sub_entry "${BASH_REMATCH[1]}" "${line#*://}"
+    done <<< "$1"
+    if (( ${#_SUB_RECORDS[@]} == 0 )); then
+        printf 'unrecognized subscription format\n' >&2
+        return 1
+    fi
+}
+
+# _sub_result: the Result JSON from _SUB_RECORDS and _SUB_RAWNAMES - names,
+# the placeholder test (spec 6.6) and the split into servers and skips.
+_sub_result() {
+    local names
+    names=$(printf '%s\n' "${_SUB_RAWNAMES[@]}" | _sub_clean_names) || return 1
+    {
+        printf '[%s]\n' "${names//$'\n'/,}"
+        printf '%s\n' "${_SUB_RECORDS[@]}"
+    } | jq -cs '
+        def placeholder:
+          . == "::" or . == "::1"
+          or (split(".") as $p
+              | ($p | length) == 4
+                and all($p[]; length >= 1 and length <= 3 and (explode | all(.[]; . >= 48 and . <= 57)))
+                and all($p[]; tonumber <= 255)
+                and (($p[0] | tonumber) == 0 or ($p[0] | tonumber) == 127));
+        .[0] as $names | .[1:] as $recs
+        | [range(0; $recs | length) as $i
+           | $recs[$i] + {name: $names[$i], n: ($i + 1)}
+           | if .reason == null and (.address | placeholder) then
+               . + {reason: "placeholder", detail: .address} else . end] as $all
+        | {total: ($recs | length),
+           servers: [$all[] | select(.reason == null)
+                     | {name: (if .name == "" then .address else .name end), address, port, outbound}],
+           skipped: [$all[] | select(.reason != null)
+                     | {name: (if .name == "" then "#\(.n)" else .name end), reason, detail}]}'
+}
+
+# subscription_decode: reads a subscription on stdin (spec 6.1) and prints
+# the Result JSON; see the header of this file.
+subscription_decode() {
+    local LC_ALL=C body
+    _SUB_RECORDS=() _SUB_RAWNAMES=()
+    # bash cannot hold a NUL; the Go side drops them as well.
+    body=$(tr -d '\000')
+    body=${body#$'\xEF\xBB\xBF'}
+    body=$(_sub_trim "$body")
+    if [[ -z $body ]]; then
+        printf 'empty subscription\n' >&2
+        return 1
+    fi
+    if [[ $body == *'://'* ]]; then
+        _sub_links "$body" || return 1
+    else
+        local text
+        if ! text=$(_sub_b64 "$body"); then
+            printf 'unrecognized subscription format\n' >&2
+            return 1
+        fi
+        _sub_links "$text" || return 1
+    fi
+    _sub_result
 }

@@ -1,0 +1,7 @@
+{
+  "total": 1,
+  "servers": [
+    {"address":"bom.example.com","name":"BOM first","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"bom.example.com","port":443,"users":[{"encryption":"none","id":"77777777-7777-4777-8777-777777777777"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443}
+  ],
+  "skipped": []
+}
