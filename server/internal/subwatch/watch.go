@@ -24,6 +24,11 @@ const (
 	// of every host in it: a resolver that answers nothing costs seconds per
 	// host, and the tick - every probe behind it - would wait all of them out.
 	FetchTimeout = 3 * time.Minute
+	// FastDeadAfter is how long the probe has to fail before an outbound whose
+	// server accepts no TCP connection counts as dead; every other failure
+	// waits DeadAfter. ReachTimeout bounds one look at a server's addresses.
+	FastDeadAfter = time.Minute
+	ReachTimeout  = 3 * time.Second
 	// FallbackCheck is how often a committed failover asks the platform about
 	// its tunnel and looks for failover_ready, and FallbackDownAfter how long
 	// that tunnel has to be gone, or not carry the clients, before they leave
@@ -67,6 +72,8 @@ type Watch struct {
 	Generate      func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error)
 	Probe         func(ctx context.Context, socksPort int) error
 	Fetch         func(ctx context.Context, url string) ([]vpnconfig.Server, error)
+	LoadServers   func() ([]vpnconfig.Server, error)
+	Reachable     func(ctx context.Context, ip string, port int) bool // nil => no TCP checks: no fast death, no return
 	Notify        func(msg string)
 	Now           func() time.Time
 	AfterRestart  func(time.Duration)
@@ -76,6 +83,7 @@ type Watch struct {
 
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
+	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
 	lastImport        time.Time
 	importRetry       time.Duration   // current wait between import waves; zero means ImportRetry
 	lastRouteKind     noteKind        // noteMoved, noteNoTunnel
@@ -146,13 +154,13 @@ func (w *Watch) Tick(ctx context.Context) {
 	// A restore whose last apply failed is work the watch has started, as a
 	// failover is: neither waits for a saved link or for Xray clients.
 	if !vpnconfig.Armed(cfg) && !w.pendingApply {
-		w.failSince = time.Time{}
+		w.resetFail()
 		return
 	}
 	if w.stopped() {
 		// Nothing the outbound did while VPN Director is stopped counts: the
 		// three minutes start again once it runs.
-		w.failSince = time.Time{}
+		w.resetFail()
 		return
 	}
 	// A download, the resolution behind it or a probe can hold the tick for
@@ -256,7 +264,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	// A pending restore is all an unarmed watch finishes: a failover of its own
 	// needs a link to refresh and Xray clients to move.
 	if !vpnconfig.Armed(cfg) {
-		w.failSince = time.Time{}
+		w.resetFail()
 		return
 	}
 
@@ -266,7 +274,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	err = w.Probe(ctx, socks)
 	if err == nil {
-		w.failSince = time.Time{}
+		w.resetFail()
 		w.importRetry = 0
 		w.lastRouteKind = noteNone
 		w.lastImportKind = noteNone
@@ -277,7 +285,9 @@ func (w *Watch) Tick(ctx context.Context) {
 	if w.failSince.IsZero() {
 		w.failSince = now
 	}
-	if now.Sub(w.failSince) < DeadAfter {
+	w.checkReach(ctx, cfg)
+	reason := w.deadReason(now)
+	if reason == "" {
 		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, "error", err)
 		return
 	}
@@ -293,7 +303,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	// transition only until the user has been told there is no fallback.
 	announce := w.lastRouteKind != noteNoTunnel
 	if announce {
-		slog.Info("Xray outbound declared dead", "socks_port", socks, "error", err)
+		slog.Info("Xray outbound declared dead", "socks_port", socks, "reason", reason, "error", err)
 	}
 
 	var plat vpnconfig.PlatformInfo
@@ -1457,10 +1467,32 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 	return cfg
 }
 
+// resetFail forgets a failing outbound: the three minutes - and the streak of
+// unreachable checks that can shorten them - start again from its next miss.
+func (w *Watch) resetFail() {
+	w.failSince = time.Time{}
+	w.downChecks = 0
+}
+
+// deadReason is why an outbound failing since failSince counts as dead at now,
+// and "" while it does not yet. A server that accepted no TCP connection at any
+// check since the first miss - two at least - dies after FastDeadAfter; every
+// other failure after DeadAfter.
+func (w *Watch) deadReason(now time.Time) string {
+	failing := now.Sub(w.failSince)
+	switch {
+	case failing >= FastDeadAfter && w.downChecks >= 2:
+		return "unreachable"
+	case failing >= DeadAfter:
+		return "probe"
+	}
+	return ""
+}
+
 // settled is a working outbound: the three minutes start again from its next
 // miss, and the next death refreshes the subscription at once.
 func (w *Watch) settled() {
-	w.failSince = time.Time{}
+	w.resetFail()
 	w.lastImport = time.Time{}
 	w.importRetry = 0
 }
