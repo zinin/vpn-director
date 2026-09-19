@@ -1,9 +1,11 @@
+/** A server as GET /api/servers shows it: no credentials. protocol is its
+ *  label, e.g. "vless·reality", "trojan·tls", "ss", "hysteria2". */
 export interface Server {
   name: string
   address: string
   port: number
-  uuid: string
   ips: string[]
+  protocol: string
 }
 
 export interface ClientInfo {
@@ -45,6 +47,11 @@ export interface OkResponse {
 export interface ImportResponse {
   ok: boolean
   count: number
+  total: number
+  skipped: Record<'unsupported' | 'composite' | 'invalid' | 'placeholder', number>
+  dns_errors: number
+  /** "Imported 32 of 40 servers: 7 composite, 1 DNS error" */
+  summary: string
 }
 
 export interface IPResponse {

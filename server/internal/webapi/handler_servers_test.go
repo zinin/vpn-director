@@ -50,6 +50,35 @@ func TestHandleListServers_OK(t *testing.T) {
 	}
 }
 
+// The page gets what it shows - and no credential of the record: an import
+// now stores passwords in the outbound, beside the UUID of a legacy record.
+func TestHandleListServers_ShowsTheProtocolAndNoCredentials(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.Config = &mockConfig{servers: []vpnconfig.Server{
+		{Address: "legacy.example.com", Port: 443, UUID: "secret-uuid", Name: "Legacy", IPs: []string{"1.1.1.1"}, Security: "reality", PublicKey: "secret-key"},
+		{Address: "hy.example.com", Port: 8443, Name: "Hy", IPs: []string{"2.2.2.2"},
+			Outbound: json.RawMessage(`{"protocol":"hysteria","settings":{"address":"hy.example.com","port":8443},"streamSettings":{"hysteriaSettings":{"auth":"secret-auth"}}}`)},
+	}}
+	rec := httptest.NewRecorder()
+	handleListServers(deps).ServeHTTP(rec, httptest.NewRequest("GET", "/api/servers", nil))
+
+	body := rec.Body.String()
+	for _, secret := range []string{"secret-uuid", "secret-key", "secret-auth", "outbound"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("response carries %q: %s", secret, body)
+		}
+	}
+	var resp struct {
+		Servers []map[string]interface{} `json:"servers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Servers) != 2 || resp.Servers[0]["protocol"] != "vless·reality" || resp.Servers[1]["protocol"] != "hysteria2" {
+		t.Fatalf("servers %v", resp.Servers)
+	}
+}
+
 func TestHandleListServers_Error(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Config = &mockConfig{err: errors.New("load failed")}

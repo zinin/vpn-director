@@ -2,6 +2,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -461,5 +462,23 @@ func TestServersHandler_HandleCallback_NilMessage(t *testing.T) {
 	// Should still acknowledge callback
 	if sender.lastAckID != "callback_nil" {
 		t.Errorf("expected callback to be acknowledged even with nil Message")
+	}
+}
+
+// A subscription now mixes protocols; the list says which one each server
+// runs on.
+func TestBuildServersPage_ShowsTheProtocol(t *testing.T) {
+	servers := []vpnconfig.Server{
+		{Name: "Oslo", Address: "oslo.example.com", IPs: []string{"1.2.3.4"},
+			Outbound: json.RawMessage(`{"protocol":"vless","streamSettings":{"network":"ws","security":"tls"}}`)},
+		{Name: "Canada SS", Address: "ss.example.com", IPs: []string{"5.6.7.8"},
+			Outbound: json.RawMessage(`{"protocol":"shadowsocks"}`)},
+	}
+	text, _ := buildServersPage(servers, 0)
+	if !strings.Contains(text, "1\\. Oslo — oslo\\.example\\.com \\(1\\.2\\.3\\.4\\) · vless·ws·tls") {
+		t.Errorf("text %q", text)
+	}
+	if !strings.Contains(text, "2\\. Canada SS — ss\\.example\\.com \\(5\\.6\\.7\\.8\\) · ss") {
+		t.Errorf("text %q", text)
 	}
 }

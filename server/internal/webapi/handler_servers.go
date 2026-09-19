@@ -15,6 +15,17 @@ import (
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
+// serverView is a server as the Servers tab shows it. The record behind it
+// also holds the outbound and its credentials - an id, a password - and the
+// page needs none of them.
+type serverView struct {
+	Name     string   `json:"name"`
+	Address  string   `json:"address"`
+	Port     int      `json:"port"`
+	IPs      []string `json:"ips"`
+	Protocol string   `json:"protocol"`
+}
+
 // handleListServers returns a handler that lists all imported servers.
 func handleListServers(deps *Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
@@ -36,8 +47,16 @@ func handleListServers(deps *Deps) http.HandlerFunc {
 		if cfg != nil {
 			active = cfg.Xray.ActiveServer
 		}
+		views := make([]serverView, 0, len(servers))
+		for _, s := range servers {
+			ips := s.IPs
+			if ips == nil {
+				ips = []string{}
+			}
+			views = append(views, serverView{Name: s.Name, Address: s.Address, Port: s.Port, IPs: ips, Protocol: s.Label()})
+		}
 		jsonOK(w, map[string]interface{}{
-			"servers":            servers,
+			"servers":            views,
 			"active":             active,
 			"subscription_saved": cfg != nil && cfg.Xray.SubscriptionURL != "",
 		})
