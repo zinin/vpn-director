@@ -131,3 +131,45 @@ setup() {
     [ "$(printf '%s' "$output" | jq -r '.inbounds[] | select(.tag == "tproxy-in") | .port')" = "12345" ]
     [ "$(printf '%s' "$output" | jq -r '.inbounds[] | select(.tag == "socks-in") | .port')" = "12346" ]
 }
+
+# An import stores the outbound it read, whatever the protocol: it goes into
+# config.json as it is, tagged proxy-out.
+@test "build_outbound: a stored outbound gets the tag and nothing else" {
+    server='{"name":"Hy","address":"198.51.100.11","port":8449,"ips":["198.51.100.11"],"outbound":{"protocol":"hysteria","settings":{"version":2,"address":"198.51.100.11","port":8449},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},"finalmask":{"quicParams":{"congestion":"bbr"}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c 'del(.tag)' | jq -S .)" = "$(printf '%s' "$server" | jq -S .outbound)" ]
+    [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
+}
+
+@test "generate: a stored outbound replaces the template's outbounds" {
+    server='{"address":"198.51.100.12","port":2030,"outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"198.51.100.12","port":2030,"method":"aes-256-gcm","password":"p"}]}}}'
+    run xrayconf_generate "$PROJECT_ROOT/opt/etc/xray/config.json.template" <<< "$server"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '[.outbounds[] | [.tag, .protocol]]')" = '[["proxy-out","shadowsocks"]]' ]
+}
+
+@test "xrayconf_validate: a config Xray accepts passes, with -format json" {
+    export PATH="$TEST_ROOT/mocks:$PATH" XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+}
+
+@test "xrayconf_validate: a config Xray rejects fails with Xray's last lines" {
+    export PATH="$TEST_ROOT/mocks:$PATH" XRAY_MOCK_EXIT=23
+    export XRAY_MOCK_OUTPUT=$'Xray 26.2.6\nFailed to start: infra/conf: "allowInsecure" has been removed'
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xray rejected the config: Xray 26.2.6; Failed to start: infra/conf: "allowInsecure" has been removed'* ]]
+}
+
+@test "xrayconf_validate: without an xray the config passes, and says so" {
+    [[ ! -x /opt/sbin/xray ]] || skip "this machine has /opt/sbin/xray"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    PATH="/usr/bin:/bin" run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [[ $output == *"xray not found"* ]]
+}

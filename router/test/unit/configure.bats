@@ -305,6 +305,56 @@ write_daemon_config() {
     assert_output "address,name,port"
 }
 
+# An import stores the server's outbound; the wizard writes it into config.json.
+@test "step_generate_configs: writes the stored outbound of the selected server" {
+    load_wizard
+    write_daemon_config
+    SELECTED_SERVER_JSON='{"name":"Canada SS","address":"198.51.100.12","port":2030,"ips":["198.51.100.12"],"outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"198.51.100.12","port":2030,"method":"aes-256-gcm","password":"p"}]}}}'
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '[.outbounds[] | [.tag, .protocol]]' "$XRAY_CONFIG_DIR/config.json"
+    assert_output '[["proxy-out","shadowsocks"]]'
+}
+
+# A config Xray rejects would take every Xray client offline at the next
+# restart; the one that runs stays.
+@test "step_generate_configs: a config Xray rejects leaves config.json alone" {
+    load_wizard
+    write_daemon_config
+    printf '%s\n' '{"outbounds":["previous"]}' > "$XRAY_CONFIG_DIR/config.json"
+    export XRAY_MOCK_EXIT=23 XRAY_MOCK_OUTPUT='Failed to start: bad key'
+
+    run step_generate_configs
+
+    assert_failure
+    assert_output --partial "xray rejected the config: Failed to start: bad key"
+    run cat "$XRAY_CONFIG_DIR/config.json"
+    assert_output '{"outbounds":["previous"]}'
+    [[ -z "$(find "$XRAY_CONFIG_DIR" -name 'config.json.??????')" ]]
+}
+
+@test "step_select_xray_server: lists each server with its protocol" {
+    load_wizard
+    cat > "$SERVERS_FILE" <<'JSON'
+[{"name":"Legacy","address":"legacy.example.com","port":443,"ips":["1.2.3.4"],"security":"reality"},
+ {"name":"Old TLS","address":"old.example.com","port":443,"ips":["1.2.3.5"]},
+ {"name":"Oslo WS","address":"oslo.example.com","port":443,"ips":["1.2.3.6"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"tls"}}},
+ {"name":"Canada SS","address":"ss.example.com","port":2030,"ips":["1.2.3.7"],"outbound":{"protocol":"shadowsocks"}},
+ {"name":"Gaming","address":"hy.example.com","port":8443,"ips":["1.2.3.8"],"outbound":{"protocol":"hysteria","streamSettings":{"network":"hysteria","security":"tls"}}}]
+JSON
+
+    run step_select_xray_server <<< "3"
+
+    assert_success
+    assert_output --partial "1) Legacy [vless·reality]"
+    assert_output --partial "2) Old TLS [vless·tls]"
+    assert_output --partial "3) Oslo WS [vless·ws·tls]"
+    assert_output --partial "4) Canada SS [ss]"
+    assert_output --partial "5) Gaming [hysteria2]"
+}
+
 # ============================================================================
 # The tunnel prompt lists what the platform has (Merlin here: rt_tables fixture)
 # ============================================================================

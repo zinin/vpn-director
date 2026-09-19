@@ -1,0 +1,9 @@
+#!/bin/bash
+# Mock xray for "xray run -test -format json -c FILE": prints XRAY_MOCK_OUTPUT
+# (default "Configuration OK.") and exits with XRAY_MOCK_EXIT (default 0). The
+# arguments go to XRAY_MOCK_LOG when it is set.
+if [[ -n ${XRAY_MOCK_LOG:-} ]]; then
+    printf '%s\n' "$*" >> "$XRAY_MOCK_LOG"
+fi
+printf '%s\n' "${XRAY_MOCK_OUTPUT:-Configuration OK.}"
+exit "${XRAY_MOCK_EXIT:-0}"

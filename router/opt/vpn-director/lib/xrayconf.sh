@@ -1,18 +1,26 @@
 #!/usr/bin/env bash
 ###############################################################################
 # lib/xrayconf.sh - Build Xray proxy-out outbound + config.json from a server
-# JSON object (as stored in servers.json). Pure jq transforms; no side effects
-# on source. Used by configure.sh; unit-tested via bats.
+# JSON object (as stored in servers.json), and have Xray test the result.
+# Pure jq transforms; no side effects on source. Used by configure.sh;
+# unit-tested via bats.
 # Mirrors the Go generator in server/internal/service/xray.go — keep both in sync.
 ###############################################################################
 
 # xrayconf_build_outbound: reads one server JSON object on stdin,
-# prints the proxy-out outbound JSON object on stdout. Fails (rc=1) on an
-# unsupported network (non-tcp) or security (not tls/reality) instead of
-# emitting a silently-broken outbound. Self-contained: pure jq; errors to stderr.
+# prints the proxy-out outbound JSON object on stdout. A server an import
+# stored with its outbound gets that outbound, tagged: the import
+# (lib/subscription.sh) checked it. A record from before outbounds were stored
+# is built from its flat VLESS fields, and fails (rc=1) on an unsupported
+# network (non-tcp) or security (not tls/reality) instead of emitting a
+# silently-broken outbound. Self-contained: pure jq; errors to stderr.
 xrayconf_build_outbound() {
     local server_json net sec
     server_json="$(cat)"
+    if printf '%s' "$server_json" | jq -e 'type == "object" and (.outbound | type) == "object"' >/dev/null 2>&1; then
+        printf '%s' "$server_json" | jq '.outbound + {tag: "proxy-out"}'
+        return
+    fi
     if ! printf '%s' "$server_json" | jq -e 'type == "object" and (.address // "") != "" and (.uuid // "") != ""' >/dev/null 2>&1; then
         printf 'xrayconf: invalid/empty server JSON (need object with address and uuid)\n' >&2
         return 1
@@ -91,4 +99,30 @@ xrayconf_generate() {
              (.inbounds[] | select(.tag == "socks-in") | .port) = ($sp | tonumber)
            end' \
         "$template"
+}
+
+# xrayconf_validate <file>: has Xray load a generated config without starting
+# it, as XrayService.GenerateConfig does (service/xray.go). An outbound can come
+# verbatim from a subscription and name a protocol the installed Xray lacks or
+# a key it refuses - allowInsecure stops Xray from loading any config since
+# 2026-06-01 - and a config Xray rejects takes every Xray client offline at the
+# next restart. S24xray runs "xray run -confdir", which loads only *.json, so a
+# mktemp name needs -format json. Without an xray there is nothing to test
+# with: that is said on stderr, and the config passes.
+xrayconf_validate() {
+    local file="$1" xray out
+    xray=$(type -P xray 2>/dev/null) || xray=""
+    if [[ -z $xray && -x /opt/sbin/xray ]]; then
+        xray=/opt/sbin/xray
+    fi
+    if [[ -z $xray ]]; then
+        printf 'xrayconf: xray not found; %s was not tested\n' "$file" >&2
+        return 0
+    fi
+    if ! out=$("$xray" run -test -format json -c "$file" 2>&1); then
+        printf 'xrayconf: xray rejected the config: %s\n' "$(printf '%s\n' "$out" | awk '
+            NF { line[++n] = $0 }
+            END { for (i = (n > 3 ? n - 2 : 1); i <= n; i++) printf "%s%s", line[i], (i < n ? "; " : "") }')" >&2
+        return 1
+    fi
 }

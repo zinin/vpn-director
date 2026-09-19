@@ -169,11 +169,23 @@ step_select_xray_server() {
 
     printf "Available servers:\n\n"
 
-    # Read servers from JSON and display
+    # Read servers from JSON and display. The label names the protocol, as the
+    # Web UI and the bot do (vpnconfig.Server.Label): a record without an
+    # outbound is a legacy VLESS one, generated as TLS when it names no
+    # security.
     i=1
-    jq -r '.[] | "\(.name)|\(.address)|\((.ips // []) | join(", "))"' "$SERVERS_FILE" | \
-    while IFS='|' read -r name address ip; do
-        printf "  %2d) %s\n      %s -> %s\n\n" "$i" "$name" "$address" "$ip"
+    jq -r '
+        def protocol_label:
+          (if (.outbound | type) == "object"
+           then [.outbound.protocol, .outbound.streamSettings.network, .outbound.streamSettings.security]
+           else ["vless", .network, (if (.security // "") == "" then "tls" else .security end)] end)
+          | map(. // "") as [$p, $n, $s]
+          | if $p == "shadowsocks" then "ss" elif $p == "hysteria" then "hysteria2"
+            else [$p] + (if $n == "" or $n == "tcp" or $n == "raw" then [] else [$n] end)
+                      + (if $s == "" or $s == "none" then [] else [$s] end) | join("·") end;
+        .[] | "\(.name)|\(.address)|\((.ips // []) | join(", "))|\(protocol_label)"' "$SERVERS_FILE" | \
+    while IFS='|' read -r name address ip label; do
+        printf "  %2d) %s [%s]\n      %s -> %s\n\n" "$i" "$name" "$label" "$address" "$ip"
         i=$((i + 1))
     done
 
@@ -551,19 +563,20 @@ step_generate_configs() {
     # Generate to a temp file first, then replace atomically. A '>' redirect would
     # truncate the live config.json before xrayconf_generate runs, so a generator
     # failure (bad params, jq/template error) would leave the router with an empty
-    # config. Write-then-mv keeps the existing config intact on any failure.
+    # config. Write-then-mv keeps the existing config intact on any failure, and
+    # one Xray rejects never replaces it (xrayconf_validate).
     _xray_cfg_tmp=$(mktemp "$XRAY_CONFIG_DIR/config.json.XXXXXX")
     if printf '%s' "$SELECTED_SERVER_JSON" \
         | xrayconf_generate "$XRAY_CONFIG_DIR/config.json.template" \
             "$_tproxy_port" "$_socks_port" \
-        > "$_xray_cfg_tmp"; then
+        > "$_xray_cfg_tmp" && xrayconf_validate "$_xray_cfg_tmp"; then
         mv -f "$_xray_cfg_tmp" "$XRAY_CONFIG_DIR/config.json"
         print_success "Generated $XRAY_CONFIG_DIR/config.json"
     else
         rm -f "$_xray_cfg_tmp"
         flock -u 9
         exec 9>&-
-        print_error "Failed to generate Xray config (invalid server params?); kept existing config.json"
+        print_error "Failed to generate an Xray config for this server, or Xray rejected it; kept existing config.json"
         exit 1
     fi
 
