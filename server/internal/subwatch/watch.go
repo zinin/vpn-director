@@ -104,6 +104,7 @@ type Watch struct {
 	running           bool
 	returnNotBefore   time.Time         // no look for the preferred server before this
 	returnRetry       time.Duration     // wait after the last failed return; zero before any
+	returnFails       int               // returns in a row that failed; at ReturnFailsMax the returns stop
 	lastReturn        time.Time         // when the last return proved live; zero once it held for ReturnHold or a death followed it
 	returnDeath       time.Time         // failSince of the last death the returns were settled at
 	lastPicked        *vpnconfig.Server // the copy the walk picked or a return proved, with the address it ran on

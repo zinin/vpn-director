@@ -164,8 +164,8 @@ func TestTick_FailedReturnGoesBackAndBacksOff(t *testing.T) {
 	if len(r.f.notes) != 0 {
 		t.Fatalf("notes %v; a failed return tells nobody", r.f.notes)
 	}
-	// The next attempts wait 10, 20, then 30 minutes.
-	for i, at := range []time.Duration{10 * time.Minute, 30 * time.Minute, 60 * time.Minute, 90 * time.Minute} {
+	// The next attempts wait 10, 20, then 30 minutes; the fourth is the last.
+	for i, at := range []time.Duration{10 * time.Minute, 30 * time.Minute, 60 * time.Minute} {
 		r.f.now = start.Add(at - time.Second)
 		r.tick()
 		if n := r.attempts(); n != i+1 {
@@ -176,6 +176,72 @@ func TestTick_FailedReturnGoesBackAndBacksOff(t *testing.T) {
 		if n := r.attempts(); n != i+2 {
 			t.Fatalf("attempts %d at %v, want %d", n, at, i+2)
 		}
+	}
+	for _, at := range []time.Duration{90 * time.Minute, 3 * time.Hour} {
+		r.f.now = start.Add(at)
+		r.tick()
+		if n := r.attempts(); n != 4 {
+			t.Fatalf("attempts %d at %v, want 4: the returns have stopped", n, at)
+		}
+	}
+}
+
+// failReturns has the return to Oslo fail ReturnFailsMax times in a row - at
+// the start, then 10, 30 and 60 minutes after it - with Madrid live to go back
+// to, and returns that start.
+func failReturns(t *testing.T, r *returnRig) time.Time {
+	t.Helper()
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	start := r.f.now
+	r.tick()
+	for _, at := range []time.Duration{10 * time.Minute, 30 * time.Minute, 60 * time.Minute} {
+		r.f.now = start.Add(at)
+		r.tick()
+	}
+	if n := r.attempts(); n != ReturnFailsMax || r.w.returnFails != ReturnFailsMax {
+		t.Fatalf("attempts %d, returnFails %d, want %d of each", n, r.w.returnFails, ReturnFailsMax)
+	}
+	return start
+}
+
+// A selection starts stopped returns over: once a walk leaves another server
+// running again, the next attempt comes at its time.
+func TestTick_ASelectionStartsStoppedReturnsOver(t *testing.T) {
+	r := newReturnRig(returnServers())
+	start := failReturns(t, r)
+	r.f.cfg.Xray.PreferredServer = nil // a selection clears it
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if r.w.returnFails != 0 {
+		t.Fatalf("returnFails %d; a selection starts the returns over", r.w.returnFails)
+	}
+	r.f.cfg.Xray.PreferredServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+	// The last failure, 60 minutes in, set the next attempt 30 minutes later.
+	r.f.now = start.Add(90*time.Minute - time.Second)
+	r.tick()
+	if n := r.attempts(); n != ReturnFailsMax {
+		t.Fatalf("attempts %d before its time, want %d", n, ReturnFailsMax)
+	}
+	r.f.now = start.Add(90 * time.Minute)
+	r.tick()
+	if n := r.attempts(); n != ReturnFailsMax+1 {
+		t.Fatalf("attempts %d at its time, want %d", n, ReturnFailsMax+1)
+	}
+}
+
+func TestTick_ADeathStartsStoppedReturnsOver(t *testing.T) {
+	r := newReturnRig(returnServers())
+	failReturns(t, r)
+	r.live[madridIP] = false // Madrid dies
+	r.f.plat = connected("ovpnc2")
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.f.cfg.Xray.Failover == nil {
+		t.Fatal("no failover")
+	}
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+		t.Fatalf("returnFails %d, returnRetry %v; a death starts the returns over", r.w.returnFails, r.w.returnRetry)
 	}
 }
 
@@ -570,6 +636,43 @@ func TestTick_ADeathSoonAfterAReturnCountsOnce(t *testing.T) {
 	}
 	if r.w.returnRetry != ReturnRetry {
 		t.Fatalf("returnRetry %v after more passes of the same death, want %v", r.w.returnRetry, ReturnRetry)
+	}
+}
+
+// A death soon after a return counts toward the cap as a failed return does:
+// one failure short of it, the death stops the returns.
+func TestTick_ADeathSoonAfterAReturnCountsTowardTheCap(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.tick() // the return: Oslo runs again
+	r.w.returnFails = ReturnFailsMax - 1
+	r.live[osloIP] = false // Oslo dies again
+	r.up[osloIP] = false
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != ReturnFailsMax {
+		t.Fatalf("returnFails %d, want %d", r.w.returnFails, ReturnFailsMax)
+	}
+	// A walk puts Madrid in Oslo's place, and the clients come back to Xray.
+	vpnconfig.RecordWalkedServer(r.f.cfg, returnServers()[1])
+	r.running = madridIP
+	r.live[madridIP] = true
+	looks := 0
+	reachable := r.w.Reachable
+	r.w.Reachable = func(ctx context.Context, ip string, port int) bool {
+		if ip == osloIP {
+			looks++
+		}
+		return reachable(ctx, ip, port)
+	}
+	tickFor(r.w, r.f, time.Hour)
+	if r.f.cfg.Xray.Failover != nil {
+		t.Fatal("the clients must be back on Xray")
+	}
+	if looks != 0 {
+		t.Fatalf("%d looks at Oslo; the returns have stopped", looks)
 	}
 }
 

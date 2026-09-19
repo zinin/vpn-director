@@ -22,22 +22,34 @@ const (
 	// return for the return to count as held: a death that starts within it
 	// counts as a failed return, and only a held return ends the backoff.
 	ReturnHold = 30 * time.Minute
+	// ReturnFailsMax is how many returns in a row may fail - a death within
+	// ReturnHold of one included - before the watch stops trying. An address
+	// that accepts TCP and keeps refusing the proxy, a blocked endpoint, would
+	// otherwise cost every Xray client a few dead seconds every ReturnRetryMax
+	// for as long as the block lasts. A new death, a selection or a restart of
+	// the bot starts the returns over.
+	ReturnFailsMax = 4
 )
 
 // maybeReturn takes Xray back to the server the user chose once a walk has left
 // another one running and the chosen one accepts TCP again. It runs after a
 // probe that passed, with no failover and no restore apply outstanding, and
 // looks every ReturnCheck - after a failed return, ReturnRetry and longer.
+// After ReturnFailsMax failed attempts in a row the returns stop.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
 		// A return clears preferred_server too; its backoff ends once it has held.
 		if w.lastReturn.IsZero() || w.Now().Sub(w.lastReturn) >= ReturnHold {
 			w.returnRetry = 0
+			w.returnFails = 0
 			w.lastReturn = time.Time{}
 		}
 		return
 	}
 	if w.LoadServers == nil || w.Reachable == nil || w.Generate == nil {
+		return
+	}
+	if w.returnFails >= ReturnFailsMax {
 		return
 	}
 	if cfg.Xray.Failover != nil || w.pendingApply || w.pendingRestore != nil {
@@ -231,19 +243,26 @@ func (w *Watch) returnAfterDeath() {
 		w.backOffReturn()
 	} else {
 		w.returnRetry = 0
+		w.returnFails = 0
 		w.returnNotBefore = time.Time{}
 	}
 	w.lastReturn = time.Time{}
 }
 
 // backOffReturn holds the next attempt back after a return that failed:
-// ReturnRetry, then twice the last wait, ReturnRetryMax at most.
+// ReturnRetry, then twice the last wait, ReturnRetryMax at most. After
+// ReturnFailsMax failures in a row there is no next attempt: the returns stop.
 func (w *Watch) backOffReturn() {
+	w.returnFails++
 	if w.returnRetry == 0 {
 		w.returnRetry = ReturnRetry
 	} else {
 		w.returnRetry = min(2*w.returnRetry, ReturnRetryMax)
 	}
 	w.returnNotBefore = w.Now().Add(w.returnRetry)
+	if w.returnFails >= ReturnFailsMax {
+		slog.Info("Returns to the preferred server stopped after failed attempts; a new death, a selection or a bot restart starts them again", "failed", w.returnFails)
+		return
+	}
 	slog.Info("Next return attempt backed off", "after", w.returnRetry)
 }
