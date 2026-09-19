@@ -58,7 +58,9 @@ cd server && go run ./cmd/webui --dev
 | `router/opt/vpn-director/lib/ipset.sh` | IPSet module: ensure, update, status |
 | `router/opt/vpn-director/lib/tunnel.sh` | Tunnel Director module: apply, stop, status |
 | `router/opt/vpn-director/lib/tproxy.sh` | Xray TPROXY module: apply, stop, status |
-| `router/opt/vpn-director/lib/xrayconf.sh` | Build Xray outbound (REALITY/TLS) + config.json from a server |
+| `router/opt/vpn-director/lib/xrayconf.sh` | Xray config.json from a server's stored outbound (legacy VLESS records built), `xray run -test` before it replaces the live one |
+| `router/opt/vpn-director/lib/subscription.sh` | Subscription decoder: share links (vless, vmess, trojan, ss, hysteria2), base64 or plain, and Xray JSON, into servers with a ready outbound |
+| `testdata/subscription/` | Cases both subscription decoders (shell and Go) must decode alike |
 | `router/opt/etc/init.d/S99vpn-director` | Entware init.d script for startup |
 | `router/jffs/scripts/firewall-start` | Asuswrt-Merlin hook for firewall reload |
 | `router/jffs/scripts/wan-event` | Asuswrt-Merlin hook for WAN events |
@@ -69,6 +71,7 @@ cd server && go run ./cmd/webui --dev
 | `server/cmd/bot/main.go` | Telegram bot daemon: DI, signal handling |
 | `server/cmd/webui/main.go` | Web UI daemon: HTTPS server, DI, dev mode |
 | `server/internal/webapi/` | HTTP API: router, JWT middleware, handlers, response deadlines |
+| `server/internal/subscription/` | Go subscription decoder, the twin of `lib/subscription.sh`; resolution and import summaries |
 | `server/internal/auth/` | Password check against the platform password file, JWT issue and validation |
 | `web/` | Vue 3 SPA, embedded into the webui binary with `go:embed` |
 | `router/opt/vpn-director/setup_telegram_bot.sh` | Bot configuration script |

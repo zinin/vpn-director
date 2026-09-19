@@ -29,29 +29,38 @@ process alone: a client meets a restarting Xray and waits. It is for a caller wh
 3. Remaining traffic → TPROXY to Xray port
 4. Xray dokodemo-door inbound → VLESS outbound
 
-## Outbound Generation (REALITY/TLS)
+## Outbound Generation
 
-`config.json.template` is valid JSON with an empty `outbounds: []`. The proxy-out outbound
-is generated per selected server from `servers.json` stream params and injected as `outbounds[0]`:
+`config.json.template` is valid JSON with an empty `outbounds: []`. The selected server's
+outbound goes into it as `outbounds[0]`, tagged `proxy-out`:
 
 - Shell: `lib/xrayconf.sh` (`xrayconf_generate`, jq) — used by `configure.sh`.
-- Go: `service/xray.go` (`buildOutbound` + `encoding/json`) — used by bot wizard and `/xray`.
+- Go: `service/xray.go` (`serverOutbound` + `encoding/json`) — used by the Web UI, the bot wizard,
+  `/xray` and the subscription watch.
 
-Per-server params (parsed from the VLESS URI): `security` (`reality`|`tls`), `network`, `flow`,
-`sni`, `fingerprint` (fp), `public_key` (pbk), `short_id` (sid), `alpn`.
+An import stores each server's Xray outbound in `servers.json` (`outbound`): converted from a share
+link, or taken from an Xray JSON subscription and sanitized — the decoders are `lib/subscription.sh`
+and `server/internal/subscription`, which answer to the same cases in `testdata/subscription/`. The
+generators insert it unread, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
+httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2.
+
+A record without `outbound` predates stored outbounds: the generators build a VLESS outbound from
+its flat fields — `security` (`reality`|`tls`), `network`, `flow`, `sni`, `fingerprint`,
+`public_key`, `short_id`, `alpn`:
 
 - `security=reality` -> `realitySettings { serverName, fingerprint, publicKey, shortId }`, user `flow`.
 - `security=tls` -> `tlsSettings { serverName (sni||address), fingerprint?, alpn? }`.
 - empty `security` -> legacy `tlsSettings { alpn:["h2"], serverName:address }`, no flow.
 
-**Migration after upgrade:** the previously generated `/opt/etc/xray/config.json` stays on disk as
-plain TLS until regenerated, so Xray — and the Telegram bot, which proxies its API connection
-through it — cannot connect to a REALITY server until the user acts:
+The next import rewrites such records; nothing converts them.
 
-1. Re-run `/import` (or, over SSH if the bot is unreachable through the broken proxy:
-   `/opt/vpn-director/import_server_list.sh`) so params land in `servers.json`.
-2. Re-select the server (`/configure` wizard or `/xray`, or over SSH `/opt/vpn-director/configure.sh`)
-   to regenerate `config.json`.
+**Every config is tested before it replaces the live one:** `xray run -test -format json -c <temp>`
+(`xrayconf_validate` in shell, `xrayTest` in Go). An outbound from a subscription can name a protocol
+the installed Xray lacks, or a key it refuses — since 2026-06-01 Xray loads no config with
+`tlsSettings.allowInsecure: true` — and a config Xray rejects would take every Xray client, and the
+bot, offline at the next restart. The temp file (`config.json.XXXXXX`) does not end in `.json`, which
+keeps `xray -confdir` from loading it and is why `-format json` is needed. Without an `xray` binary
+(dev mode, a workstation) the test is skipped.
 
 ## Configuration
 
