@@ -3,14 +3,24 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
 const testTemplate = `{"inbounds":[],"outbounds":[],"routing":{}}`
+
+// newTestXrayService is NewXrayService without the xray test, so a test does
+// not depend on whether the machine running it has an xray.
+func newTestXrayService(templatePath, outputPath string) *XrayService {
+	s := NewXrayService(templatePath, outputPath)
+	s.validate = nil
+	return s
+}
 
 func generate(t *testing.T, server vpnconfig.Server) map[string]interface{} {
 	t.Helper()
@@ -20,7 +30,7 @@ func generate(t *testing.T, server vpnconfig.Server) map[string]interface{} {
 	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
 		t.Fatalf("GenerateConfig error: %v", err)
 	}
 	content, err := os.ReadFile(outputPath)
@@ -142,7 +152,7 @@ func TestGenerateConfig_InboundPortsFollowTheConfig(t *testing.T) {
 	templatePath, outputPath := writeTemplate(t)
 	server := vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Security: "tls", SNI: "s", Fingerprint: "chrome"}
 
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server, InboundPorts{TProxy: 23456, Socks: 23457}); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server, InboundPorts{TProxy: 23456, Socks: 23457}); err != nil {
 		t.Fatalf("GenerateConfig() error = %v", err)
 	}
 
@@ -156,7 +166,7 @@ func TestGenerateConfig_WithoutPortsKeepsTheTemplate(t *testing.T) {
 	templatePath, outputPath := writeTemplate(t)
 	server := vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Security: "tls", SNI: "s", Fingerprint: "chrome"}
 
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
 		t.Fatalf("GenerateConfig() error = %v", err)
 	}
 
@@ -208,7 +218,7 @@ func readInboundPorts(t *testing.T, path string) map[string]int {
 
 func TestGenerateConfig_MissingTemplate(t *testing.T) {
 	tmpDir := t.TempDir()
-	svc := NewXrayService(filepath.Join(tmpDir, "nonexistent"), filepath.Join(tmpDir, "out"))
+	svc := newTestXrayService(filepath.Join(tmpDir, "nonexistent"), filepath.Join(tmpDir, "out"))
 	if err := svc.GenerateConfig(vpnconfig.Server{}); err == nil {
 		t.Error("expected error for missing template")
 	}
@@ -220,7 +230,7 @@ func TestGenerateConfig_UnsupportedNetwork(t *testing.T) {
 	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 		t.Fatal(err)
 	}
-	svc := NewXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
+	svc := newTestXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
 	if err := svc.GenerateConfig(vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Network: "ws", Security: "reality"}); err == nil {
 		t.Error("expected error for unsupported network 'ws'")
 	}
@@ -232,7 +242,7 @@ func TestGenerateConfig_UnsupportedSecurity(t *testing.T) {
 	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 		t.Fatal(err)
 	}
-	svc := NewXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
+	svc := newTestXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
 	if err := svc.GenerateConfig(vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Security: "xtls"}); err == nil {
 		t.Error("expected error for unsupported security 'xtls'")
 	}
@@ -245,7 +255,7 @@ func TestGenerateConfig_RealityMissingRequiredFields(t *testing.T) {
 		if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 			t.Fatal(err)
 		}
-		return NewXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
+		return newTestXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
 	}
 	base := vpnconfig.Server{
 		Address: "1.2.3.4", Port: 443, UUID: "u", Security: "reality",
@@ -283,7 +293,7 @@ func TestGenerateConfig_KeepsTemplateLogSection(t *testing.T) {
 	}
 
 	server := vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u1", Security: "tls"}
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
 		t.Fatalf("GenerateConfig error: %v", err)
 	}
 
@@ -330,5 +340,96 @@ func TestDevTemplateLogSection(t *testing.T) {
 	}
 	if got := logSection["access"]; got != "none" {
 		t.Errorf("log.access = %v, want %q", got, "none")
+	}
+}
+
+// An import stores the outbound it read; the generator puts it in place as
+// proxy-out without looking into it, whatever the protocol.
+func TestGenerateConfig_StoredOutbound(t *testing.T) {
+	cfg := generate(t, vpnconfig.Server{
+		Name: "Hysteria", Address: "198.51.100.11", Port: 8449,
+		Outbound: json.RawMessage(`{"protocol":"hysteria","settings":{"version":2,"address":"198.51.100.11","port":8449},` +
+			`"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},` +
+			`"finalmask":{"quicParams":{"congestion":"bbr"}}}}`),
+	})
+	ob := outbound0(t, cfg)
+	if ob["tag"] != "proxy-out" || ob["protocol"] != "hysteria" {
+		t.Fatalf("outbound %v", ob)
+	}
+	ss := ob["streamSettings"].(map[string]interface{})
+	if _, ok := ss["finalmask"]; !ok {
+		t.Fatalf("streamSettings %v; a key the generator does not know must pass through", ss)
+	}
+}
+
+// writeFakeXray puts an xray on PATH that prints msg and exits with code.
+func writeFakeXray(t *testing.T, code int, msg string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %q\nexit %d\n", msg, code)
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func testedService(t *testing.T) (*XrayService, string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	templatePath := filepath.Join(tmpDir, "config.json.template")
+	outputPath := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return NewXrayService(templatePath, outputPath), outputPath
+}
+
+var storedVLESS = vpnconfig.Server{
+	Name: "Oslo", Address: "oslo.example", Port: 443,
+	Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]}}`),
+}
+
+func TestGenerateConfig_XrayAcceptsTheConfig(t *testing.T) {
+	writeFakeXray(t, 0, "Configuration OK.")
+	svc, outputPath := testedService(t)
+	if err := svc.GenerateConfig(storedVLESS); err != nil {
+		t.Fatal(err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) == "previous\n" {
+		t.Fatal("config.json was not replaced")
+	}
+}
+
+// A config Xray refuses would take every Xray client offline at the next
+// restart: it never replaces the running one, and Xray's own words say why.
+func TestGenerateConfig_XrayRejectsTheConfig(t *testing.T) {
+	writeFakeXray(t, 23, `Failed to start: infra/conf: "allowInsecure" has been removed`)
+	svc, outputPath := testedService(t)
+	err := svc.GenerateConfig(storedVLESS)
+	if err == nil || !strings.Contains(err.Error(), "xray rejected the config") || !strings.Contains(err.Error(), "allowInsecure") {
+		t.Fatalf("err %v", err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) != "previous\n" {
+		t.Fatalf("config.json %q; a rejected config must not replace it", content)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(outputPath))
+	for _, e := range entries {
+		if name := e.Name(); name != "config.json" && name != "config.json.template" {
+			t.Fatalf("left behind: %s", name)
+		}
+	}
+}
+
+func TestGenerateConfig_WithoutXrayNothingIsTested(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	svc, outputPath := testedService(t)
+	if err := svc.GenerateConfig(storedVLESS); err != nil {
+		t.Fatal(err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) == "previous\n" {
+		t.Fatal("config.json was not replaced")
 	}
 }

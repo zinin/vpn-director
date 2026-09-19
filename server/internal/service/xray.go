@@ -2,10 +2,15 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
@@ -14,12 +19,58 @@ import (
 type XrayService struct {
 	templatePath string
 	outputPath   string
+	// validate tests a written config before it replaces the live one; nil
+	// skips the test. NewXrayService sets xrayTest.
+	validate func(path string) error
 }
 
 var _ XrayGenerator = (*XrayService)(nil)
 
 func NewXrayService(templatePath, outputPath string) *XrayService {
-	return &XrayService{templatePath: templatePath, outputPath: outputPath}
+	return &XrayService{templatePath: templatePath, outputPath: outputPath, validate: xrayTest}
+}
+
+// xrayTestTimeout bounds one "xray run -test"; a router needs a second or two.
+const xrayTestTimeout = 30 * time.Second
+
+// xrayTest has Xray load the config without starting a server. The outbound
+// may come verbatim from a subscription, and it may name a protocol the
+// installed Xray lacks or a key it refuses - allowInsecure stops Xray from
+// loading any config since 2026-06-01 - and a config Xray rejects takes every
+// Xray client, and the bot, offline until the next switch. S24xray runs
+// "xray run -confdir", which loads only *.json, so the temp config.json.*
+// names its format. Without an xray on PATH - the dev mode, a workstation -
+// there is nothing to test with.
+func xrayTest(path string) error {
+	bin, err := exec.LookPath("xray")
+	if err != nil {
+		slog.Debug("xray not found, config not tested", "path", path)
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), xrayTestTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, "run", "-test", "-format", "json", "-c", path).CombinedOutput()
+	if ctx.Err() != nil {
+		return fmt.Errorf("xray config test timed out after %s", xrayTestTimeout)
+	}
+	if err != nil {
+		return fmt.Errorf("xray rejected the config: %s", lastLines(string(out), 3))
+	}
+	return nil
+}
+
+// lastLines joins the last n non-empty lines of s with "; ".
+func lastLines(s string, n int) string {
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.Join(lines, "; ")
 }
 
 type xrayUser struct {
@@ -179,12 +230,31 @@ func applyInboundPorts(cfg map[string]interface{}, ports InboundPorts) {
 	}
 }
 
-// GenerateConfig parses the (valid-JSON) template and replaces outbounds
-// with a single proxy-out outbound built from the server's stream params.
-// The optional ports keep the inbounds in step with advanced.xray in
-// vpn-director.json; without them the template's ports stand.
-func (s *XrayService) GenerateConfig(server vpnconfig.Server, ports ...InboundPorts) error {
+// serverOutbound is the proxy-out outbound of a server: the outbound its
+// import stored, tagged, or for a record from before outbounds were stored,
+// the one buildOutbound makes from the flat VLESS fields.
+func serverOutbound(server vpnconfig.Server) (interface{}, error) {
+	if len(server.Outbound) > 0 {
+		ob, err := vpnconfig.DecodeOutbound(server.Outbound)
+		if err != nil {
+			return nil, fmt.Errorf("stored outbound: %w", err)
+		}
+		ob["tag"] = "proxy-out"
+		return ob, nil
+	}
 	if err := validateStreamParams(server); err != nil {
+		return nil, err
+	}
+	return buildOutbound(server), nil
+}
+
+// GenerateConfig parses the (valid-JSON) template and replaces outbounds
+// with the server's proxy-out outbound, then has Xray test the result before
+// it replaces config.json. The optional ports keep the inbounds in step with
+// advanced.xray in vpn-director.json; without them the template's ports stand.
+func (s *XrayService) GenerateConfig(server vpnconfig.Server, ports ...InboundPorts) error {
+	outbound, err := serverOutbound(server)
+	if err != nil {
 		return err
 	}
 	template, err := os.ReadFile(s.templatePath)
@@ -195,7 +265,7 @@ func (s *XrayService) GenerateConfig(server vpnconfig.Server, ports ...InboundPo
 	if err := json.Unmarshal(template, &cfg); err != nil {
 		return fmt.Errorf("parse template: %w", err)
 	}
-	cfg["outbounds"] = []xrayOutbound{buildOutbound(server)}
+	cfg["outbounds"] = []interface{}{outbound}
 	if len(ports) > 0 {
 		applyInboundPorts(cfg, ports[0])
 	}
@@ -220,6 +290,11 @@ func (s *XrayService) GenerateConfig(server vpnconfig.Server, ports ...InboundPo
 	}
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp config: %w", err)
+	}
+	if s.validate != nil {
+		if err := s.validate(tmpName); err != nil {
+			return err
+		}
 	}
 	if err := os.Rename(tmpName, s.outputPath); err != nil {
 		return fmt.Errorf("rename config: %w", err)
