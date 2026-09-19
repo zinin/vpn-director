@@ -626,6 +626,87 @@ _sub_links() {
     fi
 }
 
+# _sub_xray_json <body>: an array of Xray configs, or one config (spec 6.5),
+# in one jq program: a record per config, its raw name kept NUL- and
+# control-free for the name filter, which drops those characters anyway.
+_sub_xray_json() {
+    local count out
+    if ! count=$(jq -s 'length' <<< "$1" 2>/dev/null) || [[ $count != 1 ]]; then
+        printf 'invalid JSON subscription\n' >&2
+        return 1
+    fi
+    out=$(jq -c '
+        def obj: if type == "object" then . else {} end;
+        def str: if type == "string" then . else "" end;
+        def rawname: str | explode | map(select(. >= 32 and . != 127)) | implode;
+        def target:
+          (.settings | obj) as $s
+          | (if .protocol == "vless" or .protocol == "vmess" then "vnext"
+             elif .protocol == "trojan" or .protocol == "shadowsocks" then "servers" else "" end) as $key
+          | if $key != "" and ($s[$key] | type) == "array" and ($s[$key] | length) > 0
+            then ($s[$key][0] | if type == "object" then . else {} end) else $s end;
+        def skip($raw; $reason; $detail): {raw: $raw, reason: $reason, detail: $detail};
+        def entry:
+          if type != "object" or (.outbounds | type) != "array" then
+            skip(if type == "object" then (.remarks | rawname) else "" end; "invalid"; "not an Xray config")
+          else
+            (.remarks | rawname) as $raw
+            | [.outbounds[] | select(type == "object") | select((.protocol | type) == "string")
+               | select(.protocol | IN("freedom", "blackhole", "dns", "loopback") | not)] as $proxies
+            | if ($proxies | length) == 0 then skip($raw; "unsupported"; "no proxy outbound")
+              elif ($proxies | length) > 1 then skip($raw; "composite"; "\($proxies | length) proxy outbounds")
+              else $proxies[0] as $ob
+              | ($ob.streamSettings | obj) as $ss
+              | ($ob.settings | obj) as $settings
+              | (($settings.vnext | if type == "array" then length else 0 end) as $v
+                 | ($settings.servers | if type == "array" then length else 0 end) as $sv
+                 | if $v > 1 then $v elif $sv > 1 then $sv else 0 end) as $targets
+              | ($ob | target) as $t
+              | ($t.address | str | ltrimstr("[") | rtrimstr("]")) as $addr
+              | ($t.port | if type == "number" and . == floor and . >= 1 and . <= 65535 then floor else null end) as $port
+              | if ($ob.protocol | IN("vless", "vmess", "trojan", "shadowsocks", "hysteria") | not) then
+                  skip($raw; "unsupported"; "protocol \($ob.protocol)")
+                elif ($ob.proxySettings | obj | .tag | str) != "" or ($ss.sockopt | obj | .dialerProxy | str) != "" then
+                  skip($raw; "composite"; "chained")
+                elif $targets > 1 then skip($raw; "composite"; "\($targets) targets")
+                elif $addr == "" or $port == null then skip($raw; "invalid"; "bad address or port")
+                elif ($ss.security | str) == "tls" and ($ss.tlsSettings | obj | .allowInsecure) == true
+                     and ($ss.tlsSettings | obj | .pinnedPeerCertSha256 | str) == "" then
+                  skip($raw; "unsupported"; "insecure TLS")
+                elif ($ss.security | str) == "reality"
+                     and (($ss.realitySettings | obj) as $r
+                          | (($r.publicKey | str) == "" and ($r.password | str) == "")
+                            or ($r.serverName | str) == "" or ($r.fingerprint | str) == "") then
+                  skip($raw; "invalid"; "reality needs publicKey, serverName and fingerprint")
+                else
+                  {raw: $raw, address: $addr, port: $port,
+                   outbound: ($ob
+                     | del(.tag, .sendThrough)
+                     | if ($ss.security | str) == "tls" and ($ss.tlsSettings | obj | .allowInsecure) == true
+                       then del(.streamSettings.tlsSettings.allowInsecure) else . end
+                     | if (.streamSettings | type) == "object" and (.streamSettings.sockopt | type) == "object"
+                       then .streamSettings.sockopt |= del(.mark, .interface, .tproxy, .customSockopt)
+                            | if (.streamSettings.sockopt | length) == 0 then del(.streamSettings.sockopt) else . end
+                       else . end)}
+                end
+              end
+          end;
+        (if type == "array" then .
+         elif type == "object" and (.outbounds | type) == "array" then [.]
+         else [] end) as $configs
+        | if ($configs | length) == 0 then "unrecognized" else ($configs[] | entry) end
+    ' <<< "$1") || {
+        printf 'invalid JSON subscription\n' >&2
+        return 1
+    }
+    if [[ $out == '"unrecognized"' ]]; then
+        printf 'unrecognized subscription format\n' >&2
+        return 1
+    fi
+    mapfile -t _SUB_RECORDS <<< "$out"
+    mapfile -t _SUB_RAWNAMES <<< "$(printf '%s\n' "${_SUB_RECORDS[@]}" | jq -r '"0\t" + .raw')"
+}
+
 # _sub_result: the Result JSON from _SUB_RECORDS and _SUB_RAWNAMES - names,
 # the placeholder test (spec 6.6) and the split into servers and skips.
 _sub_result() {
@@ -667,15 +748,20 @@ subscription_decode() {
         printf 'empty subscription\n' >&2
         return 1
     fi
-    if [[ $body == *'://'* ]]; then
-        _sub_links "$body" || return 1
-    else
-        local text
-        if ! text=$(_sub_b64 "$body"); then
-            printf 'unrecognized subscription format\n' >&2
-            return 1
-        fi
-        _sub_links "$text" || return 1
-    fi
+    case ${body:0:1} in
+        '['|'{') _sub_xray_json "$body" || return 1 ;;
+        *)
+            if [[ $body == *'://'* ]]; then
+                _sub_links "$body" || return 1
+            else
+                local text
+                if ! text=$(_sub_b64 "$body"); then
+                    printf 'unrecognized subscription format\n' >&2
+                    return 1
+                fi
+                _sub_links "$text" || return 1
+            fi
+            ;;
+    esac
     _sub_result
 }

@@ -1,0 +1,28 @@
+{
+  "total": 21,
+  "servers": [
+    {"address":"198.51.100.10","name":"Switzerland-1","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"198.51.100.10","port":8443,"users":[{"encryption":"none","flow":"xtls-rprx-vision","id":"88888888-8888-4888-8888-888888888888"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"firefox","publicKey":"CCQ2Zvkmqk5biEuO8fw7k9GeGRp5NYFTBha9LgMsR2E","serverName":"www.example.org","shortId":"0a1b"},"security":"reality"}},"port":8443},
+    {"address":"198.51.100.11","name":"Netherlands GAMING","outbound":{"protocol":"hysteria","settings":{"address":"198.51.100.11","port":8449,"version":2},"streamSettings":{"finalmask":{"quicParams":{"congestion":"bbr","debug":false}},"hysteriaSettings":{"auth":"hy-auth","version":2},"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"fingerprint":"firefox","serverName":"hy.example.com"}}},"port":8449},
+    {"address":"198.51.100.12","name":"Canada SS","outbound":{"protocol":"shadowsocks","settings":{"servers":[{"UoTVersion":1,"address":"198.51.100.12","method":"chacha20-ietf-poly1305","password":"ss-pass","port":2030,"uot":false}]},"streamSettings":{"network":"tcp","security":"none","tcpSettings":{}}},"port":2030},
+    {"address":"flat.example.com","name":"Flat VLESS","outbound":{"mux":{"concurrency":-1,"enabled":false},"protocol":"vless","settings":{"address":"flat.example.com","encryption":"none","flow":"xtls-rprx-vision","id":"99999999-9999-4999-8999-999999999999","port":443},"streamSettings":{"network":"raw","security":"tls","sockopt":{"tcpFastOpen":true},"tlsSettings":{"fingerprint":"chrome","serverName":"flat.example.com"}}},"port":443},
+    {"address":"198.51.100.15","name":"Pinned TLS","outbound":{"protocol":"trojan","settings":{"servers":[{"address":"198.51.100.15","password":"tr-pass","port":443}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"pinnedPeerCertSha256":"524453c7024ff9127ac7314f4c71e97c337b274fc9d5e5a24585dd0ca1508990","serverName":"tr.example.com"},"wsSettings":{"host":"tr.example.com","path":"/tr"}}},"port":443},
+    {"address":"2001:db8::20","name":"IPv6 only","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"2001:db8::20","port":8443,"users":[{"encryption":"none","flow":"xtls-rprx-vision","id":"88888888-8888-4888-8888-888888888888"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"firefox","publicKey":"CCQ2Zvkmqk5biEuO8fw7k9GeGRp5NYFTBha9LgMsR2E","serverName":"www.example.org","shortId":"0a1b"},"security":"reality"}},"port":8443},
+    {"address":"198.51.100.23","name":"LineoneLine two","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"198.51.100.23","port":443,"users":[{"encryption":"none","flow":"xtls-rprx-vision","id":"88888888-8888-4888-8888-888888888888"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"firefox","publicKey":"CCQ2Zvkmqk5biEuO8fw7k9GeGRp5NYFTBha9LgMsR2E","serverName":"www.example.org","shortId":"0a1b"},"security":"reality"}},"port":443},
+    {"address":"198.51.100.24","name":"Reality password key","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"198.51.100.24","port":443,"users":[{"encryption":"none","flow":"xtls-rprx-vision","id":"88888888-8888-4888-8888-888888888888"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"firefox","password":"CCQ2Zvkmqk5biEuO8fw7k9GeGRp5NYFTBha9LgMsR2E","serverName":"www.example.org","shortId":"0a1b"},"security":"reality"}},"port":443}
+  ],
+  "skipped": [
+    {"name":"Auto Best server","reason":"composite"},
+    {"name":"Whitelist bypass","reason":"composite"},
+    {"name":"Chained through fragment","reason":"composite"},
+    {"name":"Insecure TLS","reason":"unsupported"},
+    {"name":"WireGuard","reason":"unsupported"},
+    {"name":"Only direct","reason":"unsupported"},
+    {"name":"Two targets","reason":"composite"},
+    {"name":"Reality without a key","reason":"invalid"},
+    {"name":"Subscription expired","reason":"placeholder"},
+    {"name":"#16","reason":"invalid"},
+    {"name":"No outbounds","reason":"invalid"},
+    {"name":"Proxy settings chain","reason":"composite"},
+    {"name":"String port","reason":"invalid"}
+  ]
+}
