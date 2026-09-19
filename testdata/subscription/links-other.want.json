@@ -1,0 +1,25 @@
+{
+  "total": 18,
+  "servers": [
+    {"address":"tr1.example.com","name":"Trojan Default","outbound":{"protocol":"trojan","settings":{"servers":[{"address":"tr1.example.com","password":"secret+pass","port":443}]},"streamSettings":{"network":"tcp","security":"tls"}},"port":443},
+    {"address":"tr2.example.com","name":"Trojan WS","outbound":{"protocol":"trojan","settings":{"servers":[{"address":"tr2.example.com","password":"pa@ss","port":8443}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"alpn":["h2","http/1.1"],"serverName":"tr2.example.com"},"wsSettings":{"host":"tr2.example.com","path":"/tr"}}},"port":8443},
+    {"address":"vm1.example.com","name":"VMess WS","outbound":{"protocol":"vmess","settings":{"vnext":[{"address":"vm1.example.com","port":443,"users":[{"id":"44444444-4444-4444-8444-444444444444","security":"auto"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"fingerprint":"chrome","serverName":"vm1.example.com"},"wsSettings":{"host":"vm1.example.com","path":"/vm"}}},"port":443},
+    {"address":"vm2.example.com","name":"VMess gRPC","outbound":{"protocol":"vmess","settings":{"vnext":[{"address":"vm2.example.com","port":8443,"users":[{"id":"55555555-5555-4555-8555-555555555555","security":"auto"}]}]},"streamSettings":{"grpcSettings":{"multiMode":true,"serviceName":"grpc-svc"},"network":"grpc","realitySettings":{"fingerprint":"firefox","publicKey":"NtAeDM330us16lXG0NRxVVYpwuv44jbIgsVh92ZSUUo","serverName":"www.example.org","shortId":"ab"},"security":"reality"}},"port":8443},
+    {"address":"vm3.example.com","name":"VMess URL","outbound":{"protocol":"vmess","settings":{"vnext":[{"address":"vm3.example.com","port":443,"users":[{"id":"44444444-4444-4444-8444-444444444444","security":"aes-128-gcm"}]}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"vm3.example.com"}}},"port":443},
+    {"address":"ss1.example.com","name":"SS SIP002","outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"ss1.example.com","method":"chacha20-ietf-poly1305","password":"pw-one","port":8388}]}},"port":8388},
+    {"address":"ss2.example.com","name":"SS 2022","outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"ss2.example.com","method":"2022-blake3-aes-256-gcm","password":"SdwVF7LewaCi46HtswNaHAILOt/l9UT8yKehM44ap60=:FHTFlZ5DQ0jQCX+BvxTDIG0+Me39608ulnXA0TkKS9o=","port":8389}]}},"port":8389},
+    {"address":"ss3.example.com","name":"SS Legacy","outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"ss3.example.com","method":"aes-256-gcm","password":"legacy-pass","port":8390}]}},"port":8390},
+    {"address":"ss6.example.com","name":"SS Upper method","outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"ss6.example.com","method":"aes-256-gcm","password":"pw-six","port":8393}]}},"port":8393},
+    {"address":"hy1.example.com","name":"Hysteria2 Plain","outbound":{"protocol":"hysteria","settings":{"address":"hy1.example.com","port":8443,"version":2},"streamSettings":{"hysteriaSettings":{"auth":"auth-token","version":2},"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"serverName":"hy1.example.com"}}},"port":8443},
+    {"address":"hy2.example.com","name":"Hysteria2 Salamander","outbound":{"protocol":"hysteria","settings":{"address":"hy2.example.com","port":443,"version":2},"streamSettings":{"finalmask":{"udp":[{"settings":{"password":"obfs-pw"},"type":"salamander"}]},"hysteriaSettings":{"auth":"auth+plus","version":2},"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3","h2"],"serverName":"hy2.example.com"}}},"port":443},
+    {"address":"hy3.example.com","name":"Hysteria2 Pinned","outbound":{"protocol":"hysteria","settings":{"address":"hy3.example.com","port":443,"version":2},"streamSettings":{"hysteriaSettings":{"auth":"auth","version":2},"network":"hysteria","security":"tls","tlsSettings":{"alpn":["h3"],"pinnedPeerCertSha256":"39:DD:F9:4F:C8:42:18:D9:02:DB:65:27:25:FB:F4:BB:31:8A:AE:A3:06:37:E0:12:4B:00:4C:E7:03:1F:11:E6"}}},"port":443}
+  ],
+  "skipped": [
+    {"name":"SS Plugin","reason":"unsupported"},
+    {"name":"SS RC4","reason":"unsupported"},
+    {"name":"Hysteria2 Insecure","reason":"unsupported"},
+    {"name":"Hysteria2 Hopping","reason":"unsupported"},
+    {"name":"Hysteria2 Other obfs","reason":"unsupported"},
+    {"name":"Hysteria2 No obfs password","reason":"invalid"}
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "total": 22,
+  "servers": [
+    {"address":"tlsr.example.com","name":"Reality ignores allowInsecure","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"tlsr.example.com","port":443,"users":[{"encryption":"none","id":"id"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"chrome","publicKey":"glTDKakoUPbVOd03b0gW7idkUX2l4CNVFK9DMWRIDXo","serverName":"a.example.org"},"security":"reality"}},"port":443},
+    {"address":"noname.example.com","name":"noname.example.com","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"noname.example.com","port":443,"users":[{"encryption":"none","id":"id"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443},
+    {"address":"names.example.com","name":"Türkiye Istanbul","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"names.example.com","port":443,"users":[{"encryption":"none","id":"id"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443},
+    {"address":"stray.example.com","name":"100 off2zz plus","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"stray.example.com","port":443,"users":[{"encryption":"none","id":"id"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443},
+    {"address":"trunc.example.com","name":"evil","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"trunc.example.com","port":443,"users":[{"encryption":"none","id":"id"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443},
+    {"address":"nul.example.com","name":"ab","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"nul.example.com","port":443,"users":[{"encryption":"none","id":"id"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443}
+  ],
+  "skipped": [
+    {"name":"TUIC Server","reason":"unsupported"},
+    {"name":"#2","reason":"unsupported"},
+    {"name":"KCP","reason":"unsupported"},
+    {"name":"HTTP header","reason":"unsupported"},
+    {"name":"Old XTLS","reason":"unsupported"},
+    {"name":"Bad Port","reason":"invalid"},
+    {"name":"No Port","reason":"invalid"},
+    {"name":"Bad Escape","reason":"invalid"},
+    {"name":"No User","reason":"invalid"},
+    {"name":"No pbk","reason":"invalid"},
+    {"name":"Extra Array","reason":"invalid"},
+    {"name":"Insecure","reason":"unsupported"},
+    {"name":"Подписка истекла","reason":"placeholder"},
+    {"name":"Placeholder v6","reason":"placeholder"},
+    {"name":"NUL in query","reason":"invalid"},
+    {"name":"#22","reason":"invalid"}
+  ]
+}

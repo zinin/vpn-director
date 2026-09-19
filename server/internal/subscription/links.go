@@ -46,8 +46,14 @@ func parseLink(scheme, rest string) (entry, error) {
 	switch scheme {
 	case "vless":
 		return parseVLESS(rest)
+	case "vmess":
+		return parseVMess(rest)
 	case "trojan":
 		return parseTrojan(rest)
+	case "ss":
+		return parseShadowsocks(rest)
+	case "hysteria2", "hy2":
+		return parseHysteria2(rest)
 	}
 	_, frag, _ := strings.Cut(rest, "#")
 	return entry{name: cleanName(unescapeName(frag))}, unsupported(scheme)

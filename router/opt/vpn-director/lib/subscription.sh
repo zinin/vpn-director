@@ -363,6 +363,227 @@ _sub_trojan() {
         password: $user}]}, streamSettings: stream}'
 }
 
+_sub_vmess_record() {
+    _sub_record '{protocol: "vmess", settings: {vnext: [{address: $addr, port: $port,
+        users: [{id: $user, security: $enc}]}]}, streamSettings: stream}'
+}
+
+# Both vmess forms: the URL form, recognized by an @, and the v2rayN form,
+# base64 of a JSON object. Xray speaks VMess AEAD only; alterId is ignored.
+_sub_vmess() {
+    local body=${1%%#*} text fields k vn
+    if [[ $body == *@* ]]; then
+        _sub_link "$1" || return 1
+        _sub_port_query || return 1
+        _sub_stream none || return 1
+        _SUB_V[user]=$_SUB_USER
+        _SUB_V[enc]=${_SUB_Q[encryption]:-auto}
+        _sub_vmess_record
+        return
+    fi
+    _SUB_DECODE=0
+    if ! text=$(_sub_b64 "$body") ||
+        ! fields=$(jq -rs '
+            def f: if type == "string" then . elif type == "number" then tostring else "" end;
+            def nonul: explode | map(select(. != 0)) | implode;
+            if length != 1 or (.[0] | type) != "object" then error("not a vmess object") else .[0] end
+            | (.port | if type == "number" then (if . == floor and . >= 1 and . <= 65535 then ["number", (floor | tostring)] else ["bad", tostring] end)
+                       elif type == "string" then ["string", .] else ["missing", ""] end) as $port
+            | ([.add, .id, .scy, .net, .type, .host, .path, .tls, .sni, .alpn, .fp, .pbk, .sid, .spx]
+               | map(f | index("\u0000") != null) | any) as $nul
+            | "V_ps=\(.ps | f | nonul | @sh) V_add=\(.add | f | nonul | @sh) V_id=\(.id | f | nonul | @sh)",
+              "V_scy=\(.scy | f | nonul | @sh) V_net=\(.net | f | nonul | @sh) V_type=\(.type | f | nonul | @sh)",
+              "V_host=\(.host | f | nonul | @sh) V_path=\(.path | f | nonul | @sh) V_tls=\(.tls | f | nonul | @sh)",
+              "V_sni=\(.sni | f | nonul | @sh) V_alpn=\(.alpn | f | nonul | @sh) V_fp=\(.fp | f | nonul | @sh)",
+              "V_pbk=\(.pbk | f | nonul | @sh) V_sid=\(.sid | f | nonul | @sh) V_spx=\(.spx | f | nonul | @sh)",
+              "V_portkind=\($port[0] | @sh) V_port=\($port[1] | nonul | @sh) V_nul=\(if $nul then 1 else 0 end)"
+        ' <<< "$text" 2>/dev/null); then
+        _sub_skip invalid "vmess link is neither form"
+        return 1
+    fi
+    local V_ps V_add V_id V_scy V_net V_type V_host V_path V_tls V_sni V_alpn V_fp V_pbk V_sid V_spx
+    local V_portkind V_port V_nul
+    eval "$fields"
+    _SUB_RAWNAME=$V_ps
+    if [[ $V_nul == 1 ]]; then
+        _sub_skip invalid "NUL byte"
+        return 1
+    fi
+    if [[ -z $V_id ]]; then
+        _sub_skip invalid "missing id"
+        return 1
+    fi
+    _SUB_HOST=${V_add#\[}
+    _SUB_HOST=${_SUB_HOST%\]}
+    if [[ -z $_SUB_HOST ]]; then
+        _sub_skip invalid "missing address"
+        return 1
+    fi
+    case $V_portkind in
+        number) _SUB_PORT=$V_port ;;
+        string) _sub_port "$V_port" || return 1 ;;
+        bad)
+            _sub_skip invalid "bad port $V_port"
+            return 1
+            ;;
+        *)
+            _sub_skip invalid "missing port"
+            return 1
+            ;;
+    esac
+    _SUB_Q=()
+    _SUB_Q[type]=$V_net
+    _SUB_Q[security]=none
+    if [[ $V_tls == tls || $V_tls == reality ]]; then
+        _SUB_Q[security]=$V_tls
+    fi
+    for k in sni alpn fp pbk sid spx host; do
+        vn=V_$k
+        _SUB_Q[$k]=${!vn}
+    done
+    case $V_net in
+        grpc) _SUB_Q[serviceName]=$V_path _SUB_Q[mode]=$V_type ;;
+        xhttp|splithttp) _SUB_Q[path]=$V_path _SUB_Q[mode]=$V_type ;;
+        ''|tcp|raw) _SUB_Q[headerType]=$V_type ;;
+        *) _SUB_Q[path]=$V_path ;;
+    esac
+    _sub_stream none || return 1
+    _SUB_V[user]=$V_id
+    _SUB_V[enc]=${V_scy:-auto}
+    _sub_vmess_record
+}
+
+# SIP002 ss://userinfo@host:port[/][?plugin=…]#name, userinfo method:password in
+# plain text or base64, and legacy ss://base64(method:password@host:port)#name.
+# Base64 may hold a /, so the userinfo is all of the part before ? up to its
+# last @, and only the host part ends at a /.
+_sub_ss() {
+    local rest=$1 body main query="" ui hostport decoded method password
+    body=${rest%%#*}
+    if [[ $body != "$rest" ]]; then
+        _SUB_RAWNAME=${rest#*#}
+    fi
+    main=${body%%\?*}
+    if [[ $main != "$body" ]]; then
+        query=${body#*\?}
+    fi
+    if [[ $main == *@* ]]; then
+        if ! _sub_unescape "${main%@*}" 0; then
+            _sub_skip invalid "userinfo: bad percent escape"
+            return 1
+        fi
+        ui=$_SUB_U
+        if [[ $ui != *:* ]]; then
+            if ! decoded=$(_sub_b64 "$ui"); then
+                _sub_skip invalid "userinfo is not base64"
+                return 1
+            fi
+            ui=$(_sub_trim "$decoded")
+        fi
+        hostport=${main##*@}
+        hostport=${hostport%%/*}
+    else
+        if ! decoded=$(_sub_b64 "$main"); then
+            _sub_skip invalid "legacy link is not base64"
+            return 1
+        fi
+        decoded=$(_sub_trim "$decoded")
+        if [[ $decoded != *@* ]]; then
+            _sub_skip invalid "legacy link has no @"
+            return 1
+        fi
+        ui=${decoded%@*}
+        hostport=${decoded##*@}
+    fi
+    # A Shadowsocks 2022 password may hold a colon of its own.
+    method=${ui%%:*}
+    password=""
+    if [[ $ui == *:* ]]; then
+        password=${ui#*:}
+    fi
+    if [[ -z $method || -z $password ]]; then
+        _sub_skip invalid "missing method or password"
+        return 1
+    fi
+    _sub_hostport "$hostport" || return 1
+    if [[ $_SUB_HASPORT != 1 ]]; then
+        _sub_skip invalid "missing port"
+        return 1
+    fi
+    _sub_port "$_SUB_RAWPORT" || return 1
+    if ! _sub_query "$query"; then
+        _sub_skip invalid "query: bad percent escape"
+        return 1
+    fi
+    if [[ -n ${_SUB_Q[plugin]:-} ]]; then
+        _sub_skip unsupported "ss plugin"
+        return 1
+    fi
+    method=${method,,}
+    case $method in
+        aes-128-gcm|aes-256-gcm|chacha20-poly1305|chacha20-ietf-poly1305|xchacha20-poly1305|\
+        xchacha20-ietf-poly1305|2022-blake3-aes-128-gcm|2022-blake3-aes-256-gcm|\
+        2022-blake3-chacha20-poly1305|none|plain) ;;
+        *)
+            _sub_skip unsupported "ss method $method"
+            return 1
+            ;;
+    esac
+    _SUB_V[method]=$method
+    _SUB_V[password]=$password
+    _sub_record '{protocol: "shadowsocks", settings: {servers: [{address: $addr, port: $port,
+        method: $method, password: $password}]}}'
+}
+
+# hysteria2://auth@host[:port][/]?query#name, hy2:// alike. The port defaults
+# to 443. Port hopping is left out: its keys moved between Xray 26.2 and 26.3.
+_sub_hy2() {
+    _sub_link "$1" || return 1
+    _SUB_PORT=443
+    if [[ $_SUB_HASPORT == 1 ]]; then
+        if [[ $_SUB_RAWPORT == *[,-]* ]]; then
+            _sub_skip unsupported "port hopping"
+            return 1
+        fi
+        _sub_port "$_SUB_RAWPORT" || return 1
+    fi
+    if ! _sub_query "$_SUB_RAWQUERY"; then
+        _sub_skip invalid "query: bad percent escape"
+        return 1
+    fi
+    local obfs=${_SUB_Q[obfs]:-}
+    case $obfs in
+        '') ;;
+        salamander)
+            if [[ -z ${_SUB_Q[obfs-password]:-} ]]; then
+                _sub_skip invalid "salamander needs obfs-password"
+                return 1
+            fi
+            ;;
+        *)
+            _sub_skip unsupported "hysteria2 obfs $obfs"
+            return 1
+            ;;
+    esac
+    if _sub_truthy "${_SUB_Q[insecure]:-}" && [[ -z ${_SUB_Q[pinSHA256]:-} ]]; then
+        _sub_skip unsupported "insecure TLS"
+        return 1
+    fi
+    _SUB_V[user]=$_SUB_USER
+    _SUB_V[sni]=${_SUB_Q[sni]:-}
+    _SUB_V[alpn]=${_SUB_Q[alpn]:-}
+    _SUB_V[pin]=${_SUB_Q[pinSHA256]:-}
+    _SUB_V[obfs]=$obfs
+    _SUB_V[obfspw]=${_SUB_Q[obfs-password]:-}
+    _sub_record '{protocol: "hysteria", settings: {version: 2, address: $addr, port: $port},
+        streamSettings: ({network: "hysteria", security: "tls",
+            hysteriaSettings: {version: 2, auth: $user},
+            tlsSettings: {serverName: $sni, alpn: ($alpn | list | if length == 0 then ["h3"] else . end),
+                          pinnedPeerCertSha256: $pin}}
+          + (if $obfs == "salamander" then {finalmask: {udp: [{type: "salamander", settings: {password: $obfspw}}]}}
+             else {} end))}'
+}
+
 # _sub_entry <scheme> <rest>: converts one link and keeps its record and raw
 # name for the assembly.
 _sub_entry() {
@@ -371,7 +592,10 @@ _sub_entry() {
     _SUB_V=()
     case $scheme in
         vless) _sub_vless "$rest" || : ;;
+        vmess) _sub_vmess "$rest" || : ;;
         trojan) _sub_trojan "$rest" || : ;;
+        ss) _sub_ss "$rest" || : ;;
+        hysteria2|hy2) _sub_hy2 "$rest" || : ;;
         *)
             if [[ $rest == *#* ]]; then
                 _SUB_RAWNAME=${rest#*#}
