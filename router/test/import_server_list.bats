@@ -2,370 +2,61 @@
 
 load 'test_helper'
 
-# Test URI for basic parsing (ASCII name, no special chars)
-TEST_URI_BASIC='vless://11111111-2222-3333-4444-555555555555@server1.test.example:8443?type=tcp&security=tls#Prague, Czechia'
-
-# URI with emoji flag + cyrillic name
-TEST_URI_EMOJI_CYRILLIC='vless://11111111-2222-3333-4444-555555555555@server2.test.example:8443?type=tcp&security=tls#🇷🇺 Россия, Москва'
-
-# URI with only emoji (should fallback to hostname)
-TEST_URI_EMOJI_ONLY='vless://11111111-2222-3333-4444-555555555555@server3.test.example:8443?type=tcp&security=tls#🇺🇸🌟✨'
-
-# URI whose fragment is a truncated two-byte sequence followed by a field separator
-# (percent-encoded \xC3|evil): the filter must not carry the | into the output
-TEST_URI_TRUNCATED_UTF8='vless://11111111-2222-3333-4444-555555555555@server2.test.example:8443?type=tcp&security=tls#%C3%7Cevil'
-
-# URI with URL-encoded spaces
-TEST_URI_URLENCODED='vless://11111111-2222-3333-4444-555555555555@server4.test.example:8443?type=tcp&security=tls#New%20York%20City'
-
-# URI with cyrillic only (no emoji)
-TEST_URI_CYRILLIC='vless://11111111-2222-3333-4444-555555555555@server5.test.example:8443?type=tcp&security=tls#Казахстан, Алматы'
-
-# What a real subscription actually sends: the whole fragment percent-encoded,
-# flag emoji included. Decoding only %20 left the hex digits of every other
-# byte in the name, and the filter below keeps digits - so servers.json held
-# "F09F87B3F09F87B1 D090D0BC..." instead of a country.
-TEST_URI_PERCENT_ENCODED='vless://11111111-2222-3333-4444-555555555555@server6.test.example:8443?type=tcp&security=tls#%F0%9F%87%B3%F0%9F%87%B1%20%D0%90%D0%BC%D1%81%D1%82%D0%B5%D1%80%D0%B4%D0%B0%D0%BC%2C%20%D0%9D%D0%B8%D0%B4%D0%B5%D1%80%D0%BB%D0%B0%D0%BD%D0%B4%D1%8B%2C%20Extra'
+# The decoding itself - every scheme, container and skip reason - is
+# router/test/unit/subscription.bats, on the cases the Go importer shares.
+# This file is the script around it: resolution, the report and publication.
 
 # ============================================================================
-# parse_vless_uri: Field extraction
+# step_parse_servers: resolution and the list it leaves for publication
 # ============================================================================
 
-@test "parse_vless_uri: extracts server hostname" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_BASIC")
-    server=$(printf '%s' "$result" | cut -d'|' -f1)
-    [ "$server" = "server1.test.example" ]
+# decode_into_result reads a subscription the way step_get_subscription does.
+decode_into_result() {
+    SUB_RESULT=$(printf '%s' "$1" | subscription_decode)
 }
-
-@test "parse_vless_uri: extracts port number" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_BASIC")
-    port=$(printf '%s' "$result" | cut -d'|' -f2)
-    [ "$port" = "8443" ]
-}
-
-@test "parse_vless_uri: extracts UUID" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_BASIC")
-    uuid=$(printf '%s' "$result" | cut -d'|' -f3)
-    [ "$uuid" = "11111111-2222-3333-4444-555555555555" ]
-}
-
-@test "parse_vless_uri: extracts ASCII name" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_BASIC")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    [ "$name" = "Prague, Czechia" ]
-}
-
-@test "parse_vless_uri: decodes a percent-encoded name" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_PERCENT_ENCODED")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    [ "$name" = "Амстердам, Нидерланды, Extra" ]
-}
-
-# The routers have no UTF-8 locale - KeeneticOS has no locale at all - so awk
-# works on bytes there. A character-wise filter splits a two-byte letter in
-# half and keeps whichever byte happens to match an ASCII class, which turned
-# "Амстердам" into "Амс?е?дам" on the device while passing here.
-@test "parse_vless_uri: keeps the name intact in the routers' byte locale" {
-    load_import_server_list
-    result=$(LC_ALL=C parse_vless_uri "$TEST_URI_PERCENT_ENCODED")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    [ "$name" = "Амстердам, Нидерланды, Extra" ]
-
-    result=$(LC_ALL=C parse_vless_uri "$TEST_URI_EMOJI_CYRILLIC")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    [ "$name" = "Россия, Москва" ]
-}
-
-@test "parse_vless_uri extracts reality stream params" {
-    load_import_server_list
-    # Real subscription format includes headerType=none before type=tcp — guards the
-    # `_vless_query_get type` lookup against matching `headerType`.
-    uri='vless://uuid@1.2.3.4:443?security=reality&encryption=none&fp=firefox&headerType=none&type=tcp&flow=xtls-rprx-vision&sni=cdn3-87.yahoo.com&pbk=PBKEY&sid=55e6#NL'
-    run parse_vless_uri "$uri"
-    [ "$status" -eq 0 ]
-    # fields: server|port|uuid|name|security|network|flow|sni|fp|pbk|sid|alpn
-    [ "$(printf '%s' "$output" | cut -d'|' -f5)" = "reality" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f6)" = "tcp" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f7)" = "xtls-rprx-vision" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f8)" = "cdn3-87.yahoo.com" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f9)" = "firefox" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f10)" = "PBKEY" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f11)" = "55e6" ]
-}
-
-@test "parse_vless_uri keeps core fields without params" {
-    load_import_server_list
-    run parse_vless_uri 'vless://uuid@1.2.3.4:443#Name'
-    [ "$status" -eq 0 ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f1)" = "1.2.3.4" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f3)" = "uuid" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f5)" = "" ]
-}
-
-# ============================================================================
-# parse_vless_uri: Name handling
-# ============================================================================
-
-@test "parse_vless_uri: filters emoji from name, keeps cyrillic" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_EMOJI_CYRILLIC")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    # Emoji flag should be removed, cyrillic preserved
-    [ "$name" = "Россия, Москва" ]
-}
-
-@test "parse_vless_uri: a truncated two-byte sequence does not smuggle a field separator" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_TRUNCATED_UTF8")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    security=$(printf '%s' "$result" | cut -d'|' -f5)
-    # The lone \xC3 is dropped with its non-continuation byte, so no | shifts the fields
-    [ "$name" = "evil" ]
-    [ "$security" = "tls" ]
-}
-
-@test "parse_vless_uri: falls back to hostname when name is only emoji" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_EMOJI_ONLY")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    # All emoji filtered out, should fallback to server hostname
-    [ "$name" = "server3.test.example" ]
-}
-
-@test "parse_vless_uri: decodes URL-encoded spaces" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_URLENCODED")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    [ "$name" = "New York City" ]
-}
-
-@test "parse_vless_uri: handles cyrillic-only name" {
-    load_import_server_list
-    result=$(parse_vless_uri "$TEST_URI_CYRILLIC")
-    name=$(printf '%s' "$result" | cut -d'|' -f4)
-    [ "$name" = "Казахстан, Алматы" ]
-}
-
-# ============================================================================
-# decode_vless_content: Format detection
-# ============================================================================
-
-@test "decode_vless_content: detects plaintext format (single URI)" {
-    load_import_server_list
-    content="vless://uuid@server:443?type=tcp#Name"
-    result=$(decode_vless_content "$content")
-    [ "$result" = "$content" ]
-}
-
-@test "decode_vless_content: detects plaintext format (multiple URIs)" {
-    load_import_server_list
-    content="vless://uuid1@server1:443?type=tcp#Name1
-vless://uuid2@server2:443?type=tcp#Name2"
-    result=$(decode_vless_content "$content")
-    [ "$result" = "$content" ]
-}
-
-@test "decode_vless_content: handles plaintext with leading empty lines" {
-    load_import_server_list
-    content="
-
-vless://uuid@server:443?type=tcp#Name"
-    result=$(decode_vless_content "$content")
-    [ "$result" = "$content" ]
-}
-
-@test "decode_vless_content: decodes base64 format" {
-    load_import_server_list
-    plaintext="vless://uuid@server:443?type=tcp#Name"
-    encoded=$(printf '%s' "$plaintext" | base64)
-    result=$(decode_vless_content "$encoded")
-    [ "$result" = "$plaintext" ]
-}
-
-@test "decode_vless_content: decodes base64 with multiple URIs" {
-    load_import_server_list
-    plaintext="vless://uuid1@server1:443#Name1
-vless://uuid2@server2:443#Name2"
-    encoded=$(printf '%s' "$plaintext" | base64)
-    result=$(decode_vless_content "$encoded")
-    [ "$result" = "$plaintext" ]
-}
-
-@test "decode_vless_content: fails on invalid content" {
-    load_import_server_list
-    run decode_vless_content "not-base64-and-not-vless!!!"
-    assert_failure
-}
-
-@test "decode_vless_content: fails on whitespace-only content" {
-    load_import_server_list
-    run decode_vless_content "
-
-    "
-    assert_failure
-}
-
-@test "decode_vless_content: decodes valid base64 even if not VLESS (validation is downstream)" {
-    load_import_server_list
-    plaintext="just some random text"
-    encoded=$(printf '%s' "$plaintext" | base64)
-    result=$(decode_vless_content "$encoded")
-    # Function succeeds - content validation is handled downstream
-    [ "$result" = "$plaintext" ]
-}
-
-@test "decode_vless_content: decodes URL-safe base64 alphabet" {
-    load_import_server_list
-    # "????" standard base64 is "Pz8/Pw=="; the URL-safe form replaces / with _.
-    # The standard decoder rejects _, so this exercises the url-safe fallback.
-    # Use command substitution (not run) so the log line on stderr is excluded.
-    result=$(decode_vless_content "Pz8_Pw==")
-    [ "$result" = "????" ]
-}
-
-@test "decode_vless_content: url-safe base64 maps both - and _ (full alphabet)" {
-    load_import_server_list
-    # ">>>???" standard base64 is "Pj4+Pz8/" (contains BOTH + and /); the URL-safe
-    # form replaces + with - and / with _, so this exercises the full -_ -> +/
-    # mapping. A reversed set (e.g. tr '_-' '+/') decodes to the wrong bytes.
-    result=$(decode_vless_content "Pj4-Pz8_")
-    [ "$result" = ">>>???" ]
-}
-
-# ============================================================================
-# parse_vless_uri: IPv6 literal host
-# ============================================================================
-
-@test "parse_vless_uri: parses bracketed IPv6 host and port" {
-    load_import_server_list
-    run parse_vless_uri 'vless://uuid@[2001:db8::1]:443?type=tcp#v6'
-    [ "$status" -eq 0 ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f1)" = "2001:db8::1" ]
-    [ "$(printf '%s' "$output" | cut -d'|' -f2)" = "443" ]
-}
-
-# ============================================================================
-# _redact_uri: mask UUID for DEBUG logging
-# ============================================================================
-
-@test "_redact_uri: masks UUID and strips fragment, keeps host" {
-    load_import_server_list
-    run _redact_uri 'vless://11111111-2222-3333-4444-555555555555@server.example:443?type=tcp#MyName'
-    [ "$status" -eq 0 ]
-    # UUID is a secret and must not leak into logs
-    [[ "$output" != *11111111-2222-3333-4444-555555555555* ]]
-    # host:port and params are kept; the #fragment is stripped
-    [[ "$output" == *server.example:443* ]]
-    [[ "$output" != *MyName* ]]
-}
-
-# ============================================================================
-# _url_decode / _vless_query_get: percent-decoding (valid %XX like url.ParseQuery;
-# lenient on malformed % — Go rejects, shell keeps literal; see ticket #41)
-# ============================================================================
-
-@test "_url_decode: decodes %XX escapes" {
-    load_import_server_list
-    result=$(_url_decode 'h2%2Chttp/1.1')
-    [ "$result" = "h2,http/1.1" ]
-}
-
-@test "_url_decode: maps + to space, leaves lone/incomplete % intact" {
-    load_import_server_list
-    # Lenient on malformed % (Go's url.ParseQuery would reject these); see #41.
-    [ "$(_url_decode 'a+b')" = "a b" ]
-    [ "$(_url_decode '50%')" = "50%" ]
-    [ "$(_url_decode 'x%2y')" = "x%2y" ]
-}
-
-@test "_vless_query_get: URL-decodes the value (valid %XX like url.ParseQuery)" {
-    load_import_server_list
-    result=$(_vless_query_get 'type=tcp&alpn=h2%2Chttp/1.1' alpn)
-    [ "$result" = "h2,http/1.1" ]
-}
-
-@test "parse_vless_uri: URL-decodes percent-encoded alpn into comma list" {
-    load_import_server_list
-    result=$(parse_vless_uri 'vless://uuid@1.2.3.4:443?type=tcp&alpn=h2%2Chttp/1.1#N')
-    [ "$(printf '%s' "$result" | cut -d'|' -f12)" = "h2,http/1.1" ]
-}
-
-# ============================================================================
-# step_parse_servers: JSON output
-# ============================================================================
 
 # step_parse_servers leaves the list in $SERVERS_TMP for step_publish_servers,
 # so these call it directly: "run" would keep the variable in its subshell.
-@test "step_parse_servers: saves ips array instead of ip" {
+@test "step_parse_servers: every server keeps its outbound and gets its IPs" {
     load_import_server_list
-
-    DATA_DIR="/tmp/bats_test_import_data"
-    mkdir -p "$DATA_DIR"
-
-    # Override VPD_CONFIG to a temp config with our data_dir
-    VPD_CONFIG="/tmp/bats_test_import_data/vpn-director.json"
-    printf '{"data_dir": "%s"}\n' "$DATA_DIR" > "$VPD_CONFIG"
-
-    VLESS_SERVERS="vless://test-uuid@example.com:443?type=tcp#TestServer"
+    VPD_CONFIG="$BATS_TEST_TMPDIR/vpn-director.json"
+    printf '{"data_dir":"%s"}' "$BATS_TEST_TMPDIR/data" > "$VPD_CONFIG"
+    decode_into_result 'vless://test-uuid@example.com:443?security=reality&flow=xtls-rprx-vision&sni=cdn.example.com&pbk=PBK&fp=firefox&sid=sid1#TestServer'
 
     step_parse_servers
 
-    # Check that the list has "ips" array, not "ip" string
-    result=$(jq -r '.[0].ips | type' "$SERVERS_TMP")
-    [ "$result" = "array" ]
-
-    # Check that "ip" field does not exist
-    result=$(jq -r '.[0] | has("ip")' "$SERVERS_TMP")
-    [ "$result" = "false" ]
-
-    # Check the resolved IP is in the ips array
-    result=$(jq -r '.[0].ips[0]' "$SERVERS_TMP")
-    [ "$result" = "93.184.216.34" ]
-
-    rm -rf "$DATA_DIR"
+    run jq -c '.[0] | [.name, .address, .port, .ips]' "$SERVERS_TMP"
+    assert_output '["TestServer","example.com",443,["93.184.216.34"]]'
+    run jq -c '.[0].outbound.streamSettings.realitySettings | [.publicKey, .shortId, .serverName]' "$SERVERS_TMP"
+    assert_output '["PBK","sid1","cdn.example.com"]'
+    run jq -c '.[0] | [has("uuid"), has("security"), has("ip")]' "$SERVERS_TMP"
+    assert_output '[false,false,false]'
 }
 
-@test "step_parse_servers writes reality params to the list" {
+@test "step_parse_servers: a server whose host does not resolve is left out and counted" {
     load_import_server_list
+    VPD_CONFIG="$BATS_TEST_TMPDIR/vpn-director.json"
+    printf '{"data_dir":"%s"}' "$BATS_TEST_TMPDIR/data" > "$VPD_CONFIG"
+    decode_into_result $'vless://u@nx.example.com:443#Gone\nvless://u@5.6.7.8:443#Good\nvless://u@[2001:db8::1]:443#Six\ntuic://u:p@5.6.7.9:443#TUIC'
 
-    tmp_data="$BATS_TEST_TMPDIR/data"
-    mkdir -p "$tmp_data"
-    # get_data_dir reads VPD_CONFIG/VPD_TEMPLATE; override to a temp config
-    cfg="$BATS_TEST_TMPDIR/vpn-director.json"
-    printf '{"data_dir":"%s"}' "$tmp_data" > "$cfg"
-    VPD_CONFIG="$cfg"
-    VLESS_SERVERS='vless://uuid@1.2.3.4:443?security=reality&flow=xtls-rprx-vision&sni=cdn.example.com&pbk=PBK&sid=sid1&type=tcp#NL'
-    step_parse_servers
-    out="$SERVERS_TMP"
-    [ "$(jq -r '.[0].security' "$out")" = "reality" ]
-    [ "$(jq -r '.[0].flow' "$out")" = "xtls-rprx-vision" ]
-    [ "$(jq -r '.[0].public_key' "$out")" = "PBK" ]
-    [ "$(jq -r '.[0].short_id' "$out")" = "sid1" ]
-    [ "$(jq -r '.[0].sni' "$out")" = "cdn.example.com" ]
-    [ "$(jq -r '.[0] | has("alpn")' "$out")" = "false" ]
+    step_parse_servers 2>"$BATS_TEST_TMPDIR/err"
+
+    run jq -c '[.[].name]' "$SERVERS_TMP"
+    assert_output '["Good"]'
+    run cat "$LOG_FILE"
+    assert_output --partial "Found 1 servers in 4 entries (1 unsupported, 2 DNS errors)"
 }
 
-@test "step_parse_servers skips out-of-range port, keeps valid server" {
+@test "step_get_subscription: logs every skipped entry with its reason" {
     load_import_server_list
+    printf '%s\n' 'vless://u@5.6.7.8:443?type=kcp#KCP' 'vless://u@5.6.7.9:443#Good' > "$BATS_TEST_TMPDIR/list.txt"
 
-    tmp_data="$BATS_TEST_TMPDIR/data"
-    mkdir -p "$tmp_data"
-    cfg="$BATS_TEST_TMPDIR/vpn-director.json"
-    printf '{"data_dir":"%s"}' "$tmp_data" > "$cfg"
-    VPD_CONFIG="$cfg"
-    # First URI has an out-of-range port (must be skipped); the second is valid
-    # and must still be saved (one bad entry does not drop the rest).
-    VLESS_SERVERS=$'vless://uuid@1.2.3.4:99999?type=tcp#Bad\nvless://uuid@5.6.7.8:443?type=tcp#Good'
-    step_parse_servers
-    out="$SERVERS_TMP"
-    [ "$(jq length "$out")" -eq 1 ]
-    [ "$(jq -r '.[0].address' "$out")" = "5.6.7.8" ]
-    [ "$(jq -r '.[0].port' "$out")" -eq 443 ]
+    step_get_subscription <<< "$BATS_TEST_TMPDIR/list.txt"
+
+    run cat "$LOG_FILE"
+    assert_output --partial "Skipping KCP: unsupported (transport kcp)"
+    run jq -c '[.servers[].name]' <<< "$SUB_RESULT"
+    assert_output '["Good"]'
 }
 
 # ============================================================================
@@ -540,6 +231,42 @@ release_config_lock() {
     run_import "$BATS_TEST_TMPDIR/servers.txt"
 
     assert_failure
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["Old"]'
+}
+
+# The new provider serves no links at all: its subscription is an array of
+# Xray configs. The proxy outbound of each is the server; a config with more
+# than one proxy is skipped as composite.
+@test "import_server_list.sh imports an Xray JSON subscription" {
+    load_import_into
+    write_imported_state
+    cat > "$BATS_TEST_TMPDIR/servers.txt" <<'JSON'
+[{"remarks": "Oslo", "outbounds": [{"tag": "proxy", "protocol": "trojan", "settings": {"servers": [{"address": "198.51.100.10", "port": 443, "password": "p"}]}, "streamSettings": {"network": "tcp", "security": "tls"}}, {"tag": "direct", "protocol": "freedom"}]},
+ {"remarks": "Auto", "outbounds": [{"protocol": "vless", "settings": {"address": "198.51.100.11", "port": 443, "id": "u"}}, {"protocol": "vless", "settings": {"address": "198.51.100.12", "port": 443, "id": "u"}}]}]
+JSON
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt"
+
+    assert_success
+    assert_output --partial "Skipping Auto: composite (2 proxy outbounds)"
+    run jq -c '[.[] | [.name, .outbound.protocol, .outbound.settings.servers[0].password, .ips]]' "$VPD_DIR/data/servers.json"
+    assert_output '[["Oslo","trojan","p",["198.51.100.10"]]]'
+    run jq -c '.xray.servers' "$VPD_CONFIG"
+    assert_output '["198.51.100.10"]'
+}
+
+# An HTML page - what some panels answer a browser with - is no subscription;
+# the list the router has stays.
+@test "import_server_list.sh refuses a body it cannot read and keeps the previous list" {
+    load_import_into
+    write_imported_state
+    printf '%s\n' '<!doctype html><html><body>Open this link in your VPN app</body></html>' > "$BATS_TEST_TMPDIR/servers.txt"
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt"
+
+    assert_failure
+    assert_output --partial "Cannot read the subscription: unrecognized subscription format"
     run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
     assert_output '["Old"]'
 }
