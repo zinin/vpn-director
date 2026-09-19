@@ -7,20 +7,25 @@ import (
 	"sort"
 )
 
+// Server is one entry of servers.json. An import writes Name, Address, Port,
+// IPs and Outbound, the Xray outbound the server runs on. The flat VLESS fields
+// below are what imports wrote before Outbound existed: a record that has no
+// Outbound is still read, and generated from them.
 type Server struct {
-	Address     string   `json:"address"`
-	Port        int      `json:"port"`
-	UUID        string   `json:"uuid"`
-	Name        string   `json:"name"`
-	IPs         []string `json:"ips"`
-	Security    string   `json:"security,omitempty"`
-	Network     string   `json:"network,omitempty"`
-	Flow        string   `json:"flow,omitempty"`
-	SNI         string   `json:"sni,omitempty"`
-	Fingerprint string   `json:"fingerprint,omitempty"`
-	PublicKey   string   `json:"public_key,omitempty"`
-	ShortID     string   `json:"short_id,omitempty"`
-	ALPN        []string `json:"alpn,omitempty"`
+	Address     string          `json:"address"`
+	Port        int             `json:"port"`
+	UUID        string          `json:"uuid,omitempty"`
+	Name        string          `json:"name"`
+	IPs         []string        `json:"ips"`
+	Outbound    json.RawMessage `json:"outbound,omitempty"`
+	Security    string          `json:"security,omitempty"`
+	Network     string          `json:"network,omitempty"`
+	Flow        string          `json:"flow,omitempty"`
+	SNI         string          `json:"sni,omitempty"`
+	Fingerprint string          `json:"fingerprint,omitempty"`
+	PublicKey   string          `json:"public_key,omitempty"`
+	ShortID     string          `json:"short_id,omitempty"`
+	ALPN        []string        `json:"alpn,omitempty"`
 }
 
 // ServerIPs returns every non-empty IP across servers, de-duplicated and
