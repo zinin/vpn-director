@@ -94,6 +94,20 @@ if [[ ${DEBUG:-0} == 1 ]]; then
 fi
 
 ###################################################################################################
+# _resolve_nslookup - nslookup with the resolver's wait bounded
+# -------------------------------------------------------------------------------------------------
+# Asuswrt-Merlin's nslookup (BusyBox 1.25) takes no -type and asks glibc for A and AAAA at once,
+# straight at the WAN DNS servers in /etc/resolv.conf, with glibc's default of 5 s per try, two
+# tries and two servers: a name whose AAAA answer is lost cost up to 20 s, and tproxy_apply
+# resolves every OpenVPN endpoint on each run. glibc 2.26 has no no-aaaa option, but it reads
+# RES_OPTIONS: timeout:1 attempts:2 caps a stuck name at about 4 s and changes no answer.
+# KeeneticOS already resolves through a local proxy with timeout:1.
+###################################################################################################
+_resolve_nslookup() {
+    RES_OPTIONS="timeout:1 attempts:2" nslookup "$@"
+}
+
+###################################################################################################
 # _resolve_ip_impl - internal resolver used by resolve_ip / resolve_lan_ip
 # -------------------------------------------------------------------------------------------------
 # Flags:
@@ -197,7 +211,7 @@ _resolve_ip_impl() {
         [[ -n $ip ]] && { printf '%s\n' "$ip"; return 0; }
 
         ip=$(
-            nslookup "$host" 2>/dev/null |
+            _resolve_nslookup "$host" 2>/dev/null |
             awk -v pat="$fam_pat" -v only_g="$only_global" -v ng="$non_global_pat" '
                 BEGIN { in_ans = 0 }
                 /^Name:[[:space:]]*/ { in_ans = 1; next }
@@ -225,7 +239,7 @@ _resolve_ip_impl() {
                     }
                 }' "${HOSTS_FILE:-/etc/hosts}" 2>/dev/null
 
-            nslookup "$host" 2>/dev/null |
+            _resolve_nslookup "$host" 2>/dev/null |
             awk -v pat="$fam_pat" -v only_g="$only_global" -v ng="$non_global_pat" '
                 BEGIN { in_ans = 0 }
                 /^Name:[[:space:]]*/ { in_ans = 1; next }

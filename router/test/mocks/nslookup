@@ -1,4 +1,8 @@
 #!/bin/bash
+# A test that sets NSLOOKUP_ENV_LOG finds there the RES_OPTIONS each call ran with.
+if [[ -n ${NSLOOKUP_ENV_LOG:-} ]]; then
+    printf 'RES_OPTIONS=%s\n' "${RES_OPTIONS-}" >> "$NSLOOKUP_ENV_LOG"
+fi
 host="$1"
 case "$host" in
     "example.com")
