@@ -100,7 +100,8 @@ fi
 # straight at the WAN DNS servers in /etc/resolv.conf, with glibc's default of 5 s per try, two
 # tries and two servers: a name whose AAAA answer is lost cost up to 20 s, and tproxy_apply
 # resolves every OpenVPN endpoint on each run. glibc 2.26 has no no-aaaa option, but it reads
-# RES_OPTIONS: timeout:1 attempts:2 caps a stuck name at about 4 s and changes no answer.
+# RES_OPTIONS: timeout:1 attempts:2 caps a stuck name at about 4 s; a resolver that needs more than
+# a second per try now returns nothing for that name, where the 5 s default still answered.
 # KeeneticOS already resolves through a local proxy with timeout:1.
 ###################################################################################################
 _resolve_nslookup() {

@@ -291,7 +291,10 @@ func (w *Watch) Tick(ctx context.Context) {
 	if w.failSince.IsZero() {
 		w.failSince = now
 	}
-	w.checkReach(ctx, cfg)
+	// Past DeadAfter the outbound is dead whatever a look finds.
+	if now.Sub(w.failSince) < DeadAfter {
+		w.checkReach(ctx, cfg)
+	}
 	reason := w.deadReason(now)
 	if reason == "" {
 		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, "error", err)

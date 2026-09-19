@@ -2,6 +2,7 @@ package subwatch
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,7 @@ import (
 
 const (
 	osloIP    = "203.0.113.10"
+	osloIP2   = "203.0.113.11"
 	madridIP  = "203.0.113.20"
 	madridIP2 = "203.0.113.21"
 )
@@ -122,6 +124,27 @@ func TestTick_ReturnsToThePreferredServerOnceItAnswers(t *testing.T) {
 	}
 }
 
+// Every address of the preferred server is tried in turn until one works.
+func TestTick_ReturnTriesEveryAddressOfThePreferredServer(t *testing.T) {
+	servers := returnServers()
+	servers[0].IPs = []string{osloIP, osloIP2}
+	r := newReturnRig(servers)
+	r.up[osloIP] = true
+	r.up[osloIP2] = true
+	r.live[osloIP2] = true
+	r.tick()
+	want := []string{"Oslo@" + osloIP, "restart", "Oslo@" + osloIP2, "restart"}
+	if !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	if want := []string{"Xray back on the preferred server Oslo"}; !reflect.DeepEqual(r.f.notes, want) {
+		t.Fatalf("notes %v, want %v", r.f.notes, want)
+	}
+	if r.w.lastPicked == nil || dialIP(*r.w.lastPicked) != osloIP2 {
+		t.Fatalf("lastPicked %+v, want the address that works", r.w.lastPicked)
+	}
+}
+
 func TestTick_FailedReturnGoesBackAndBacksOff(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
@@ -153,6 +176,27 @@ func TestTick_FailedReturnGoesBackAndBacksOff(t *testing.T) {
 		if n := r.attempts(); n != i+2 {
 			t.Fatalf("attempts %d at %v, want %d", n, at, i+2)
 		}
+	}
+}
+
+// A config.json that could not be generated for the preferred server is a
+// failed return: nothing was restarted, so there is nothing to switch back.
+func TestTick_AReturnWhoseConfigWasNotWrittenBacksOff(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	generate := r.w.Generate
+	r.w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		if s.Name == "Oslo" {
+			return false, r.f.seq(), errors.New("read config.json.template: no such file or directory")
+		}
+		return generate(s, guard)
+	}
+	r.tick()
+	if len(r.events) != 0 {
+		t.Fatalf("events %v; nothing to restart or switch back", r.events)
+	}
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
 	}
 }
 
@@ -234,6 +278,34 @@ func TestTick_ASelectionDuringTheReturnStands(t *testing.T) {
 	}
 }
 
+// A probe that passes does not announce Oslo when a selection committed while
+// it ran: Oslo no longer runs.
+func TestTick_ASelectionDuringTheLiveProbeIsNotAnnounced(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	r.onProbe = func() {
+		if r.running == osloIP {
+			// The Web UI selects a server while the watch probes Oslo.
+			selectManual(r.f)
+			r.f.cfg.Xray.PreferredServer = nil
+		}
+	}
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	if len(r.f.notes) != 0 {
+		t.Fatalf("notes %v; the selection replaced Oslo", r.f.notes)
+	}
+	if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Manual" {
+		t.Fatalf("active %+v, want the selection", a)
+	}
+	if p := r.w.lastPicked; p != nil && p.Name == "Oslo" {
+		t.Fatalf("lastPicked %+v; Oslo no longer runs", p)
+	}
+}
+
 func TestTick_AStopDuringTheReturnEndsIt(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
@@ -247,6 +319,52 @@ func TestTick_AStopDuringTheReturnEndsIt(t *testing.T) {
 	r.tick()
 	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
 		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	if len(r.f.notes) != 0 {
+		t.Fatalf("notes %v", r.f.notes)
+	}
+}
+
+func TestTick_AStopDuringTheLiveProbeAnnouncesNothing(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	var stopped atomic.Bool
+	r.w.Stopped = stopped.Load
+	r.onProbe = func() {
+		if r.running == osloIP {
+			stopped.Store(true) // the stop finishes while the watch probes Oslo
+		}
+	}
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	if len(r.f.notes) != 0 {
+		t.Fatalf("notes %v", r.f.notes)
+	}
+}
+
+// A bot shutdown while Oslo is probed ends the attempt there: a probe the
+// cancel cut short says nothing about Oslo, so no rollback is written and no
+// wait is added.
+func TestTick_ACancelDuringTheReturnProbeEndsIt(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.onProbe = func() {
+		if r.running == osloIP {
+			cancel()
+		}
+	}
+	r.w.Tick(ctx)
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	if r.w.returnRetry != 0 {
+		t.Fatalf("returnRetry %v; the attempt did not fail, it was cut short", r.w.returnRetry)
 	}
 	if len(r.f.notes) != 0 {
 		t.Fatalf("notes %v", r.f.notes)
@@ -302,6 +420,24 @@ func TestTick_ADeathStartsTheReturnsOver(t *testing.T) {
 	}
 	if r.w.returnRetry != 0 {
 		t.Fatalf("returnRetry %v; a death starts the returns over", r.w.returnRetry)
+	}
+}
+
+// With no preferred server left - a selection clears it - what the failed
+// returns backed off to is done with.
+func TestTick_NoPreferredServerStartsTheReturnsOver(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.tick() // a failed return: the next waits ReturnRetry
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
+	}
+	r.f.cfg.Xray.PreferredServer = nil
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if r.w.returnRetry != 0 {
+		t.Fatalf("returnRetry %v; with no preferred server the returns start over", r.w.returnRetry)
 	}
 }
 

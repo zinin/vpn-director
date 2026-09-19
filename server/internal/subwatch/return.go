@@ -46,6 +46,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	w.returnNotBefore = now.Add(ReturnCheck)
 	servers, err := w.LoadServers()
 	if err != nil {
+		slog.Warn("Failed to load servers.json for the return to the preferred server", "error", err)
 		return
 	}
 	i := chosenIndex(servers, preferred)
@@ -81,6 +82,11 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			return
 		}
 		if live {
+			// A stop or a selection can land while the probe waits; the walk
+			// makes the same look before it announces.
+			if w.stopped() || endsWalk(w.walkOwnsNow(sw.rawURL, sw.started, sw.lastRecorded, sw.seq)) {
+				return
+			}
 			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
 			w.lastPicked = &c
 			w.returnRetry = 0
@@ -125,10 +131,14 @@ type switcher struct {
 }
 
 // to writes c as the running server, restarts Xray and probes it. live is a
-// probe that passed; ended is a write the guard refused or a restart a stop
-// skipped, after which nothing more may be written.
+// probe that passed; ended is a write the guard refused, a restart a stop
+// skipped, or a context or stop that ended the attempt, after which nothing
+// more may be written.
 func (s *switcher) to(ctx context.Context, c vpnconfig.Server) (live, ended bool) {
 	w := s.w
+	if ctx.Err() != nil || w.stopped() {
+		return false, true
+	}
 	generated, seq, err := w.Generate(c, w.walkGuard(s.rawURL, s.started, s.lastRecorded, s.seq))
 	if endsWalk(err) {
 		return false, true
@@ -154,6 +164,11 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server) (live, ended bool
 	}
 	w.AfterRestart(SettleAfterRestart)
 	if err := w.Probe(ctx, s.socks); err != nil {
+		// A probe a cancelled context or a stop cut short says nothing about
+		// the server.
+		if ctx.Err() != nil || w.stopped() {
+			return false, true
+		}
 		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, "error", err)
 		return false, false
 	}

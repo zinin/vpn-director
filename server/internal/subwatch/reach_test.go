@@ -102,6 +102,17 @@ func TestReachable_KeepsTheOrderOfTheCopiesThatAnswered(t *testing.T) {
 	}
 }
 
+// A look a stop or a shutdown cut short is no answer, whatever the dials
+// returned before they were abandoned.
+func TestActiveServerDown_ACancelledLookIsNoAnswer(t *testing.T) {
+	w := reachWatch(deadFake(), osloServers(), map[string]bool{})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if w.activeServerDown(ctx, osloActiveCfg()) {
+		t.Fatal("a cancelled look counted the server down")
+	}
+}
+
 func TestTick_UnreachableServerIsDeadAfterAMinute(t *testing.T) {
 	logs := captureLog(t)
 	f := deadFake()
@@ -176,4 +187,31 @@ func TestTick_HealthyProbeStartsANewUnreachableStreak(t *testing.T) {
 	f.probeErr = errProbe
 	delete(up, "203.0.113.10")
 	assertDiesAt(t, w, f, FastDeadAfter)
+}
+
+// With no fallback every tick after the death comes back to the failing
+// branch. Past DeadAfter a look can change nothing, and the server is dialed
+// no more.
+func TestTick_NoTCPCheckPastThreeMinutes(t *testing.T) {
+	f := deadFake()
+	f.plat = vpnconfig.PlatformInfo{} // no Tunnel Director fallback
+	w := reachWatch(f, osloServers(), map[string]bool{})
+	checks := 0
+	dial := w.Reachable
+	w.Reachable = func(ctx context.Context, ip string, port int) bool {
+		checks++
+		return dial(ctx, ip, port)
+	}
+	tickFor(w, f, DeadAfter)
+	if want := []string{"Xray outbound is down; no Tunnel Director fallback"}; !reflect.DeepEqual(f.notes, want) {
+		t.Fatalf("notes %v, want %v", f.notes, want)
+	}
+	if checks == 0 {
+		t.Fatal("the looks before DeadAfter must dial the server")
+	}
+	n := checks
+	tickFor(w, f, ImportRetry)
+	if checks != n {
+		t.Fatalf("%d TCP checks past DeadAfter, want none", checks-n)
+	}
 }
