@@ -71,9 +71,10 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // tryReturn switches Xray to each reachable copy of the preferred server in
 // turn and keeps the first the probe finds live. With none it switches back to
 // the server that ran before - the address the walk picked first, when this
-// process remembers it - and holds the next attempt back. Every write carries
-// the walk's guard: a stop, a newly saved link or a selection made meanwhile
-// refuses it, and the attempt ends there.
+// process remembers it - and holds the next attempt back. That way back is
+// known before the first switch, and an attempt without one is put off. Every
+// write carries the walk's guard: a stop, a newly saved link or a selection
+// made meanwhile refuses it, and the attempt ends there.
 func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, servers, candidates []vpnconfig.Server) {
 	before := cfg.Xray.ActiveServer
 	sw := &switcher{
@@ -82,6 +83,11 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		started: activeID(before),
 		seq:     vpnconfig.ActiveSeq(before),
 		socks:   w.socksPort(cfg),
+	}
+	back := rollbackOrder(servers, before, w.lastPicked)
+	if len(back) == 0 {
+		slog.Info("Return to the preferred server put off; no way back to the server that runs now", "server", before.Name)
+		return
 	}
 	slog.Info("Returning to the preferred server", "server", candidates[0].Name, "from", before.Name)
 	for _, c := range candidates {
@@ -106,12 +112,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 	if !sw.wrote {
 		return
 	}
-	j := chosenIndex(servers, before)
-	if j < 0 {
-		slog.Warn("Return to the preferred server failed and the previous server is no longer listed", "previous", before.Name)
-		return
-	}
-	for _, c := range rollbackOrder(perAddress(servers[j:j+1]), w.lastPicked) {
+	for _, c := range back {
 		live, ended := sw.to(ctx, c)
 		if ended {
 			return
@@ -183,10 +184,18 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server) (live, ended bool
 	return true, false
 }
 
-// rollbackOrder is the copies of the server that ran before, with the copy the
-// walk picked or a return proved first: the address it ran on, when this
-// process remembers it.
-func rollbackOrder(copies []vpnconfig.Server, last *vpnconfig.Server) []vpnconfig.Server {
+// rollbackOrder is where a failed return goes back to: the server that ran
+// before, before - its copy the walk picked or a return proved first, the
+// address it ran on, when this process remembers it, then every other address
+// its servers.json entry lists. The remembered copy leads even when a list
+// imported since no longer has its address: Xray passed its probe on it.
+// Empty when servers.json no longer lists that server and nothing is
+// remembered: there is no way back.
+func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, last *vpnconfig.Server) []vpnconfig.Server {
+	var copies []vpnconfig.Server
+	if j := chosenIndex(servers, before); j >= 0 {
+		copies = perAddress(servers[j : j+1])
+	}
 	if last == nil {
 		return copies
 	}
@@ -199,7 +208,16 @@ func rollbackOrder(copies []vpnconfig.Server, last *vpnconfig.Server) []vpnconfi
 		out = append(out, copies[:i]...)
 		return append(out, copies[i+1:]...)
 	}
-	return copies
+	if !sameServer(*last, before) {
+		return copies
+	}
+	out := []vpnconfig.Server{*last}
+	for _, c := range copies {
+		if dialIP(c) != dialIP(*last) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // returnAfterDeath settles the returns at a death. A death is a new episode,

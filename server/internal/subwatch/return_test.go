@@ -403,6 +403,74 @@ func TestTick_RollbackStartsWithTheAddressTheWalkPicked(t *testing.T) {
 	}
 }
 
+// An import dropped the server that runs, and the process remembers no copy of
+// it: a return that failed could not be undone, so none is tried.
+func TestTick_NoReturnWithoutAWayBack(t *testing.T) {
+	r := newReturnRig(returnServers()[:1]) // the import dropped Madrid
+	r.up[osloIP] = true
+	looks := 0
+	reachable := r.w.Reachable
+	r.w.Reachable = func(ctx context.Context, ip string, port int) bool {
+		looks++
+		return reachable(ctx, ip, port)
+	}
+	start := r.f.now
+	r.tick()
+	if len(r.events) != 0 {
+		t.Fatalf("events %v; there is no way back to Madrid", r.events)
+	}
+	if r.w.returnRetry != 0 {
+		t.Fatalf("returnRetry %v; nothing was tried", r.w.returnRetry)
+	}
+	if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Madrid" {
+		t.Fatalf("active %+v, want Madrid", a)
+	}
+	if looks != 1 {
+		t.Fatalf("looks %d, want 1", looks)
+	}
+	r.f.now = start.Add(ReturnCheck)
+	r.tick()
+	if looks != 2 {
+		t.Fatalf("looks %d, want the next %v later", looks, ReturnCheck)
+	}
+	if len(r.events) != 0 {
+		t.Fatalf("events %v; the list still has no way back", r.events)
+	}
+}
+
+// The copy the walk picked is a way back even after an import dropped its
+// server: Xray passed its probe on it.
+func TestTick_RollbackUsesTheRememberedCopyOfAServerNoLongerListed(t *testing.T) {
+	r := newReturnRig(returnServers()[:1]) // the import dropped Madrid
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.w.lastPicked = &vpnconfig.Server{Name: "Madrid", Address: "madrid.example", Port: 443, IPs: []string{madridIP}}
+	r.tick()
+	want := []string{"Oslo@" + osloIP, "restart", "Madrid@" + madridIP, "restart"}
+	if !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Madrid" {
+		t.Fatalf("active %+v, want Madrid back", a)
+	}
+}
+
+// An import moved the server that runs to another address: the address Xray
+// ran on comes first all the same.
+func TestTick_RollbackStartsWithTheRememberedAddressAnImportDropped(t *testing.T) {
+	servers := returnServers()
+	servers[1].IPs = []string{madridIP2}
+	r := newReturnRig(servers)
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.w.lastPicked = &vpnconfig.Server{Name: "Madrid", Address: "madrid.example", Port: 443, IPs: []string{madridIP}}
+	r.tick()
+	want := []string{"Oslo@" + osloIP, "restart", "Madrid@" + madridIP, "restart"}
+	if !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+}
+
 func TestTick_ADeathStartsTheReturnsOver(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
