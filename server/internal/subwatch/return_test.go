@@ -423,6 +423,88 @@ func TestTick_ADeathStartsTheReturnsOver(t *testing.T) {
 	}
 }
 
+// A preferred server that dies again soon after the return flaps: the death
+// counts as a failed return, and the restore after it does not shorten the
+// wait.
+func TestTick_ADeathSoonAfterAReturnCountsAsAFailedReturn(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.tick()               // the return: Oslo runs again
+	r.live[osloIP] = false // Oslo dies again
+	r.up[osloIP] = false
+	r.f.now = r.f.now.Add(ProbeInterval)
+	start := r.f.now
+	tickUntilDead(r.w, r.f)
+	if r.f.cfg.Xray.Failover == nil {
+		t.Fatal("no failover")
+	}
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
+	}
+	// Oslo accepts no TCP: it is dead a minute after the first miss.
+	want := start.Add(FastDeadAfter).Add(ReturnRetry)
+	if !r.w.returnNotBefore.Equal(want) {
+		t.Fatalf("returnNotBefore %v, want %v", r.w.returnNotBefore, want)
+	}
+	r.w.settled()
+	if !r.w.returnNotBefore.Equal(want) {
+		t.Fatalf("returnNotBefore %v after the restore, want %v", r.w.returnNotBefore, want)
+	}
+}
+
+func TestTick_ADeathAfterAReturnHeldStartsTheReturnsOver(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.tick() // the return: Oslo runs again
+	r.live[osloIP] = false
+	r.up[osloIP] = false
+	r.f.now = r.f.now.Add(ReturnHold)
+	tickUntilDead(r.w, r.f)
+	if r.f.cfg.Xray.Failover == nil {
+		t.Fatal("no failover")
+	}
+	if r.w.returnRetry != 0 {
+		t.Fatalf("returnRetry %v; the return held for %v", r.w.returnRetry, ReturnHold)
+	}
+}
+
+// With no fallback the later ticks of a death come back to the death branch:
+// the death counts as one failed return, not one per pass.
+func TestTick_ADeathSoonAfterAReturnCountsOnce(t *testing.T) {
+	r := newReturnRig(returnServers()) // no tunnel to fall back on
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	platforms := 0
+	load := r.w.LoadPlatform
+	r.w.LoadPlatform = func() (vpnconfig.PlatformInfo, error) {
+		platforms++
+		return load()
+	}
+	r.tick() // the return: Oslo runs again
+	r.live[osloIP] = false
+	r.up[osloIP] = false
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if n := countNotes(r.f.notes, "Xray outbound is down; no Tunnel Director fallback"); n != 1 {
+		t.Fatalf("notes %v", r.f.notes)
+	}
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
+	}
+	n := platforms
+	tickFor(r.w, r.f, ImportRetry)
+	if platforms == n {
+		t.Fatal("the death branch must run again once ImportRetry has passed")
+	}
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v after more passes of the same death, want %v", r.w.returnRetry, ReturnRetry)
+	}
+}
+
 // With no preferred server left - a selection clears it - what the failed
 // returns backed off to is done with.
 func TestTick_NoPreferredServerStartsTheReturnsOver(t *testing.T) {
@@ -438,6 +520,35 @@ func TestTick_NoPreferredServerStartsTheReturnsOver(t *testing.T) {
 	r.tick()
 	if r.w.returnRetry != 0 {
 		t.Fatalf("returnRetry %v; with no preferred server the returns start over", r.w.returnRetry)
+	}
+}
+
+// A return after failed ones ends their backoff only once it has held: until
+// then a death would count as one more failed return.
+func TestTick_AReturnEndsTheBackoffOnceItHasHeld(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.tick() // a failed return: the next waits ReturnRetry
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
+	}
+	r.live[osloIP] = true
+	r.f.now = r.f.now.Add(ReturnRetry)
+	r.tick() // the next attempt: Oslo works now
+	if p := r.f.cfg.Xray.PreferredServer; p != nil {
+		t.Fatalf("preferred %+v, want none once Oslo runs again", p)
+	}
+	returned := r.f.now
+	r.f.now = returned.Add(ReturnHold - ProbeInterval)
+	r.tick()
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v %v after the return, want %v", r.w.returnRetry, ReturnHold-ProbeInterval, ReturnRetry)
+	}
+	r.f.now = returned.Add(ReturnHold)
+	r.tick()
+	if r.w.returnRetry != 0 {
+		t.Fatalf("returnRetry %v; the return held for %v", r.w.returnRetry, ReturnHold)
 	}
 }
 

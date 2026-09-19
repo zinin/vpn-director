@@ -104,6 +104,8 @@ type Watch struct {
 	running           bool
 	returnNotBefore   time.Time         // no look for the preferred server before this
 	returnRetry       time.Duration     // wait after the last failed return; zero before any
+	lastReturn        time.Time         // when the last return proved live; zero once it held for ReturnHold or a death followed it
+	returnDeath       time.Time         // failSince of the last death the returns were settled at
 	lastPicked        *vpnconfig.Server // the copy the walk picked or a return proved, with the address it ran on
 }
 
@@ -308,10 +310,14 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
+	// Later ticks of the same death come back here - no tunnel, a failed
+	// platform lookup, a failed stage - and the returns settle once per death.
+	if !w.returnDeath.Equal(w.failSince) {
+		w.returnDeath = w.failSince
+		w.returnAfterDeath()
+	}
 	// With no tunnel to move to, every later tick comes back here: log the
 	// transition only until the user has been told there is no fallback.
-	// A death is a new episode: whatever the returns backed off to is done with.
-	w.returnRetry = 0
 	announce := w.lastRouteKind != noteNoTunnel
 	if announce {
 		slog.Info("Xray outbound declared dead", "socks_port", socks, "reason", reason, "error", err)
@@ -1503,13 +1509,16 @@ func (w *Watch) deadReason(now time.Time) string {
 
 // settled is a working outbound: the three minutes start again from its next
 // miss, the next death refreshes the subscription at once, and the first look
-// for the preferred server waits ReturnCheck.
+// for the preferred server waits ReturnCheck at least.
 func (w *Watch) settled() {
 	w.resetFail()
 	w.lastImport = time.Time{}
 	w.importRetry = 0
-	// The preferred server failed minutes ago: the first look at it waits.
-	w.returnNotBefore = w.Now().Add(ReturnCheck)
+	// The preferred server failed minutes ago: the first look at it waits -
+	// longer when the death counted as a failed return (returnAfterDeath).
+	if hold := w.Now().Add(ReturnCheck); hold.After(w.returnNotBefore) {
+		w.returnNotBefore = hold
+	}
 }
 
 // resetFallbackState ends what one failover episode knew about its fallbacks:

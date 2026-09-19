@@ -18,6 +18,10 @@ const (
 	// can accept TCP and still refuse the proxy - doubling up to ReturnRetryMax.
 	ReturnRetry    = 10 * time.Minute
 	ReturnRetryMax = 30 * time.Minute
+	// ReturnHold is how long the preferred server has to keep working after a
+	// return for the return to count as held: a death that starts within it
+	// counts as a failed return, and only a held return ends the backoff.
+	ReturnHold = 30 * time.Minute
 )
 
 // maybeReturn takes Xray back to the server the user chose once a walk has left
@@ -26,7 +30,11 @@ const (
 // looks every ReturnCheck - after a failed return, ReturnRetry and longer.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
-		w.returnRetry = 0
+		// A return clears preferred_server too; its backoff ends once it has held.
+		if w.lastReturn.IsZero() || w.Now().Sub(w.lastReturn) >= ReturnHold {
+			w.returnRetry = 0
+			w.lastReturn = time.Time{}
+		}
 		return
 	}
 	if w.LoadServers == nil || w.Reachable == nil || w.Generate == nil {
@@ -89,7 +97,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			}
 			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
 			w.lastPicked = &c
-			w.returnRetry = 0
+			w.lastReturn = w.Now()
 			w.notify(noteReturned, fmt.Sprintf(msgReturned, c.Name))
 			return
 		}
@@ -192,6 +200,22 @@ func rollbackOrder(copies []vpnconfig.Server, last *vpnconfig.Server) []vpnconfi
 		return append(out, copies[i+1:]...)
 	}
 	return copies
+}
+
+// returnAfterDeath settles the returns at a death. A death is a new episode,
+// and whatever the returns backed off to is done with - unless it started
+// within ReturnHold of a return: the preferred server has failed again, and
+// the death counts as a failed return, so a server that flaps is not
+// returned to every few minutes.
+func (w *Watch) returnAfterDeath() {
+	if !w.lastReturn.IsZero() && w.failSince.Sub(w.lastReturn) < ReturnHold {
+		slog.Info("The preferred server died soon after the return; counted as a failed return", "after", w.failSince.Sub(w.lastReturn))
+		w.backOffReturn()
+	} else {
+		w.returnRetry = 0
+		w.returnNotBefore = time.Time{}
+	}
+	w.lastReturn = time.Time{}
 }
 
 // backOffReturn holds the next attempt back after a return that failed:
