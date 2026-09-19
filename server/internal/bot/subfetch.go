@@ -14,7 +14,7 @@ import (
 
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
-	"github.com/zinin/vpn-director/server/internal/vless"
+	"github.com/zinin/vpn-director/server/internal/subscription"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -60,7 +60,7 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 	// IPv4 only and bound to ctx: an AF_UNSPEC lookup of every hostname in the
 	// subscription can hold a watch tick for minutes on this router, and a stop
 	// has to be able to end it.
-	wanLookup := vless.LookupIPv4(ctx)
+	wanLookup := subscription.LookupIPv4(ctx)
 	p, tunnel := subscriptionTunnel(cfgSvc, vpnSvc)
 	var tunnelLookup func(host string) ([]net.IP, error)
 	if tunnel != nil {
@@ -122,7 +122,7 @@ func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, 
 // IPv4 address. A nil first is the default resolver, bound to ctx.
 func eitherLookup(ctx context.Context, first, second func(host string) ([]net.IP, error)) func(host string) ([]net.IP, error) {
 	if first == nil {
-		first = vless.LookupIPv4(ctx)
+		first = subscription.LookupIPv4(ctx)
 	}
 	if second == nil {
 		return first
@@ -148,14 +148,12 @@ func hasIPv4(ips []net.IP) bool {
 // watch and keeps the servers whose addresses resolved through lookup, the
 // default resolver when it is nil.
 func serversFromSubscriptionLookup(body []byte, lookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
-	var result vless.Import
-	if lookup == nil {
-		result = vless.DecodeAndResolve(string(body))
-	} else {
-		result = vless.DecodeAndResolveLookup(string(body), lookup)
+	result, err := subscription.DecodeAndResolveLookup(string(body), lookup)
+	if err != nil {
+		return nil, err
 	}
 	if result.Parsed == 0 {
-		return nil, errors.New("no VLESS servers")
+		return nil, errors.New("no supported servers")
 	}
 	if len(result.Servers) == 0 {
 		return nil, errNoResolved

@@ -7,12 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
-	"github.com/zinin/vpn-director/server/internal/vless"
+	"github.com/zinin/vpn-director/server/internal/subscription"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -222,11 +221,15 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 			return
 		}
 
-		// Decode VLESS subscription and resolve IPs. Parse errors travel back to
-		// the user so a rejected link explains itself, as the bot's /import does.
-		result := vless.DecodeAndResolve(string(body))
+		// Decode the subscription and resolve IPs. What was skipped, and why,
+		// travels back to the user, as the bot's /import says it.
+		result, err := subscription.DecodeAndResolve(string(body))
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		if result.Parsed == 0 {
-			jsonError(w, http.StatusBadRequest, noServersMessage(result.ParseErrors))
+			jsonError(w, http.StatusBadRequest, result.NoServers())
 			return
 		}
 
@@ -265,7 +268,14 @@ func handleImportServers(deps *Deps) http.HandlerFunc {
 			return
 		}
 
-		jsonOK(w, map[string]interface{}{"ok": true, "count": len(result.Servers)})
+		jsonOK(w, map[string]interface{}{
+			"ok":         true,
+			"count":      len(result.Servers),
+			"total":      result.Total,
+			"skipped":    result.SkippedByReason(),
+			"dns_errors": result.ResolveErrors,
+			"summary":    result.Summary(),
+		})
 	}
 }
 
@@ -298,21 +308,4 @@ func resolveSubscriptionURL(reqURL string, cfg *vpnconfig.VPNDirectorConfig) (st
 		return cfg.Xray.SubscriptionURL, nil
 	}
 	return "", errors.New("url is required")
-}
-
-// noServersMessage explains an empty subscription. Up to three parse errors
-// are appended so the user learns why the link was rejected.
-func noServersMessage(errs []error) string {
-	const msg = "no VLESS servers found in subscription"
-	if len(errs) == 0 {
-		return msg
-	}
-	parts := make([]string, 0, 3)
-	for _, e := range errs {
-		if len(parts) == 3 {
-			break
-		}
-		parts = append(parts, e.Error())
-	}
-	return msg + ": " + strings.Join(parts, "; ")
 }

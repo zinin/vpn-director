@@ -240,8 +240,12 @@ func TestNewTunnelHTTPClient_DoesNotFollowRedirects(t *testing.T) {
 }
 
 func TestServersFromSubscription(t *testing.T) {
-	if _, err := serversFromSubscriptionLookup([]byte("not base64 !!!"), nil); err == nil || err.Error() != "no VLESS servers" {
-		t.Fatalf("err %v, want no VLESS servers", err)
+	if _, err := serversFromSubscriptionLookup([]byte("not base64 !!!"), nil); err == nil || err.Error() != "unrecognized subscription format" {
+		t.Fatalf("err %v, want unrecognized subscription format", err)
+	}
+	// A readable subscription none of whose entries Xray can run.
+	if _, err := serversFromSubscriptionLookup([]byte("tuic://uuid:pw@203.0.113.10:443#TUIC"), nil); err == nil || err.Error() != "no supported servers" {
+		t.Fatalf("err %v, want no supported servers", err)
 	}
 
 	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443#Oslo"))

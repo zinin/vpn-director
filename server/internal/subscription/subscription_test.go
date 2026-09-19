@@ -1,8 +1,14 @@
 package subscription
 
 import (
+	"context"
 	"errors"
+	"net"
+	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
 func TestCleanName(t *testing.T) {
@@ -95,5 +101,117 @@ func TestDecodeBase64(t *testing.T) {
 		if got != tc.want || ok != tc.ok {
 			t.Errorf("decodeBase64(%q) = %q, %v; want %q, %v", tc.in, got, ok, tc.want, tc.ok)
 		}
+	}
+}
+
+func TestImportSummary(t *testing.T) {
+	imp := Import{Total: 40, ResolveErrors: 1}
+	imp.Servers = make([]vpnconfig.Server, 32)
+	for i := 0; i < 7; i++ {
+		imp.Skipped = append(imp.Skipped, Skip{Name: "Auto", Reason: ReasonComposite, Detail: "12 proxy outbounds"})
+	}
+	if got := imp.Counts(); got != "7 composite, 1 DNS error" {
+		t.Errorf("Counts() = %q", got)
+	}
+	if got := imp.Summary(); got != "Imported 32 of 40 servers: 7 composite, 1 DNS error" {
+		t.Errorf("Summary() = %q", got)
+	}
+	if got := imp.SkippedByReason(); !reflect.DeepEqual(got, map[string]int{ReasonUnsupported: 0, ReasonComposite: 7, ReasonInvalid: 0, ReasonPlaceholder: 0}) {
+		t.Errorf("SkippedByReason() = %v", got)
+	}
+	whole := Import{Total: 2, Servers: make([]vpnconfig.Server, 2)}
+	if got := whole.Summary(); got != "Imported 2 servers" {
+		t.Errorf("Summary() = %q", got)
+	}
+}
+
+func TestImportNoServers(t *testing.T) {
+	imp := Import{Total: 6, Skipped: []Skip{
+		{Name: "TUIC", Reason: ReasonUnsupported, Detail: "tuic"},
+		{Name: "Auto", Reason: ReasonComposite, Detail: "3 proxy outbounds"},
+		{Name: "A", Reason: ReasonPlaceholder, Detail: "127.0.0.1"},
+		{Name: "B", Reason: ReasonPlaceholder, Detail: "0.0.0.0"},
+		{Name: "Bad", Reason: ReasonInvalid, Detail: "missing port"},
+		{Name: "KCP", Reason: ReasonUnsupported, Detail: "transport kcp"},
+	}}
+	want := "no supported servers in subscription: 2 unsupported, 1 composite, 1 invalid, 2 placeholders; " +
+		"TUIC: tuic; Bad: missing port; KCP: transport kcp"
+	if got := imp.NoServers(); got != want {
+		t.Errorf("NoServers() =\n%q\nwant\n%q", got, want)
+	}
+}
+
+func TestDecodeAndResolve(t *testing.T) {
+	// IP literals resolve without DNS; the IPv6 one does not resolve over IPv4.
+	body := strings.Join([]string{
+		"vless://uuid-1@203.0.113.10:443?security=none#Oslo",
+		"vless://missing-at-sign:443#Broken",
+		"trojan://pw@198.51.100.7:8443#Paris",
+		"vless://uuid-2@[2001:db8::1]:443#Six",
+	}, "\n")
+
+	imp, err := DecodeAndResolve(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imp.Total != 4 || imp.Parsed != 3 || len(imp.Skipped) != 1 || imp.ResolveErrors != 1 {
+		t.Fatalf("%+v", imp)
+	}
+	if len(imp.Servers) != 2 {
+		t.Fatalf("servers %+v", imp.Servers)
+	}
+	if got := imp.Servers[0]; got.Name != "Oslo" || !reflect.DeepEqual(got.IPs, []string{"203.0.113.10"}) {
+		t.Errorf("first server %+v", got)
+	}
+	if got := imp.Servers[1]; got.Name != "Paris" || !reflect.DeepEqual(got.IPs, []string{"198.51.100.7"}) {
+		t.Errorf("second server %+v", got)
+	}
+}
+
+func TestDecodeAndResolve_PassesTheDecodeErrorThrough(t *testing.T) {
+	if _, err := DecodeAndResolve("<html>not a subscription</html>"); !errors.Is(err, ErrUnrecognized) {
+		t.Fatalf("err %v, want ErrUnrecognized", err)
+	}
+}
+
+func TestDecodeAndResolveLookup(t *testing.T) {
+	var looked []string
+	imp, err := DecodeAndResolveLookup("vless://uuid-1@oslo.example.invalid:443#Oslo", func(host string) ([]net.IP, error) {
+		looked = append(looked, host)
+		return []net.IP{net.ParseIP("2001:db8::5"), net.ParseIP("203.0.113.50")}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imp.Servers) != 1 || !reflect.DeepEqual(imp.Servers[0].IPs, []string{"203.0.113.50"}) {
+		t.Fatalf("%+v", imp)
+	}
+	if !reflect.DeepEqual(looked, []string{"oslo.example.invalid"}) {
+		t.Fatalf("lookup %v", looked)
+	}
+}
+
+func TestLookupIPv4_ReturnsOnlyIPv4(t *testing.T) {
+	ips, err := LookupIPv4(context.Background())("localhost")
+	if err != nil {
+		t.Skipf("no local resolver for localhost: %v", err)
+	}
+	if len(ips) == 0 {
+		t.Fatal("localhost resolved to nothing")
+	}
+	for _, ip := range ips {
+		if ip.To4() == nil {
+			t.Fatalf("resolved %v; an AF_UNSPEC lookup is what waits out the AAAA half", ip)
+		}
+	}
+}
+
+// The subscription of a router can name tens of hosts, resolved one after the
+// other inside a watch tick. A stop or a shutdown has to be able to end that.
+func TestLookupIPv4_HonoursTheContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := LookupIPv4(ctx)("localhost"); err == nil {
+		t.Fatal("a canceled context must end the lookup")
 	}
 }

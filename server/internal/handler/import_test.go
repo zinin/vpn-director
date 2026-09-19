@@ -597,14 +597,13 @@ func TestImportHandler_HandleImport_InvalidBase64(t *testing.T) {
 	if sender.lastChatID != 222 {
 		t.Errorf("expected chatID 222, got %d", sender.lastChatID)
 	}
-	// Should report no servers found or decode error
-	if !strings.Contains(sender.lastText, "No") && !strings.Contains(sender.lastText, "decode") && !strings.Contains(sender.lastText, "base64") {
-		t.Errorf("expected error about decoding or no servers, got %q", sender.lastText)
+	if !strings.Contains(sender.lastText, "unrecognized subscription format") {
+		t.Errorf("expected the unrecognized format error, got %q", sender.lastText)
 	}
 }
 
 func TestImportHandler_HandleImport_EmptySubscription(t *testing.T) {
-	// Create a subscription with no VLESS URLs
+	// A base64 body with no link in it
 	encoded := base64.StdEncoding.EncodeToString([]byte("just some text\nno vless here"))
 
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -631,8 +630,8 @@ func TestImportHandler_HandleImport_EmptySubscription(t *testing.T) {
 	if sender.lastChatID != 333 {
 		t.Errorf("expected chatID 333, got %d", sender.lastChatID)
 	}
-	if !strings.Contains(sender.lastText, "No") {
-		t.Errorf("expected 'No VLESS servers' message, got %q", sender.lastText)
+	if !strings.Contains(sender.lastText, "unrecognized subscription format") {
+		t.Errorf("expected the unrecognized format error, got %q", sender.lastText)
 	}
 }
 
@@ -661,5 +660,49 @@ func TestImportHandler_HandleImport_BlocksPrivateURL(t *testing.T) {
 	}
 	if config.savedServers != nil {
 		t.Error("expected no servers saved for a blocked private URL")
+	}
+}
+
+// An import says what it left out, and why: the counts under the country
+// list, then the entries a user can act on.
+func TestImportHandler_HandleImport_ReportsWhatWasSkipped(t *testing.T) {
+	server := subscriptionServer(t, strings.Join([]string{
+		"vless://uuid-1@203.0.113.10:443?type=tcp#Oslo",
+		"tuic://uuid:pw@203.0.113.11:443#TUIC",
+		"vless://uuid-2@203.0.113.12:443?type=kcp#KCP",
+	}, "\n"))
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{dataDirVal: t.TempDir()}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import " + server.URL))
+
+	for _, want := range []string{"Imported 1 of 3 servers:", "2 unsupported", "TUIC: tuic", "KCP: transport kcp"} {
+		if !strings.Contains(sender.lastText, want) {
+			t.Errorf("message %q lacks %q", sender.lastText, want)
+		}
+	}
+	if len(config.savedServers) != 1 || config.savedServers[0].Name != "Oslo" {
+		t.Fatalf("saved %+v", config.savedServers)
+	}
+}
+
+func TestImportHandler_HandleImport_NoSupportedServers(t *testing.T) {
+	server := subscriptionServer(t, "tuic://uuid:pw@203.0.113.11:443#TUIC")
+	sender := &mockSender{}
+	config := &mockConfigStoreForImport{dataDirVal: t.TempDir()}
+	h := NewImportHandler(&Deps{Sender: sender, Config: config})
+	h.httpClient = server.Client()
+
+	h.HandleImport(importCommand("/import " + server.URL))
+
+	for _, want := range []string{"No supported servers in subscription", "1 unsupported", "TUIC: tuic"} {
+		if !strings.Contains(sender.lastText, want) {
+			t.Errorf("message %q lacks %q", sender.lastText, want)
+		}
+	}
+	if config.savedServers != nil {
+		t.Fatalf("saved %+v", config.savedServers)
 	}
 }
