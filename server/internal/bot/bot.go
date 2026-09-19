@@ -119,6 +119,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Apply:        vpnSvc.ApplyUnlessStopped,
 			RestartXray:  vpnSvc.RestartXrayProcessUnlessStopped,
 			SaveServers:  configSvc.SaveServers,
+			LoadServers:  configSvc.LoadServers,
+			Reachable:    reachTCP4(nil),
 			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 				cfg, err := configSvc.LoadVPNConfig()
 				if err != nil {

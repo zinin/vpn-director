@@ -24,6 +24,7 @@ server/
 │   │   ├── transport.go      # DialPath, NewPathClient, SO_BINDTODEVICE
 │   │   ├── transport_linux.go # SO_BINDTODEVICE + SO_MARK socket control
 │   │   ├── transport_other.go # Non-Linux stub that fails the dial
+│   │   ├── reach.go          # tcp4 reachability check for the subscription watch
 │   │   └── subfetch.go       # Subscription fetch: WAN then DialPath tunnel
 │   ├── chatstore/            # Chat ID persistence
 │   │   └── store.go          # Thread-safe chat storage for notifications
