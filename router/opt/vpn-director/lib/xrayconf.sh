@@ -110,7 +110,7 @@ xrayconf_generate() {
 # mktemp name needs -format json. Without an xray there is nothing to test
 # with: that is said on stderr, and the config passes.
 xrayconf_validate() {
-    local file="$1" xray out
+    local file="$1" xray out rc=0
     xray=$(type -P xray 2>/dev/null) || xray=""
     if [[ -z $xray && -x /opt/sbin/xray ]]; then
         xray=/opt/sbin/xray
@@ -119,10 +119,24 @@ xrayconf_validate() {
         printf 'xrayconf: xray not found; %s was not tested\n' "$file" >&2
         return 0
     fi
-    if ! out=$("$xray" run -test -format json -c "$file" 2>&1); then
-        printf 'xrayconf: xray rejected the config: %s\n' "$(printf '%s\n' "$out" | awk '
+    # The caller holds the config lock while this runs, and every other writer
+    # waits 30 s for that lock, so an xray that never answers may not be waited
+    # for forever: XrayService.GenerateConfig bounds the same test at 30 s
+    # (service/xray.go). busybox and coreutils both bring timeout; without one
+    # the test runs unbounded, as it did before. A killed xray says nothing, and
+    # its exit code is 124 or 143 depending on which timeout ran, so the message
+    # names the code rather than reading it.
+    local -a test_cmd=("$xray" run -test -format json -c "$file")
+    if type -P timeout >/dev/null 2>&1; then
+        test_cmd=(timeout 30 "${test_cmd[@]}")
+    fi
+    out=$("${test_cmd[@]}" 2>&1) || rc=$?
+    if (( rc != 0 )); then
+        local detail
+        detail=$(printf '%s\n' "$out" | awk '
             NF { line[++n] = $0 }
-            END { for (i = (n > 3 ? n - 2 : 1); i <= n; i++) printf "%s%s", line[i], (i < n ? "; " : "") }')" >&2
+            END { for (i = (n > 3 ? n - 2 : 1); i <= n; i++) printf "%s%s", line[i], (i < n ? "; " : "") }')
+        printf 'xrayconf: xray rejected the config: %s\n' "${detail:-no output, exit $rc}" >&2
         return 1
     fi
 }

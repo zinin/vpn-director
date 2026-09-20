@@ -166,6 +166,16 @@ setup() {
     [[ $output == *'xray rejected the config: Xray 26.2.6; Failed to start: infra/conf: "allowInsecure" has been removed'* ]]
 }
 
+# A timeout kills xray without a word, and the exit code is 124 or 143
+# depending on which timeout ran, so the message names the code instead.
+@test "xrayconf_validate: an xray that answers nothing fails with its exit code" {
+    export PATH="$TEST_ROOT/mocks:$PATH" XRAY_MOCK_EXIT=124 XRAY_MOCK_OUTPUT=""
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xray rejected the config: no output, exit 124'* ]]
+}
+
 @test "xrayconf_validate: without an xray the config passes, and says so" {
     [[ ! -x /opt/sbin/xray ]] || skip "this machine has /opt/sbin/xray"
     printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
