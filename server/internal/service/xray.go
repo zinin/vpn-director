@@ -31,7 +31,12 @@ func NewXrayService(templatePath, outputPath string) *XrayService {
 }
 
 // xrayTestTimeout bounds one "xray run -test"; a router needs a second or two.
-const xrayTestTimeout = 30 * time.Second
+// It stays well under configLockTimeout, because the test runs inside
+// UpdateVPNConfig: a bound as long as the lock's would let a single hung xray
+// use up the entire wait every other writer is willing to sit through, so an
+// apply or an import beside it would fail with "config is busy" instead of
+// taking its turn.
+const xrayTestTimeout = 15 * time.Second
 
 // xrayTest has Xray load the config without starting a server. The outbound
 // may come verbatim from a subscription, and it may name a protocol the

@@ -73,7 +73,9 @@ the installed Xray lacks, or a key it refuses — since 2026-06-01 Xray loads no
 `tlsSettings.allowInsecure: true` — and a config Xray rejects would take every Xray client, and the
 bot, offline at the next restart. The temp file (`config.json.XXXXXX`) does not end in `.json`, which
 keeps `xray -confdir` from loading it and is why `-format json` is needed. Without an `xray` binary
-(dev mode, a workstation) the test is skipped.
+(dev mode, a workstation) the test is skipped. The test runs under the config lock and is bounded at
+15 s, half of the 30 s every other writer waits for that lock: a hung `xray` lets them take their
+turn instead of using up the whole wait.
 
 ## Configuration
 

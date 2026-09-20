@@ -120,15 +120,17 @@ xrayconf_validate() {
         return 0
     fi
     # The caller holds the config lock while this runs, and every other writer
-    # waits 30 s for that lock, so an xray that never answers may not be waited
-    # for forever: XrayService.GenerateConfig bounds the same test at 30 s
-    # (service/xray.go). busybox and coreutils both bring timeout; without one
+    # waits 30 s for that lock, so the test is bounded at half of it: an xray
+    # that never answers then lets the others take their turn instead of using
+    # up their whole wait. XrayService.GenerateConfig bounds the same test the
+    # same way (xrayTestTimeout in service/xray.go). busybox and coreutils both
+    # bring timeout; without one
     # the test runs unbounded, as it did before. A killed xray says nothing, and
     # its exit code is 124 or 143 depending on which timeout ran, so the message
     # names the code rather than reading it.
     local -a test_cmd=("$xray" run -test -format json -c "$file")
     if type -P timeout >/dev/null 2>&1; then
-        test_cmd=(timeout 30 "${test_cmd[@]}")
+        test_cmd=(timeout 15 "${test_cmd[@]}")
     fi
     out=$("${test_cmd[@]}" 2>&1) || rc=$?
     if (( rc != 0 )); then
