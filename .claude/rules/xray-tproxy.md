@@ -50,11 +50,12 @@ it. A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in
 `interface`, `tproxy` or `customSockopt` — a foreign fwmark could collide with ours (0x100 Xray,
 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an interface would route around the WAN; a
 `sockopt` left empty goes too. A `sockopt.dialerProxy` anywhere makes the entry `composite`
-(`chained`), as one at the top always did. A tls stream anywhere carrying `allowInsecure` loses the
-flag when it names a `pinnedPeerCertSha256` and makes the entry `unsupported` (`insecure TLS`) when
-it does not — Xray has loaded no config with the flag since 2026-06-01. Only a tls stream is read
-for it: Xray ignores `tlsSettings` under any other security, and 26.2.6 loads a stray flag there
-without complaint.
+(`chained`), as one at the top always did. A tls stream anywhere loses its `allowInsecure` whatever
+the value is, and the entry is `unsupported` (`insecure TLS`) when that value was the boolean `true`
+and no `pinnedPeerCertSha256` replaces it — Xray has loaded no config with the flag since
+2026-06-01, and it reads the field as a bool, so a panel's `false` is noise while its `"true"` would
+make Xray refuse the config outright. Only a tls stream is read for it: Xray ignores `tlsSettings`
+under any other security, and 26.2.6 loads a stray flag there without complaint.
 
 A record without `outbound` predates stored outbounds: the generators build a VLESS outbound from
 its flat fields — `security` (`reality`|`tls`), `network`, `flow`, `sni`, `fingerprint`,

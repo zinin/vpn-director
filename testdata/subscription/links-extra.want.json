@@ -1,8 +1,9 @@
 {
-  "total": 4,
+  "total": 5,
   "servers": [
     {"address":"xh3.example.com","name":"Extra pinned","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"xh3.example.com","port":443,"users":[{"encryption":"none","id":"99999999-9999-4999-8999-999999999999"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xh3.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp","security":"tls","tlsSettings":{"pinnedPeerCertSha256":"39ddf94fc84218d902db652725fbf4bb318aaea30637e0124b004ce7031f11e6"}}},"path":"/x"}}},"port":443},
-    {"address":"xh4.example.com","name":"Extra flag no security","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"xh4.example.com","port":443,"users":[{"encryption":"none","id":"99999999-9999-4999-8999-999999999999"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xh4.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp","tlsSettings":{"allowInsecure":true}}},"path":"/x"}}},"port":443}
+    {"address":"xh4.example.com","name":"Extra flag no security","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"xh4.example.com","port":443,"users":[{"encryption":"none","id":"99999999-9999-4999-8999-999999999999"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xh4.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp","tlsSettings":{"allowInsecure":true}}},"path":"/x"}}},"port":443},
+    {"address":"xh5.example.com","name":"Extra flag false","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"xh5.example.com","port":443,"users":[{"encryption":"none","id":"99999999-9999-4999-8999-999999999999"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xh5.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xh5.example.com"}}},"path":"/x"}}},"port":443}
   ],
   "skipped": [
     {"name":"Extra chained","reason":"composite"},

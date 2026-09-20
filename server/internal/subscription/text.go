@@ -212,6 +212,10 @@ func hasDialerProxy(v interface{}) bool {
 // inside an xhttp "extra" fails the load exactly like the one at the top.
 // Only a tls stream is read for it - Xray ignores tlsSettings under any other
 // security, and a stray flag there costs nothing (checked against 26.2.6).
+// The key goes whatever its value, as drop_insecure does in
+// lib/subscription.sh: only the boolean true asks for an insecure dial, but a
+// panel's "allowInsecure": false is noise, and a string "true" is worse - Xray
+// reads the field as a bool and refuses the whole config over one.
 func sanitizeTLS(v interface{}) bool {
 	insecure := false
 	switch t := v.(type) {
@@ -222,8 +226,8 @@ func sanitizeTLS(v interface{}) bool {
 					if pin, _ := tls["pinnedPeerCertSha256"].(string); pin == "" {
 						insecure = true
 					}
-					delete(tls, "allowInsecure")
 				}
+				delete(tls, "allowInsecure")
 			}
 		}
 		for _, child := range t {

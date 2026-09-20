@@ -157,4 +157,77 @@
       }
     ]
   }
+,
+  {
+    "remarks": "JSON tls flag false",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je5.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "js.example.com",
+            "allowInsecure": false
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON extra flag string",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je6.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "tls",
+          "xhttpSettings": {
+            "path": "/js",
+            "extra": {
+              "downloadSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                  "serverName": "js.example.com",
+                  "allowInsecure": "true"
+                }
+              }
+            }
+          },
+          "tlsSettings": {
+            "serverName": "js.example.com"
+          }
+        }
+      }
+    ]
+  }
 ]
