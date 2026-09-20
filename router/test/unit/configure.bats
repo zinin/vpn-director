@@ -362,14 +362,16 @@ JSON
     load_wizard
     cat > "$SERVERS_FILE" <<'JSON'
 [{"name":"Broken","address":"broken.example.com","port":443,"ips":["1.2.3.4"],"outbound":{"protocol":"vless","streamSettings":"tcp"}},
+ {"name":"Null","address":"null.example.com","port":443,"ips":["1.2.3.5"],"outbound":null},
  {"name":"Oslo WS","address":"oslo.example.com","port":443,"ips":["1.2.3.6"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"tls"}}}]
 JSON
 
-    run step_select_xray_server <<< "2"
+    run step_select_xray_server <<< "3"
 
     assert_success
     assert_output --partial "1) Broken [?]"
-    assert_output --partial "2) Oslo WS [vless·ws·tls]"
+    assert_output --partial "2) Null [?]"
+    assert_output --partial "3) Oslo WS [vless·ws·tls]"
 }
 
 # ============================================================================

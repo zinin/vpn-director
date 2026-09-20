@@ -67,6 +67,10 @@ func TestServerLabel(t *testing.T) {
 		{Server{Outbound: json.RawMessage(`{"protocol":"trojan","streamSettings":{"network":"tcp","security":"tls"}}`)}, "trojan·tls"},
 		{Server{Outbound: json.RawMessage(`{"protocol":"shadowsocks","streamSettings":{"network":"tcp","security":"none"}}`)}, "ss"},
 		{Server{Outbound: json.RawMessage(`{"protocol":"hysteria","streamSettings":{"network":"hysteria","security":"tls"}}`)}, "hysteria2"},
+		// An outbound that is there but is no outbound: neither a legacy
+		// record nor a labelled one. configure.sh prints "?" for both.
+		{Server{Outbound: json.RawMessage(`null`), Security: "reality"}, "?"},
+		{Server{Outbound: json.RawMessage(`{"protocol":"vless","streamSettings":"tcp"}`)}, "?"},
 	} {
 		if got := tc.server.Label(); got != tc.want {
 			t.Errorf("Label() of %+v = %q, want %q", tc.server, got, tc.want)

@@ -179,10 +179,14 @@ step_select_xray_server() {
           # An outbound is stored as the subscription wrote it, so nothing says
           # its streamSettings is an object: indexing one that is not ends jq,
           # and with it the whole list. Server.Label in vpnconfig/outbound.go
-          # answers "?" to an outbound it cannot read; so does this.
+          # answers "?" to an outbound it cannot read; so does this. Only a
+          # record with no outbound key at all is the legacy one - jq reads a
+          # null the way it reads a missing key, and a null outbound is no
+          # outbound: the generators reject it, so it is a "?" too.
           try (
-            (if (.outbound | type) == "null"
+            (if (has("outbound") | not)
              then ["vless", .network, (if (.security // "") == "" then "tls" else .security end)]
+             elif (.outbound | type) != "object" then error("not an outbound")
              else [.outbound.protocol, .outbound.streamSettings.network, .outbound.streamSettings.security] end)
             | map(if . == null then "" elif type == "string" then . else error("not a string") end) as [$p, $n, $s]
             | if $p == "shadowsocks" then "ss" elif $p == "hysteria" then "hysteria2"
