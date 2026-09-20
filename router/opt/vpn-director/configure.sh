@@ -176,13 +176,19 @@ step_select_xray_server() {
     i=1
     jq -r '
         def protocol_label:
-          (if (.outbound | type) == "object"
-           then [.outbound.protocol, .outbound.streamSettings.network, .outbound.streamSettings.security]
-           else ["vless", .network, (if (.security // "") == "" then "tls" else .security end)] end)
-          | map(. // "") as [$p, $n, $s]
-          | if $p == "shadowsocks" then "ss" elif $p == "hysteria" then "hysteria2"
-            else [$p] + (if $n == "" or $n == "tcp" or $n == "raw" then [] else [$n] end)
-                      + (if $s == "" or $s == "none" then [] else [$s] end) | join("·") end;
+          # An outbound is stored as the subscription wrote it, so nothing says
+          # its streamSettings is an object: indexing one that is not ends jq,
+          # and with it the whole list. Server.Label in vpnconfig/outbound.go
+          # answers "?" to an outbound it cannot read; so does this.
+          try (
+            (if (.outbound | type) == "null"
+             then ["vless", .network, (if (.security // "") == "" then "tls" else .security end)]
+             else [.outbound.protocol, .outbound.streamSettings.network, .outbound.streamSettings.security] end)
+            | map(if . == null then "" elif type == "string" then . else error("not a string") end) as [$p, $n, $s]
+            | if $p == "shadowsocks" then "ss" elif $p == "hysteria" then "hysteria2"
+              else [$p] + (if $n == "" or $n == "tcp" or $n == "raw" then [] else [$n] end)
+                        + (if $s == "" or $s == "none" then [] else [$s] end) | join("·") end
+          ) catch "?";
         .[] | "\(.name)|\(.address)|\((.ips // []) | join(", "))|\(protocol_label)"' "$SERVERS_FILE" | \
     while IFS='|' read -r name address ip label; do
         printf "  %2d) %s [%s]\n      %s -> %s\n\n" "$i" "$name" "$label" "$address" "$ip"
