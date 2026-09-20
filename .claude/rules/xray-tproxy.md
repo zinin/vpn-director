@@ -44,12 +44,17 @@ and `server/internal/subscription`, which answer to the same cases in `testdata/
 generators insert it unread, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
 httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2.
 
-Sanitizing keeps routing ours. A stored outbound carries no `tag` and no `sendThrough`, and no
-`sockopt` in it — at any depth, from either format — keeps `mark`, `interface`, `tproxy` or
-`customSockopt`; a `sockopt` left empty goes too. Depth is the point: an xhttp `extra` holds whatever
-the subscription wrote, and Xray reads a whole `downloadSettings` stream config out of it. A foreign
-fwmark could collide with ours (0x100 Xray, 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an
-interface would route around the WAN.
+Sanitizing keeps routing ours, and it reads the whole outbound, not its top only: an xhttp `extra`
+holds whatever the subscription wrote, and Xray reads a whole `downloadSettings` stream config out of
+it. A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in it keeps `mark`,
+`interface`, `tproxy` or `customSockopt` — a foreign fwmark could collide with ours (0x100 Xray,
+0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an interface would route around the WAN; a
+`sockopt` left empty goes too. A `sockopt.dialerProxy` anywhere makes the entry `composite`
+(`chained`), as one at the top always did. A tls stream anywhere carrying `allowInsecure` loses the
+flag when it names a `pinnedPeerCertSha256` and makes the entry `unsupported` (`insecure TLS`) when
+it does not — Xray has loaded no config with the flag since 2026-06-01. Only a tls stream is read
+for it: Xray ignores `tlsSettings` under any other security, and 26.2.6 loads a stray flag there
+without complaint.
 
 A record without `outbound` predates stored outbounds: the generators build a VLESS outbound from
 its flat fields — `security` (`reality`|`tls`), `network`, `flow`, `sni`, `fingerprint`,

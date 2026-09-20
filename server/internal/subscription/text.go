@@ -180,6 +180,67 @@ func scrubSockopt(v interface{}) {
 	}
 }
 
+// hasDialerProxy reports whether any sockopt in v, however deep, names an
+// outbound to dial through. A sockopt at the top of an entry already makes it
+// composite; one inside an xhttp "extra" is the same chain, one level down.
+func hasDialerProxy(v interface{}) bool {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		if sockopt, ok := t["sockopt"].(map[string]interface{}); ok {
+			if dialer, _ := sockopt["dialerProxy"].(string); dialer != "" {
+				return true
+			}
+		}
+		for _, child := range t {
+			if hasDialerProxy(child) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, child := range t {
+			if hasDialerProxy(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// sanitizeTLS deletes allowInsecure from every tls stream in v, however deep,
+// and reports whether one of them named no pinnedPeerCertSha256 to replace it:
+// Xray has loaded no config carrying the flag since 2026-06-01, and a stream
+// inside an xhttp "extra" fails the load exactly like the one at the top.
+// Only a tls stream is read for it - Xray ignores tlsSettings under any other
+// security, and a stray flag there costs nothing (checked against 26.2.6).
+func sanitizeTLS(v interface{}) bool {
+	insecure := false
+	switch t := v.(type) {
+	case map[string]interface{}:
+		if security, _ := t["security"].(string); security == "tls" {
+			if tls, ok := t["tlsSettings"].(map[string]interface{}); ok {
+				if flag, _ := tls["allowInsecure"].(bool); flag {
+					if pin, _ := tls["pinnedPeerCertSha256"].(string); pin == "" {
+						insecure = true
+					}
+					delete(tls, "allowInsecure")
+				}
+			}
+		}
+		for _, child := range t {
+			if sanitizeTLS(child) {
+				insecure = true
+			}
+		}
+	case []interface{}:
+		for _, child := range t {
+			if sanitizeTLS(child) {
+				insecure = true
+			}
+		}
+	}
+	return insecure
+}
+
 // prune removes empty strings, arrays and objects, innermost first, so an
 // object that only held empty values goes too (spec 6.3). It changes v in
 // place and returns it.

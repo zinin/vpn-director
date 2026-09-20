@@ -38,23 +38,40 @@ _SUB_KEYS=" type security encryption flow sni fp alpn pbk sid spx pqv host path
 headerType serviceName mode authority extra pcs vcn allowInsecure insecure
 plugin obfs obfs-password pinSHA256 "
 
-# jq that strips from every sockopt, however deep, the keys that could route
-# around our own rules, and drops a sockopt left empty. Depth matters: an xhttp
-# "extra" carries whatever the subscription wrote, and Xray reads a
-# downloadSettings stream config - sockopt included - out of it. A foreign
-# fwmark could collide with ours (0x100 Xray, 0x01 firmware VPN, 0x00ff0000
-# Tunnel Director), and an interface would route around the WAN. Both jq
-# programs below take it, as scrubSockopt serves both Go paths.
-_SUB_JQ_SCRUB='
+# jq that holds an outbound to our rules at every depth, not at its top only:
+# an xhttp "extra" carries whatever the subscription wrote, and Xray reads a
+# whole downloadSettings stream config out of it - sockopt, security and
+# tlsSettings of its own.
+#   scrub_sockopt  a foreign fwmark could collide with ours (0x100 Xray, 0x01
+#                  firmware VPN, 0x00ff0000 Tunnel Director), and an interface
+#                  would route around the WAN; a sockopt left empty goes too.
+#   deep_dialer    a dialerProxy names an outbound to dial through - the chain
+#                  a top-level sockopt is already skipped for.
+#   deep_insecure  Xray has loaded no config with allowInsecure since
+#                  2026-06-01, so an entry carrying one without a
+#                  pinnedPeerCertSha256 to replace it is skipped, and
+#   drop_insecure  the flag goes from the rest. Only a tls stream is read for
+#                  it: Xray ignores tlsSettings under any other security, and
+#                  a stray flag there costs nothing (checked against 26.2.6).
+# Both jq programs below take these, as the Go twins serve both Go paths.
+_SUB_JQ_SANITIZE='
 def scrub_sockopt: walk(if type == "object" and (.sockopt | type) == "object"
                         then .sockopt |= del(.mark, .interface, .tproxy, .customSockopt)
                              | if (.sockopt | length) == 0 then del(.sockopt) else . end
                         else . end);
+def deep_dialer: [.. | objects | .sockopt | objects
+                  | select((.dialerProxy | type) == "string" and .dialerProxy != "")] | length > 0;
+def deep_insecure: [.. | objects | select(.security == "tls") | .tlsSettings | objects
+                    | select(.allowInsecure == true)
+                    | select((.pinnedPeerCertSha256 | type) != "string" or .pinnedPeerCertSha256 == "")]
+                   | length > 0;
+def drop_insecure: walk(if type == "object" and .security == "tls" and (.tlsSettings | type) == "object"
+                        then .tlsSettings |= del(.allowInsecure) else . end);
 '
 
 # jq shared by every converter and by the final assembly.
 # shellcheck disable=SC2016  # $vars are jq's, set with --arg
-_SUB_JQ_LIB=$_SUB_JQ_SCRUB'
+_SUB_JQ_LIB=$_SUB_JQ_SANITIZE'
 def trimsp: if startswith(" ") then .[1:] | trimsp elif endswith(" ") then .[:-1] | trimsp else . end;
 def list: split(",") | map(trimsp) | map(select(. != ""));
 def prune: walk(if type == "object" then with_entries(select(.value != "" and .value != [] and .value != {}))
@@ -72,7 +89,8 @@ def stream:
      elif $net == "grpc" then {grpcSettings: ({serviceName: $serviceName, authority: $authority}
                                               + (if $mode == "multi" then {multiMode: true} else {} end))}
      elif $net == "xhttp" then {xhttpSettings: ({path: $path, host: $host, mode: $mode}
-                                                + (if $extra == "" then {} else {extra: ($extra | fromjson | scrub_sockopt)} end))}
+                                                + (if $extra == "" then {} else
+                                                   {extra: ($extra | fromjson | drop_insecure | scrub_sockopt)} end))}
      else {} end);
 '
 
@@ -335,10 +353,29 @@ _sub_stream() {
             return 1
             ;;
     esac
-    if [[ $net == xhttp && -n ${_SUB_Q[extra]:-} ]] &&
-        ! jq -es 'length == 1 and (.[0] | type) == "object"' <<< "${_SUB_Q[extra]}" >/dev/null 2>&1; then
-        _sub_skip invalid "xhttp extra is not a JSON object"
-        return 1
+    if [[ $net == xhttp && -n ${_SUB_Q[extra]:-} ]]; then
+        # What the extra holds is read here, where a skip can still be made;
+        # the record program only sanitizes what survives.
+        local verdict
+        verdict=$(jq -rs "$_SUB_JQ_SANITIZE"'
+            if length == 1 and (.[0] | type) == "object" then
+              .[0] | if deep_dialer then "chained" elif deep_insecure then "insecure" else "ok" end
+            else "invalid" end' <<< "${_SUB_Q[extra]}" 2>/dev/null) || verdict=invalid
+        case $verdict in
+            ok) ;;
+            chained)
+                _sub_skip composite "chained"
+                return 1
+                ;;
+            insecure)
+                _sub_skip unsupported "insecure TLS"
+                return 1
+                ;;
+            *)
+                _sub_skip invalid "xhttp extra is not a JSON object"
+                return 1
+                ;;
+        esac
     fi
     _SUB_V[net]=$net
     _SUB_V[sec]=$sec
@@ -651,7 +688,7 @@ _sub_xray_json() {
         printf 'invalid JSON subscription\n' >&2
         return 1
     fi
-    out=$(jq -c "$_SUB_JQ_SCRUB"'
+    out=$(jq -c "$_SUB_JQ_SANITIZE"'
         def obj: if type == "object" then . else {} end;
         def str: if type == "string" then . else "" end;
         def rawname: str | explode | map(select(. >= 32 and . != 127)) | implode;
@@ -682,12 +719,11 @@ _sub_xray_json() {
               | ($t.port | if type == "number" and . == floor and . >= 1 and . <= 65535 then floor else null end) as $port
               | if ($ob.protocol | IN("vless", "vmess", "trojan", "shadowsocks", "hysteria") | not) then
                   skip($raw; "unsupported"; "protocol \($ob.protocol)")
-                elif ($ob.proxySettings | obj | .tag | str) != "" or ($ss.sockopt | obj | .dialerProxy | str) != "" then
+                elif ($ob.proxySettings | obj | .tag | str) != "" or ($ob | deep_dialer) then
                   skip($raw; "composite"; "chained")
                 elif $targets > 1 then skip($raw; "composite"; "\($targets) targets")
                 elif $addr == "" or $port == null then skip($raw; "invalid"; "bad address or port")
-                elif ($ss.security | str) == "tls" and ($ss.tlsSettings | obj | .allowInsecure) == true
-                     and ($ss.tlsSettings | obj | .pinnedPeerCertSha256 | str) == "" then
+                elif ($ob | deep_insecure) then
                   skip($raw; "unsupported"; "insecure TLS")
                 elif ($ss.security | str) == "reality"
                      and (($ss.realitySettings | obj) as $r
@@ -698,8 +734,7 @@ _sub_xray_json() {
                   {raw: $raw, address: $addr, port: $port,
                    outbound: ($ob
                      | del(.tag, .sendThrough)
-                     | if ($ss.security | str) == "tls" and ($ss.tlsSettings | obj | .allowInsecure) == true
-                       then del(.streamSettings.tlsSettings.allowInsecure) else . end
+                     | drop_insecure
                      | scrub_sockopt)}
                 end
               end

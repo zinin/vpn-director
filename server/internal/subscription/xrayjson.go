@@ -77,11 +77,10 @@ func xrayEntry(raw interface{}) (entry, error) {
 	}
 	proxySettings, _ := ob["proxySettings"].(map[string]interface{})
 	stream, _ := ob["streamSettings"].(map[string]interface{})
-	sockopt, _ := stream["sockopt"].(map[string]interface{})
 	if tag, _ := proxySettings["tag"].(string); tag != "" {
 		return e, composite("chained")
 	}
-	if dialer, _ := sockopt["dialerProxy"].(string); dialer != "" {
+	if hasDialerProxy(ob) {
 		return e, composite("chained")
 	}
 	settings, _ := ob["settings"].(map[string]interface{})
@@ -98,15 +97,10 @@ func xrayEntry(raw interface{}) (entry, error) {
 	if address == "" || !ok {
 		return e, invalid("bad address or port")
 	}
+	if sanitizeTLS(ob) {
+		return e, unsupported("insecure TLS")
+	}
 	switch security, _ := stream["security"].(string); security {
-	case "tls":
-		tls, _ := stream["tlsSettings"].(map[string]interface{})
-		if insecure, _ := tls["allowInsecure"].(bool); insecure {
-			if pin, _ := tls["pinnedPeerCertSha256"].(string); pin == "" {
-				return e, unsupported("insecure TLS")
-			}
-			delete(tls, "allowInsecure")
-		}
 	case "reality":
 		reality, _ := stream["realitySettings"].(map[string]interface{})
 		key, _ := reality["publicKey"].(string)

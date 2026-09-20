@@ -244,6 +244,12 @@ func streamSettings(p params, defaultSecurity string) (map[string]interface{}, e
 			if err != nil {
 				return nil, invalid("xhttp extra is not a JSON object")
 			}
+			if hasDialerProxy(extra) {
+				return nil, composite("chained")
+			}
+			if sanitizeTLS(extra) {
+				return nil, unsupported("insecure TLS")
+			}
 			scrubSockopt(extra)
 			xhttp["extra"] = extra
 		}
