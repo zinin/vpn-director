@@ -95,8 +95,10 @@ def stream:
 '
 
 # _sub_unescape <value> <plus>: decodes %XX into _SUB_U; + is a space when plus
-# is 1. A % without two hex digits after it, or %00, returns 1 - unescape in
-# server/internal/subscription/text.go.
+# is 1. A % without two hex digits after it, or %00, returns 1 and names which
+# of the two in _SUB_UERR - the two errors unescape returns in
+# server/internal/subscription/text.go, so a caller's skip detail reads the
+# same on both sides.
 _sub_unescape() {
     local s=$1 bs='\x'
     if [[ $2 == 1 ]]; then
@@ -108,6 +110,16 @@ _sub_unescape() {
     fi
     local rest=${s//%[0-9A-Fa-f][0-9A-Fa-f]/}
     if [[ $rest == *%* || $s == *%00* ]]; then
+        # Go walks the string and stops at the first of the two, so the reason
+        # is whichever comes first here too: a bad escape anywhere before the
+        # first %00 wins, and without one the NUL does.
+        local nul='%00' head
+        head=${s%%"$nul"*}
+        if [[ ${head//%[0-9A-Fa-f][0-9A-Fa-f]/} == *%* ]]; then
+            _SUB_UERR='bad percent escape'
+        else
+            _SUB_UERR='NUL byte'
+        fi
         return 1
     fi
     s=${s//\\/\\\\}
@@ -290,7 +302,7 @@ _sub_link() {
         return 1
     fi
     if ! _sub_unescape "${authority%@*}" 0; then
-        _sub_skip invalid "userinfo: bad percent escape"
+        _sub_skip invalid "userinfo: $_SUB_UERR"
         return 1
     fi
     _SUB_USER=$_SUB_U
@@ -309,7 +321,7 @@ _sub_port_query() {
     fi
     _sub_port "$_SUB_RAWPORT" || return 1
     if ! _sub_query "$_SUB_RAWQUERY"; then
-        _sub_skip invalid "query: bad percent escape"
+        _sub_skip invalid "query: $_SUB_UERR"
         return 1
     fi
 }
@@ -446,14 +458,16 @@ _sub_vmess() {
             if length != 1 or (.[0] | type) != "object" then error("not a vmess object") else .[0] end
             | (.port | if type == "number" then (if . == floor and . >= 1 and . <= 65535 then ["number", (floor | tostring)] else ["bad", tostring] end)
                        elif type == "string" then ["string", .] else ["missing", ""] end) as $port
-            | ([.add, .id, .scy, .net, .type, .host, .path, .tls, .sni, .alpn, .fp, .pbk, .sid, .spx]
-               | map(f | index("\u0000") != null) | any) as $nul
+            | ([["add", .add], ["id", .id], ["scy", .scy], ["net", .net], ["type", .type],
+                ["host", .host], ["path", .path], ["tls", .tls], ["sni", .sni], ["alpn", .alpn],
+                ["fp", .fp], ["pbk", .pbk], ["sid", .sid], ["spx", .spx]]
+               | map(select((.[1] | f | index("\u0000")) != null)) | (.[0][0] // "")) as $nul
             | "V_ps=\(.ps | f | nonul | @sh) V_add=\(.add | f | nonul | @sh) V_id=\(.id | f | nonul | @sh)",
               "V_scy=\(.scy | f | nonul | @sh) V_net=\(.net | f | nonul | @sh) V_type=\(.type | f | nonul | @sh)",
               "V_host=\(.host | f | nonul | @sh) V_path=\(.path | f | nonul | @sh) V_tls=\(.tls | f | nonul | @sh)",
               "V_sni=\(.sni | f | nonul | @sh) V_alpn=\(.alpn | f | nonul | @sh) V_fp=\(.fp | f | nonul | @sh)",
               "V_pbk=\(.pbk | f | nonul | @sh) V_sid=\(.sid | f | nonul | @sh) V_spx=\(.spx | f | nonul | @sh)",
-              "V_portkind=\($port[0] | @sh) V_port=\($port[1] | nonul | @sh) V_nul=\(if $nul then 1 else 0 end)"
+              "V_portkind=\($port[0] | @sh) V_port=\($port[1] | nonul | @sh) V_nul=\($nul | @sh)"
         ' <<< "$text" 2>/dev/null); then
         _sub_skip invalid "vmess link is neither form"
         return 1
@@ -462,8 +476,8 @@ _sub_vmess() {
     local V_portkind V_port V_nul
     eval "$fields"
     _SUB_RAWNAME=$V_ps
-    if [[ $V_nul == 1 ]]; then
-        _sub_skip invalid "NUL byte"
+    if [[ -n $V_nul ]]; then
+        _sub_skip invalid "NUL byte in $V_nul"
         return 1
     fi
     if [[ -z $V_id ]]; then
@@ -526,7 +540,7 @@ _sub_ss() {
     fi
     if [[ $main == *@* ]]; then
         if ! _sub_unescape "${main%@*}" 0; then
-            _sub_skip invalid "userinfo: bad percent escape"
+            _sub_skip invalid "userinfo: $_SUB_UERR"
             return 1
         fi
         ui=$_SUB_U
@@ -569,7 +583,7 @@ _sub_ss() {
     fi
     _sub_port "$_SUB_RAWPORT" || return 1
     if ! _sub_query "$query"; then
-        _sub_skip invalid "query: bad percent escape"
+        _sub_skip invalid "query: $_SUB_UERR"
         return 1
     fi
     if [[ -n ${_SUB_Q[plugin]:-} ]]; then
@@ -605,7 +619,7 @@ _sub_hy2() {
         _sub_port "$_SUB_RAWPORT" || return 1
     fi
     if ! _sub_query "$_SUB_RAWQUERY"; then
-        _sub_skip invalid "query: bad percent escape"
+        _sub_skip invalid "query: $_SUB_UERR"
         return 1
     fi
     local obfs=${_SUB_Q[obfs]:-}

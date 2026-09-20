@@ -51,6 +51,26 @@ check_fixtures() {
     assert_success
 }
 
+# A .want.json compares name and reason only: a detail is prose (spec 6.7).
+# But import_server_list.sh prints it per skipped entry and the bot sends it on
+# in Import.Details, so the same subscription must explain itself the same way
+# on the router and in Telegram. These are the answers the Go decoder gives the
+# same seven inputs.
+@test "subscription_decode: a skip's detail words the reason as the Go decoder does" {
+    local vmess
+    vmess=$(printf '%s' '{"add":"h.example.com","port":443,"id":"11111111-1111-4111-8111-111111111111","host":"a\u0000b","ps":"Nul host"}' |
+        base64 | tr -d '\n')
+    detail_of() { subscription_decode <<< "$1" | jq -r '.skipped[0].detail'; }
+
+    [ "$(detail_of 'vless://u@h.example.com:443?a=%zz#Bad escape')" = "query: bad percent escape" ]
+    [ "$(detail_of 'vless://u@h.example.com:443?a=%00#Nul query')" = "query: NUL byte" ]
+    [ "$(detail_of 'vless://%zz@h.example.com:443#Bad userinfo')" = "userinfo: bad percent escape" ]
+    [ "$(detail_of 'vless://%00@h.example.com:443#Nul userinfo')" = "userinfo: NUL byte" ]
+    [ "$(detail_of 'ss://%00@h.example.com:8388#Nul ss userinfo')" = "userinfo: NUL byte" ]
+    [ "$(detail_of 'hysteria2://a@h.example.com:443?sni=%00#Nul hy2 query')" = "query: NUL byte" ]
+    [ "$(detail_of "vmess://$vmess")" = "NUL byte in host" ]
+}
+
 # Entware's jq is built without oniguruma: a regex builtin works on a
 # workstation and fails on the router. _sub_clean_names is gawk, where sub and
 # gsub are native.
