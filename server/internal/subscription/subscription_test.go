@@ -215,3 +215,18 @@ func TestLookupIPv4_HonoursTheContext(t *testing.T) {
 		t.Fatal("a canceled context must end the lookup")
 	}
 }
+
+// A skip's detail is the twin of the shell's, which interpolates the port as
+// written (_sub_port in lib/subscription.sh). Escaping it - strconv.Quote
+// turns a quote into \" and a backslash into \\ - would make the two disagree
+// about the same link.
+func TestDecode_BadPortDetailIsThePortAsWritten(t *testing.T) {
+	res, err := Decode(`vless://u@h.example.com:4"4\5#Bad port`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `bad port "4"4\5"`
+	if len(res.Skipped) != 1 || res.Skipped[0].Detail != want {
+		t.Fatalf("skipped %+v, want one skip detailed %s", res.Skipped, want)
+	}
+}

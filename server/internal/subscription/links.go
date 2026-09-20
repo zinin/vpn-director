@@ -123,14 +123,21 @@ func splitHostPort(hostport string) (host, port string, hasPort bool, err error)
 	return host, port, hasPort, nil
 }
 
+// badPort details a port the grammar refused. The port goes in as written:
+// _sub_port in lib/subscription.sh interpolates it, and strconv.Quote would
+// escape a quote or a backslash that the shell leaves alone.
+func badPort(s string) string {
+	return `bad port "` + s + `"`
+}
+
 // parsePort reads a port of one to five decimal digits, 1-65535.
 func parsePort(s string) (int, error) {
 	if s == "" || len(s) > 5 || strings.Trim(s, "0123456789") != "" {
-		return 0, invalid("bad port " + strconv.Quote(s))
+		return 0, invalid(badPort(s))
 	}
 	n, _ := strconv.Atoi(s)
 	if n < 1 || n > 65535 {
-		return 0, invalid("bad port " + strconv.Quote(s))
+		return 0, invalid(badPort(s))
 	}
 	return n, nil
 }
