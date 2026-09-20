@@ -131,7 +131,11 @@ _sub_b64() {
         3) pad='=' ;;
         *) pad='' ;;
     esac
+    # The status is base64's own, not the trailing tr's: a caller that sources
+    # this library without pipefail - a bats file does - would otherwise read a
+    # body its base64 refused as an empty decode that succeeded.
     printf '%s%s' "$s" "$pad" | base64 -d 2>/dev/null | tr -d '\000'
+    return "${PIPESTATUS[1]}"
 }
 
 # _sub_trim <text>: prints text without ASCII whitespace at either end.
