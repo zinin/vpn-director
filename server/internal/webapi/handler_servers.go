@@ -143,7 +143,12 @@ func handleSelectServer(deps *Deps) http.HandlerFunc {
 			if errors.Is(err, service.ErrConfigLoad) {
 				jsonError(w, http.StatusInternalServerError, "failed to load vpn config")
 			} else {
-				jsonError(w, http.StatusInternalServerError, "failed to generate xray config")
+				// Xray rejects a config it cannot load, and its complaint is
+				// the only thing that says which server to stop picking. The
+				// bot and the wizard both pass it on; so does this.
+				slog.Error("Failed to generate the Xray config", "server", server.Name, "error", err)
+				jsonError(w, http.StatusInternalServerError,
+					"failed to generate xray config: "+lastErrorLine(err))
 			}
 			return
 		}
