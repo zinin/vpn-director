@@ -1,0 +1,7 @@
+{
+  "total": 1,
+  "servers": [
+    {"address":"xh9.example.com","name":"XHTTP extra sockopt","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"xh9.example.com","port":443,"users":[{"encryption":"none","id":"99999999-9999-4999-8999-999999999999"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xh9.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp","sockopt":{"tcpFastOpen":true}},"headers":{"X-Test":"one"}},"path":"/x"}}},"port":443}
+  ],
+  "skipped": []
+}

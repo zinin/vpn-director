@@ -153,6 +153,33 @@ func splitList(s string) []interface{} {
 // truthy is how share links spell a set flag.
 func truthy(v string) bool { return v == "1" || v == "true" }
 
+// scrubSockopt removes from every sockopt object in v, however deep, the keys
+// that could route around our own rules, and drops a sockopt left empty. Depth
+// matters: an xhttp "extra" carries whatever the subscription wrote, and Xray
+// reads a downloadSettings stream config - sockopt included - out of it. A
+// foreign fwmark could collide with ours (0x100 Xray, 0x01 firmware VPN,
+// 0x00ff0000 Tunnel Director), and an interface would route around the WAN.
+func scrubSockopt(v interface{}) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		if sockopt, ok := t["sockopt"].(map[string]interface{}); ok {
+			for _, key := range []string{"mark", "interface", "tproxy", "customSockopt"} {
+				delete(sockopt, key)
+			}
+			if len(sockopt) == 0 {
+				delete(t, "sockopt")
+			}
+		}
+		for _, child := range t {
+			scrubSockopt(child)
+		}
+	case []interface{}:
+		for _, child := range t {
+			scrubSockopt(child)
+		}
+	}
+}
+
 // prune removes empty strings, arrays and objects, innermost first, so an
 // object that only held empty values goes too (spec 6.3). It changes v in
 // place and returns it.

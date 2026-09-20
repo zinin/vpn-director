@@ -119,19 +119,11 @@ func xrayEntry(raw interface{}) (entry, error) {
 			return e, invalid("reality needs publicKey, serverName and fingerprint")
 		}
 	}
-	// A foreign fwmark could collide with ours (0x100 Xray, 0x01 firmware
-	// VPN, 0x00ff0000 Tunnel Director), and an interface would route around
-	// the WAN.
+	// Routing is VPN Director's own: an entry keeps neither an outbound tag
+	// nor a source address, and no sockopt of its own (scrubSockopt says why).
 	delete(ob, "tag")
 	delete(ob, "sendThrough")
-	if sockopt != nil {
-		for _, key := range []string{"mark", "interface", "tproxy", "customSockopt"} {
-			delete(sockopt, key)
-		}
-		if len(sockopt) == 0 {
-			delete(stream, "sockopt")
-		}
-	}
+	scrubSockopt(ob)
 	e.address, e.port, e.outbound = address, port, ob
 	return e, nil
 }

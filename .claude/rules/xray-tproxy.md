@@ -39,10 +39,17 @@ outbound goes into it as `outbounds[0]`, tagged `proxy-out`:
   `/xray` and the subscription watch.
 
 An import stores each server's Xray outbound in `servers.json` (`outbound`): converted from a share
-link, or taken from an Xray JSON subscription and sanitized — the decoders are `lib/subscription.sh`
+link, or taken from an Xray JSON subscription — the decoders are `lib/subscription.sh`
 and `server/internal/subscription`, which answer to the same cases in `testdata/subscription/`. The
 generators insert it unread, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
 httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2.
+
+Sanitizing keeps routing ours. A stored outbound carries no `tag` and no `sendThrough`, and no
+`sockopt` in it — at any depth, from either format — keeps `mark`, `interface`, `tproxy` or
+`customSockopt`; a `sockopt` left empty goes too. Depth is the point: an xhttp `extra` holds whatever
+the subscription wrote, and Xray reads a whole `downloadSettings` stream config out of it. A foreign
+fwmark could collide with ours (0x100 Xray, 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an
+interface would route around the WAN.
 
 A record without `outbound` predates stored outbounds: the generators build a VLESS outbound from
 its flat fields — `security` (`reality`|`tls`), `network`, `flow`, `sni`, `fingerprint`,

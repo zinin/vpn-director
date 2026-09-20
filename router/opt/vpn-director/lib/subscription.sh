@@ -38,9 +38,23 @@ _SUB_KEYS=" type security encryption flow sni fp alpn pbk sid spx pqv host path
 headerType serviceName mode authority extra pcs vcn allowInsecure insecure
 plugin obfs obfs-password pinSHA256 "
 
+# jq that strips from every sockopt, however deep, the keys that could route
+# around our own rules, and drops a sockopt left empty. Depth matters: an xhttp
+# "extra" carries whatever the subscription wrote, and Xray reads a
+# downloadSettings stream config - sockopt included - out of it. A foreign
+# fwmark could collide with ours (0x100 Xray, 0x01 firmware VPN, 0x00ff0000
+# Tunnel Director), and an interface would route around the WAN. Both jq
+# programs below take it, as scrubSockopt serves both Go paths.
+_SUB_JQ_SCRUB='
+def scrub_sockopt: walk(if type == "object" and (.sockopt | type) == "object"
+                        then .sockopt |= del(.mark, .interface, .tproxy, .customSockopt)
+                             | if (.sockopt | length) == 0 then del(.sockopt) else . end
+                        else . end);
+'
+
 # jq shared by every converter and by the final assembly.
 # shellcheck disable=SC2016  # $vars are jq's, set with --arg
-_SUB_JQ_LIB='
+_SUB_JQ_LIB=$_SUB_JQ_SCRUB'
 def trimsp: if startswith(" ") then .[1:] | trimsp elif endswith(" ") then .[:-1] | trimsp else . end;
 def list: split(",") | map(trimsp) | map(select(. != ""));
 def prune: walk(if type == "object" then with_entries(select(.value != "" and .value != [] and .value != {}))
@@ -58,7 +72,7 @@ def stream:
      elif $net == "grpc" then {grpcSettings: ({serviceName: $serviceName, authority: $authority}
                                               + (if $mode == "multi" then {multiMode: true} else {} end))}
      elif $net == "xhttp" then {xhttpSettings: ({path: $path, host: $host, mode: $mode}
-                                                + (if $extra == "" then {} else {extra: ($extra | fromjson)} end))}
+                                                + (if $extra == "" then {} else {extra: ($extra | fromjson | scrub_sockopt)} end))}
      else {} end);
 '
 
@@ -637,7 +651,7 @@ _sub_xray_json() {
         printf 'invalid JSON subscription\n' >&2
         return 1
     fi
-    out=$(jq -c '
+    out=$(jq -c "$_SUB_JQ_SCRUB"'
         def obj: if type == "object" then . else {} end;
         def str: if type == "string" then . else "" end;
         def rawname: str | explode | map(select(. >= 32 and . != 127)) | implode;
@@ -686,10 +700,7 @@ _sub_xray_json() {
                      | del(.tag, .sendThrough)
                      | if ($ss.security | str) == "tls" and ($ss.tlsSettings | obj | .allowInsecure) == true
                        then del(.streamSettings.tlsSettings.allowInsecure) else . end
-                     | if (.streamSettings | type) == "object" and (.streamSettings.sockopt | type) == "object"
-                       then .streamSettings.sockopt |= del(.mark, .interface, .tproxy, .customSockopt)
-                            | if (.streamSettings.sockopt | length) == 0 then del(.streamSettings.sockopt) else . end
-                       else . end)}
+                     | scrub_sockopt)}
                 end
               end
           end;

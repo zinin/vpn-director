@@ -244,6 +244,7 @@ func streamSettings(p params, defaultSecurity string) (map[string]interface{}, e
 			if err != nil {
 				return nil, invalid("xhttp extra is not a JSON object")
 			}
+			scrubSockopt(extra)
 			xhttp["extra"] = extra
 		}
 		ss["xhttpSettings"] = xhttp
