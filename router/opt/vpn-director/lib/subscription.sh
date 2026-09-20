@@ -22,6 +22,8 @@
 ###############################################################################
 
 _SUB_SPACE=$' \t\r\n\v\f'
+# _SUB_RAWNAMES holds one line per entry, so a name may carry neither byte.
+_SUB_EOL=$'\n\r'
 
 declare -gA _SUB_Q=() _SUB_V=()
 declare -ga _SUB_RECORDS=() _SUB_RAWNAMES=()
@@ -40,7 +42,7 @@ plugin obfs obfs-password pinSHA256 "
 # shellcheck disable=SC2016  # $vars are jq's, set with --arg
 _SUB_JQ_LIB='
 def trimsp: if startswith(" ") then .[1:] | trimsp elif endswith(" ") then .[:-1] | trimsp else . end;
-def list: split(",") | map(trimsp);
+def list: split(",") | map(trimsp) | map(select(. != ""));
 def prune: walk(if type == "object" then with_entries(select(.value != "" and .value != [] and .value != {}))
                 elif type == "array" then map(select(. != "" and . != [] and . != {}))
                 else . end);
@@ -608,7 +610,7 @@ _sub_entry() {
             '{reason: $reason, detail: $detail}')
     fi
     _SUB_RECORDS+=("$_SUB_REC")
-    _SUB_RAWNAMES+=("$_SUB_DECODE"$'\t'"$_SUB_RAWNAME")
+    _SUB_RAWNAMES+=("$_SUB_DECODE"$'\t'"${_SUB_RAWNAME//[$_SUB_EOL]/}")
 }
 
 # _sub_links <text>: one link per line; other lines are ignored (spec 6.1).
