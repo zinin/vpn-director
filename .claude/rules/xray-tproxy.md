@@ -65,7 +65,9 @@ its flat fields — `security` (`reality`|`tls`), `network`, `flow`, `sni`, `fin
 - `security=tls` -> `tlsSettings { serverName (sni||address), fingerprint?, alpn? }`.
 - empty `security` -> legacy `tlsSettings { alpn:["h2"], serverName:address }`, no flow.
 
-The next import rewrites such records; nothing converts them.
+The next import rewrites such records; nothing converts them. A link that names no `security` then
+stores `none` — how the share-link standard reads it, and every other client with it — where the
+legacy record dialed TLS; a server that wants TLS says so in its link.
 
 **Every config is tested before it replaces the live one:** `xray run -test -format json -c <temp>`
 (`xrayconf_validate` in shell, `xrayTest` in Go). An outbound from a subscription can name a protocol
