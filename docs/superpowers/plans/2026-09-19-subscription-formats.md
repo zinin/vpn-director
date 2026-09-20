@@ -93,22 +93,22 @@ Patches are unified diffs against the tree the earlier tasks left; run each bloc
 
 Spec 13. Everything CI runs, then an optional check against a real Xray, then the device check.
 
-- [ ] **Step 1: The whole Go suite, as CI runs it**
+- [x] **Step 1: The whole Go suite, as CI runs it**
 
 Run: `cd server && go vet ./... && go test ./... -count=1`
 Expected: every package `ok`.
 
-- [ ] **Step 2: The whole bats suite, as CI runs it**
+- [x] **Step 2: The whole bats suite, as CI runs it**
 
 Run: `bats router/test/*.bats router/test/unit router/test/integration`
 Expected: no `not ok` line (578+ tests at the time of writing).
 
-- [ ] **Step 3: The Web UI build**
+- [x] **Step 3: The Web UI build**
 
 Run: `cd web && npm ci && npm run build`
 Expected: `✓ built`.
 
-- [ ] **Step 4 (optional, needs network): every case's servers load in Xray 26.2.6**
+- [x] **Step 4 (optional, needs network): every case's servers load in Xray 26.2.6**
 
 The routers run Entware's xray-core 26.2.6; every server a shared case yields must load in it. This downloads the release into a temporary directory:
 
