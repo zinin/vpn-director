@@ -271,6 +271,14 @@ curl -4 -s --connect-timeout 5 --max-time 10 ifconfig.me
 Where a wait is acceptable instead, keep the connect timeout above five seconds
 so the resolver's second attempt can land.
 
+The shell resolver cannot ask for one family: BusyBox 1.25's `nslookup` on Asuswrt-Merlin takes no
+`-type`, and glibc 2.26 predates `options no-aaaa`. `_resolve_ip_impl` bounds the wait instead:
+`_resolve_nslookup` runs `nslookup` with `RES_OPTIONS="timeout:1 attempts:2"`, which glibc reads, so
+a lost AAAA answer costs about a second per try rather than five. On an RT-AX86U the five OpenVPN
+endpoint lookups for `TPROXY_BYPASS` had added about 20 s to every second `tproxy_apply`, the
+subscription watch's failover and restore included. KeeneticOS resolves through a local proxy with
+`timeout:1` already.
+
 ### BusyBox `sh` has no `command` builtin
 
 **Problem**: on Asuswrt-Merlin, `/bin/sh` is BusyBox and `command` is not there:

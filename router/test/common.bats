@@ -158,6 +158,26 @@ load 'test_helper'
     assert_output ""
 }
 
+@test "resolve_ip: nslookup runs with the resolver's wait bounded" {
+    load_common
+    export NSLOOKUP_ENV_LOG="$BATS_TEST_TMPDIR/nslookup_env"
+    run resolve_ip example.com
+    assert_success
+    assert_output "93.184.216.34"
+    run cat "$NSLOOKUP_ENV_LOG"
+    assert_output "RES_OPTIONS=timeout:1 attempts:2"
+}
+
+@test "resolve_ip -a: nslookup runs with the resolver's wait bounded" {
+    load_common
+    export NSLOOKUP_ENV_LOG="$BATS_TEST_TMPDIR/nslookup_env"
+    run resolve_ip -a example.com
+    assert_success
+    assert_output "93.184.216.34"
+    run cat "$NSLOOKUP_ENV_LOG"
+    assert_output "RES_OPTIONS=timeout:1 attempts:2"
+}
+
 # ============================================================================
 # log
 # ============================================================================
