@@ -54,5 +54,36 @@
         "tag": "direct"
       }
     ]
+  },
+  {
+    "remarks": "JSON sockopt nested",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "js2.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none",
+          "sockopt": {
+            "sockopt": {
+              "mark": 255
+            }
+          }
+        }
+      }
+    ]
   }
 ]

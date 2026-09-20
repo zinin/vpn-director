@@ -162,6 +162,12 @@ func truthy(v string) bool { return v == "1" || v == "true" }
 func scrubSockopt(v interface{}) {
 	switch t := v.(type) {
 	case map[string]interface{}:
+		// Children first, the order jq's walk gives scrub_sockopt in the shell
+		// twin: a sockopt this one holds must be scrubbed, and dropped if that
+		// left it empty, before this level weighs whether its own is empty.
+		for _, child := range t {
+			scrubSockopt(child)
+		}
 		if sockopt, ok := t["sockopt"].(map[string]interface{}); ok {
 			for _, key := range []string{"mark", "interface", "tproxy", "customSockopt"} {
 				delete(sockopt, key)
@@ -169,9 +175,6 @@ func scrubSockopt(v interface{}) {
 			if len(sockopt) == 0 {
 				delete(t, "sockopt")
 			}
-		}
-		for _, child := range t {
-			scrubSockopt(child)
 		}
 	case []interface{}:
 		for _, child := range t {
