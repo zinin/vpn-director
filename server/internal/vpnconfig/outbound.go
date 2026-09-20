@@ -46,6 +46,22 @@ func OutboundTarget(ob map[string]interface{}) map[string]interface{} {
 	return settings
 }
 
+// Protocol is what a server's outbound dials with: the stored outbound's own
+// protocol, "vless" for a legacy record without one - the only protocol the
+// legacy builders generate - and "" for an outbound that cannot be read or
+// names none.
+func (s Server) Protocol() string {
+	if len(s.Outbound) == 0 {
+		return "vless"
+	}
+	ob, err := DecodeOutbound(s.Outbound)
+	if err != nil {
+		return ""
+	}
+	protocol, _ := ob["protocol"].(string)
+	return protocol
+}
+
 // Label names a server's protocol for a list: "vless·reality",
 // "vless·ws·tls", "trojan·tls", "ss", "hysteria2". A record without an
 // outbound is a legacy VLESS one, which the generators build as TLS when it

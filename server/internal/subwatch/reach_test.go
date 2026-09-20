@@ -3,6 +3,7 @@ package subwatch
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"reflect"
@@ -263,5 +264,30 @@ func TestTick_NoTCPCheckPastThreeMinutes(t *testing.T) {
 	tickFor(w, f, ImportRetry)
 	if checks != n {
 		t.Fatalf("%d TCP checks past DeadAfter, want none", checks-n)
+	}
+}
+
+// hysteria2Outbound is what an import stores for a Hysteria2 server: a QUIC
+// outbound, whose port accepts no TCP connection.
+var hysteria2Outbound = json.RawMessage(`{"protocol":"hysteria","settings":{"version":2,"address":"oslo.example","port":443},` +
+	`"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"secret"}}}`)
+
+// A Hysteria2 server speaks QUIC: it accepts no TCP connection on its port,
+// and one it does accept - a masquerade site - says nothing about the proxy
+// behind it. So it is not dialed at all, and the three minutes stand.
+func TestTick_QUICServerKeepsThreeMinutes(t *testing.T) {
+	f := deadFake()
+	servers := osloServers()
+	servers[0].Outbound = hysteria2Outbound
+	w := reachWatch(f, servers, map[string]bool{})
+	dials := 0
+	dial := w.Reachable
+	w.Reachable = func(ctx context.Context, ip string, port int) bool {
+		dials++
+		return dial(ctx, ip, port)
+	}
+	assertDiesAt(t, w, f, DeadAfter)
+	if dials != 0 {
+		t.Fatalf("%d TCP dials for a QUIC server, want none", dials)
 	}
 }

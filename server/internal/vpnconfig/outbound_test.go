@@ -89,3 +89,26 @@ func TestServer_NoEmptyUUIDInTheFile(t *testing.T) {
 		t.Fatalf("marshal %s", out)
 	}
 }
+
+func TestServerProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		name, outbound, want string
+	}{
+		{"hysteria", `{"protocol":"hysteria","settings":{"version":2}}`, "hysteria"},
+		{"vless", `{"protocol":"vless","settings":{"vnext":[{}]}}`, "vless"},
+		{"shadowsocks", `{"protocol":"shadowsocks","settings":{"servers":[{}]}}`, "shadowsocks"},
+		{"legacy record", ``, "vless"},
+		{"null outbound", `null`, ""},
+		{"outbound without a protocol", `{"settings":{}}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var s Server
+			if tc.outbound != "" {
+				s.Outbound = json.RawMessage(tc.outbound)
+			}
+			if got := s.Protocol(); got != tc.want {
+				t.Fatalf("Protocol = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

@@ -63,6 +63,15 @@ func (w *Watch) reachable(ctx context.Context, copies []vpnconfig.Server) []vpnc
 	return out
 }
 
+// tcpChecked reports whether a TCP dial says anything about a server. A
+// Hysteria2 outbound speaks QUIC: its port accepts no TCP connection, and a
+// port that does accept one - a masquerade site beside it - says nothing about
+// the proxy behind it. Every other protocol an import stores dials over TCP,
+// over every transport it stores.
+func tcpChecked(s vpnconfig.Server) bool {
+	return s.Protocol() != "hysteria"
+}
+
 // reachControls are dialed when a look finds the active server down. A WAN that
 // works reaches one of them - Cloudflare and Google answered all through the
 // outages the fast rule is for - so when neither accepts, the look says nothing
@@ -77,8 +86,9 @@ var reachControls = []vpnconfig.Server{
 // TCP connection on any address its servers.json entry lists while the WAN
 // reaches a control address. Every look without an answer is false: no record,
 // no entry, no IPv4 address to dial, no control accepting either, a look a
-// stop cut short, or a watch without LoadServers or Reachable. The controls
-// are dialed only once the server's addresses have all failed.
+// stop cut short, a server no TCP dial can see (tcpChecked), or a watch
+// without LoadServers or Reachable. The controls are dialed only once the
+// server's addresses have all failed.
 func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
 	if w.LoadServers == nil || w.Reachable == nil || cfg == nil || cfg.Xray.ActiveServer == nil {
 		return false
@@ -88,7 +98,7 @@ func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirector
 		return false
 	}
 	i := chosenIndex(servers, cfg.Xray.ActiveServer)
-	if i < 0 {
+	if i < 0 || !tcpChecked(servers[i]) {
 		return false
 	}
 	copies := dialable(perAddress(servers[i : i+1]))
