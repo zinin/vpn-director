@@ -123,15 +123,25 @@ xrayconf_validate() {
     # waits 30 s for that lock, so the test is bounded at half of it: an xray
     # that never answers then lets the others take their turn instead of using
     # up their whole wait. XrayService.GenerateConfig bounds the same test the
-    # same way (xrayTestTimeout in service/xray.go). busybox and coreutils both
-    # bring timeout; without one
-    # the test runs unbounded, as it did before. A killed xray says nothing, and
+    # same way (xrayTestTimeout in service/xray.go). Without a timeout of any
+    # kind the test runs unbounded, as it did before. A killed xray says nothing, and
     # its exit code is 124 or 143 depending on which timeout ran, so the message
     # names the code rather than reading it.
-    local -a test_cmd=("$xray" run -test -format json -c "$file")
+    #
+    # Which form a router's timeout takes cannot be read off its name: coreutils
+    # and busybox from 1.30 take "timeout SECS PROG", busybox before it - Merlin
+    # ships 1.25 - only "timeout -t SECS PROG", and there the seconds would be
+    # taken for the program, failing every config with exit 127. So the form is
+    # probed, at the cost of one run of true.
+    local -a test_cmd=("$xray" run -test -format json -c "$file") bound=()
     if type -P timeout >/dev/null 2>&1; then
-        test_cmd=(timeout 15 "${test_cmd[@]}")
+        if timeout 1 true >/dev/null 2>&1; then
+            bound=(timeout 15)
+        elif timeout -t 1 true >/dev/null 2>&1; then
+            bound=(timeout -t 15)
+        fi
     fi
+    test_cmd=("${bound[@]}" "${test_cmd[@]}")
     out=$("${test_cmd[@]}" 2>&1) || rc=$?
     if (( rc != 0 )); then
         local detail

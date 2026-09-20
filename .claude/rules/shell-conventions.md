@@ -400,3 +400,31 @@ log() {
 
 **Solution**: `download_file` prefers wget, then falls back to curl when wget
 is missing or fails. Keenetic installs `curl` as a required package.
+
+### BusyBox before 1.30 spells `timeout` as `-t SECS`
+
+**Problem**: `timeout 15 cmd …` is the coreutils form, which BusyBox learned
+only in 1.30. Asuswrt-Merlin ships BusyBox 1.25, whose applet is
+`timeout [-t SECS] [-s SIG] PROG ARGS`: it takes the first free argument as the
+program, so `timeout 15 xray run -test …` tries to execute `15` and exits 127.
+Nothing installs Entware's `coreutils-timeout`, so a router may have only the
+applet. In `xrayconf_validate` that turned every config into "xray rejected the
+config", and `configure.sh` exits 1 rather than write one.
+
+**Solution**: probe the form — both spell the command `timeout`, so only a run
+tells them apart — and leave the command unbounded when neither answers:
+
+```bash
+local -a bound=()
+if type -P timeout >/dev/null 2>&1; then
+    if timeout 1 true >/dev/null 2>&1; then
+        bound=(timeout 15)
+    elif timeout -t 1 true >/dev/null 2>&1; then
+        bound=(timeout -t 15)
+    fi
+fi
+cmd=("${bound[@]}" "${cmd[@]}")
+```
+
+A killed process exits 124 under coreutils and 143 under BusyBox, so a message
+about one names the code rather than reading it.

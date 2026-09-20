@@ -77,7 +77,9 @@ bot, offline at the next restart. The temp file (`config.json.XXXXXX`) does not 
 keeps `xray -confdir` from loading it and is why `-format json` is needed. Without an `xray` binary
 (dev mode, a workstation) the test is skipped. The test runs under the config lock and is bounded at
 15 s, half of the 30 s every other writer waits for that lock: a hung `xray` lets them take their
-turn instead of using up the whole wait.
+turn instead of using up the whole wait. The shell probes which `timeout` the router has — BusyBox
+before 1.30 takes the seconds only after `-t` — and runs the test unbounded when it can drive
+neither form.
 
 ## Configuration
 

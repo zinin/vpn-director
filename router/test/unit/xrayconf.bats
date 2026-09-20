@@ -176,6 +176,45 @@ setup() {
     [[ $output == *'xray rejected the config: no output, exit 124'* ]]
 }
 
+# BusyBox before 1.30 - Asuswrt-Merlin ships 1.25 - spells the bound
+# "timeout -t SECS PROG" and runs the first free argument as the program, so
+# "timeout 15 xray" there tries to execute 15 and fails every config. The form
+# is probed, not assumed.
+@test "xrayconf_validate: drives a busybox-syntax timeout" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/timeout" <<'MOCK'
+#!/usr/bin/env bash
+if [[ ${1:-} != -t ]]; then
+    printf "timeout: can't execute '%s': No such file or directory\n" "${1:-}" >&2
+    exit 127
+fi
+shift 2
+printf '%s\n' "$*" >> "$TIMEOUT_MOCK_LOG"
+exec "$@"
+MOCK
+    chmod +x "$BATS_TEST_TMPDIR/bin/timeout"
+    export PATH="$BATS_TEST_TMPDIR/bin:$TEST_ROOT/mocks:$PATH"
+    export XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log" TIMEOUT_MOCK_LOG="$BATS_TEST_TMPDIR/timeout.log"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+    [[ $(tail -1 "$TIMEOUT_MOCK_LOG") == *"xray run -test -format json"* ]]
+}
+
+# A timeout that answers to neither form is left alone: running the test
+# unbounded, as before the bound existed, beats failing every config with it.
+@test "xrayconf_validate: a timeout it cannot drive is left alone" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    printf '#!/usr/bin/env bash\nexit 127\n' > "$BATS_TEST_TMPDIR/bin/timeout"
+    chmod +x "$BATS_TEST_TMPDIR/bin/timeout"
+    export PATH="$BATS_TEST_TMPDIR/bin:$TEST_ROOT/mocks:$PATH" XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+}
+
 @test "xrayconf_validate: without an xray the config passes, and says so" {
     [[ ! -x /opt/sbin/xray ]] || skip "this machine has /opt/sbin/xray"
     printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
