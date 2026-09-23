@@ -1,0 +1,11 @@
+{
+  "total": 4,
+  "servers": [
+    {"address":"flatonly.example.com","name":"JSON flat only","outbound":{"protocol":"vless","settings":{"address":"flatonly.example.com","encryption":"none","id":"12121212-1212-4212-8212-121212121212","port":8443},"streamSettings":{"network":"tcp","security":"none"}},"port":8443},
+    {"address":"vnext.example.com","name":"JSON vnext null address","outbound":{"protocol":"vless","settings":{"address":null,"vnext":[{"address":"vnext.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443}
+  ],
+  "skipped": [
+    {"name":"JSON flat and vnext","reason":"invalid"},
+    {"name":"JSON flat and servers","reason":"invalid"}
+  ]
+}

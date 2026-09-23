@@ -42,7 +42,13 @@ func decodeXrayJSON(body string) (Result, error) {
 }
 
 // xrayEntry takes the config's single proxy outbound, checks it and removes
-// what could reach past the proxy into the router's own routing.
+// what could reach past the proxy into the router's own routing. Settings that
+// hold a non-null address beside a non-empty list under the key the protocol
+// uses (vnext for vless and vmess, servers for trojan and shadowsocks) are
+// invalid: Xray dials the flat address whenever one is set - all four builders
+// replace the list with it (26.2.6) - while OutboundTarget reads the list, so
+// the stored address, its IPs and the watch's TCP checks would describe a host
+// Xray does not dial. _sub_xray_json in lib/subscription.sh skips it alike.
 func xrayEntry(raw interface{}) (entry, error) {
 	cfg, ok := raw.(map[string]interface{})
 	if !ok {
@@ -87,6 +93,18 @@ func xrayEntry(raw interface{}) (entry, error) {
 	for _, key := range []string{"vnext", "servers"} {
 		if list, ok := settings[key].([]interface{}); ok && len(list) > 1 {
 			return e, composite(strconv.Itoa(len(list)) + " targets")
+		}
+	}
+	if flat, ok := settings["address"]; ok && flat != nil {
+		listKey := ""
+		switch protocol {
+		case "vless", "vmess":
+			listKey = "vnext"
+		case "trojan", "shadowsocks":
+			listKey = "servers"
+		}
+		if list, _ := settings[listKey].([]interface{}); listKey != "" && len(list) > 0 {
+			return e, invalid("flat address beside a server list")
 		}
 	}
 	target := vpnconfig.OutboundTarget(ob)

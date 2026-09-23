@@ -715,7 +715,12 @@ _sub_links() {
 
 # _sub_xray_json <body>: an array of Xray configs, or one config (spec 6.5),
 # in one jq program: a record per config, its raw name kept NUL- and
-# control-free for the name filter, which drops those characters anyway.
+# control-free for the name filter, which drops those characters anyway. A
+# proxy whose settings hold a non-null address beside a non-empty vnext or
+# servers list - the one its protocol uses - is invalid: Xray dials the flat
+# address whenever one is set, while target reads the list, so the stored
+# address would name a host Xray does not dial (xrayEntry in
+# server/internal/subscription/xrayjson.go says the same).
 _sub_xray_json() {
     local count out
     if ! count=$(jq -s 'length' <<< "$1" 2>/dev/null) || [[ $count != 1 ]]; then
@@ -748,6 +753,8 @@ _sub_xray_json() {
               | (($settings.vnext | if type == "array" then length else 0 end) as $v
                  | ($settings.servers | if type == "array" then length else 0 end) as $sv
                  | if $v > 1 then $v elif $sv > 1 then $sv else 0 end) as $targets
+              | ($ob.protocol | if . == "vless" or . == "vmess" then "vnext"
+                 elif . == "trojan" or . == "shadowsocks" then "servers" else "" end) as $listkey
               | ($ob | target) as $t
               | ($t.address | str | ltrimstr("[") | rtrimstr("]")) as $addr
               | ($t.port | if type == "number" and . == floor and . >= 1 and . <= 65535 then floor else null end) as $port
@@ -756,6 +763,9 @@ _sub_xray_json() {
                 elif ($ob.proxySettings | obj | .tag | str) != "" or ($ob | deep_dialer) then
                   skip($raw; "composite"; "chained")
                 elif $targets > 1 then skip($raw; "composite"; "\($targets) targets")
+                elif $settings.address != null and $listkey != ""
+                     and ($settings[$listkey] | type) == "array" and ($settings[$listkey] | length) > 0 then
+                  skip($raw; "invalid"; "flat address beside a server list")
                 elif $addr == "" or $port == null then skip($raw; "invalid"; "bad address or port")
                 elif ($ob | deep_insecure) then
                   skip($raw; "unsupported"; "insecure TLS")
