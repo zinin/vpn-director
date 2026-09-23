@@ -812,3 +812,43 @@ func TestServerIPs_EmptyMarshalsToJSONArray(t *testing.T) {
 		})
 	}
 }
+
+// Two providers can both name a server Germany-1. A walk that moves from one
+// to the other has moved away from the user's choice, and the record keeps
+// that choice aside, as it does for a move to another name.
+func TestRecordWalkedServer_TheSameNameInAnotherSubscriptionIsAMove(t *testing.T) {
+	cfg := &VPNDirectorConfig{}
+	cfg.Xray.ActiveServer = &ActiveServer{Subscription: "0a1b2c3d", Name: "Germany-1", Address: "a.example.com", Port: 443, Seq: 4}
+
+	RecordWalkedServer(cfg, Server{Subscription: "1b2c3d4e", Name: "Germany-1", Address: "b.example.net", Port: 443})
+
+	p := cfg.Xray.PreferredServer
+	if p == nil || p.Subscription != "0a1b2c3d" || p.Name != "Germany-1" || p.Seq != 0 {
+		t.Fatalf("preferred %+v, want the user's Germany-1 of 0a1b2c3d", p)
+	}
+	if a := cfg.Xray.ActiveServer; a.Subscription != "1b2c3d4e" || a.Seq != 5 {
+		t.Fatalf("active %+v", a)
+	}
+
+	// Back on the user's server - its subscription and name, at a new address.
+	RecordWalkedServer(cfg, Server{Subscription: "0a1b2c3d", Name: "Germany-1", Address: "c.example.com", Port: 443})
+
+	if cfg.Xray.PreferredServer != nil {
+		t.Fatalf("preferred %+v, want none", cfg.Xray.PreferredServer)
+	}
+}
+
+func TestNewActiveServer_RecordsTheSubscription(t *testing.T) {
+	a := NewActiveServer(Server{Subscription: "0a1b2c3d", Name: "Oslo", Address: "a.example.com", Port: 443, UUID: "secret"})
+
+	if *a != (ActiveServer{Subscription: "0a1b2c3d", Name: "Oslo", Address: "a.example.com", Port: 443}) {
+		t.Fatalf("got %+v", *a)
+	}
+	data, err := json.Marshal(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"subscription":"0a1b2c3d"`) || strings.Contains(string(data), "secret") {
+		t.Fatalf("marshaled %s", data)
+	}
+}

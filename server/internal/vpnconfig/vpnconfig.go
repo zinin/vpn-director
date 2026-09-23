@@ -26,6 +26,9 @@ type Server struct {
 	PublicKey   string          `json:"public_key,omitempty"`
 	ShortID     string          `json:"short_id,omitempty"`
 	ALPN        []string        `json:"alpn,omitempty"`
+	// Subscription is the id of the subscription file the server came from.
+	// LoadSubscriptions fills it in; the file does not repeat it.
+	Subscription string `json:"-"`
 }
 
 // ServerIPs returns every non-empty IP across servers, de-duplicated and
@@ -104,6 +107,10 @@ type ActiveServer struct {
 	Name    string `json:"name"`
 	Address string `json:"address"`
 	Port    int    `json:"port"`
+	// Subscription is the id of the server's subscription. Two subscriptions
+	// can name a server alike, and a record without it - one written before
+	// subscriptions - matches no server.
+	Subscription string `json:"subscription,omitempty"`
 	// Seq counts the writes of this record. Two selections of the very same
 	// server differ in nothing else, so it is what lets the subscription walk
 	// tell a choice made while it was busy from the one it started out with.
@@ -114,7 +121,7 @@ type ActiveServer struct {
 // rest - UUID, REALITY keys - would put credentials in a file the Web UI hands
 // out over /api/config.
 func NewActiveServer(s Server) *ActiveServer {
-	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port}
+	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port, Subscription: s.Subscription}
 }
 
 // ActiveSeq is the write counter a carries, and zero for no record at all or
@@ -139,20 +146,26 @@ func RecordActiveServer(prev *ActiveServer, s Server) *ActiveServer {
 // RecordWalkedServer names s as the running server for the subscription walk.
 // The walk tries servers nobody chose, and one cut short - the bot restarted, a
 // stop - leaves active_server on one of them. So the server the user chose is
-// kept in preferred_server from the first record that leaves its name until one
-// comes back to it. A new address under the same name is no move away: a
-// subscription that rotates endpoints gives a name one every day.
+// kept in preferred_server from the first record that leaves its choice until
+// one comes back to it. A new address under the same name is no move away: a
+// subscription that rotates endpoints gives a name one every day. The same
+// name in another subscription is another server.
 func RecordWalkedServer(cfg *VPNDirectorConfig, s Server) {
 	x := &cfg.Xray
 	switch {
-	case x.PreferredServer != nil && x.PreferredServer.Name == s.Name:
+	case x.PreferredServer != nil && sameChoice(x.PreferredServer, s):
 		x.PreferredServer = nil
-	case x.PreferredServer == nil && x.ActiveServer != nil && x.ActiveServer.Name != s.Name:
+	case x.PreferredServer == nil && x.ActiveServer != nil && !sameChoice(x.ActiveServer, s):
 		chosen := *x.ActiveServer
 		chosen.Seq = 0
 		x.PreferredServer = &chosen
 	}
 	x.ActiveServer = RecordActiveServer(x.ActiveServer, s)
+}
+
+// sameChoice reports whether a names the choice s is: its subscription and its name.
+func sameChoice(a *ActiveServer, s Server) bool {
+	return a.Subscription == s.Subscription && a.Name == s.Name
 }
 
 // ClientInfo represents a VPN client with its route and pause status.

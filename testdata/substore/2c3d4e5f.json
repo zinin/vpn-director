@@ -1,0 +1,19 @@
+{
+  "id": "2c3d4e5f",
+  "name": "Gamma",
+  "url": "https://panel.example.org/sub/fixture-token",
+  "added": "2026-09-24T18:00:00Z",
+  "refreshed": "2026-09-24T18:00:00Z",
+  "servers": [
+    {
+      "address": "203.0.113.30",
+      "port": 443,
+      "name": "Riga",
+      "ips": ["203.0.113.30"],
+      "outbound": {
+        "protocol": "shadowsocks",
+        "settings": {"servers": [{"address": "203.0.113.30", "port": 443, "method": "chacha20-ietf-poly1305", "password": "fixture-password"}]}
+      }
+    }
+  ]
+}
