@@ -45,8 +45,16 @@ plugin obfs obfs-password pinSHA256 "
 #   scrub_sockopt  a foreign fwmark could collide with ours (0x100 Xray, 0x01
 #                  firmware VPN, 0x00ff0000 Tunnel Director), and an interface
 #                  would route around the WAN; a sockopt left empty goes too.
+#                  An echSockopt - the socket tlsSettings dials its ECH query
+#                  on, the only other SocketConfig Xray reads - gets the same.
 #   deep_dialer    a dialerProxy names an outbound to dial through - the chain
-#                  a top-level sockopt is already skipped for.
+#                  a top-level sockopt is already skipped for - in a sockopt
+#                  or an echSockopt alike.
+#   drop_keylog    a masterKeyLog in tlsSettings or realitySettings is a path
+#                  Xray opens to append every session's keys to, creating it
+#                  0644 (checked against 26.2.6): a file on the router the
+#                  subscription picks, and traffic anyone who reads it can
+#                  decrypt. It goes whatever the stream's security.
 #   deep_insecure  Xray has loaded no config with allowInsecure since
 #                  2026-06-01, so an entry carrying one without a
 #                  pinnedPeerCertSha256 to replace it is skipped, and
@@ -54,13 +62,21 @@ plugin obfs obfs-password pinSHA256 "
 #                  it: Xray ignores tlsSettings under any other security, and
 #                  a stray flag there costs nothing (checked against 26.2.6).
 # Both jq programs below take these, as the Go twins serve both Go paths.
+# shellcheck disable=SC2016  # $k is jq's, bound by reduce
 _SUB_JQ_SANITIZE='
-def scrub_sockopt: walk(if type == "object" and (.sockopt | type) == "object"
-                        then .sockopt |= del(.mark, .interface, .tproxy, .customSockopt)
-                             | if (.sockopt | length) == 0 then del(.sockopt) else . end
+def scrub_sockopt: walk(if type == "object"
+                        then reduce ("sockopt", "echSockopt") as $k (.;
+                               if (.[$k] | type) == "object"
+                               then .[$k] |= del(.mark, .interface, .tproxy, .customSockopt)
+                                    | if (.[$k] | length) == 0 then del(.[$k]) else . end
+                               else . end)
                         else . end);
-def deep_dialer: [.. | objects | .sockopt | objects
+def deep_dialer: [.. | objects | (.sockopt, .echSockopt) | objects
                   | select((.dialerProxy | type) == "string" and .dialerProxy != "")] | length > 0;
+def drop_keylog: walk(if type == "object"
+                      then reduce ("tlsSettings", "realitySettings") as $k (.;
+                             if (.[$k] | type) == "object" then .[$k] |= del(.masterKeyLog) else . end)
+                      else . end);
 def deep_insecure: [.. | objects | select(.security == "tls") | .tlsSettings | objects
                     | select(.allowInsecure == true)
                     | select((.pinnedPeerCertSha256 | type) != "string" or .pinnedPeerCertSha256 == "")]
@@ -90,7 +106,7 @@ def stream:
                                               + (if $mode == "multi" then {multiMode: true} else {} end))}
      elif $net == "xhttp" then {xhttpSettings: ({path: $path, host: $host, mode: $mode}
                                                 + (if $extra == "" then {} else
-                                                   {extra: ($extra | fromjson | drop_insecure | scrub_sockopt)} end))}
+                                                   {extra: ($extra | fromjson | drop_insecure | scrub_sockopt | drop_keylog)} end))}
      else {} end);
 '
 
@@ -460,7 +476,7 @@ _sub_vmess() {
                        elif type == "string" then ["string", .] else ["missing", ""] end) as $port
             | ([["add", .add], ["id", .id], ["scy", .scy], ["net", .net], ["type", .type],
                 ["host", .host], ["path", .path], ["tls", .tls], ["sni", .sni], ["alpn", .alpn],
-                ["fp", .fp], ["pbk", .pbk], ["sid", .sid], ["spx", .spx]]
+                ["fp", .fp], ["pbk", .pbk], ["sid", .sid], ["spx", .spx], ["port", .port]]
                | map(select((.[1] | f | index("\u0000")) != null)) | (.[0][0] // "")) as $nul
             | "V_ps=\(.ps | f | nonul | @sh) V_add=\(.add | f | nonul | @sh) V_id=\(.id | f | nonul | @sh)",
               "V_scy=\(.scy | f | nonul | @sh) V_net=\(.net | f | nonul | @sh) V_type=\(.type | f | nonul | @sh)",
@@ -753,7 +769,8 @@ _sub_xray_json() {
                    outbound: ($ob
                      | del(.tag, .sendThrough)
                      | drop_insecure
-                     | scrub_sockopt)}
+                     | scrub_sockopt
+                     | drop_keylog)}
                 end
               end
           end;

@@ -118,6 +118,7 @@ func xrayEntry(raw interface{}) (entry, error) {
 	delete(ob, "tag")
 	delete(ob, "sendThrough")
 	scrubSockopt(ob)
+	dropKeyLog(ob)
 	e.address, e.port, e.outbound = address, port, ob
 	return e, nil
 }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
@@ -420,6 +421,27 @@ func TestGenerateConfig_XrayRejectsTheConfig(t *testing.T) {
 		if name := e.Name(); name != "config.json" && name != "config.json.template" {
 			t.Fatalf("left behind: %s", name)
 		}
+	}
+}
+
+// The test runs under the config lock: an xray that never answers is given
+// up on at the bound, and the error says it timed out rather than that Xray
+// rejected the config.
+func TestXrayTest_TimesOut(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte("#!/bin/sh\nexec sleep 10\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	prev := xrayTestTimeout
+	xrayTestTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { xrayTestTimeout = prev })
+	path := filepath.Join(t.TempDir(), "config.json.test")
+	if err := os.WriteFile(path, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := xrayTest(path); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err %v, want a timeout", err)
 	}
 }
 

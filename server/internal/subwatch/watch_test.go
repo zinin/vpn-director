@@ -474,6 +474,10 @@ func TestServerForDial_KeepsTheHostnameWhereTheSourceLeftItToTheAddress(t *testi
 	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
 		t.Fatalf("ws %v; a Host header the source set stays the Host", ws)
 	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"ws","wsSettings":{"headers":{"host":"front.example"}}}}`)
+	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
+		t.Fatalf("ws %v; Xray takes a host header in any case, so it stays the Host", ws)
+	}
 	ss = dial("cdn.example", `{"protocol":"trojan","settings":{"servers":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"sni.example"}}}`)
 	if tls := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "sni.example" {
 		t.Fatalf("tls %v; an explicit server name stays", tls)

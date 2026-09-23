@@ -258,6 +258,7 @@ func streamSettings(p params, defaultSecurity string) (map[string]interface{}, e
 				return nil, unsupported("insecure TLS")
 			}
 			scrubSockopt(extra)
+			dropKeyLog(extra)
 			xhttp["extra"] = extra
 		}
 		ss["xhttpSettings"] = xhttp

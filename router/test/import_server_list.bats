@@ -59,6 +59,24 @@ decode_into_result() {
     assert_output '["Good"]'
 }
 
+# A skip's detail holds what the subscription decoded: an escape sequence in it
+# reached the terminal, the log file and syslog, and a line break made a line
+# of its own that the subscription wrote.
+@test "step_get_subscription: a skip line carries no control character from the subscription" {
+    load_import_server_list
+    # common.sh points LOG_FILE at /tmp/vpn-director.log, which every run
+    # appends to; what this test refutes has to be looked for in its own lines.
+    LOG_FILE="$BATS_TEST_TMPDIR/vpn-director.log"
+    printf '%s\n' 'vless://u@5.6.7.8:443?type=%1B%5B31mX%0Afake#Evil' 'vless://u@5.6.7.9:443#Good' > "$BATS_TEST_TMPDIR/list.txt"
+
+    step_get_subscription <<< "$BATS_TEST_TMPDIR/list.txt"
+
+    run cat "$LOG_FILE"
+    assert_output --partial "Skipping Evil: unsupported (transport [31mXfake)"
+    refute_output --partial $'\x1b'
+    refute_line --regexp '^fake'
+}
+
 # ============================================================================
 # Publishing: servers.json, xray.servers and the link a refresh fetches
 # ============================================================================

@@ -142,6 +142,18 @@ setup() {
     [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
 }
 
+# An outbound that is there but is no object is no legacy record either:
+# serverOutbound in service/xray.go rejects it, so the flat fields beside it
+# must not become a VLESS outbound here.
+@test "build_outbound: a stored outbound that is no object -> error" {
+    run xrayconf_build_outbound <<< '{"address":"1.2.3.4","port":443,"uuid":"u1","outbound":"not-an-object"}'
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound is not an object'* ]]
+    run xrayconf_build_outbound <<< '{"address":"1.2.3.4","port":443,"uuid":"u1","outbound":null}'
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound is not an object'* ]]
+}
+
 @test "generate: a stored outbound replaces the template's outbounds" {
     server='{"address":"198.51.100.12","port":2030,"outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"198.51.100.12","port":2030,"method":"aes-256-gcm","password":"p"}]}}}'
     run xrayconf_generate "$PROJECT_ROOT/opt/etc/xray/config.json.template" <<< "$server"
@@ -166,14 +178,28 @@ setup() {
     [[ $output == *'xray rejected the config: Xray 26.2.6; Failed to start: infra/conf: "allowInsecure" has been removed'* ]]
 }
 
-# A timeout kills xray without a word, and the exit code is 124 or 143
-# depending on which timeout ran, so the message names the code instead.
-@test "xrayconf_validate: an xray that answers nothing fails with its exit code" {
-    export PATH="$TEST_ROOT/mocks:$PATH" XRAY_MOCK_EXIT=124 XRAY_MOCK_OUTPUT=""
+# Xray prints its version banner before it loads the config, so an xray the
+# bound kills has said something too: the exit code of the timeout - 124 or
+# 143, depending on which one ran - is what tells a timeout from a rejection.
+@test "xrayconf_validate: an xray the bound kills is reported as a timeout" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/timeout" <<'MOCK'
+#!/usr/bin/env bash
+# The probe "timeout 1 true" passes; the test itself prints the banner and
+# is killed.
+if [[ ${1:-} == 1 && ${2:-} == true ]]; then
+    exit 0
+fi
+printf 'Xray 26.2.6 (Xray, Penetrates Everything.) Custom (go1.25.6 linux/arm64)\n'
+exit 124
+MOCK
+    chmod +x "$BATS_TEST_TMPDIR/bin/timeout"
+    export PATH="$BATS_TEST_TMPDIR/bin:$TEST_ROOT/mocks:$PATH"
     printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
     run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
     [ "$status" -eq 1 ]
-    [[ $output == *'xray rejected the config: no output, exit 124'* ]]
+    [[ $output == *'timed out after 15s'* ]]
+    [[ $output != *'rejected'* ]]
 }
 
 # BusyBox before 1.30 - Asuswrt-Merlin ships 1.25 - spells the bound

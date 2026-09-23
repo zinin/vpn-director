@@ -49,8 +49,13 @@ holds whatever the subscription wrote, and Xray reads a whole `downloadSettings`
 it. A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in it keeps `mark`,
 `interface`, `tproxy` or `customSockopt` — a foreign fwmark could collide with ours (0x100 Xray,
 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an interface would route around the WAN; a
-`sockopt` left empty goes too. A `sockopt.dialerProxy` anywhere makes the entry `composite`
-(`chained`), as one at the top always did. A tls stream anywhere loses its `allowInsecure` whatever
+`sockopt` left empty goes too. `tlsSettings.echSockopt`, the socket the ECH config query is dialed
+on and the only other SocketConfig Xray reads, gets the same. A `dialerProxy` in a `sockopt` or an
+`echSockopt` anywhere makes the entry `composite` (`chained`), as one at the top always did. No
+`tlsSettings` or `realitySettings` anywhere keeps a `masterKeyLog`, whatever the stream's security:
+Xray opens that path to append every session's keys to, creating it 0644 (`GetTLSConfig` in
+26.2.6, REALITY alike) — a file on the router the subscription picks, and traffic anyone who reads
+it can decrypt. A tls stream anywhere loses its `allowInsecure` whatever
 the value is, and the entry is `unsupported` (`insecure TLS`) when that value was the boolean `true`
 and no `pinnedPeerCertSha256` replaces it — Xray has loaded no config with the flag since
 2026-06-01, and it reads the field as a bool, so a panel's `false` is noise while its `"true"` would

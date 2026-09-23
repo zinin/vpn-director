@@ -54,6 +54,12 @@ read_input() {
     read -r INPUT_RESULT
 }
 
+# jq that drops control characters - C0, DEL and C1 - from a string. A skip's
+# name and detail and a server's address are subscription text, and would
+# otherwise take an escape sequence or a line break of their own to the
+# terminal, the log file and syslog.
+JQ_PRINTABLE='def printable: explode | map(select(. >= 32 and (. < 127 or . > 159))) | implode;'
+
 ###############################################################################
 # Get data directory from config
 ###############################################################################
@@ -99,7 +105,7 @@ step_get_subscription() {
         http://*|https://*)
             log "Downloading from URL..."
             content=$(curl -fsSL --connect-timeout 10 --max-time 60 "$SUB_INPUT") || {
-                log -l ERROR "Failed to download from $SUB_INPUT"
+                log -l ERROR "Failed to download the subscription"
                 exit 1
             }
             ;;
@@ -120,7 +126,8 @@ step_get_subscription() {
     fi
 
     local skipped line
-    skipped=$(printf '%s' "$SUB_RESULT" | jq -r '.skipped[] | "Skipping \(.name): \(.reason) (\(.detail))"')
+    skipped=$(printf '%s' "$SUB_RESULT" | jq -r "$JQ_PRINTABLE"'
+        .skipped[] | "Skipping \(.name | printable): \(.reason) (\(.detail | printable))"')
     if [[ -n $skipped ]]; then
         while IFS= read -r line; do
             log -l WARN "$line"
@@ -147,18 +154,20 @@ step_parse_servers() {
     SERVERS_FILE="$DATA_DIR/servers.json"
     SERVERS_TMP=$(tmp_file)
 
-    local records server address name ips_raw ips_json dns_errors=0
+    local records server address shown_address name ips_raw ips_json dns_errors=0
     records=$(tmp_file)
     while IFS= read -r server; do
+        # The address as it is for the lookup, a printable copy for the output.
         address=$(printf '%s' "$server" | jq -r '.address')
-        name=$(printf '%s' "$server" | jq -r '.name')
+        shown_address=$(printf '%s' "$server" | jq -r "$JQ_PRINTABLE"' .address | printable')
+        name=$(printf '%s' "$server" | jq -r "$JQ_PRINTABLE"' .name | printable')
         ips_raw=$(resolve_ip -a -q "$address" 2>/dev/null) || ips_raw=""
         if [[ -z "$ips_raw" ]]; then
-            log -l WARN "Cannot resolve $address, skipping"
+            log -l WARN "Cannot resolve $shown_address, skipping"
             dns_errors=$((dns_errors + 1))
             continue
         fi
-        printf "  %s (%s) -> %s\n" "$name" "$address" "$(printf '%s' "$ips_raw" | tr '\n' ',' | sed 's/,$//')" >&2
+        printf "  %s (%s) -> %s\n" "$name" "$shown_address" "$(printf '%s' "$ips_raw" | tr '\n' ',' | sed 's/,$//')" >&2
         ips_json=$(printf '%s\n' "$ips_raw" | jq -R 'select(length > 0)' | jq -s .)
         printf '%s' "$server" | jq -c --argjson ips "$ips_json" '. + {ips: $ips}' >> "$records"
     done <<< "$(printf '%s' "$SUB_RESULT" | jq -c '.servers[]')"

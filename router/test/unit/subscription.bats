@@ -69,6 +69,7 @@ check_fixtures() {
     [ "$(detail_of 'ss://%00@h.example.com:8388#Nul ss userinfo')" = "userinfo: NUL byte" ]
     [ "$(detail_of 'hysteria2://a@h.example.com:443?sni=%00#Nul hy2 query')" = "query: NUL byte" ]
     [ "$(detail_of "vmess://$vmess")" = "NUL byte in host" ]
+    [ "$(detail_of "$(< "$FIXTURES/vmess-nul-port.in")")" = "NUL byte in port" ]
     [ "$(detail_of 'vless://u@h.example.com:4"4\5#Bad port')" = 'bad port "4"4\5"' ]
 }
 

@@ -67,8 +67,10 @@ func (s Server) Protocol() string {
 // outbound is a legacy VLESS one, which the generators build as TLS when it
 // names no security. An outbound that is there but cannot be read is "?" -
 // including a null one, which is not the legacy record it looks like: the
-// generators reject it through DecodeOutbound, so the list says so too.
-// protocol_label in configure.sh answers the same three ways.
+// generators reject it through DecodeOutbound, so the list says so too. An
+// outbound that names no protocol is "?" as well: there is nothing to label,
+// and "·ws·tls" is no label. protocol_label in configure.sh answers the same
+// three ways.
 func (s Server) Label() string {
 	if len(s.Outbound) == 0 {
 		security := s.Security
@@ -95,6 +97,8 @@ func (s Server) Label() string {
 
 func protocolLabel(protocol, network, security string) string {
 	switch protocol {
+	case "":
+		return "?"
 	case "shadowsocks":
 		return "ss"
 	case "hysteria":

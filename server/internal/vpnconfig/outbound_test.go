@@ -71,6 +71,7 @@ func TestServerLabel(t *testing.T) {
 		// record nor a labelled one. configure.sh prints "?" for both.
 		{Server{Outbound: json.RawMessage(`null`), Security: "reality"}, "?"},
 		{Server{Outbound: json.RawMessage(`{"protocol":"vless","streamSettings":"tcp"}`)}, "?"},
+		{Server{Outbound: json.RawMessage(`{"streamSettings":{"network":"ws","security":"tls"}}`)}, "?"},
 	} {
 		if got := tc.server.Label(); got != tc.want {
 			t.Errorf("Label() of %+v = %q, want %q", tc.server, got, tc.want)

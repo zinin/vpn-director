@@ -357,13 +357,15 @@ JSON
 
 # An outbound is stored as the subscription wrote it. jq dies on a
 # streamSettings that is not an object, and the wizard dies with it under
-# pipefail - with no list and nothing to select. Server.Label answers "?".
+# pipefail - with no list and nothing to select. Server.Label answers "?", and
+# so it does to an outbound that names no protocol.
 @test "step_select_xray_server: an outbound it cannot read is listed as ?" {
     load_wizard
     cat > "$SERVERS_FILE" <<'JSON'
 [{"name":"Broken","address":"broken.example.com","port":443,"ips":["1.2.3.4"],"outbound":{"protocol":"vless","streamSettings":"tcp"}},
  {"name":"Null","address":"null.example.com","port":443,"ips":["1.2.3.5"],"outbound":null},
- {"name":"Oslo WS","address":"oslo.example.com","port":443,"ips":["1.2.3.6"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"tls"}}}]
+ {"name":"Oslo WS","address":"oslo.example.com","port":443,"ips":["1.2.3.6"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"tls"}}},
+ {"name":"No protocol","address":"noproto.example.com","port":443,"ips":["1.2.3.7"],"outbound":{"streamSettings":{"network":"ws","security":"tls"}}}]
 JSON
 
     run step_select_xray_server <<< "3"
@@ -372,6 +374,7 @@ JSON
     assert_output --partial "1) Broken [?]"
     assert_output --partial "2) Null [?]"
     assert_output --partial "3) Oslo WS [vless·ws·tls]"
+    assert_output --partial "4) No protocol [?]"
 }
 
 # ============================================================================

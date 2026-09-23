@@ -1,0 +1,131 @@
+[
+  {
+    "remarks": "JSON keylog tls",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "jk1.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "jk1.example.com",
+            "masterKeyLog": "/tmp/keys.log"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON keylog reality",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "jk2.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "www.example.org",
+            "fingerprint": "chrome",
+            "publicKey": "hhoT6JDl8yIxCxQkytm-w8ToNy6DTsn3t9Njaaoy-dE",
+            "shortId": "01",
+            "masterKeyLog": "/tmp/keys.log"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON ech sockopt",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "jk3.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "jk3.example.com",
+            "echSockopt": {
+              "mark": 255,
+              "interface": "eth0",
+              "tcpKeepAliveIdle": 30
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON ech chained",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "jk4.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "jk4.example.com",
+            "echSockopt": {
+              "dialerProxy": "relay"
+            }
+          }
+        }
+      }
+    ]
+  }
+]

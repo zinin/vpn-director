@@ -10,16 +10,23 @@
 # xrayconf_build_outbound: reads one server JSON object on stdin,
 # prints the proxy-out outbound JSON object on stdout. A server an import
 # stored with its outbound gets that outbound, tagged: the import
-# (lib/subscription.sh) checked it. A record from before outbounds were stored
-# is built from its flat VLESS fields, and fails (rc=1) on an unsupported
-# network (non-tcp) or security (not tls/reality) instead of emitting a
-# silently-broken outbound. Self-contained: pure jq; errors to stderr.
+# (lib/subscription.sh) checked it. An outbound that is there but is no
+# object - a string, a null - fails (rc=1), as serverOutbound in
+# service/xray.go rejects it through DecodeOutbound: it is no legacy record.
+# A record from before outbounds were stored is built from its flat VLESS
+# fields, and fails (rc=1) on an unsupported network (non-tcp) or security
+# (not tls/reality) instead of emitting a silently-broken outbound.
+# Self-contained: pure jq; errors to stderr.
 xrayconf_build_outbound() {
     local server_json net sec
     server_json="$(cat)"
     if printf '%s' "$server_json" | jq -e 'type == "object" and (.outbound | type) == "object"' >/dev/null 2>&1; then
         printf '%s' "$server_json" | jq '.outbound + {tag: "proxy-out"}'
         return
+    fi
+    if printf '%s' "$server_json" | jq -e 'type == "object" and has("outbound")' >/dev/null 2>&1; then
+        printf 'xrayconf: stored outbound is not an object\n' >&2
+        return 1
     fi
     if ! printf '%s' "$server_json" | jq -e 'type == "object" and (.address // "") != "" and (.uuid // "") != ""' >/dev/null 2>&1; then
         printf 'xrayconf: invalid/empty server JSON (need object with address and uuid)\n' >&2
@@ -124,9 +131,10 @@ xrayconf_validate() {
     # that never answers then lets the others take their turn instead of using
     # up their whole wait. XrayService.GenerateConfig bounds the same test the
     # same way (xrayTestTimeout in service/xray.go). Without a timeout of any
-    # kind the test runs unbounded, as it did before. A killed xray says nothing, and
-    # its exit code is 124 or 143 depending on which timeout ran, so the message
-    # names the code rather than reading it.
+    # kind the test runs unbounded, as it did before. Xray prints its version
+    # banner before it loads the config, so a killed xray has said something
+    # too: the timeout's exit code - 124 or 143, depending on which timeout
+    # ran - not the output, tells a timeout from a rejection.
     #
     # Which form a router's timeout takes cannot be read off its name: coreutils
     # and busybox from 1.30 take "timeout SECS PROG", busybox before it - Merlin
@@ -144,6 +152,10 @@ xrayconf_validate() {
     test_cmd=("${bound[@]}" "${test_cmd[@]}")
     out=$("${test_cmd[@]}" 2>&1) || rc=$?
     if (( rc != 0 )); then
+        if (( ${#bound[@]} > 0 )) && [[ $rc == 124 || $rc == 143 ]]; then
+            printf 'xrayconf: xray config test timed out after 15s\n' >&2
+            return 1
+        fi
         local detail
         detail=$(printf '%s\n' "$out" | awk '
             NF { line[++n] = $0 }

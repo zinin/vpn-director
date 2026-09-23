@@ -174,7 +174,7 @@ type importServersRequest struct {
 	URL string `json:"url"`
 }
 
-// handleImportServers returns a handler that imports servers from a VLESS
+// handleImportServers returns a handler that imports servers from a
 // subscription URL. It enforces HTTPS-only and SSRF protections.
 func handleImportServers(deps *Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {

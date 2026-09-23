@@ -1,0 +1,7 @@
+{
+  "total": 1,
+  "servers": [],
+  "skipped": [
+    {"name":"NulPort","reason":"invalid"}
+  ]
+}

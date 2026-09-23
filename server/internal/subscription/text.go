@@ -153,12 +153,18 @@ func splitList(s string) []interface{} {
 // truthy is how share links spell a set flag.
 func truthy(v string) bool { return v == "1" || v == "true" }
 
-// scrubSockopt removes from every sockopt object in v, however deep, the keys
-// that could route around our own rules, and drops a sockopt left empty. Depth
-// matters: an xhttp "extra" carries whatever the subscription wrote, and Xray
-// reads a downloadSettings stream config - sockopt included - out of it. A
-// foreign fwmark could collide with ours (0x100 Xray, 0x01 firmware VPN,
-// 0x00ff0000 Tunnel Director), and an interface would route around the WAN.
+// socketKeys are the keys that hold an Xray SocketConfig: a stream's sockopt,
+// and tlsSettings.echSockopt, the socket the ECH config query is dialed on.
+var socketKeys = []string{"sockopt", "echSockopt"}
+
+// scrubSockopt removes from every sockopt and echSockopt object in v, however
+// deep, the keys that could route around our own rules, and drops one left
+// empty. Depth matters: an xhttp "extra" carries whatever the subscription
+// wrote, and Xray reads a downloadSettings stream config - sockopt and
+// tlsSettings included - out of it. A foreign fwmark could collide with ours
+// (0x100 Xray, 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an
+// interface would route around the WAN. dropKeyLog, run beside it, takes out
+// masterKeyLog.
 func scrubSockopt(v interface{}) {
 	switch t := v.(type) {
 	case map[string]interface{}:
@@ -168,12 +174,14 @@ func scrubSockopt(v interface{}) {
 		for _, child := range t {
 			scrubSockopt(child)
 		}
-		if sockopt, ok := t["sockopt"].(map[string]interface{}); ok {
-			for _, key := range []string{"mark", "interface", "tproxy", "customSockopt"} {
-				delete(sockopt, key)
-			}
-			if len(sockopt) == 0 {
-				delete(t, "sockopt")
+		for _, socketKey := range socketKeys {
+			if sockopt, ok := t[socketKey].(map[string]interface{}); ok {
+				for _, key := range []string{"mark", "interface", "tproxy", "customSockopt"} {
+					delete(sockopt, key)
+				}
+				if len(sockopt) == 0 {
+					delete(t, socketKey)
+				}
 			}
 		}
 	case []interface{}:
@@ -183,15 +191,18 @@ func scrubSockopt(v interface{}) {
 	}
 }
 
-// hasDialerProxy reports whether any sockopt in v, however deep, names an
-// outbound to dial through. A sockopt at the top of an entry already makes it
-// composite; one inside an xhttp "extra" is the same chain, one level down.
+// hasDialerProxy reports whether any sockopt or echSockopt in v, however
+// deep, names an outbound to dial through. A sockopt at the top of an entry
+// already makes it composite; one inside an xhttp "extra", or the echSockopt
+// of a tlsSettings, is the same chain in another place.
 func hasDialerProxy(v interface{}) bool {
 	switch t := v.(type) {
 	case map[string]interface{}:
-		if sockopt, ok := t["sockopt"].(map[string]interface{}); ok {
-			if dialer, _ := sockopt["dialerProxy"].(string); dialer != "" {
-				return true
+		for _, socketKey := range socketKeys {
+			if sockopt, ok := t[socketKey].(map[string]interface{}); ok {
+				if dialer, _ := sockopt["dialerProxy"].(string); dialer != "" {
+					return true
+				}
 			}
 		}
 		for _, child := range t {
@@ -207,6 +218,30 @@ func hasDialerProxy(v interface{}) bool {
 		}
 	}
 	return false
+}
+
+// dropKeyLog deletes masterKeyLog from every tlsSettings and realitySettings
+// object in v, however deep, whatever the stream's security, as drop_keylog
+// does in lib/subscription.sh. Xray opens that path to append every session's
+// keys to, creating it 0644 (GetTLSConfig in 26.2.6, and REALITY alike): a
+// file on the router the subscription picks, and traffic anyone who reads it
+// can decrypt.
+func dropKeyLog(v interface{}) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for _, child := range t {
+			dropKeyLog(child)
+		}
+		for _, key := range []string{"tlsSettings", "realitySettings"} {
+			if settings, ok := t[key].(map[string]interface{}); ok {
+				delete(settings, "masterKeyLog")
+			}
+		}
+	case []interface{}:
+		for _, child := range t {
+			dropKeyLog(child)
+		}
+	}
 }
 
 // sanitizeTLS deletes allowInsecure from every tls stream in v, however deep,

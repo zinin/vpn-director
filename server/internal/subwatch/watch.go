@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1225,8 +1226,11 @@ func keepHostname(ob map[string]interface{}, host string) {
 		if h, _ := transport["host"].(string); h != "" {
 			return
 		}
-		if h, _ := headers["Host"].(string); h != "" {
-			return
+		// Xray's ws builder takes a host header in any case.
+		for key, value := range headers {
+			if h, _ := value.(string); strings.EqualFold(key, "host") && h != "" {
+				return
+			}
 		}
 		transport["host"] = host
 	}

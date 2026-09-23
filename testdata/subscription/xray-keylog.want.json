@@ -1,0 +1,11 @@
+{
+  "total": 4,
+  "servers": [
+    {"address":"jk1.example.com","name":"JSON keylog tls","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"jk1.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"jk1.example.com"}}},"port":443},
+    {"address":"jk2.example.com","name":"JSON keylog reality","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"jk2.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"chrome","publicKey":"hhoT6JDl8yIxCxQkytm-w8ToNy6DTsn3t9Njaaoy-dE","serverName":"www.example.org","shortId":"01"},"security":"reality"}},"port":443},
+    {"address":"jk3.example.com","name":"JSON ech sockopt","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"jk3.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"echSockopt":{"tcpKeepAliveIdle":30},"serverName":"jk3.example.com"}}},"port":443}
+  ],
+  "skipped": [
+    {"name":"JSON ech chained","reason":"composite"}
+  ]
+}

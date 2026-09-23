@@ -54,7 +54,7 @@ func parseVMessV2rayN(body string) (entry, error) {
 		return ""
 	}
 	name := cleanName(field("ps"))
-	for _, key := range []string{"add", "id", "scy", "net", "type", "host", "path", "tls", "sni", "alpn", "fp", "pbk", "sid", "spx"} {
+	for _, key := range []string{"add", "id", "scy", "net", "type", "host", "path", "tls", "sni", "alpn", "fp", "pbk", "sid", "spx", "port"} {
 		if strings.ContainsRune(field(key), 0) {
 			return entry{name: name}, invalid("NUL byte in " + key)
 		}

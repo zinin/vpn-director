@@ -182,14 +182,17 @@ step_select_xray_server() {
           # answers "?" to an outbound it cannot read; so does this. Only a
           # record with no outbound key at all is the legacy one - jq reads a
           # null the way it reads a missing key, and a null outbound is no
-          # outbound: the generators reject it, so it is a "?" too.
+          # outbound: the generators reject it, so it is a "?" too. So is an
+          # outbound that names no protocol, as it is for Server.Label: there
+          # is nothing to label, and "·ws·tls" is no label.
           try (
             (if (has("outbound") | not)
              then ["vless", .network, (if (.security // "") == "" then "tls" else .security end)]
              elif (.outbound | type) != "object" then error("not an outbound")
              else [.outbound.protocol, .outbound.streamSettings.network, .outbound.streamSettings.security] end)
             | map(if . == null then "" elif type == "string" then . else error("not a string") end) as [$p, $n, $s]
-            | if $p == "shadowsocks" then "ss" elif $p == "hysteria" then "hysteria2"
+            | if $p == "" then "?"
+              elif $p == "shadowsocks" then "ss" elif $p == "hysteria" then "hysteria2"
               else [$p] + (if $n == "" or $n == "tcp" or $n == "raw" then [] else [$n] end)
                         + (if $s == "" or $s == "none" then [] else [$s] end) | join("·") end
           ) catch "?";
@@ -398,7 +401,7 @@ step_configure_clients() {
         fi
 
         printf "\nWhere to route traffic for %s?\n" "$client_ip"
-        printf "  1) Xray (VLESS proxy)\n"
+        printf "  1) Xray (proxy)\n"
         printf "  2) Tunnel Director (VPN tunnel)\n"
         printf "Choice [1-2]: "
         read -r route_choice

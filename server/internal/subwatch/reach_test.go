@@ -291,3 +291,32 @@ func TestTick_QUICServerKeepsThreeMinutes(t *testing.T) {
 		t.Fatalf("%d TCP dials for a QUIC server, want none", dials)
 	}
 }
+
+// A TCP dial says nothing about a server that does not listen on TCP: mKCP
+// runs over UDP, and Hysteria2 and xhttp over HTTP/3 over QUIC.
+func TestTCPChecked(t *testing.T) {
+	for _, tc := range []struct {
+		name, outbound string
+		want           bool
+	}{
+		{"legacy record", ``, true},
+		{"hysteria", string(hysteria2Outbound), false},
+		{"vless tcp tls", `{"protocol":"vless","streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"oslo.example"}}}`, true},
+		{"vless kcp", `{"protocol":"vless","streamSettings":{"network":"kcp","security":"none"}}`, false},
+		{"vless xhttp tls h3", `{"protocol":"vless","streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}}`, false},
+		{"vless xhttp tls h3 and h2", `{"protocol":"vless","streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3","h2"]}}}`, true},
+		// Xray reads no tlsSettings under REALITY, whose xhttp dials HTTP/2.
+		{"vless xhttp reality", `{"protocol":"vless","streamSettings":{"network":"xhttp","security":"reality",` +
+			`"realitySettings":{"serverName":"www.example.org"},"tlsSettings":{"alpn":["h3"]}}}`, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := vpnconfig.Server{Name: "Oslo", Address: "oslo.example", Port: 443}
+			if tc.outbound != "" {
+				s.Outbound = json.RawMessage(tc.outbound)
+			}
+			if got := tcpChecked(s); got != tc.want {
+				t.Fatalf("tcpChecked = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}

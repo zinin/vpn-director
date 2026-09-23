@@ -66,10 +66,33 @@ func (w *Watch) reachable(ctx context.Context, copies []vpnconfig.Server) []vpnc
 // tcpChecked reports whether a TCP dial says anything about a server. A
 // Hysteria2 outbound speaks QUIC: its port accepts no TCP connection, and a
 // port that does accept one - a masquerade site beside it - says nothing about
-// the proxy behind it. Every other protocol an import stores dials over TCP,
-// over every transport it stores.
+// the proxy behind it. Two transports leave TCP as well: mKCP runs over UDP,
+// and xhttp over TLS whose alpn is exactly ["h3"] dials HTTP/3 over QUIC
+// (decideHTTPVersion in Xray 26.2.6). Everything else is dialed: every other
+// protocol and transport an import stores runs over TCP, a legacy record
+// without an outbound is VLESS over TCP, and an outbound that cannot be read
+// gives no reason not to.
 func tcpChecked(s vpnconfig.Server) bool {
-	return s.Protocol() != "hysteria"
+	if s.Protocol() == "hysteria" {
+		return false
+	}
+	ob, err := vpnconfig.DecodeOutbound(s.Outbound)
+	if err != nil {
+		// A legacy record, which has no outbound, or one that cannot be read.
+		return true
+	}
+	ss, _ := ob["streamSettings"].(map[string]interface{})
+	switch ss["network"] {
+	case "kcp", "mkcp":
+		return false
+	case "xhttp", "splithttp":
+		tls, _ := ss["tlsSettings"].(map[string]interface{})
+		alpn, _ := tls["alpn"].([]interface{})
+		if ss["security"] == "tls" && len(alpn) == 1 && alpn[0] == "h3" {
+			return false
+		}
+	}
+	return true
 }
 
 // reachControls are dialed when a look finds the active server down. A WAN that
