@@ -45,10 +45,24 @@ func (imp Import) Details(n int) []string {
 			break
 		}
 		if s.Reason == ReasonUnsupported || s.Reason == ReasonInvalid {
-			lines = append(lines, s.Name+": "+s.Detail)
+			lines = append(lines, printable(s.Name+": "+s.Detail))
 		}
 	}
 	return lines
+}
+
+// printable drops control characters - C0, DEL and C1 - from a string, the
+// set JQ_PRINTABLE in import_server_list.sh drops. A skip's detail embeds
+// subscription text as written, and cleanName keeps the C1 controls with the
+// rest of U+0080-U+07FF, so either would otherwise take an escape sequence or
+// a line break of its own to Telegram and the Web UI.
+func printable(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7F || (r >= 0x80 && r <= 0x9F) {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 // Summary is the one sentence the Web UI shows after an import:

@@ -303,7 +303,11 @@ func TestTCPChecked(t *testing.T) {
 		{"hysteria", string(hysteria2Outbound), false},
 		{"vless tcp tls", `{"protocol":"vless","streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"oslo.example"}}}`, true},
 		{"vless kcp", `{"protocol":"vless","streamSettings":{"network":"kcp","security":"none"}}`, false},
+		{"vless over hysteria transport", `{"protocol":"vless","streamSettings":{"network":"hysteria","security":"tls"}}`, false},
+		{"vless KCP", `{"protocol":"vless","streamSettings":{"network":"KCP"}}`, false},
+		{"vless Hysteria", `{"protocol":"vless","streamSettings":{"network":"Hysteria"}}`, false},
 		{"vless xhttp tls h3", `{"protocol":"vless","streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3"]}}}`, false},
+		{"vless xhttp TLS h3", `{"protocol":"vless","streamSettings":{"network":"xhttp","security":"TLS","tlsSettings":{"alpn":["h3"]}}}`, false},
 		{"vless xhttp tls h3 and h2", `{"protocol":"vless","streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"alpn":["h3","h2"]}}}`, true},
 		// Xray reads no tlsSettings under REALITY, whose xhttp dials HTTP/2.
 		{"vless xhttp reality", `{"protocol":"vless","streamSettings":{"network":"xhttp","security":"reality",` +

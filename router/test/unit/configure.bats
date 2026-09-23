@@ -377,6 +377,24 @@ JSON
     assert_output --partial "4) No protocol [?]"
 }
 
+# A name and an outbound are subscription text: an escape sequence in either
+# must not reach the terminal. The wizard's own colours are escape sequences
+# too, so they are switched off: any ESC left in the output came from
+# servers.json.
+@test "step_select_xray_server: control characters from servers.json do not reach the terminal" {
+    load_wizard
+    RED='' GREEN='' YELLOW='' BLUE='' NC=''
+    cat > "$SERVERS_FILE" <<'JSON'
+[{"name":"Bad\u001b[31mName","address":"bad.example.com","port":443,"ips":["1.2.3.4"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"\u001b]0;owned\u0007tls"}}}]
+JSON
+
+    run step_select_xray_server <<< "1"
+
+    assert_success
+    refute_output --partial $'\x1b'
+    assert_output --partial "1) Bad[31mName [vless·ws·]0;ownedtls]"
+}
+
 # ============================================================================
 # The tunnel prompt lists what the platform has (Merlin here: rt_tables fixture)
 # ============================================================================

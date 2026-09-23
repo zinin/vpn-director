@@ -141,6 +141,18 @@ func TestImportNoServers(t *testing.T) {
 	}
 }
 
+// A detail embeds subscription text as written, and a name keeps the C1
+// controls: neither may take an escape sequence or a line break to Telegram.
+func TestImportDetailsDropControls(t *testing.T) {
+	imp := Import{Total: 1, Skipped: []Skip{
+		{Name: "A\u0085B", Reason: ReasonUnsupported, Detail: "transport \x1b[31mX\nfake"},
+	}}
+	want := []string{"AB: transport [31mXfake"}
+	if got := imp.Details(3); !reflect.DeepEqual(got, want) {
+		t.Errorf("Details(3) = %q, want %q", got, want)
+	}
+}
+
 func TestDecodeAndResolve(t *testing.T) {
 	// IP literals resolve without DNS; the IPv6 one does not resolve over IPv4.
 	body := strings.Join([]string{

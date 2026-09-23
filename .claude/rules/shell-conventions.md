@@ -426,5 +426,7 @@ fi
 cmd=("${bound[@]}" "${cmd[@]}")
 ```
 
-A killed process exits 124 under coreutils and 143 under BusyBox, so a message
-about one names the code rather than reading it.
+A killed process exits 124 under coreutils and 143 under BusyBox. Xray prints
+its version banner before it loads the config, so `xrayconf_validate` reads
+that exit code — not the output — to tell a timeout
+(`xray config test timed out after 15s`) from a rejection.

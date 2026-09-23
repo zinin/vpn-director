@@ -126,6 +126,12 @@ confirm() {
     esac
 }
 
+# jq that drops control characters - C0, DEL and C1 - from a string; the twin
+# of JQ_PRINTABLE in import_server_list.sh. A server's name, address and label
+# are subscription text, and would otherwise take an escape sequence to the
+# terminal.
+JQ_PRINTABLE='def printable: explode | map(select(. >= 32 and (. < 127 or . > 159))) | implode;'
+
 ###############################################################################
 # Get data directory and validate servers
 ###############################################################################
@@ -174,7 +180,7 @@ step_select_xray_server() {
     # outbound is a legacy VLESS one, generated as TLS when it names no
     # security.
     i=1
-    jq -r '
+    jq -r "$JQ_PRINTABLE"'
         def protocol_label:
           # An outbound is stored as the subscription wrote it, so nothing says
           # its streamSettings is an object: indexing one that is not ends jq,
@@ -196,7 +202,7 @@ step_select_xray_server() {
               else [$p] + (if $n == "" or $n == "tcp" or $n == "raw" then [] else [$n] end)
                         + (if $s == "" or $s == "none" then [] else [$s] end) | join("·") end
           ) catch "?";
-        .[] | "\(.name)|\(.address)|\((.ips // []) | join(", "))|\(protocol_label)"' "$SERVERS_FILE" | \
+        .[] | "\(.name | printable)|\(.address | printable)|\((.ips // []) | join(", "))|\(protocol_label | printable)"' "$SERVERS_FILE" | \
     while IFS='|' read -r name address ip label; do
         printf "  %2d) %s [%s]\n      %s -> %s\n\n" "$i" "$name" "$label" "$address" "$ip"
         i=$((i + 1))
@@ -219,7 +225,7 @@ step_select_xray_server() {
     SELECTED_SERVER_ADDRESS=$(jq -r ".[$idx].address" "$SERVERS_FILE")
     SELECTED_SERVER_PORT=$(jq -r ".[$idx].port" "$SERVERS_FILE")
     SELECTED_SERVER_JSON=$(jq -c ".[$idx]" "$SERVERS_FILE")
-    selected_name=$(jq -r ".[$idx].name" "$SERVERS_FILE")
+    selected_name=$(jq -r "$JQ_PRINTABLE .[$idx].name | printable" "$SERVERS_FILE")
 
     print_success "Selected: $selected_name ($SELECTED_SERVER_ADDRESS)"
 }

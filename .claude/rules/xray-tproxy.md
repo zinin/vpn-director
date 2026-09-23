@@ -27,7 +27,7 @@ process alone: a client meets a restarting Xray and waits. It is for a caller wh
 1. Selected LAN clients → mangle PREROUTING chain
 2. Exclude: servers, private IPs, specified countries
 3. Remaining traffic → TPROXY to Xray port
-4. Xray dokodemo-door inbound → VLESS outbound
+4. Xray dokodemo-door inbound → the selected server's outbound (proxy-out; any protocol the import stored)
 
 ## Outbound Generation
 
