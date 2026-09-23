@@ -1150,6 +1150,12 @@ func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) b
 // and drops the other - or an empty grpcSettings.authority, which a
 // cleartext gRPC stream otherwise takes from the address. With TLS, Xray
 // takes that Host, and gRPC's authority, from the server name.
+//
+// The download host of an xhttp extra (downloadSettings.address) keeps its
+// name: the record's IPs are the main address's, and Xray resolves that host
+// itself through the system resolver. So with the WAN resolver silent, a
+// server whose download host is another name is judged dead although its main
+// address resolved; looking that host up over the tunnel is a separate task.
 func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
 	ip := ""
 	for _, v := range s.IPs {
