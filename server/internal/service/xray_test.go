@@ -478,6 +478,53 @@ func TestServerOutbound_DownloadSettingsAsXrayReadsThem(t *testing.T) {
 	}
 }
 
+// splithttp's dialer panics on a scMaxEachPostBytes of 8192 or less the first
+// time it dials packet-up, which "xray run -test" never does. The range counts
+// from extra when there is one - Xray builds the stream from it, the outer
+// mode copied on - and an empty mode is packet-up unless the stream is REALITY.
+func TestServerOutbound_SmallPacketUpPosts(t *testing.T) {
+	for _, tc := range []struct {
+		name, streamSettings string
+		refused              bool
+	}{
+		{"8192", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":8192}}`, true},
+		{"a range from 1", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":"1-8192"}}`, true},
+		{"packet-up over tls", `{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","mode":"packet-up","scMaxEachPostBytes":100}}`, true},
+		{"above 8192", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000}}`, false},
+		// Xray's default replaces a range whose upper end is 0.
+		{"0", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":0}}`, false},
+		// Xray's own Build refuses it, and "xray run -test" with it.
+		{"8192.0", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":8192.0}}`, false},
+		{"stream-up", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","mode":"stream-up","scMaxEachPostBytes":100}}`, false},
+		// No mode under REALITY is stream-one.
+		{"reality", `{"network":"xhttp","security":"reality","realitySettings":{"serverName":"www.example.org",` +
+			`"publicKey":"hhoT6JDl8yIxCxQkytm-w8ToNy6DTsn3t9Njaaoy-dE","fingerprint":"chrome"},` +
+			`"xhttpSettings":{"path":"/x","scMaxEachPostBytes":100}}`, false},
+		{"extra's range", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000,` +
+			`"extra":{"scMaxEachPostBytes":100}}}`, true},
+		// Xray builds the stream from extra, and extra names no range.
+		{"extra replaces the outer range", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":100,` +
+			`"extra":{"xmux":{"maxConcurrency":"16-32"}}}}`, false},
+		{"splithttp", `{"network":"splithttp","security":"none","splithttpSettings":{"scMaxEachPostBytes":100}}`, true},
+		{"folded keys", `{"network":"XHTTP","security":"none","XhttpSettings":{"ScMaxEachPostBytes":100}}`, true},
+		{"not xhttp", `{"network":"ws","security":"none","wsSettings":{"scMaxEachPostBytes":1}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := serverOutbound(vpnconfig.Server{
+				Name: "Oslo", Address: "oslo.example", Port: 443,
+				Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},` +
+					`"streamSettings":` + tc.streamSettings + `}`),
+			})
+			switch {
+			case tc.refused && (err == nil || !strings.Contains(err.Error(), "scMaxEachPostBytes")):
+				t.Fatalf("err %v, want the stream refused over its scMaxEachPostBytes", err)
+			case !tc.refused && err != nil:
+				t.Fatalf("err %v, want the stream accepted", err)
+			}
+		})
+	}
+}
+
 // The test runs under the config lock: an xray that never answers is given
 // up on at the bound, and the error says it timed out rather than that Xray
 // rejected the config.

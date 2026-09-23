@@ -192,6 +192,56 @@ setup() {
     [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
 }
 
+# stored_stream <streamSettings>: a server whose stored vless outbound runs on
+# the given stream.
+stored_stream() {
+    printf '{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":%s}}' "$1"
+}
+
+# splithttp's dialer panics on a scMaxEachPostBytes of 8192 or less the first
+# time it dials packet-up - an empty mode is packet-up without REALITY - and
+# "xray run -test" never dials. smallPacketUpPosts in service/xray.go refuses
+# the same streams.
+@test "build_outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode -> error" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":8192}}')"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode'* ]]
+}
+
+@test "build_outbound: xhttp scMaxEachPostBytes above 8192 -> ok" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000}}')"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '.streamSettings.xhttpSettings')" = '{"path":"/x","scMaxEachPostBytes":1000000}' ]
+}
+
+@test "build_outbound: xhttp stream-up with a small scMaxEachPostBytes -> ok" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","mode":"stream-up","scMaxEachPostBytes":100}}')"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '.streamSettings.xhttpSettings')" = '{"path":"/x","mode":"stream-up","scMaxEachPostBytes":100}' ]
+}
+
+# Xray builds the stream from an xhttp extra, with the outer host, path and
+# mode copied onto it: the range counts from extra, and only from there.
+@test "build_outbound: xhttp scMaxEachPostBytes of 8192 or less in extra -> error" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000,"extra":{"scMaxEachPostBytes":100}}}')"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode'* ]]
+}
+
+@test "build_outbound: an xhttp extra without scMaxEachPostBytes sets the outer one aside -> ok" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":100,"extra":{"xmux":{"maxConcurrency":"16-32"}}}}')"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '.streamSettings.xhttpSettings')" = '{"path":"/x","scMaxEachPostBytes":100,"extra":{"xmux":{"maxConcurrency":"16-32"}}}' ]
+}
+
+# A record stored before the importers refused other spellings can hold them,
+# and Xray reads them whatever their case.
+@test "build_outbound: XhttpSettings with a small ScMaxEachPostBytes -> error" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"XHTTP","security":"none","XhttpSettings":{"ScMaxEachPostBytes":100}}')"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode'* ]]
+}
+
 @test "generate: a stored outbound replaces the template's outbounds" {
     server='{"address":"198.51.100.12","port":2030,"outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"198.51.100.12","port":2030,"method":"aes-256-gcm","password":"p"}]}}}'
     run xrayconf_generate "$PROJECT_ROOT/opt/etc/xray/config.json.template" <<< "$server"

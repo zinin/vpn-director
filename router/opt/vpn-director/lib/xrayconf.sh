@@ -19,23 +19,72 @@
 # "DownloadSettings" is the download stream to it and an "Address" its
 # address - and a record stored before the importers refused such spellings
 # can hold either. fold is the one in lib/subscription.sh, the long s and the
-# Kelvin sign included. An outbound that is there but is no object - a
-# string, a null - fails (rc=1), as serverOutbound rejects it through
-# DecodeOutbound: it is no legacy record.
+# Kelvin sign included.
+# It fails (rc=1) as well on an xhttp stream Xray would dial packet-up with a
+# scMaxEachPostBytes of 8192 or less, as smallPacketUpPosts in service/xray.go
+# does: splithttp's dialer panics on that range ("scMaxEachPostBytes should
+# be bigger than 8192" in 26.2.6) the first time it dials packet-up, after
+# "xray run -test" has passed the config. When xhttpSettings (or
+# splithttpSettings, which it takes precedence over) holds an extra, Xray
+# builds the stream from extra alone, with the outer host, path and mode
+# copied onto it: the range counts from extra, and the mode is the outer one.
+# An empty or "auto" mode is packet-up unless the stream is REALITY;
+# stream-up and stream-one never reach the panic, and a range whose upper end
+# is 0 gives way to Xray's default. The keys are read folded too; where one
+# key is spelled several ways, any spelling that would panic is enough.
+# An outbound that is there but is no object - a string, a null - fails
+# (rc=1), as serverOutbound rejects it through DecodeOutbound: it is no legacy
+# record.
 # A record from before outbounds were stored is built from its flat VLESS
 # fields, and fails (rc=1) on an unsupported network (non-tcp) or security
 # (not tls/reality) instead of emitting a silently-broken outbound.
 # Self-contained: pure jq; errors to stderr.
 xrayconf_build_outbound() {
     local server_json net sec
+    local jq_fold='def fold: explode | map(if . == 383 then 115 elif . == 8490 then 107 elif . >= 65 and . <= 90 then . + 32 else . end) | implode;'
     server_json="$(cat)"
     if printf '%s' "$server_json" | jq -e 'type == "object" and (.outbound | type) == "object"' >/dev/null 2>&1; then
-        if printf '%s' "$server_json" | jq -e '
-                def fold: explode | map(if . == 383 then 115 elif . == 8490 then 107 elif . >= 65 and . <= 90 then . + 32 else . end) | implode;
+        if printf '%s' "$server_json" | jq -e "$jq_fold"'
                 [.outbound | .. | objects | to_entries[] | select(.key | fold == "downloadsettings") | .value | objects
                  | select([to_entries[] | select(.key | fold == "address") | .value | strings | select(. != "")] | length == 0)]
                 | length > 0' >/dev/null 2>&1; then
             printf 'xrayconf: stored outbound: xhttp downloadSettings without an address\n' >&2
+            return 1
+        fi
+        # at($n): every value an object holds under a key Xray reads as $n;
+        # strs($n): those values as strings, "" for one that is not, [""] when
+        # there is none; atoi: strconv.Atoi, a sign and digits; xray_range:
+        # Xray's Int32Range, [from, to] ordered, nothing for a shape its Build
+        # refuses.
+        if printf '%s' "$server_json" | jq -e "$jq_fold"'
+                def at($n): objects | to_entries[] | select(.key | fold == $n) | .value;
+                def strs($n): [at($n) | if type == "string" then . else "" end] | if length == 0 then [""] else . end;
+                def atoi: explode | (if .[0] == 43 or .[0] == 45 then .[1:] else . end) as $d
+                          | if ($d | length) > 0 and ($d | all(. >= 48 and . <= 57))
+                            then (reduce ($d[] - 48) as $x (0; . * 10 + $x)) * (if .[0] == 45 then -1 else 1 end)
+                            else empty end;
+                def xray_range: if type == "number" then select(. == floor) | [., .]
+                                elif type == "string" then
+                                  . as $s
+                                  | if $s == "" then [0, 0]
+                                    elif ([$s | atoi] | length) == 1 then [($s | atoi), ($s | atoi)]
+                                    else ($s | split("-")) as $p
+                                         | (if ($s | startswith("-")) then ["-" + $p[1], ($p[2:] | join("-"))]
+                                            else [$p[0], ($p[1:] | join("-"))] end)
+                                         | [(.[0] | atoi), (.[1] | atoi)] | select(length == 2)
+                                    end
+                                else empty end
+                                | sort;
+                [.outbound | at("streamsettings") | objects as $ss
+                 | select($ss | strs("network") | any(ascii_downcase | . == "xhttp" or . == "splithttp"))
+                 | ($ss | strs("security") | all(ascii_downcase == "reality")) as $reality
+                 | ([$ss | at("xhttpsettings") | objects] | if length > 0 then . else [$ss | at("splithttpsettings") | objects] end)[] as $x
+                 | select($x | strs("mode") | any(. == "packet-up" or ((. == "" or . == "auto") and ($reality | not))))
+                 | ([$x | at("extra")] | if length > 0 then map(objects) else [$x] end)[]
+                 | at("scmaxeachpostbytes") | xray_range
+                 | select(.[1] != 0 and .[0] <= 8192)]
+                | length > 0' >/dev/null 2>&1; then
+            printf 'xrayconf: stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode\n' >&2
             return 1
         fi
         printf '%s' "$server_json" | jq '.outbound + {tag: "proxy-out"}'

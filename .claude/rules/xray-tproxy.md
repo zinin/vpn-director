@@ -42,15 +42,18 @@ An import stores each server's Xray outbound in `servers.json` (`outbound`): con
 link, or taken from an Xray JSON subscription — the decoders are `lib/subscription.sh`
 and `server/internal/subscription`, which answer to the same cases in `testdata/subscription/`. The
 generators insert it as stored, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
-httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2. They look for two shapes only, and refuse
-both: an `outbound` that is there but is no object (a string, a null — only a record without the key
-is a legacy one), and an xhttp `downloadSettings` anywhere in it that names no `address` — both names
-found under the same folding Xray applies (below), since a record stored before the importers refused
-a `DownloadSettings` or an `Address` can still hold one. Xray gives
-that download stream no destination and dereferences it on the first dial (`splithttp` in 26.2.6):
-a panic that takes Xray down, and every Xray client with it. `xray run -test` never dials, so it
-passes such a config; the selection fails with the reason instead, and the watch walk moves on to
-the next server.
+httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2. They look for three shapes only, and
+refuse all three: an `outbound` that is there but is no object (a string, a null — only a record
+without the key is a legacy one); an xhttp `downloadSettings` anywhere in it that names no `address`,
+a download stream Xray gives no destination and dereferences on the first dial (`splithttp` in
+26.2.6); and an xhttp `scMaxEachPostBytes` of 8192 or less — read from `extra` when there is one,
+since Xray builds from `extra` with the outer `host`, `path` and `mode` copied onto it — in a stream
+Xray would run in packet-up mode (mode `packet-up`, or empty/`auto` without REALITY), on which
+`splithttp`'s dialer panics (`scMaxEachPostBytes should be bigger than 8192`). Their names are found
+under the same folding Xray applies (below), since a record stored before the importers refused other
+spellings can still hold them. Either panic takes Xray down, and every Xray client with it, and only
+a dial reaches it: `xray run -test` never dials, so it passes such a config; the selection fails with
+the reason instead, and the watch walk moves on to the next server.
 
 Sanitizing keeps routing ours, and it reads the whole outbound, not its top only: an xhttp `extra`
 holds whatever the subscription wrote, and Xray reads a whole `downloadSettings` stream config out of

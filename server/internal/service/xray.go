@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -247,6 +248,9 @@ func serverOutbound(server vpnconfig.Server) (interface{}, error) {
 		if downloadWithoutAddress(ob) {
 			return nil, fmt.Errorf("stored outbound: xhttp downloadSettings without an address")
 		}
+		if smallPacketUpPosts(ob) {
+			return nil, fmt.Errorf("stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode")
+		}
 		ob["tag"] = "proxy-out"
 		return ob, nil
 	}
@@ -301,6 +305,149 @@ func hasAddress(download map[string]interface{}) bool {
 		}
 	}
 	return false
+}
+
+// smallPacketUpPosts reports whether ob holds an xhttp stream Xray would dial
+// packet-up with a scMaxEachPostBytes of 8192 or less. splithttp's dialer
+// panics on that range ("scMaxEachPostBytes should be bigger than 8192", Dial
+// in 26.2.6) the first time it dials packet-up - a panic that takes Xray down,
+// and every client with it - and "xray run -test" never dials, so such a
+// config passes the test and replaces config.json. When xhttpSettings (or
+// splithttpSettings, which it takes precedence over) holds an extra, Xray
+// builds the stream from extra alone, with the outer host, path and mode
+// copied onto it: the range counts from extra, and the mode is always the
+// outer one. An empty or "auto" mode is packet-up unless the stream is
+// REALITY; "stream-up" and "stream-one" never reach the panic, and a range
+// whose upper end is 0 gives way to Xray's default. The keys are read folded,
+// as downloadWithoutAddress reads its own; where one key is spelled several
+// ways, any spelling that would panic is enough, since a map cannot say which
+// one Xray reads last. xrayconf_build_outbound in lib/xrayconf.sh refuses the
+// same streams.
+func smallPacketUpPosts(ob map[string]interface{}) bool {
+	for _, stream := range objects(foldedValues(ob, "streamSettings")) {
+		xhttp, reality := false, true
+		for _, network := range foldedStrings(stream, "network") {
+			network = strings.ToLower(network)
+			xhttp = xhttp || network == "xhttp" || network == "splithttp"
+		}
+		for _, security := range foldedStrings(stream, "security") {
+			reality = reality && strings.ToLower(security) == "reality"
+		}
+		if !xhttp {
+			continue
+		}
+		settings := objects(foldedValues(stream, "xhttpSettings"))
+		if len(settings) == 0 {
+			settings = objects(foldedValues(stream, "splithttpSettings"))
+		}
+		for _, x := range settings {
+			packetUp := false
+			for _, mode := range foldedStrings(x, "mode") {
+				packetUp = packetUp || mode == "packet-up" || (mode == "" || mode == "auto") && !reality
+			}
+			if !packetUp {
+				continue
+			}
+			// An extra that is no object fails Xray's own Build.
+			holders := []map[string]interface{}{x}
+			if extras := foldedValues(x, "extra"); len(extras) > 0 {
+				holders = objects(extras)
+			}
+			for _, holder := range holders {
+				for _, value := range foldedValues(holder, "scMaxEachPostBytes") {
+					if from, to, ok := xrayRange(value); ok && to != 0 && from <= 8192 {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+// foldedValues returns every value m holds under a key Xray reads as name:
+// encoding/json matches a key to a field whatever its case.
+func foldedValues(m map[string]interface{}, name string) []interface{} {
+	var values []interface{}
+	for key, value := range m {
+		if strings.EqualFold(key, name) {
+			values = append(values, value)
+		}
+	}
+	return values
+}
+
+// foldedStrings returns foldedValues as strings, "" for a value that is not
+// one, and [""] when m holds none.
+func foldedStrings(m map[string]interface{}, name string) []string {
+	values := foldedValues(m, name)
+	if len(values) == 0 {
+		return []string{""}
+	}
+	strs := make([]string, len(values))
+	for i, value := range values {
+		strs[i], _ = value.(string)
+	}
+	return strs
+}
+
+// objects returns the values that are objects.
+func objects(values []interface{}) []map[string]interface{} {
+	var out []map[string]interface{}
+	for _, value := range values {
+		if object, ok := value.(map[string]interface{}); ok {
+			out = append(out, object)
+		}
+	}
+	return out
+}
+
+// xrayRange reads v as Xray reads an Int32Range: a whole-number literal, or a
+// string holding one integer, nothing (0), or two integers joined by "-", a
+// leading "-" belonging to the first - strconv.Atoi's integers, a sign and
+// digits. from <= to; ok is false for any other shape, which Xray's own Build
+// refuses, and "xray run -test" with it.
+func xrayRange(v interface{}) (from, to int64, ok bool) {
+	switch t := v.(type) {
+	case json.Number:
+		n, err := t.Int64()
+		if err != nil {
+			return 0, 0, false
+		}
+		from, to = n, n
+	case string:
+		if t == "" {
+			return 0, 0, true
+		}
+		if n, err := strconv.ParseInt(t, 10, 64); err == nil {
+			from, to = n, n
+			break
+		}
+		skip := 0
+		if strings.HasPrefix(t, "-") {
+			skip = 1
+		}
+		i := strings.Index(t[skip:], "-")
+		if i < 0 {
+			return 0, 0, false
+		}
+		i += skip
+		left, err := strconv.ParseInt(t[:i], 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		right, err := strconv.ParseInt(t[i+1:], 10, 64)
+		if err != nil {
+			return 0, 0, false
+		}
+		from, to = left, right
+	default:
+		return 0, 0, false
+	}
+	if from > to {
+		from, to = to, from
+	}
+	return from, to, true
 }
 
 // GenerateConfig parses the (valid-JSON) template and replaces outbounds
