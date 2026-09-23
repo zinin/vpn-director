@@ -100,18 +100,38 @@ step_get_subscription() {
         exit 1
     fi
 
-    local content
+    # The largest subscription taken, in bytes: 1 MiB, the cap of the bot's
+    # /import (handler/import.go) and the Web UI import
+    # (webapi/handler_servers.go). A larger one is refused, never cut short:
+    # cut, a base64 list decodes to a shorter one.
+    local -r max_bytes=1048576
+    local content rc=0
     case "$SUB_INPUT" in
         http://*|https://*)
             log "Downloading from URL..."
-            content=$(curl -fsSL --connect-timeout 10 --max-time 60 "$SUB_INPUT") || {
+            content=$(curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize "$max_bytes" "$SUB_INPUT") || rc=$?
+            if (( rc == 63 )); then
+                # curl's "maximum file size exceeded"
+                log -l ERROR "Subscription exceeds 1 MiB; nothing was imported"
+                exit 1
+            elif (( rc != 0 )); then
                 log -l ERROR "Failed to download the subscription"
                 exit 1
-            }
+            fi
+            # curl before 8.4.0 does not stop a transfer whose size it did not
+            # know in advance.
+            if (( $(printf '%s' "$content" | wc -c) > max_bytes )); then
+                log -l ERROR "Subscription exceeds 1 MiB; nothing was imported"
+                exit 1
+            fi
             ;;
         *)
             if [[ ! -f "$SUB_INPUT" ]]; then
                 log -l ERROR "File not found: $SUB_INPUT"
+                exit 1
+            fi
+            if (( $(wc -c < "$SUB_INPUT") > max_bytes )); then
+                log -l ERROR "Subscription exceeds 1 MiB; nothing was imported"
                 exit 1
             fi
             content=$(cat "$SUB_INPUT")

@@ -113,6 +113,16 @@ write_list_file() {
         > "$BATS_TEST_TMPDIR/servers.txt"
 }
 
+# write_oversized_list writes write_list_file's servers followed by a line that
+# is no link, 1048577 bytes in all: one byte past the 1 MiB cap, and a list
+# that would import but for its size.
+write_oversized_list() {
+    write_list_file
+    local size
+    size=$(wc -c < "$BATS_TEST_TMPDIR/servers.txt")
+    head -c $(( 1048577 - size )) /dev/zero | tr '\0' '#' >> "$BATS_TEST_TMPDIR/servers.txt"
+}
+
 # serve_list_file puts a curl first on PATH that answers any link with that
 # list, the way a subscription host would.
 serve_list_file() {
@@ -285,6 +295,61 @@ JSON
 
     assert_failure
     assert_output --partial "Cannot read the subscription: unrecognized subscription format"
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["Old"]'
+}
+
+# The bot's /import and the Web UI refuse a subscription over 1 MiB rather
+# than cut it short, and so does the router: the list it has stays.
+@test "import_server_list.sh refuses a subscription file over 1 MiB" {
+    load_import_into
+    write_imported_state
+    write_oversized_list
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt"
+
+    assert_failure 1
+    assert_output --partial "exceeds 1 MiB"
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["Old"]'
+}
+
+# curl --max-filesize stops a transfer it knows to be too large with exit 63:
+# the subscription's size, not a download that failed.
+@test "import_server_list.sh refuses a download curl stops at 1 MiB" {
+    load_import_into
+    write_imported_state
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/curl" <<MOCK
+#!/bin/sh
+printf '%s\n' "\$*" > "$BATS_TEST_TMPDIR/curl.args"
+exit 63
+MOCK
+    chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+
+    run_import "https://cdn.example/s/big"
+
+    assert_failure 1
+    assert_output --partial "exceeds 1 MiB"
+    run cat "$BATS_TEST_TMPDIR/curl.args"
+    assert_output --partial -- "--max-filesize 1048576"
+    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    assert_output '["Old"]'
+}
+
+# curl before 8.4.0 does not stop a transfer whose size it did not know in
+# advance, so what it downloaded is measured again.
+@test "import_server_list.sh refuses a download over 1 MiB that curl let through" {
+    load_import_into
+    write_imported_state
+    write_oversized_list
+    serve_list_file
+
+    run_import "https://cdn.example/s/big"
+
+    assert_failure 1
+    assert_output --partial "exceeds 1 MiB"
     run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
     assert_output '["Old"]'
 }
