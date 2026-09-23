@@ -54,7 +54,8 @@ func decodeXrayJSON(body string) (Result, error) {
 // 4.43e2, and the entry keeps its literal as written, so it would import and
 // then fail "xray run -test" whenever it was selected. jsonPort reads the
 // value only; the v2rayN vmess path, which builds its outbound from that
-// integer, keeps taking 443.0.
+// integer, keeps taking 443.0. The shell sees the number as jq prints it, so a
+// literal jq normalizes (4.43e2) is stored there with the normalized port.
 func xrayEntry(raw interface{}) (entry, error) {
 	cfg, ok := raw.(map[string]interface{})
 	if !ok {
