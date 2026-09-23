@@ -41,8 +41,14 @@ outbound goes into it as `outbounds[0]`, tagged `proxy-out`:
 An import stores each server's Xray outbound in `servers.json` (`outbound`): converted from a share
 link, or taken from an Xray JSON subscription — the decoders are `lib/subscription.sh`
 and `server/internal/subscription`, which answer to the same cases in `testdata/subscription/`. The
-generators insert it unread, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
-httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2.
+generators insert it as stored, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
+httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2. They look for two shapes only, and refuse
+both: an `outbound` that is there but is no object (a string, a null — only a record without the key
+is a legacy one), and an xhttp `downloadSettings` anywhere in it that names no `address`. Xray gives
+that download stream no destination and dereferences it on the first dial (`splithttp` in 26.2.6):
+a panic that takes Xray down, and every Xray client with it. `xray run -test` never dials, so it
+passes such a config; the selection fails with the reason instead, and the watch walk moves on to
+the next server.
 
 Sanitizing keeps routing ours, and it reads the whole outbound, not its top only: an xhttp `extra`
 holds whatever the subscription wrote, and Xray reads a whole `downloadSettings` stream config out of
@@ -82,7 +88,8 @@ bot, offline at the next restart. The temp file (`config.json.XXXXXX`) does not 
 keeps `xray -confdir` from loading it and is why `-format json` is needed. Without an `xray` binary
 (dev mode, a workstation) the test is skipped. The test runs under the config lock and is bounded at
 15 s, half of the 30 s every other writer waits for that lock: a hung `xray` lets them take their
-turn instead of using up the whole wait. The shell probes which `timeout` the router has — BusyBox
+turn instead of using up the whole wait, and the error says the test timed out rather than that Xray
+rejected the config. The shell probes which `timeout` the router has — BusyBox
 before 1.30 takes the seconds only after `-t` — and runs the test unbounded when it can drive
 neither form.
 
