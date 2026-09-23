@@ -1,0 +1,7 @@
+{
+  "total": 1,
+  "servers": [
+    {"address":"single.example.com","name":"Single config","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"single.example.com","port":443,"users":[{"encryption":"none","id":"88888888-8888-4888-8888-888888888888"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"cdn.example.com"},"wsSettings":{"headers":{"Host":"cdn.example.com"},"path":"/ws"}}},"port":443}
+  ],
+  "skipped": []
+}

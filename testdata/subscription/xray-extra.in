@@ -1,0 +1,232 @@
+[
+  {
+    "remarks": "JSON extra chained",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je1.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "tls",
+          "xhttpSettings": {
+            "path": "/js",
+            "extra": {
+              "downloadSettings": {
+                "network": "xhttp",
+                "sockopt": {
+                  "dialerProxy": "relay"
+                }
+              }
+            }
+          },
+          "tlsSettings": {
+            "serverName": "js.example.com"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON extra insecure",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je2.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "tls",
+          "xhttpSettings": {
+            "path": "/js",
+            "extra": {
+              "downloadSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                  "allowInsecure": true
+                }
+              }
+            }
+          },
+          "tlsSettings": {
+            "serverName": "js.example.com"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON extra pinned",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je3.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "tls",
+          "xhttpSettings": {
+            "path": "/js",
+            "extra": {
+              "downloadSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                  "allowInsecure": true,
+                  "pinnedPeerCertSha256": "39ddf94fc84218d902db652725fbf4bb318aaea30637e0124b004ce7031f11e6"
+                }
+              }
+            }
+          },
+          "tlsSettings": {
+            "serverName": "js.example.com"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON reality stray flag",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je4.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "www.example.org",
+            "fingerprint": "chrome",
+            "publicKey": "hhoT6JDl8yIxCxQkytm-w8ToNy6DTsn3t9Njaaoy-dE",
+            "shortId": "01"
+          },
+          "tlsSettings": {
+            "allowInsecure": true
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON tls flag false",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je5.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "js.example.com",
+            "allowInsecure": false
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON extra flag string",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "je6.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "tls",
+          "xhttpSettings": {
+            "path": "/js",
+            "extra": {
+              "downloadSettings": {
+                "network": "xhttp",
+                "security": "tls",
+                "tlsSettings": {
+                  "serverName": "js.example.com",
+                  "allowInsecure": "true"
+                }
+              }
+            }
+          },
+          "tlsSettings": {
+            "serverName": "js.example.com"
+          }
+        }
+      }
+    ]
+  }
+]

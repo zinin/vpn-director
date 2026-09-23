@@ -1,0 +1,104 @@
+[
+  {
+    "remarks": "JSON flat and vnext",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "address": "flat.example.com",
+          "port": 443,
+          "id": "12121212-1212-4212-8212-121212121212",
+          "encryption": "none",
+          "vnext": [
+            {
+              "address": "list.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none"
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON flat and servers",
+    "outbounds": [
+      {
+        "protocol": "trojan",
+        "settings": {
+          "address": "tflat.example.com",
+          "port": 443,
+          "password": "trojan-pass",
+          "servers": [
+            {
+              "address": "tlist.example.com",
+              "port": 443,
+              "password": "trojan-pass"
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "tlist.example.com"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON flat only",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "address": "flatonly.example.com",
+          "port": 8443,
+          "id": "12121212-1212-4212-8212-121212121212",
+          "encryption": "none"
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none"
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "JSON vnext null address",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "address": null,
+          "vnext": [
+            {
+              "address": "vnext.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none"
+        }
+      }
+    ]
+  }
+]

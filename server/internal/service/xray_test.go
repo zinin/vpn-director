@@ -3,14 +3,25 @@ package service
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
 const testTemplate = `{"inbounds":[],"outbounds":[],"routing":{}}`
+
+// newTestXrayService is NewXrayService without the xray test, so a test does
+// not depend on whether the machine running it has an xray.
+func newTestXrayService(templatePath, outputPath string) *XrayService {
+	s := NewXrayService(templatePath, outputPath)
+	s.validate = nil
+	return s
+}
 
 func generate(t *testing.T, server vpnconfig.Server) map[string]interface{} {
 	t.Helper()
@@ -20,7 +31,7 @@ func generate(t *testing.T, server vpnconfig.Server) map[string]interface{} {
 	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
 		t.Fatalf("GenerateConfig error: %v", err)
 	}
 	content, err := os.ReadFile(outputPath)
@@ -142,7 +153,7 @@ func TestGenerateConfig_InboundPortsFollowTheConfig(t *testing.T) {
 	templatePath, outputPath := writeTemplate(t)
 	server := vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Security: "tls", SNI: "s", Fingerprint: "chrome"}
 
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server, InboundPorts{TProxy: 23456, Socks: 23457}); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server, InboundPorts{TProxy: 23456, Socks: 23457}); err != nil {
 		t.Fatalf("GenerateConfig() error = %v", err)
 	}
 
@@ -156,7 +167,7 @@ func TestGenerateConfig_WithoutPortsKeepsTheTemplate(t *testing.T) {
 	templatePath, outputPath := writeTemplate(t)
 	server := vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Security: "tls", SNI: "s", Fingerprint: "chrome"}
 
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
 		t.Fatalf("GenerateConfig() error = %v", err)
 	}
 
@@ -208,7 +219,7 @@ func readInboundPorts(t *testing.T, path string) map[string]int {
 
 func TestGenerateConfig_MissingTemplate(t *testing.T) {
 	tmpDir := t.TempDir()
-	svc := NewXrayService(filepath.Join(tmpDir, "nonexistent"), filepath.Join(tmpDir, "out"))
+	svc := newTestXrayService(filepath.Join(tmpDir, "nonexistent"), filepath.Join(tmpDir, "out"))
 	if err := svc.GenerateConfig(vpnconfig.Server{}); err == nil {
 		t.Error("expected error for missing template")
 	}
@@ -220,7 +231,7 @@ func TestGenerateConfig_UnsupportedNetwork(t *testing.T) {
 	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 		t.Fatal(err)
 	}
-	svc := NewXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
+	svc := newTestXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
 	if err := svc.GenerateConfig(vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Network: "ws", Security: "reality"}); err == nil {
 		t.Error("expected error for unsupported network 'ws'")
 	}
@@ -232,7 +243,7 @@ func TestGenerateConfig_UnsupportedSecurity(t *testing.T) {
 	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 		t.Fatal(err)
 	}
-	svc := NewXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
+	svc := newTestXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
 	if err := svc.GenerateConfig(vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u", Security: "xtls"}); err == nil {
 		t.Error("expected error for unsupported security 'xtls'")
 	}
@@ -245,7 +256,7 @@ func TestGenerateConfig_RealityMissingRequiredFields(t *testing.T) {
 		if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
 			t.Fatal(err)
 		}
-		return NewXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
+		return newTestXrayService(templatePath, filepath.Join(tmpDir, "config.json"))
 	}
 	base := vpnconfig.Server{
 		Address: "1.2.3.4", Port: 443, UUID: "u", Security: "reality",
@@ -283,7 +294,7 @@ func TestGenerateConfig_KeepsTemplateLogSection(t *testing.T) {
 	}
 
 	server := vpnconfig.Server{Address: "1.2.3.4", Port: 443, UUID: "u1", Security: "tls"}
-	if err := NewXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
+	if err := newTestXrayService(templatePath, outputPath).GenerateConfig(server); err != nil {
 		t.Fatalf("GenerateConfig error: %v", err)
 	}
 
@@ -330,5 +341,218 @@ func TestDevTemplateLogSection(t *testing.T) {
 	}
 	if got := logSection["access"]; got != "none" {
 		t.Errorf("log.access = %v, want %q", got, "none")
+	}
+}
+
+// An import stores the outbound it read; the generator puts it in place as
+// proxy-out without looking into it, whatever the protocol.
+func TestGenerateConfig_StoredOutbound(t *testing.T) {
+	cfg := generate(t, vpnconfig.Server{
+		Name: "Hysteria", Address: "198.51.100.11", Port: 8449,
+		Outbound: json.RawMessage(`{"protocol":"hysteria","settings":{"version":2,"address":"198.51.100.11","port":8449},` +
+			`"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},` +
+			`"finalmask":{"quicParams":{"congestion":"bbr"}}}}`),
+	})
+	ob := outbound0(t, cfg)
+	if ob["tag"] != "proxy-out" || ob["protocol"] != "hysteria" {
+		t.Fatalf("outbound %v", ob)
+	}
+	ss := ob["streamSettings"].(map[string]interface{})
+	if _, ok := ss["finalmask"]; !ok {
+		t.Fatalf("streamSettings %v; a key the generator does not know must pass through", ss)
+	}
+}
+
+// writeFakeXray puts an xray on PATH that prints msg and exits with code.
+func writeFakeXray(t *testing.T, code int, msg string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' %q\nexit %d\n", msg, code)
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+}
+
+func testedService(t *testing.T) (*XrayService, string) {
+	t.Helper()
+	tmpDir := t.TempDir()
+	templatePath := filepath.Join(tmpDir, "config.json.template")
+	outputPath := filepath.Join(tmpDir, "config.json")
+	if err := os.WriteFile(templatePath, []byte(testTemplate), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return NewXrayService(templatePath, outputPath), outputPath
+}
+
+var storedVLESS = vpnconfig.Server{
+	Name: "Oslo", Address: "oslo.example", Port: 443,
+	Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]}}`),
+}
+
+func TestGenerateConfig_XrayAcceptsTheConfig(t *testing.T) {
+	writeFakeXray(t, 0, "Configuration OK.")
+	svc, outputPath := testedService(t)
+	if err := svc.GenerateConfig(storedVLESS); err != nil {
+		t.Fatal(err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) == "previous\n" {
+		t.Fatal("config.json was not replaced")
+	}
+}
+
+// A config Xray refuses would take every Xray client offline at the next
+// restart: it never replaces the running one, and Xray's own words say why.
+func TestGenerateConfig_XrayRejectsTheConfig(t *testing.T) {
+	writeFakeXray(t, 23, `Failed to start: infra/conf: "allowInsecure" has been removed`)
+	svc, outputPath := testedService(t)
+	err := svc.GenerateConfig(storedVLESS)
+	if err == nil || !strings.Contains(err.Error(), "xray rejected the config") || !strings.Contains(err.Error(), "allowInsecure") {
+		t.Fatalf("err %v", err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) != "previous\n" {
+		t.Fatalf("config.json %q; a rejected config must not replace it", content)
+	}
+	entries, _ := os.ReadDir(filepath.Dir(outputPath))
+	for _, e := range entries {
+		if name := e.Name(); name != "config.json" && name != "config.json.template" {
+			t.Fatalf("left behind: %s", name)
+		}
+	}
+}
+
+// storedXHTTP is a stored vless xhttp outbound whose extra carries the given
+// downloadSettings.
+func storedXHTTP(downloadSettings string) vpnconfig.Server {
+	return vpnconfig.Server{
+		Name: "Oslo", Address: "oslo.example", Port: 443,
+		Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},` +
+			`"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"downloadSettings":` + downloadSettings + `}}}}`),
+	}
+}
+
+// Xray gives downloadSettings a destination only from its address, and
+// splithttp's dialer panics on a nil one at the first connection - which
+// "xray run -test" never makes. Such an outbound never replaces the running
+// config; one that names its address generates as any other.
+func TestGenerateConfig_DownloadSettingsWithoutAnAddress(t *testing.T) {
+	writeFakeXray(t, 0, "Configuration OK.")
+	svc, outputPath := testedService(t)
+	err := svc.GenerateConfig(storedXHTTP(`{"network":"xhttp"}`))
+	if err == nil || !strings.Contains(err.Error(), "downloadSettings without an address") {
+		t.Fatalf("err %v", err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) != "previous\n" {
+		t.Fatalf("config.json %q; an outbound that crashes Xray must not replace it", content)
+	}
+
+	svc, outputPath = testedService(t)
+	if err := svc.GenerateConfig(storedXHTTP(`{"network":"xhttp","address":"dl.example.com","port":443}`)); err != nil {
+		t.Fatal(err)
+	}
+	if content, _ := os.ReadFile(outputPath); !strings.Contains(string(content), "dl.example.com") {
+		t.Fatalf("config.json %q; the outbound with its download address was not written", content)
+	}
+}
+
+// Xray loads its config with encoding/json, which matches a key to a field
+// whatever its case: a "DownloadSettings" is the download stream to it, and
+// an "Address" its address. A record stored before the importers refused such
+// spellings is read the same way.
+func TestServerOutbound_DownloadSettingsAsXrayReadsThem(t *testing.T) {
+	stored := func(extra string) vpnconfig.Server {
+		return vpnconfig.Server{
+			Name: "Oslo", Address: "oslo.example", Port: 443,
+			Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},` +
+				`"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":` + extra + `}}}`),
+		}
+	}
+	if _, err := serverOutbound(stored(`{"DownloadSettings":{}}`)); err == nil || !strings.Contains(err.Error(), "downloadSettings without an address") {
+		t.Fatalf("err %v, want the DownloadSettings without an address refused", err)
+	}
+	if _, err := serverOutbound(stored(`{"downloadSettings":{"Address":"dl.example.com"}}`)); err != nil {
+		t.Fatalf("err %v, want the downloadSettings with its Address accepted", err)
+	}
+}
+
+// splithttp's dialer panics on a scMaxEachPostBytes of 8192 or less the first
+// time it dials packet-up, which "xray run -test" never does. The range counts
+// from extra when there is one - Xray builds the stream from it, the outer
+// mode copied on - and an empty mode is packet-up unless the stream is REALITY.
+func TestServerOutbound_SmallPacketUpPosts(t *testing.T) {
+	for _, tc := range []struct {
+		name, streamSettings string
+		refused              bool
+	}{
+		{"8192", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":8192}}`, true},
+		{"a range from 1", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":"1-8192"}}`, true},
+		{"packet-up over tls", `{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","mode":"packet-up","scMaxEachPostBytes":100}}`, true},
+		{"above 8192", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000}}`, false},
+		// Xray's default replaces a range whose upper end is 0.
+		{"0", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":0}}`, false},
+		// Xray's own Build refuses it, and "xray run -test" with it.
+		{"8192.0", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":8192.0}}`, false},
+		{"stream-up", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","mode":"stream-up","scMaxEachPostBytes":100}}`, false},
+		// No mode under REALITY is stream-one.
+		{"reality", `{"network":"xhttp","security":"reality","realitySettings":{"serverName":"www.example.org",` +
+			`"publicKey":"hhoT6JDl8yIxCxQkytm-w8ToNy6DTsn3t9Njaaoy-dE","fingerprint":"chrome"},` +
+			`"xhttpSettings":{"path":"/x","scMaxEachPostBytes":100}}`, false},
+		{"extra's range", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000,` +
+			`"extra":{"scMaxEachPostBytes":100}}}`, true},
+		// Xray builds the stream from extra, and extra names no range.
+		{"extra replaces the outer range", `{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":100,` +
+			`"extra":{"xmux":{"maxConcurrency":"16-32"}}}}`, false},
+		{"splithttp", `{"network":"splithttp","security":"none","splithttpSettings":{"scMaxEachPostBytes":100}}`, true},
+		{"folded keys", `{"network":"XHTTP","security":"none","XhttpSettings":{"ScMaxEachPostBytes":100}}`, true},
+		{"not xhttp", `{"network":"ws","security":"none","wsSettings":{"scMaxEachPostBytes":1}}`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := serverOutbound(vpnconfig.Server{
+				Name: "Oslo", Address: "oslo.example", Port: 443,
+				Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},` +
+					`"streamSettings":` + tc.streamSettings + `}`),
+			})
+			switch {
+			case tc.refused && (err == nil || !strings.Contains(err.Error(), "scMaxEachPostBytes")):
+				t.Fatalf("err %v, want the stream refused over its scMaxEachPostBytes", err)
+			case !tc.refused && err != nil:
+				t.Fatalf("err %v, want the stream accepted", err)
+			}
+		})
+	}
+}
+
+// The test runs under the config lock: an xray that never answers is given
+// up on at the bound, and the error says it timed out rather than that Xray
+// rejected the config.
+func TestXrayTest_TimesOut(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte("#!/bin/sh\nexec sleep 10\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	prev := xrayTestTimeout
+	xrayTestTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { xrayTestTimeout = prev })
+	path := filepath.Join(t.TempDir(), "config.json.test")
+	if err := os.WriteFile(path, []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := xrayTest(path); err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err %v, want a timeout", err)
+	}
+}
+
+func TestGenerateConfig_WithoutXrayNothingIsTested(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	svc, outputPath := testedService(t)
+	if err := svc.GenerateConfig(storedVLESS); err != nil {
+		t.Fatal(err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) == "previous\n" {
+		t.Fatal("config.json was not replaced")
 	}
 }

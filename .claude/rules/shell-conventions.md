@@ -400,3 +400,54 @@ log() {
 
 **Solution**: `download_file` prefers wget, then falls back to curl when wget
 is missing or fails. Keenetic installs `curl` as a required package.
+
+### BusyBox before 1.30 spells `timeout` as `-t SECS`
+
+**Problem**: `timeout 15 cmd …` is the coreutils form, which BusyBox learned
+only in 1.30. Asuswrt-Merlin ships BusyBox 1.25, whose applet is
+`timeout [-t SECS] [-s SIG] PROG ARGS`: it takes the first free argument as the
+program, so `timeout 15 xray run -test …` tries to execute `15` and exits 127.
+Nothing installs Entware's `coreutils-timeout`, so a router may have only the
+applet. In `xrayconf_validate` that turned every config into "xray rejected the
+config", and `configure.sh` exits 1 rather than write one.
+
+**Solution**: probe the form — both spell the command `timeout`, so only a run
+tells them apart — and leave the command unbounded when neither answers:
+
+```bash
+local -a bound=()
+if type -P timeout >/dev/null 2>&1; then
+    if timeout 1 true >/dev/null 2>&1; then
+        bound=(timeout 15)
+    elif timeout -t 1 true >/dev/null 2>&1; then
+        bound=(timeout -t 15)
+    fi
+fi
+cmd=("${bound[@]}" "${cmd[@]}")
+```
+
+A killed process exits 124 under coreutils and 143 under BusyBox. Xray prints
+its version banner before it loads the config, so `xrayconf_validate` reads
+that exit code — not the output — to tell a timeout
+(`xray config test timed out after 15s`) from a rejection.
+
+### jq reads number literals that are not JSON
+
+**Problem**: jq 1.8.1 takes number literals Go's `encoding/json` refuses:
+
+```bash
+printf '[nan, NaN, Infinity, .5, 1., +1, 0443]' | jq -c .
+# [null,null,1.7976931348623157e+308,0.5,1,1,443]
+```
+
+An Xray JSON body, an xhttp `extra` or a v2rayN vmess object holding one
+imports through `lib/subscription.sh` and is `invalid JSON subscription` (or an
+`invalid` entry) in the Go decoder — the bot, the Web UI and the watch. Only
+`nan` and `Infinity` can still be told apart after parsing (`isnan`,
+`isinfinite`); the rest are ordinary numbers by then, so parity would take a
+pass over the raw text before jq.
+
+**Rule**: the subscription decoders keep this divergence (see the comment
+above `_sub_xray_json`): no panel writes such a literal, and the value reaches
+Xray as a number or a null. Any other jq that reads untrusted JSON on the
+router inherits the same leniency.

@@ -126,6 +126,12 @@ confirm() {
     esac
 }
 
+# jq that drops control characters - C0, DEL and C1 - from a string; the twin
+# of JQ_PRINTABLE in import_server_list.sh. A server's name, address and label
+# are subscription text, and would otherwise take an escape sequence to the
+# terminal.
+JQ_PRINTABLE='def printable: explode | map(select(. >= 32 and (. < 127 or . > 159))) | implode;'
+
 ###############################################################################
 # Get data directory and validate servers
 ###############################################################################
@@ -169,11 +175,36 @@ step_select_xray_server() {
 
     printf "Available servers:\n\n"
 
-    # Read servers from JSON and display
+    # Read servers from JSON and display. The label names the protocol, as the
+    # Web UI and the bot do (vpnconfig.Server.Label): a record without an
+    # outbound is a legacy VLESS one, generated as TLS when it names no
+    # security.
     i=1
-    jq -r '.[] | "\(.name)|\(.address)|\((.ips // []) | join(", "))"' "$SERVERS_FILE" | \
-    while IFS='|' read -r name address ip; do
-        printf "  %2d) %s\n      %s -> %s\n\n" "$i" "$name" "$address" "$ip"
+    jq -r "$JQ_PRINTABLE"'
+        def protocol_label:
+          # An outbound is stored as the subscription wrote it, so nothing says
+          # its streamSettings is an object: indexing one that is not ends jq,
+          # and with it the whole list. Server.Label in vpnconfig/outbound.go
+          # answers "?" to an outbound it cannot read; so does this. Only a
+          # record with no outbound key at all is the legacy one - jq reads a
+          # null the way it reads a missing key, and a null outbound is no
+          # outbound: the generators reject it, so it is a "?" too. So is an
+          # outbound that names no protocol, as it is for Server.Label: there
+          # is nothing to label, and "·ws·tls" is no label.
+          try (
+            (if (has("outbound") | not)
+             then ["vless", .network, (if (.security // "") == "" then "tls" else .security end)]
+             elif (.outbound | type) != "object" then error("not an outbound")
+             else [.outbound.protocol, .outbound.streamSettings.network, .outbound.streamSettings.security] end)
+            | map(if . == null then "" elif type == "string" then . else error("not a string") end) as [$p, $n, $s]
+            | if $p == "" then "?"
+              elif $p == "shadowsocks" then "ss" elif $p == "hysteria" then "hysteria2"
+              else [$p] + (if $n == "" or $n == "tcp" or $n == "raw" then [] else [$n] end)
+                        + (if $s == "" or $s == "none" then [] else [$s] end) | join("·") end
+          ) catch "?";
+        .[] | "\(.name | printable)|\(.address | printable)|\((.ips // []) | join(", "))|\(protocol_label | printable)"' "$SERVERS_FILE" | \
+    while IFS='|' read -r name address ip label; do
+        printf "  %2d) %s [%s]\n      %s -> %s\n\n" "$i" "$name" "$label" "$address" "$ip"
         i=$((i + 1))
     done
 
@@ -194,7 +225,7 @@ step_select_xray_server() {
     SELECTED_SERVER_ADDRESS=$(jq -r ".[$idx].address" "$SERVERS_FILE")
     SELECTED_SERVER_PORT=$(jq -r ".[$idx].port" "$SERVERS_FILE")
     SELECTED_SERVER_JSON=$(jq -c ".[$idx]" "$SERVERS_FILE")
-    selected_name=$(jq -r ".[$idx].name" "$SERVERS_FILE")
+    selected_name=$(jq -r "$JQ_PRINTABLE .[$idx].name | printable" "$SERVERS_FILE")
 
     print_success "Selected: $selected_name ($SELECTED_SERVER_ADDRESS)"
 }
@@ -376,7 +407,7 @@ step_configure_clients() {
         fi
 
         printf "\nWhere to route traffic for %s?\n" "$client_ip"
-        printf "  1) Xray (VLESS proxy)\n"
+        printf "  1) Xray (proxy)\n"
         printf "  2) Tunnel Director (VPN tunnel)\n"
         printf "Choice [1-2]: "
         read -r route_choice
@@ -551,19 +582,20 @@ step_generate_configs() {
     # Generate to a temp file first, then replace atomically. A '>' redirect would
     # truncate the live config.json before xrayconf_generate runs, so a generator
     # failure (bad params, jq/template error) would leave the router with an empty
-    # config. Write-then-mv keeps the existing config intact on any failure.
+    # config. Write-then-mv keeps the existing config intact on any failure, and
+    # one Xray rejects never replaces it (xrayconf_validate).
     _xray_cfg_tmp=$(mktemp "$XRAY_CONFIG_DIR/config.json.XXXXXX")
     if printf '%s' "$SELECTED_SERVER_JSON" \
         | xrayconf_generate "$XRAY_CONFIG_DIR/config.json.template" \
             "$_tproxy_port" "$_socks_port" \
-        > "$_xray_cfg_tmp"; then
+        > "$_xray_cfg_tmp" && xrayconf_validate "$_xray_cfg_tmp"; then
         mv -f "$_xray_cfg_tmp" "$XRAY_CONFIG_DIR/config.json"
         print_success "Generated $XRAY_CONFIG_DIR/config.json"
     else
         rm -f "$_xray_cfg_tmp"
         flock -u 9
         exec 9>&-
-        print_error "Failed to generate Xray config (invalid server params?); kept existing config.json"
+        print_error "Failed to generate an Xray config for this server, or Xray rejected it; kept existing config.json"
         exit 1
     fi
 

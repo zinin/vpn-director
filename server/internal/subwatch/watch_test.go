@@ -406,6 +406,133 @@ func TestServerForDial_LeavesARealitySNIEmpty(t *testing.T) {
 	}
 }
 
+// A stored outbound gets the IP in its own address slot, whatever the
+// protocol keeps it in; the record and the outbound agree on the address.
+func TestServerForDial_WritesTheIPIntoTheOutbound(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		outbound string
+		path     []string
+	}{
+		{"vless vnext", `{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u"}]}]}}`, []string{"settings", "vnext", "0", "address"}},
+		{"vless flat", `{"protocol":"vless","settings":{"address":"oslo.example","port":443,"id":"u"}}`, []string{"settings", "address"}},
+		{"trojan", `{"protocol":"trojan","settings":{"servers":[{"address":"oslo.example","port":443,"password":"p"}]}}`, []string{"settings", "servers", "0", "address"}},
+		{"shadowsocks", `{"protocol":"shadowsocks","settings":{"servers":[{"address":"oslo.example","port":8388,"method":"aes-256-gcm","password":"p"}]}}`, []string{"settings", "servers", "0", "address"}},
+		{"hysteria", `{"protocol":"hysteria","settings":{"version":2,"address":"oslo.example","port":443}}`, []string{"settings", "address"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"", "203.0.113.50"}, Outbound: json.RawMessage(tc.outbound)})
+			if s.Address != "203.0.113.50" {
+				t.Fatalf("address %q", s.Address)
+			}
+			var ob interface{}
+			if err := json.Unmarshal(s.Outbound, &ob); err != nil {
+				t.Fatal(err)
+			}
+			v := ob
+			for _, key := range tc.path {
+				switch node := v.(type) {
+				case map[string]interface{}:
+					v = node[key]
+				case []interface{}:
+					v = node[0]
+				}
+			}
+			if v != "203.0.113.50" {
+				t.Fatalf("outbound %s", s.Outbound)
+			}
+		})
+	}
+}
+
+// Dialing an IP must not change the name the server is reached by: an empty
+// TLS server name gets the hostname, and so does the Host of a transport
+// without security; with TLS Xray takes that Host from the server name, and
+// an explicit value stays.
+func TestServerForDial_KeepsTheHostnameWhereTheSourceLeftItToTheAddress(t *testing.T) {
+	dial := func(address, outbound string) map[string]interface{} {
+		t.Helper()
+		s := ServerForDial(vpnconfig.Server{Address: address, IPs: []string{"203.0.113.50"}, Outbound: json.RawMessage(outbound)})
+		var ob map[string]interface{}
+		if err := json.Unmarshal(s.Outbound, &ob); err != nil {
+			t.Fatal(err)
+		}
+		return ob["streamSettings"].(map[string]interface{})
+	}
+	ss := dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"ws","security":"tls","wsSettings":{"path":"/ws"}}}`)
+	if tls := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "cdn.example" {
+		t.Fatalf("tls %v", tls)
+	}
+	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
+		t.Fatalf("ws %v; with TLS the Host follows the server name", ws)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"httpupgrade","security":"none"}}`)
+	if hu := ss["httpupgradeSettings"].(map[string]interface{}); hu["host"] != "cdn.example" {
+		t.Fatalf("httpupgrade %v", hu)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"ws","wsSettings":{"headers":{"Host":"front.example"}}}}`)
+	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
+		t.Fatalf("ws %v; a Host header the source set stays the Host", ws)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"ws","wsSettings":{"headers":{"host":"front.example"}}}}`)
+	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
+		t.Fatalf("ws %v; Xray takes a host header in any case, so it stays the Host", ws)
+	}
+	ss = dial("cdn.example", `{"protocol":"trojan","settings":{"servers":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"sni.example"}}}`)
+	if tls := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "sni.example" {
+		t.Fatalf("tls %v; an explicit server name stays", tls)
+	}
+	ss = dial("198.51.100.7", `{"protocol":"trojan","settings":{"servers":[{"address":"198.51.100.7","port":443}]},"streamSettings":{"network":"tcp","security":"tls"}}`)
+	if _, ok := ss["tlsSettings"]; ok {
+		t.Fatalf("stream %v; an IP source has no hostname to keep", ss)
+	}
+	ss = dial("oslo.example", `{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443}]},"streamSettings":{"network":"xhttp","security":"reality","realitySettings":{"serverName":"www.example.org"}}}`)
+	if _, ok := ss["xhttpSettings"]; ok {
+		t.Fatalf("stream %v; REALITY gives xhttp its Host", ss)
+	}
+	// Xray reads xhttpSettings over splithttpSettings and drops the other, so
+	// the Host goes into the one the record has.
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"splithttp","splithttpSettings":{"path":"/secret","mode":"packet-up"}}}`)
+	if splithttp, _ := ss["splithttpSettings"].(map[string]interface{}); splithttp["host"] != "cdn.example" || splithttp["path"] != "/secret" {
+		t.Fatalf("splithttp %v", splithttp)
+	}
+	if _, ok := ss["xhttpSettings"]; ok {
+		t.Fatalf("stream %v; a new xhttpSettings would replace the splithttpSettings", ss)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/a"},"splithttpSettings":{"path":"/b"}}}`)
+	if xhttp, _ := ss["xhttpSettings"].(map[string]interface{}); xhttp["host"] != "cdn.example" {
+		t.Fatalf("xhttp %v", xhttp)
+	}
+	if splithttp, _ := ss["splithttpSettings"].(map[string]interface{}); splithttp["host"] != nil {
+		t.Fatalf("splithttp %v; Xray reads the xhttpSettings", splithttp)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"xhttp","security":"none"}}`)
+	if xhttp, _ := ss["xhttpSettings"].(map[string]interface{}); xhttp["host"] != "cdn.example" {
+		t.Fatalf("stream %v", ss)
+	}
+	// A cleartext gRPC stream takes its :authority from the address when
+	// grpcSettings names none; with TLS, Xray takes the server name.
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc"}}}`)
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "cdn.example" || grpc["serviceName"] != "svc" {
+		t.Fatalf("grpc %v", grpc)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","authority":"front.example"}}}`)
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "front.example" {
+		t.Fatalf("grpc %v; an explicit authority stays", grpc)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"grpc","security":"tls","grpcSettings":{"serviceName":"svc"}}}`)
+	if tls, _ := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "cdn.example" {
+		t.Fatalf("tls %v", tls)
+	}
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != nil {
+		t.Fatalf("grpc %v; with TLS the authority follows the server name", grpc)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none"}}`)
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "cdn.example" {
+		t.Fatalf("stream %v", ss)
+	}
+}
+
 // An endpoint ban takes an address, not the name: a provider's host can resolve
 // to one the router cannot reach and another it can. The walk dialed only the
 // first, and a server whose first address was banned was rejected whole.

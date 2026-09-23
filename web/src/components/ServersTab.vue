@@ -11,6 +11,8 @@ const importLoading = ref(false)
 const selectLoading = ref(-1)
 const importUrl = ref('')
 const error = ref('')
+// What the last import brought in and what it left out.
+const importSummary = ref('')
 
 async function loadServers() {
   loading.value = true
@@ -67,8 +69,10 @@ async function importServers(url: string) {
     return
   }
   importLoading.value = true
+  importSummary.value = ''
   try {
-    await api.importServers(url)
+    const resp = await api.importServers(url)
+    importSummary.value = resp.data.summary ?? ''
     await loadServers()
   } catch (e: any) {
     alert('Error: ' + (e.response?.data?.error || e.message))
@@ -102,6 +106,7 @@ onMounted(loadServers)
     </div>
 
     <p v-if="error" class="error-msg">{{ error }}</p>
+    <p v-if="importSummary" style="font-size: 0.875rem;">{{ importSummary }}</p>
 
     <table v-if="servers.length > 0">
       <thead>
@@ -110,6 +115,7 @@ onMounted(loadServers)
           <th>Name</th>
           <th>Address</th>
           <th>Port</th>
+          <th>Protocol</th>
           <th>Action</th>
         </tr>
       </thead>
@@ -122,6 +128,7 @@ onMounted(loadServers)
           </td>
           <td>{{ server.address }}</td>
           <td>{{ server.port }}</td>
+          <td>{{ server.protocol }}</td>
           <td>
             <button
               class="btn btn-green"

@@ -48,6 +48,7 @@ router/test/
 │   ├── pgrep                # Mock process lookup
 │   ├── insmod               # Mock insmod (Keenetic modules)
 │   ├── cru                  # Mock cru (Merlin cron)
+│   ├── xray                 # Mock "xray run -test" (XRAY_MOCK_EXIT, XRAY_MOCK_OUTPUT, XRAY_MOCK_LOG)
 │   └── keenetic/
 │       └── curl             # RCI fixtures, per-test PATH
 ├── unit/                    # Unit tests for lib/ modules
@@ -59,7 +60,9 @@ router/test/
 │   ├── platform_keenetic.bats
 │   ├── hooks.bats           # NDM hooks
 │   ├── install.bats
-│   └── configure.bats
+│   ├── configure.bats
+│   ├── subscription.bats    # lib/subscription.sh on the shared cases in testdata/subscription
+│   └── xrayconf.bats        # lib/xrayconf.sh
 ├── integration/             # Integration tests
 │   ├── vpn_director.bats    # Tests for vpn-director.sh CLI
 │   └── ipset_sources.bats   # Tests for IPSet download sources
@@ -170,3 +173,15 @@ failure — it just cannot say which one.
 `load_common` now saves the trap before sourcing and restores it afterwards,
 and `teardown()` calls `_cleanup_tmp` in its place. If you add a helper that
 sources a module some other way, keep the trap.
+
+## Shared subscription cases
+
+`testdata/subscription/` at the repository root holds `<case>.in` (a body as served) and
+`<case>.want.json` (the error, or `total`, the servers and the skips by name and reason).
+`router/test/unit/subscription.bats` runs every case through `lib/subscription.sh`, and
+`server/internal/subscription/fixtures_test.go` through the Go decoder: a new case is two files,
+and both decoders must pass it. The cases are synthetic — documentation addresses
+(192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24, 2001:db8::/32), `example.com` hosts, made-up keys in
+the formats Xray checks — because the repository is public and a provider's real hosts would be a
+ready blocklist. Entware's jq has no regex builtins; `subscription.bats` fails when
+`lib/subscription.sh` uses one.

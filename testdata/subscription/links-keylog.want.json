@@ -1,0 +1,7 @@
+{
+  "total": 1,
+  "servers": [
+    {"address":"xk1.example.com","name":"XHTTP extra keylog","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"xk1.example.com","port":443,"users":[{"encryption":"none","id":"99999999-9999-4999-8999-999999999999"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"xk1.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"address":"dl.example.com","network":"xhttp","port":443,"security":"tls","tlsSettings":{"serverName":"dl.example.com"}}},"path":"/x"}}},"port":443}
+  ],
+  "skipped": []
+}

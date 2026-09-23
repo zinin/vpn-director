@@ -14,8 +14,8 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
+	"github.com/zinin/vpn-director/server/internal/subscription"
 	"github.com/zinin/vpn-director/server/internal/telegram"
-	"github.com/zinin/vpn-director/server/internal/vless"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -35,7 +35,7 @@ func NewImportHandler(deps *Deps) *ImportHandler {
 	}
 }
 
-// HandleImport handles /import command - downloads and imports VLESS subscription
+// HandleImport handles /import command - downloads and imports a subscription
 func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	args := msg.CommandArguments()
 	fetchURL := args
@@ -96,18 +96,19 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Decode VLESS subscription and resolve IPs for each server
-	result := vless.DecodeAndResolve(string(body))
+	// Decode the subscription and resolve IPs for each server
+	result, err := subscription.DecodeAndResolve(string(body))
+	if err != nil {
+		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("Error: "+err.Error()))
+		return
+	}
 	if result.Parsed == 0 {
-		var sb strings.Builder
-		sb.WriteString("No VLESS servers found")
-		if len(result.ParseErrors) > 0 {
-			sb.WriteString("\nErrors:\n")
-			for _, e := range result.ParseErrors {
-				sb.WriteString(fmt.Sprintf("- %s\n", e))
-			}
+		lines := []string{"No supported servers in subscription"}
+		if counts := result.Counts(); counts != "" {
+			lines = append(lines, counts)
 		}
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(sb.String()))
+		lines = append(lines, result.Details(3)...)
+		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(strings.Join(lines, "\n")))
 		return
 	}
 
@@ -146,10 +147,12 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Build response with grouped stats
+	// Build response with grouped stats: what was left out, and why, under the
+	// country list.
 	var sb strings.Builder
-	if result.ResolveErrors > 0 || len(result.ParseErrors) > 0 {
-		sb.WriteString(fmt.Sprintf("Imported %d of %d servers:\n", len(result.Servers), result.Parsed))
+	counts := result.Counts()
+	if counts != "" {
+		sb.WriteString(fmt.Sprintf("Imported %d of %d servers:\n", len(result.Servers), result.Total))
 	} else {
 		sb.WriteString(fmt.Sprintf("Imported %d servers:\n", len(result.Servers)))
 	}
@@ -157,17 +160,10 @@ func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
 	groupedStr := groupServersByCountry(result.Servers)
 	sb.WriteString(telegram.EscapeMarkdownV2(groupedStr))
 
-	if result.ResolveErrors > 0 || len(result.ParseErrors) > 0 {
+	if counts != "" {
+		lines := append([]string{counts}, result.Details(3)...)
 		sb.WriteString("\n\n")
-		if result.ResolveErrors > 0 {
-			sb.WriteString(fmt.Sprintf("%d DNS errors", result.ResolveErrors))
-		}
-		if len(result.ParseErrors) > 0 {
-			if result.ResolveErrors > 0 {
-				sb.WriteString(", ")
-			}
-			sb.WriteString(fmt.Sprintf("%d parse errors", len(result.ParseErrors)))
-		}
+		sb.WriteString(telegram.EscapeMarkdownV2(strings.Join(lines, "\n")))
 	}
 
 	h.deps.Sender.Send(msg.Chat.ID, sb.String())

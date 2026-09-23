@@ -32,10 +32,11 @@ const (
 )
 
 // maybeReturn takes Xray back to the server the user chose once a walk has left
-// another one running and the chosen one accepts TCP again. It runs after a
-// probe that passed, with no failover and no restore apply outstanding, and
-// looks every ReturnCheck - after a failed return, ReturnRetry and longer.
-// After ReturnFailsMax failed attempts in a row the returns stop.
+// another one running and the chosen one accepts TCP again - or, for a server
+// no TCP dial can see, once its turn comes round. It runs after a probe that
+// passed, with no failover and no restore apply outstanding, and looks every
+// ReturnCheck - after a failed return, ReturnRetry and longer. After
+// ReturnFailsMax failed attempts in a row the returns stop.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
 		// A return clears preferred_server too; its backoff ends once it has held.
@@ -73,14 +74,20 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if i < 0 {
 		return
 	}
-	candidates := w.reachable(ctx, dialable(perAddress(servers[i:i+1])))
+	// A server no TCP dial can see is returned to without one: the attempt
+	// itself is then the only check there is, and a failed one backs the next
+	// off as any other does.
+	candidates := dialable(perAddress(servers[i : i+1]))
+	if tcpChecked(servers[i]) {
+		candidates = w.reachable(ctx, candidates)
+	}
 	if len(candidates) == 0 || ctx.Err() != nil || w.stopped() {
 		return
 	}
 	w.tryReturn(ctx, cfg, servers, candidates)
 }
 
-// tryReturn switches Xray to each reachable copy of the preferred server in
+// tryReturn switches Xray to each candidate copy of the preferred server in
 // turn and keeps the first the probe finds live. With none it switches back to
 // the server that ran before - the address the walk picked first, when this
 // process remembers it - and holds the next attempt back. That way back is

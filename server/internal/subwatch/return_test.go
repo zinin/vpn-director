@@ -743,3 +743,44 @@ func TestTick_WalkRemembersTheAddressItPicked(t *testing.T) {
 		t.Fatalf("lastPicked %+v, want Oslo at 203.0.113.10", w.lastPicked)
 	}
 }
+
+// A Hysteria2 preferred server answers no TCP dial, so the cheap check cannot
+// see it come back. The return is made on the schedule instead.
+func TestTick_ReturnsToAQUICPreferredServerNoDialCanSee(t *testing.T) {
+	servers := returnServers()
+	servers[0].Outbound = hysteria2Outbound
+	r := newReturnRig(servers)
+	r.live[osloIP] = true // the probe passes; nothing accepts TCP
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	if want := []string{"Xray back on the preferred server Oslo"}; !reflect.DeepEqual(r.f.notes, want) {
+		t.Fatalf("notes %v, want %v", r.f.notes, want)
+	}
+}
+
+// A return made without a check costs a switch like any other, so one that
+// fails backs the next one off just the same.
+func TestTick_AReturnNoDialCanSeeBacksOffWhenItFails(t *testing.T) {
+	servers := returnServers()
+	servers[0].Outbound = hysteria2Outbound
+	r := newReturnRig(servers)
+	r.live[madridIP] = true // Oslo refuses the proxy; Madrid comes back
+	start := r.f.now
+	r.tick()
+	want := []string{"Oslo@" + osloIP, "restart", "Madrid@" + madridIP, "restart"}
+	if !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v", r.events, want)
+	}
+	r.f.now = start.Add(ReturnCheck)
+	r.tick()
+	if n := r.attempts(); n != 1 {
+		t.Fatalf("attempts %d at %v, want the failed return to wait ReturnRetry", n, ReturnCheck)
+	}
+	r.f.now = start.Add(ReturnRetry)
+	r.tick()
+	if n := r.attempts(); n != 2 {
+		t.Fatalf("attempts %d at %v, want the next attempt", n, ReturnRetry)
+	}
+}

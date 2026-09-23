@@ -1,0 +1,9 @@
+mixed-port: 7890
+proxies:
+  - name: Server
+    type: vless
+    server: 198.51.100.40
+proxy-groups:
+  - name: Auto
+    type: url-test
+    url: http://www.gstatic.com/generate_204

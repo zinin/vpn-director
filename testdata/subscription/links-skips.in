@@ -1,0 +1,25 @@
+# Provider notice: this line is not a link
+STATUS=expires 2026-12-31
+
+tuic://uuid:pw@tu.example.com:443?congestion_control=bbr#TUIC%20Server
+ssr://c29tZXRoaW5nLWJhc2U2NA
+vless://id@kcp.example.com:443?type=kcp#KCP
+vless://id@http.example.com:443?type=tcp&headerType=http#HTTP%20header
+vless://id@sec.example.com:443?security=xtls#Old%20XTLS
+vless://id@bad.example.com:99999?type=tcp#Bad%20Port
+vless://id@noport.example.com?type=tcp#No%20Port
+vless://id@pct.example.com:443?type=tcp&path=%ZZ#Bad%20Escape
+vless://@nouser.example.com:443#No%20User
+vless://id@r.example.com:443?security=reality&sni=a.example.org&fp=chrome#No%20pbk
+vless://id@x.example.com:443?type=xhttp&extra=%5B1%5D#Extra%20Array
+vless://id@tls.example.com:443?security=tls&allowInsecure=1#Insecure
+vless://id@tlsr.example.com:443?security=reality&allowInsecure=1&sni=a.example.org&fp=chrome&pbk=glTDKakoUPbVOd03b0gW7idkUX2l4CNVFK9DMWRIDXo#Reality%20ignores%20allowInsecure
+vless://00000000-0000-0000-0000-000000000000@127.0.0.1:1#%D0%9F%D0%BE%D0%B4%D0%BF%D0%B8%D1%81%D0%BA%D0%B0%20%D0%B8%D1%81%D1%82%D0%B5%D0%BA%D0%BB%D0%B0
+vless://00000000-0000-0000-0000-000000000000@[::]:1#Placeholder%20v6
+vless://id@noname.example.com:443?security=none#🇺🇸🌟✨
+vless://id@names.example.com:443#%20%20T%C3%BCrkiye%20%20%20Istanbul%20%2C%20
+vless://id@stray.example.com:443#100%25%20off%2%zz+plus
+vless://id@trunc.example.com:443#%C3%7Cevil
+vless://id@nul.example.com:443#a%00b
+vless://id@nulq.example.com:443?sni=a%00b#NUL%20in%20query
+vmess://not-base64!!!

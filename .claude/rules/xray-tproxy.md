@@ -27,31 +27,90 @@ process alone: a client meets a restarting Xray and waits. It is for a caller wh
 1. Selected LAN clients → mangle PREROUTING chain
 2. Exclude: servers, private IPs, specified countries
 3. Remaining traffic → TPROXY to Xray port
-4. Xray dokodemo-door inbound → VLESS outbound
+4. Xray dokodemo-door inbound → the selected server's outbound (proxy-out; any protocol the import stored)
 
-## Outbound Generation (REALITY/TLS)
+## Outbound Generation
 
-`config.json.template` is valid JSON with an empty `outbounds: []`. The proxy-out outbound
-is generated per selected server from `servers.json` stream params and injected as `outbounds[0]`:
+`config.json.template` is valid JSON with an empty `outbounds: []`. The selected server's
+outbound goes into it as `outbounds[0]`, tagged `proxy-out`:
 
 - Shell: `lib/xrayconf.sh` (`xrayconf_generate`, jq) — used by `configure.sh`.
-- Go: `service/xray.go` (`buildOutbound` + `encoding/json`) — used by bot wizard and `/xray`.
+- Go: `service/xray.go` (`serverOutbound` + `encoding/json`) — used by the Web UI, the bot wizard,
+  `/xray` and the subscription watch.
 
-Per-server params (parsed from the VLESS URI): `security` (`reality`|`tls`), `network`, `flow`,
-`sni`, `fingerprint` (fp), `public_key` (pbk), `short_id` (sid), `alpn`.
+An import stores each server's Xray outbound in `servers.json` (`outbound`): converted from a share
+link, or taken from an Xray JSON subscription — the decoders are `lib/subscription.sh`
+and `server/internal/subscription`, which answer to the same cases in `testdata/subscription/`. The
+generators insert it as stored, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
+httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2. They look for three shapes only, and
+refuse all three: an `outbound` that is there but is no object (a string, a null — only a record
+without the key is a legacy one); an xhttp `downloadSettings` anywhere in it that names no `address`,
+a download stream Xray gives no destination and dereferences on the first dial (`splithttp` in
+26.2.6); and an xhttp `scMaxEachPostBytes` of 8192 or less — read from `extra` when there is one,
+since Xray builds from `extra` with the outer `host`, `path` and `mode` copied onto it — in a stream
+Xray would run in packet-up mode (mode `packet-up`, or empty/`auto` without REALITY), on which
+`splithttp`'s dialer panics (`scMaxEachPostBytes should be bigger than 8192`). Their names are found
+under the same folding Xray applies (below), since a record stored before the importers refused other
+spellings can still hold them. Either panic takes Xray down, and every Xray client with it, and only
+a dial reaches it: `xray run -test` never dials, so it passes such a config; the selection fails with
+the reason instead, and the watch walk moves on to the next server.
+
+Sanitizing keeps routing ours, and it reads the whole outbound, not its top only: an xhttp `extra`
+holds whatever the subscription wrote, and Xray reads a whole `downloadSettings` stream config out of
+it. Every key the decoders, the sanitizer, the generators and the watch read is matched as Xray
+matches it: Xray loads its config with `encoding/json`, which folds case — the long s (U+017F) and
+the Kelvin sign (U+212A) included — so a key that folds to one of those names without being it
+(`Sockopt`, `MasterKeyLog`, `marK`) would pass every exact lookup and still reach Xray. Such a key
+makes the entry `invalid` (`key "Sockopt" is spelled "sockopt"`; with several, the first in byte
+order), except under `headers`, which Xray reads as a map: a header's name is the panel's to spell.
+The names are `guardedKeys` in Go and `guard` in the shell, and they grow with whatever a consumer
+starts reading. Values are read as Xray reads them too: an Xray JSON entry's `protocol`, and every
+`security` and `network` in its proxy outbound (`headers` excepted), are stored lowercased, since
+Xray lowercases all three before it looks — so `TLS` is a tls stream to the sanitizer, the label,
+`tcpChecked` and `keepHostname` alike. Share links already refuse another spelling of their `type`
+and `security` as `unsupported`; the `extra` an xhttp link carries is Xray's JSON, and its
+`security` and `network` values are lowercased the same way before any check reads them, so a
+`TLS` download stream there loses its `allowInsecure` as a `tls` one does.
+A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in it keeps `mark`,
+`interface`, `tproxy` or `customSockopt` — a foreign fwmark could collide with ours (0x100 Xray,
+0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an interface would route around the WAN; a
+`sockopt` left empty goes too. `tlsSettings.echSockopt`, the socket the ECH config query is dialed
+on and the only other SocketConfig Xray reads, gets the same. A `dialerProxy` in a `sockopt` or an
+`echSockopt` anywhere makes the entry `composite` (`chained`), as one at the top always did. No
+`tlsSettings` or `realitySettings` anywhere keeps a `masterKeyLog`, whatever the stream's security:
+Xray opens that path to append every session's keys to, creating it 0644 (`GetTLSConfig` in
+26.2.6, REALITY alike) — a file on the router the subscription picks, and traffic anyone who reads
+it can decrypt. A tls stream anywhere loses its `allowInsecure` whatever
+the value is, and the entry is `unsupported` (`insecure TLS`) when that value was the boolean `true`
+and no `pinnedPeerCertSha256` replaces it — Xray has loaded no config with the flag since
+2026-06-01, and it reads the field as a bool, so a panel's `false` is noise while its `"true"` would
+make Xray refuse the config outright. Only a tls stream is read for it: Xray ignores `tlsSettings`
+under any other security, and 26.2.6 loads a stray flag there without complaint.
+
+A record without `outbound` predates stored outbounds: the generators build a VLESS outbound from
+its flat fields — `security` (`reality`|`tls`), `network`, `flow`, `sni`, `fingerprint`,
+`public_key`, `short_id`, `alpn`:
 
 - `security=reality` -> `realitySettings { serverName, fingerprint, publicKey, shortId }`, user `flow`.
 - `security=tls` -> `tlsSettings { serverName (sni||address), fingerprint?, alpn? }`.
 - empty `security` -> legacy `tlsSettings { alpn:["h2"], serverName:address }`, no flow.
 
-**Migration after upgrade:** the previously generated `/opt/etc/xray/config.json` stays on disk as
-plain TLS until regenerated, so Xray — and the Telegram bot, which proxies its API connection
-through it — cannot connect to a REALITY server until the user acts:
+The next import rewrites such records; nothing converts them. A link that names no `security` then
+stores `none` — how the share-link standard reads it, and every other client with it — where the
+legacy record dialed TLS; a server that wants TLS says so in its link.
 
-1. Re-run `/import` (or, over SSH if the bot is unreachable through the broken proxy:
-   `/opt/vpn-director/import_server_list.sh`) so params land in `servers.json`.
-2. Re-select the server (`/configure` wizard or `/xray`, or over SSH `/opt/vpn-director/configure.sh`)
-   to regenerate `config.json`.
+**Every config is tested before it replaces the live one:** `xray run -test -format json -c <temp>`
+(`xrayconf_validate` in shell, `xrayTest` in Go). An outbound from a subscription can name a protocol
+the installed Xray lacks, or a key it refuses — since 2026-06-01 Xray loads no config with
+`tlsSettings.allowInsecure: true` — and a config Xray rejects would take every Xray client, and the
+bot, offline at the next restart. The temp file (`config.json.XXXXXX`) does not end in `.json`, which
+keeps `xray -confdir` from loading it and is why `-format json` is needed. Without an `xray` binary
+(dev mode, a workstation) the test is skipped. The test runs under the config lock and is bounded at
+15 s, half of the 30 s every other writer waits for that lock: a hung `xray` lets them take their
+turn instead of using up the whole wait, and the error says the test timed out rather than that Xray
+rejected the config. The shell probes which `timeout` the router has — BusyBox
+before 1.30 takes the seconds only after `-t` — and runs the test unbounded when it can drive
+neither form.
 
 ## Configuration
 

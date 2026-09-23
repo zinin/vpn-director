@@ -1,0 +1,8 @@
+{
+  "total": 2,
+  "servers": [
+    {"address":"js1.example.com","name":"JSON sockopt","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"js1.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"xhttp","security":"tls","sockopt":{"tcpKeepAliveIdle":30},"tlsSettings":{"serverName":"js1.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp"}},"path":"/js"}}},"port":443},
+    {"address":"js2.example.com","name":"JSON sockopt nested","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"js2.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443}
+  ],
+  "skipped": []
+}

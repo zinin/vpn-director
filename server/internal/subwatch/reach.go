@@ -3,6 +3,7 @@ package subwatch
 import (
 	"context"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
@@ -63,6 +64,44 @@ func (w *Watch) reachable(ctx context.Context, copies []vpnconfig.Server) []vpnc
 	return out
 }
 
+// tcpChecked reports whether a TCP dial says anything about a server. A
+// Hysteria2 outbound speaks QUIC: its port accepts no TCP connection, and a
+// port that does accept one - a masquerade site beside it - says nothing about
+// the proxy behind it. Three transports leave TCP as well: the Hysteria
+// transport is QUIC under any protocol, mKCP runs over UDP, and xhttp over TLS
+// whose alpn is exactly ["h3"] dials HTTP/3 over QUIC (decideHTTPVersion in
+// Xray 26.2.6). The network and security names are read as Xray reads them,
+// lowercased (TransportProtocol.Build and StreamConfig.Build), so "KCP" is
+// mKCP and "TLS" is TLS. Everything else is dialed: every other protocol and
+// transport an import stores runs over TCP, a legacy record without an
+// outbound is VLESS over TCP, and an outbound that cannot be read gives no
+// reason not to.
+func tcpChecked(s vpnconfig.Server) bool {
+	ob, err := vpnconfig.DecodeOutbound(s.Outbound)
+	if err != nil {
+		// A legacy record, which has no outbound, or one that cannot be read.
+		return true
+	}
+	if protocol, _ := ob["protocol"].(string); protocol == "hysteria" {
+		return false
+	}
+	ss, _ := ob["streamSettings"].(map[string]interface{})
+	network, _ := ss["network"].(string)
+	security, _ := ss["security"].(string)
+	network, security = strings.ToLower(network), strings.ToLower(security)
+	switch network {
+	case "hysteria", "kcp", "mkcp":
+		return false
+	case "xhttp", "splithttp":
+		tls, _ := ss["tlsSettings"].(map[string]interface{})
+		alpn, _ := tls["alpn"].([]interface{})
+		if security == "tls" && len(alpn) == 1 && alpn[0] == "h3" {
+			return false
+		}
+	}
+	return true
+}
+
 // reachControls are dialed when a look finds the active server down. A WAN that
 // works reaches one of them - Cloudflare and Google answered all through the
 // outages the fast rule is for - so when neither accepts, the look says nothing
@@ -77,8 +116,9 @@ var reachControls = []vpnconfig.Server{
 // TCP connection on any address its servers.json entry lists while the WAN
 // reaches a control address. Every look without an answer is false: no record,
 // no entry, no IPv4 address to dial, no control accepting either, a look a
-// stop cut short, or a watch without LoadServers or Reachable. The controls
-// are dialed only once the server's addresses have all failed.
+// stop cut short, a server no TCP dial can see (tcpChecked), or a watch
+// without LoadServers or Reachable. The controls are dialed only once the
+// server's addresses have all failed.
 func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
 	if w.LoadServers == nil || w.Reachable == nil || cfg == nil || cfg.Xray.ActiveServer == nil {
 		return false
@@ -88,7 +128,7 @@ func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirector
 		return false
 	}
 	i := chosenIndex(servers, cfg.Xray.ActiveServer)
-	if i < 0 {
+	if i < 0 || !tcpChecked(servers[i]) {
 		return false
 	}
 	copies := dialable(perAddress(servers[i : i+1]))

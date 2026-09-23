@@ -591,7 +591,7 @@ print_next_steps() {
     print_header "Installation Complete ($RELEASE_TAG)"
 
     printf "Next steps:\n\n"
-    printf "  1. Import VLESS servers:\n"
+    printf "  1. Import the servers of your subscription:\n"
     printf "     ${GREEN}/opt/vpn-director/import_server_list.sh${NC}\n\n"
     printf "  2. Run configuration wizard:\n"
     printf "     ${GREEN}/opt/vpn-director/configure.sh${NC}\n\n"

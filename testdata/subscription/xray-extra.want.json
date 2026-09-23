@@ -1,0 +1,13 @@
+{
+  "total": 6,
+  "servers": [
+    {"address":"je3.example.com","name":"JSON extra pinned","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"je3.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"js.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp","security":"tls","tlsSettings":{"pinnedPeerCertSha256":"39ddf94fc84218d902db652725fbf4bb318aaea30637e0124b004ce7031f11e6"}}},"path":"/js"}}},"port":443},
+    {"address":"je4.example.com","name":"JSON reality stray flag","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"je4.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"chrome","publicKey":"hhoT6JDl8yIxCxQkytm-w8ToNy6DTsn3t9Njaaoy-dE","serverName":"www.example.org","shortId":"01"},"security":"reality","tlsSettings":{"allowInsecure":true}}},"port":443},
+    {"address":"je5.example.com","name":"JSON tls flag false","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"je5.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"js.example.com"}}},"port":443},
+    {"address":"je6.example.com","name":"JSON extra flag string","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"je6.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"js.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"js.example.com"}}},"path":"/js"}}},"port":443}
+  ],
+  "skipped": [
+    {"name":"JSON extra chained","reason":"composite"},
+    {"name":"JSON extra insecure","reason":"unsupported"}
+  ]
+}

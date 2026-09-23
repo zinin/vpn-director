@@ -50,6 +50,35 @@ func TestHandleListServers_OK(t *testing.T) {
 	}
 }
 
+// The page gets what it shows - and no credential of the record: an import
+// now stores passwords in the outbound, beside the UUID of a legacy record.
+func TestHandleListServers_ShowsTheProtocolAndNoCredentials(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.Config = &mockConfig{servers: []vpnconfig.Server{
+		{Address: "legacy.example.com", Port: 443, UUID: "secret-uuid", Name: "Legacy", IPs: []string{"1.1.1.1"}, Security: "reality", PublicKey: "secret-key"},
+		{Address: "hy.example.com", Port: 8443, Name: "Hy", IPs: []string{"2.2.2.2"},
+			Outbound: json.RawMessage(`{"protocol":"hysteria","settings":{"address":"hy.example.com","port":8443},"streamSettings":{"hysteriaSettings":{"auth":"secret-auth"}}}`)},
+	}}
+	rec := httptest.NewRecorder()
+	handleListServers(deps).ServeHTTP(rec, httptest.NewRequest("GET", "/api/servers", nil))
+
+	body := rec.Body.String()
+	for _, secret := range []string{"secret-uuid", "secret-key", "secret-auth", "outbound"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("response carries %q: %s", secret, body)
+		}
+	}
+	var resp struct {
+		Servers []map[string]interface{} `json:"servers"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Servers) != 2 || resp.Servers[0]["protocol"] != "vless·reality" || resp.Servers[1]["protocol"] != "hysteria2" {
+		t.Fatalf("servers %v", resp.Servers)
+	}
+}
+
 func TestHandleListServers_Error(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Config = &mockConfig{err: errors.New("load failed")}
@@ -424,18 +453,61 @@ func TestSyncXrayServers_MissingConfigIsSurfaced(t *testing.T) {
 	}
 }
 
-func TestNoServersMessage(t *testing.T) {
-	if got := noServersMessage(nil); got != "no VLESS servers found in subscription" {
-		t.Errorf("no errors: got %q", got)
+// An import says what it left out and why, and the page shows it: a
+// subscription that is all composite entries and TUIC imported nothing and
+// said only "no VLESS servers".
+func TestHandleImportServers_SaysWhatNothingCouldBeImportedFrom(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.Config = &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+	deps.ImportClient = subscriptionHost(t, "tuic://uuid:pw@203.0.113.10:443#TUIC\nssr://c29tZQ")
+
+	code, resp := postImport(t, deps, `{"url":"https://93.184.216.34/s/token"}`)
+
+	want := "no supported servers in subscription: 2 unsupported; TUIC: tuic; #2: ssr"
+	if code != http.StatusBadRequest || resp["error"] != want {
+		t.Fatalf("got %d %v, want 400 %q", code, resp, want)
 	}
-	two := []error{errors.New("line 1: bad scheme"), errors.New("line 2: missing uuid")}
-	want := "no VLESS servers found in subscription: line 1: bad scheme; line 2: missing uuid"
-	if got := noServersMessage(two); got != want {
-		t.Errorf("two errors: got %q, want %q", got, want)
+}
+
+func TestHandleImportServers_RefusesAnUnrecognizedBody(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.Config = &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+	deps.ImportClient = subscriptionHost(t, "<!doctype html><html>Open the app</html>")
+
+	code, resp := postImport(t, deps, `{"url":"https://93.184.216.34/s/token"}`)
+
+	if code != http.StatusBadRequest || resp["error"] != "unrecognized subscription format" {
+		t.Fatalf("got %d %v", code, resp)
 	}
-	five := []error{errors.New("e1"), errors.New("e2"), errors.New("e3"), errors.New("e4"), errors.New("e5")}
-	if got := noServersMessage(five); got != "no VLESS servers found in subscription: e1; e2; e3" {
-		t.Errorf("five errors must be capped at three: got %q", got)
+}
+
+func TestHandleImportServers_ReportsTheSkips(t *testing.T) {
+	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	deps.ImportClient = subscriptionHost(t, strings.Join([]string{
+		"vless://uuid-1@203.0.113.10:443?type=tcp#Oslo",
+		"vless://uuid-2@203.0.113.11:443?type=kcp#KCP",
+		"vless://uuid-3@127.0.0.1:1#Expired",
+	}, "\n"))
+
+	code, resp := postImport(t, deps, `{"url":"https://93.184.216.34/s/token"}`)
+
+	if code != http.StatusOK {
+		t.Fatalf("got %d %v", code, resp)
+	}
+	if resp["count"] != float64(1) || resp["total"] != float64(3) || resp["dns_errors"] != float64(0) {
+		t.Fatalf("response %v", resp)
+	}
+	skipped, _ := resp["skipped"].(map[string]interface{})
+	if skipped["unsupported"] != float64(1) || skipped["placeholder"] != float64(1) || skipped["composite"] != float64(0) {
+		t.Fatalf("skipped %v", skipped)
+	}
+	if resp["summary"] != "Imported 1 of 3 servers: 1 unsupported, 1 placeholder" {
+		t.Fatalf("summary %v", resp["summary"])
+	}
+	if len(mc.savedServers) != 1 || mc.savedServers[0].Name != "Oslo" || len(mc.savedServers[0].Outbound) == 0 {
+		t.Fatalf("saved %+v", mc.savedServers)
 	}
 }
 

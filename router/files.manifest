@@ -24,6 +24,7 @@ common   router/opt/vpn-director/lib/ipset.sh
 common   router/opt/vpn-director/lib/tunnel.sh
 common   router/opt/vpn-director/lib/tproxy.sh
 common   router/opt/vpn-director/lib/xrayconf.sh
+common   router/opt/vpn-director/lib/subscription.sh
 common   router/opt/vpn-director/lib/send-email.sh
 common   router/opt/etc/xray/config.json.template
 common   router/opt/etc/init.d/S99vpn-director

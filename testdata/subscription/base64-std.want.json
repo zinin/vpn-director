@@ -1,0 +1,8 @@
+{
+  "total": 2,
+  "servers": [
+    {"address":"b64.example.com","name":"Base64 one","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"b64.example.com","port":443,"users":[{"encryption":"none","flow":"xtls-rprx-vision","id":"66666666-6666-4666-8666-666666666666"}]}]},"streamSettings":{"network":"tcp","realitySettings":{"fingerprint":"firefox","publicKey":"hhoT6JDl8yIxCxQkytm-w8ToNy6DTsn3t9Njaaoy-dE","serverName":"www.example.org","shortId":"01"},"security":"reality"}},"port":443},
+    {"address":"b64t.example.com","name":"Base64 two","outbound":{"protocol":"trojan","settings":{"servers":[{"address":"b64t.example.com","password":"p>?>?","port":443}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"b64t.example.com"}}},"port":443}
+  ],
+  "skipped": []
+}

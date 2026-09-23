@@ -1,0 +1,89 @@
+[
+  {
+    "remarks": "JSON sockopt",
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "sendThrough": "203.0.113.9",
+        "settings": {
+          "vnext": [
+            {
+              "address": "js1.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "js1.example.com"
+          },
+          "xhttpSettings": {
+            "path": "/js",
+            "extra": {
+              "downloadSettings": {
+                "network": "xhttp",
+                "sockopt": {
+                  "mark": 66,
+                  "customSockopt": [
+                    {
+                      "level": "1"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "sockopt": {
+            "mark": 255,
+            "interface": "eth0",
+            "tcpKeepAliveIdle": 30
+          }
+        }
+      },
+      {
+        "protocol": "freedom",
+        "tag": "direct"
+      }
+    ]
+  },
+  {
+    "remarks": "JSON sockopt nested",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "js2.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "12121212-1212-4212-8212-121212121212",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none",
+          "sockopt": {
+            "sockopt": {
+              "mark": 255
+            }
+          }
+        }
+      }
+    ]
+  }
+]

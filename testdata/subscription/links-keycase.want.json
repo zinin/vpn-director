@@ -1,0 +1,11 @@
+{
+  "total": 4,
+  "servers": [
+    {"address":"lk4.example.com","name":"Extra ok","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"lk4.example.com","port":443,"users":[{"encryption":"none","id":"15151515-1515-4515-8515-151515151515"}]}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"headers":{"X-Front":"a"},"xmux":{"maxConcurrency":"16-32"}},"path":"/up"}}},"port":443}
+  ],
+  "skipped": [
+    {"name":"Extra download","reason":"invalid"},
+    {"name":"Extra sockopt","reason":"invalid"},
+    {"name":"Extra key log","reason":"invalid"}
+  ]
+}

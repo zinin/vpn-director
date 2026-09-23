@@ -1,0 +1,7 @@
+{
+  "total": 1,
+  "servers": [
+    {"address":"u.example.com","name":"URL-safe ???","outbound":{"protocol":"trojan","settings":{"servers":[{"address":"u.example.com","password":"pass-word","port":443}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"u.example.com"}}},"port":443}
+  ],
+  "skipped": []
+}

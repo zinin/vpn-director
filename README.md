@@ -6,7 +6,7 @@ Selective traffic routing through Xray TPROXY and OpenVPN/WireGuard tunnels.
 
 ## Features
 
-- **Xray TPROXY**: Transparent proxy for selected LAN clients via VLESS
+- **Xray TPROXY**: Transparent proxy for selected LAN clients via VLESS, VMess, Trojan, Shadowsocks or Hysteria2
 - **Tunnel Director**: Route traffic through OpenVPN/WireGuard by destination
 - **Country-based routing**: Route traffic directly or through VPN based on destination geography
 - **Web UI**: HTTPS web interface for managing VPN Director from the browser
@@ -26,7 +26,7 @@ curl -fsSL \
 
 After installation:
 
-1. Import VLESS servers (optional):
+1. Import the servers of your subscription (optional):
    ```bash
    /opt/vpn-director/import_server_list.sh
    ```
@@ -199,7 +199,7 @@ Remote management via Telegram with username-based authorization.
 | `/status` | VPN Director status |
 | `/xray` | Switch Xray server |
 | `/servers` | Server list |
-| `/import <url>` | Import VLESS subscription (auto-syncs xray.servers) |
+| `/import <url>` | Import a subscription (auto-syncs xray.servers) |
 | `/exclude` | Manage excluded IPs/CIDRs |
 | `/clients` | Manage VPN clients |
 | `/configure` | Configuration wizard |
@@ -222,7 +222,9 @@ The `/configure` command starts a 4-step wizard:
 
 ### Xray TPROXY
 
-Traffic from specified LAN clients is transparently redirected through Xray using TPROXY. The proxy uses VLESS protocol over TLS to connect to your VPN server.
+Traffic from specified LAN clients is transparently redirected through Xray using TPROXY. Xray reaches the server you select with the protocol your subscription gives it.
+
+Subscriptions it reads: share links (`vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://` / `hy2://`), base64-encoded or plain, and Xray JSON - the array of Xray configs panels such as Remnawave and Marzban give Xray clients. An entry Xray cannot run - TUIC, SSR, a balancer, a chained config - is skipped, and the import says why.
 
 ### Tunnel Director
 

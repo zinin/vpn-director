@@ -1,0 +1,10 @@
+{
+  "total": 3,
+  "servers": [
+    {"address":"pl4.example.com","name":"JSON port 443","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"pl4.example.com","port":443,"users":[{"encryption":"none","id":"12121212-1212-4212-8212-121212121212"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443}
+  ],
+  "skipped": [
+    {"name":"JSON port 443.0","reason":"invalid"},
+    {"name":"JSON port 1e2","reason":"invalid"}
+  ]
+}

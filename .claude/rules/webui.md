@@ -47,8 +47,8 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET | `/api/ip` | External IP |
 | GET | `/api/version` | Build version and commit |
 | GET | `/api/platform` | `vpn-director.sh platform`: firmware, password file, LAN/WAN interfaces, tunnels; 503 when the script cannot answer |
-| GET | `/api/servers` | Xray server list plus `active`, the recorded server, and `subscription_saved` |
-| POST | `/api/servers/active`, `/api/servers/import` | Select the active server (`index` plus the `name`, `address` and `port` the page showed there; 409 "server list changed" when the list has another server at that index); import a subscription (`url` empty reuses the saved URL; a body over 1 MiB is refused) |
+| GET | `/api/servers` | Xray server list — name, address, port, IPs and the protocol label (`vless·reality`, `ss`, `hysteria2`), no credentials — plus `active`, the recorded server, and `subscription_saved` |
+| POST | `/api/servers/active`, `/api/servers/import` | Select the active server (`index` plus the `name`, `address` and `port` the page showed there; 409 "server list changed" when the list has another server at that index); import a subscription (`url` empty reuses the saved URL; a body over 1 MiB is refused; the answer carries `count`, `total`, `skipped` by reason, `dns_errors` and the `summary` the page shows) |
 | GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config |
 | POST | `/api/clients/pause`, `/api/clients/resume` | Pause and resume a client |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |

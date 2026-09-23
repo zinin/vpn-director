@@ -1,0 +1,1 @@
+vless://99999999-9999-4999-8999-999999999999@xh9.example.com:443?type=xhttp&security=tls&sni=xh9.example.com&path=%2Fx&extra=%7B%22headers%22%3A%7B%22X-Test%22%3A%22one%22%7D%2C%22downloadSettings%22%3A%7B%22network%22%3A%22xhttp%22%2C%22sockopt%22%3A%7B%22mark%22%3A65536%2C%22interface%22%3A%22wgc1%22%2C%22tcpFastOpen%22%3Atrue%7D%7D%7D#XHTTP%20extra%20sockopt

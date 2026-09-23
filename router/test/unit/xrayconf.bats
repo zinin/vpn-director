@@ -131,3 +131,208 @@ setup() {
     [ "$(printf '%s' "$output" | jq -r '.inbounds[] | select(.tag == "tproxy-in") | .port')" = "12345" ]
     [ "$(printf '%s' "$output" | jq -r '.inbounds[] | select(.tag == "socks-in") | .port')" = "12346" ]
 }
+
+# An import stores the outbound it read, whatever the protocol: it goes into
+# config.json as it is, tagged proxy-out.
+@test "build_outbound: a stored outbound gets the tag and nothing else" {
+    server='{"name":"Hy","address":"198.51.100.11","port":8449,"ips":["198.51.100.11"],"outbound":{"protocol":"hysteria","settings":{"version":2,"address":"198.51.100.11","port":8449},"streamSettings":{"network":"hysteria","security":"tls","hysteriaSettings":{"version":2,"auth":"a"},"finalmask":{"quicParams":{"congestion":"bbr"}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c 'del(.tag)' | jq -S .)" = "$(printf '%s' "$server" | jq -S .outbound)" ]
+    [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
+}
+
+# An outbound that is there but is no object is no legacy record either:
+# serverOutbound in service/xray.go rejects it, so the flat fields beside it
+# must not become a VLESS outbound here.
+@test "build_outbound: a stored outbound that is no object -> error" {
+    run xrayconf_build_outbound <<< '{"address":"1.2.3.4","port":443,"uuid":"u1","outbound":"not-an-object"}'
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound is not an object'* ]]
+    run xrayconf_build_outbound <<< '{"address":"1.2.3.4","port":443,"uuid":"u1","outbound":null}'
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound is not an object'* ]]
+}
+
+# Xray gives an xhttp downloadSettings a destination only from its address,
+# and without one the first dial through it panics - "xray run -test" never
+# dials. serverOutbound in service/xray.go refuses it the same way.
+@test "build_outbound: an xhttp downloadSettings without an address -> error" {
+    server='{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"downloadSettings":{"network":"xhttp"}}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp downloadSettings without an address'* ]]
+}
+
+@test "build_outbound: an xhttp downloadSettings with its address -> ok" {
+    server='{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"downloadSettings":{"network":"xhttp","address":"dl.example.com","port":443}}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.streamSettings.xhttpSettings.extra.downloadSettings.address')" = "dl.example.com" ]
+    [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
+}
+
+# Xray loads its config with encoding/json, which matches a key to a field
+# whatever its case: a "DownloadSettings" is the download stream to it, and an
+# "Address" its address. A record stored before the importers refused such
+# spellings is read the same way, as downloadWithoutAddress in
+# service/xray.go reads it.
+@test "build_outbound: a DownloadSettings without an address -> error" {
+    server='{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"DownloadSettings":{}}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp downloadSettings without an address'* ]]
+}
+
+@test "build_outbound: a downloadSettings with its Address -> ok" {
+    server='{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"downloadSettings":{"Address":"dl.example.com"}}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.streamSettings.xhttpSettings.extra.downloadSettings.Address')" = "dl.example.com" ]
+    [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
+}
+
+# stored_stream <streamSettings>: a server whose stored vless outbound runs on
+# the given stream.
+stored_stream() {
+    printf '{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":%s}}' "$1"
+}
+
+# splithttp's dialer panics on a scMaxEachPostBytes of 8192 or less the first
+# time it dials packet-up - an empty mode is packet-up without REALITY - and
+# "xray run -test" never dials. smallPacketUpPosts in service/xray.go refuses
+# the same streams.
+@test "build_outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode -> error" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":8192}}')"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode'* ]]
+}
+
+@test "build_outbound: xhttp scMaxEachPostBytes above 8192 -> ok" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000}}')"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '.streamSettings.xhttpSettings')" = '{"path":"/x","scMaxEachPostBytes":1000000}' ]
+}
+
+@test "build_outbound: xhttp stream-up with a small scMaxEachPostBytes -> ok" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","mode":"stream-up","scMaxEachPostBytes":100}}')"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '.streamSettings.xhttpSettings')" = '{"path":"/x","mode":"stream-up","scMaxEachPostBytes":100}' ]
+}
+
+# Xray builds the stream from an xhttp extra, with the outer host, path and
+# mode copied onto it: the range counts from extra, and only from there.
+@test "build_outbound: xhttp scMaxEachPostBytes of 8192 or less in extra -> error" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":1000000,"extra":{"scMaxEachPostBytes":100}}}')"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode'* ]]
+}
+
+@test "build_outbound: an xhttp extra without scMaxEachPostBytes sets the outer one aside -> ok" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","scMaxEachPostBytes":100,"extra":{"xmux":{"maxConcurrency":"16-32"}}}}')"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '.streamSettings.xhttpSettings')" = '{"path":"/x","scMaxEachPostBytes":100,"extra":{"xmux":{"maxConcurrency":"16-32"}}}' ]
+}
+
+# A record stored before the importers refused other spellings can hold them,
+# and Xray reads them whatever their case.
+@test "build_outbound: XhttpSettings with a small ScMaxEachPostBytes -> error" {
+    run xrayconf_build_outbound <<< "$(stored_stream '{"network":"XHTTP","security":"none","XhttpSettings":{"ScMaxEachPostBytes":100}}')"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp scMaxEachPostBytes of 8192 or less in packet-up mode'* ]]
+}
+
+@test "generate: a stored outbound replaces the template's outbounds" {
+    server='{"address":"198.51.100.12","port":2030,"outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"198.51.100.12","port":2030,"method":"aes-256-gcm","password":"p"}]}}}'
+    run xrayconf_generate "$PROJECT_ROOT/opt/etc/xray/config.json.template" <<< "$server"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -c '[.outbounds[] | [.tag, .protocol]]')" = '[["proxy-out","shadowsocks"]]' ]
+}
+
+@test "xrayconf_validate: a config Xray accepts passes, with -format json" {
+    export PATH="$TEST_ROOT/mocks:$PATH" XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+}
+
+@test "xrayconf_validate: a config Xray rejects fails with Xray's last lines" {
+    export PATH="$TEST_ROOT/mocks:$PATH" XRAY_MOCK_EXIT=23
+    export XRAY_MOCK_OUTPUT=$'Xray 26.2.6\nFailed to start: infra/conf: "allowInsecure" has been removed'
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xray rejected the config: Xray 26.2.6; Failed to start: infra/conf: "allowInsecure" has been removed'* ]]
+}
+
+# Xray prints its version banner before it loads the config, so an xray the
+# bound kills has said something too: the exit code of the timeout - 124 or
+# 143, depending on which one ran - is what tells a timeout from a rejection.
+@test "xrayconf_validate: an xray the bound kills is reported as a timeout" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/timeout" <<'MOCK'
+#!/usr/bin/env bash
+# The probe "timeout 1 true" passes; the test itself prints the banner and
+# is killed.
+if [[ ${1:-} == 1 && ${2:-} == true ]]; then
+    exit 0
+fi
+printf 'Xray 26.2.6 (Xray, Penetrates Everything.) Custom (go1.25.6 linux/arm64)\n'
+exit 124
+MOCK
+    chmod +x "$BATS_TEST_TMPDIR/bin/timeout"
+    export PATH="$BATS_TEST_TMPDIR/bin:$TEST_ROOT/mocks:$PATH"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 1 ]
+    [[ $output == *'timed out after 15s'* ]]
+    [[ $output != *'rejected'* ]]
+}
+
+# BusyBox before 1.30 - Asuswrt-Merlin ships 1.25 - spells the bound
+# "timeout -t SECS PROG" and runs the first free argument as the program, so
+# "timeout 15 xray" there tries to execute 15 and fails every config. The form
+# is probed, not assumed.
+@test "xrayconf_validate: drives a busybox-syntax timeout" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/timeout" <<'MOCK'
+#!/usr/bin/env bash
+if [[ ${1:-} != -t ]]; then
+    printf "timeout: can't execute '%s': No such file or directory\n" "${1:-}" >&2
+    exit 127
+fi
+shift 2
+printf '%s\n' "$*" >> "$TIMEOUT_MOCK_LOG"
+exec "$@"
+MOCK
+    chmod +x "$BATS_TEST_TMPDIR/bin/timeout"
+    export PATH="$BATS_TEST_TMPDIR/bin:$TEST_ROOT/mocks:$PATH"
+    export XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log" TIMEOUT_MOCK_LOG="$BATS_TEST_TMPDIR/timeout.log"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+    [[ $(tail -1 "$TIMEOUT_MOCK_LOG") == *"xray run -test -format json"* ]]
+}
+
+# A timeout that answers to neither form is left alone: running the test
+# unbounded, as before the bound existed, beats failing every config with it.
+@test "xrayconf_validate: a timeout it cannot drive is left alone" {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    printf '#!/usr/bin/env bash\nexit 127\n' > "$BATS_TEST_TMPDIR/bin/timeout"
+    chmod +x "$BATS_TEST_TMPDIR/bin/timeout"
+    export PATH="$BATS_TEST_TMPDIR/bin:$TEST_ROOT/mocks:$PATH" XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+}
+
+@test "xrayconf_validate: without an xray the config passes, and says so" {
+    [[ ! -x /opt/sbin/xray ]] || skip "this machine has /opt/sbin/xray"
+    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    PATH="/usr/bin:/bin" run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
+    [ "$status" -eq 0 ]
+    [[ $output == *"xray not found"* ]]
+}
