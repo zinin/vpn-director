@@ -57,9 +57,11 @@ check_fixtures() {
 # on the router and in Telegram. These are the answers the Go decoder gives the
 # same seven inputs.
 @test "subscription_decode: a skip's detail words the reason as the Go decoder does" {
-    local vmess
+    local vmess sockopt
     vmess=$(printf '%s' '{"add":"h.example.com","port":443,"id":"11111111-1111-4111-8111-111111111111","host":"a\u0000b","ps":"Nul host"}' |
         base64 | tr -d '\n')
+    # Both keys are misspelled; the detail names the first in byte order.
+    sockopt='{"remarks":"Sockopt","outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"kc.example.com","port":443,"users":[{"id":"16161616-1616-4616-8616-161616161616","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"none","Sockopt":{"Mark":256}}}]}'
     detail_of() { subscription_decode <<< "$1" | jq -r '.skipped[0].detail'; }
 
     [ "$(detail_of 'vless://u@h.example.com:443?a=%zz#Bad escape')" = "query: bad percent escape" ]
@@ -71,6 +73,7 @@ check_fixtures() {
     [ "$(detail_of "vmess://$vmess")" = "NUL byte in host" ]
     [ "$(detail_of "$(< "$FIXTURES/vmess-nul-port.in")")" = "NUL byte in port" ]
     [ "$(detail_of 'vless://u@h.example.com:4"4\5#Bad port')" = 'bad port "4"4\5"' ]
+    [ "$(detail_of "$sockopt")" = 'key "Mark" is spelled "mark"' ]
 }
 
 # Entware's jq is built without oniguruma: a regex builtin works on a

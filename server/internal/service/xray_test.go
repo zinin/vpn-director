@@ -458,6 +458,26 @@ func TestGenerateConfig_DownloadSettingsWithoutAnAddress(t *testing.T) {
 	}
 }
 
+// Xray loads its config with encoding/json, which matches a key to a field
+// whatever its case: a "DownloadSettings" is the download stream to it, and
+// an "Address" its address. A record stored before the importers refused such
+// spellings is read the same way.
+func TestServerOutbound_DownloadSettingsAsXrayReadsThem(t *testing.T) {
+	stored := func(extra string) vpnconfig.Server {
+		return vpnconfig.Server{
+			Name: "Oslo", Address: "oslo.example", Port: 443,
+			Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},` +
+				`"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":` + extra + `}}}`),
+		}
+	}
+	if _, err := serverOutbound(stored(`{"DownloadSettings":{}}`)); err == nil || !strings.Contains(err.Error(), "downloadSettings without an address") {
+		t.Fatalf("err %v, want the DownloadSettings without an address refused", err)
+	}
+	if _, err := serverOutbound(stored(`{"downloadSettings":{"Address":"dl.example.com"}}`)); err != nil {
+		t.Fatalf("err %v, want the downloadSettings with its Address accepted", err)
+	}
+}
+
 // The test runs under the config lock: an xray that never answers is given
 // up on at the bound, and the error says it timed out rather than that Xray
 // rejected the config.

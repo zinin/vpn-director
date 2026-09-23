@@ -265,15 +265,19 @@ func serverOutbound(server vpnconfig.Server) (interface{}, error) {
 // run -test" never dials, so such a config passes the test and replaces
 // config.json: the generator has to refuse it itself.
 // xrayconf_build_outbound in lib/xrayconf.sh refuses the same shape.
+// Both names are looked up as Xray reads them: it loads its config with
+// encoding/json, which matches a key to a field whatever its case
+// (strings.EqualFold, the long s and the Kelvin sign included), so a
+// "DownloadSettings" is the download stream to it and an "Address" its
+// address - and a record stored before the importers refused such spellings
+// can hold either.
 func downloadWithoutAddress(v interface{}) bool {
 	switch t := v.(type) {
 	case map[string]interface{}:
-		if download, ok := t["downloadSettings"].(map[string]interface{}); ok {
-			if address, _ := download["address"].(string); address == "" {
+		for key, child := range t {
+			if download, ok := child.(map[string]interface{}); ok && strings.EqualFold(key, "downloadSettings") && !hasAddress(download) {
 				return true
 			}
-		}
-		for _, child := range t {
 			if downloadWithoutAddress(child) {
 				return true
 			}
@@ -283,6 +287,17 @@ func downloadWithoutAddress(v interface{}) bool {
 			if downloadWithoutAddress(child) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// hasAddress reports whether a key of download that Xray reads as its address
+// holds a non-empty string.
+func hasAddress(download map[string]interface{}) bool {
+	for key, value := range download {
+		if address, _ := value.(string); address != "" && strings.EqualFold(key, "address") {
+			return true
 		}
 	}
 	return false

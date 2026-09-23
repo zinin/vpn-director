@@ -1,0 +1,16 @@
+{
+  "total": 9,
+  "servers": [
+    {"address":"kc9.example.com","name":"Headers host","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"kc9.example.com","port":443,"users":[{"encryption":"none","id":"14141414-1414-4414-8414-141414141414"}]}]},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"Host":"cdn.example.com"},"path":"/ws"}}},"port":443}
+  ],
+  "skipped": [
+    {"name":"Key log","reason":"invalid"},
+    {"name":"Sockopt","reason":"invalid"},
+    {"name":"Dialer","reason":"invalid"},
+    {"name":"Send through","reason":"invalid"},
+    {"name":"Stream","reason":"invalid"},
+    {"name":"Download","reason":"invalid"},
+    {"name":"Long s","reason":"invalid"},
+    {"name":"Kelvin","reason":"invalid"}
+  ]
+}

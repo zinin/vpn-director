@@ -1,0 +1,267 @@
+[
+  {
+    "remarks": "Key log",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc1.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "TLSSettings": {
+            "serverName": "a.example.com",
+            "MasterKeyLog": "/opt/etc/xray/keys.log"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Sockopt",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc2.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none",
+          "Sockopt": {
+            "Mark": 256
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Dialer",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc3.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none",
+          "sockopt": {
+            "DialerProxy": "relay"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Send through",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "SendThrough": "192.0.2.1",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc4.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none"
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Stream",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc5.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "StreamSettings": {
+          "network": "tcp",
+          "security": "none"
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Download",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc6.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "none",
+          "xhttpSettings": {
+            "extra": {
+              "DownloadSettings": {
+                "network": "xhttp"
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Long s",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc7.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "a.example.com",
+            "ma\u017fterKeyLog": "/tmp/k"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Kelvin",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc8.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none",
+          "sockopt": {
+            "mar\u212a": 256
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Headers host",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "kc9.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "14141414-1414-4414-8414-141414141414",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "none",
+          "wsSettings": {
+            "path": "/ws",
+            "headers": {
+              "Host": "cdn.example.com"
+            }
+          }
+        }
+      }
+    ]
+  }
+]

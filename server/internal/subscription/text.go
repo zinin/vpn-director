@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -153,6 +154,72 @@ func splitList(s string) []interface{} {
 // truthy is how share links spell a set flag.
 func truthy(v string) bool { return v == "1" || v == "true" }
 
+// guardedKeys holds every key the decoders, the sanitizer, the generators and
+// the watch read or write, spelled as they look it up. It must grow when one
+// of them starts reading a new key: keyCase refuses an entry that spells one
+// of these otherwise. guard in lib/subscription.sh is the twin.
+var guardedKeys = []string{
+	"protocol", "settings", "vnext", "servers", "address", "port", "streamSettings", "network",
+	"security", "tlsSettings", "realitySettings", "serverName", "alpn", "fingerprint", "publicKey",
+	"password", "allowInsecure", "pinnedPeerCertSha256", "masterKeyLog", "sockopt", "echSockopt",
+	"mark", "interface", "tproxy", "customSockopt", "dialerProxy", "proxySettings", "tag",
+	"sendThrough", "xhttpSettings", "splithttpSettings", "wsSettings", "httpupgradeSettings",
+	"grpcSettings", "authority", "host", "mode", "extra", "downloadSettings", "scMaxEachPostBytes",
+}
+
+// keyCase returns the first key in v, however deep and in byte order, that
+// Xray reads as one of guardedKeys without being spelled that way, and the
+// name it reads it as; "", "" when there is none. Every lookup here, in the
+// sanitizer and in the generators is exact, but Xray loads its config with
+// encoding/json, whose field matching folds case as strings.EqualFold does -
+// the long s (U+017F) is an s to it and the Kelvin sign (U+212A) a k - so
+// "Sockopt", "MasterKeyLog" or "marK" would pass every check and still reach
+// Xray. Such an entry is refused, not repaired. What a "headers" object holds
+// is left alone: Xray reads it as a map, and a header's name is the panel's
+// to spell. The keys are sorted because a map has no order, so keycase in
+// lib/subscription.sh names the same one.
+func keyCase(v interface{}) (key, canonical string) {
+	keys := miscased(v, nil)
+	if len(keys) == 0 {
+		return "", ""
+	}
+	sort.Strings(keys)
+	return keys[0], foldsTo(keys[0])
+}
+
+// miscased appends to keys every key in v, however deep, that folds to a
+// guarded name without being it, and returns them.
+func miscased(v interface{}, keys []string) []string {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, child := range t {
+			if canonical := foldsTo(k); canonical != "" && canonical != k {
+				keys = append(keys, k)
+			}
+			if k != "headers" {
+				keys = miscased(child, keys)
+			}
+		}
+	case []interface{}:
+		for _, child := range t {
+			keys = miscased(child, keys)
+		}
+	}
+	return keys
+}
+
+// foldsTo returns the guarded name k matches as encoding/json matches a key
+// to a field, or "" when it matches none. No two guarded names fold alike, so
+// a guarded name matches itself only.
+func foldsTo(k string) string {
+	for _, name := range guardedKeys {
+		if strings.EqualFold(k, name) {
+			return name
+		}
+	}
+	return ""
+}
+
 // socketKeys are the keys that hold an Xray SocketConfig: a stream's sockopt,
 // and tlsSettings.echSockopt, the socket the ECH config query is dialed on.
 var socketKeys = []string{"sockopt", "echSockopt"}
@@ -164,7 +231,8 @@ var socketKeys = []string{"sockopt", "echSockopt"}
 // tlsSettings included - out of it. A foreign fwmark could collide with ours
 // (0x100 Xray, 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an
 // interface would route around the WAN. dropKeyLog, run beside it, takes out
-// masterKeyLog.
+// masterKeyLog. Keys are looked up as spelled: keyCase has already refused an
+// entry that spells one of them any other way Xray would still read.
 func scrubSockopt(v interface{}) {
 	switch t := v.(type) {
 	case map[string]interface{}:

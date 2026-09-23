@@ -42,6 +42,20 @@ plugin obfs obfs-password pinSHA256 "
 # an xhttp "extra" carries whatever the subscription wrote, and Xray reads a
 # whole downloadSettings stream config out of it - sockopt, security and
 # tlsSettings of its own.
+#   keycase        every lookup below is exact, but Xray loads its config with
+#                  Go's encoding/json, which matches a key to a field whatever
+#                  its case - the long s (U+017F) is an s to it, the Kelvin
+#                  sign (U+212A) a k - so "Sockopt" or "MasterKeyLog" would
+#                  pass every check here and still reach Xray. keycase names
+#                  the first key, in byte order, that folds to a name in guard
+#                  without being it, and that name; the entry is invalid.
+#                  guard holds every key the decoders, the sanitizer, the
+#                  generators and the watch read or write, and grows when one
+#                  of them starts reading another. What a "headers" object
+#                  holds is left alone: Xray reads it as a map, and a header's
+#                  name is the panel's to spell. fold spells the folding out
+#                  code point by code point, since no regex builtin is at hand.
+#                  keyCase in server/internal/subscription/text.go is the twin.
 #   scrub_sockopt  a foreign fwmark could collide with ours (0x100 Xray, 0x01
 #                  firmware VPN, 0x00ff0000 Tunnel Director), and an interface
 #                  would route around the WAN; a sockopt left empty goes too.
@@ -62,8 +76,21 @@ plugin obfs obfs-password pinSHA256 "
 #                  it: Xray ignores tlsSettings under any other security, and
 #                  a stray flag there costs nothing (checked against 26.2.6).
 # Both jq programs below take these, as the Go twins serve both Go paths.
-# shellcheck disable=SC2016  # $k is jq's, bound by reduce
+# shellcheck disable=SC2016  # $k and $lower are jq's
 _SUB_JQ_SANITIZE='
+def guard: ["protocol", "settings", "vnext", "servers", "address", "port", "streamSettings", "network",
+            "security", "tlsSettings", "realitySettings", "serverName", "alpn", "fingerprint", "publicKey",
+            "password", "allowInsecure", "pinnedPeerCertSha256", "masterKeyLog", "sockopt", "echSockopt",
+            "mark", "interface", "tproxy", "customSockopt", "dialerProxy", "proxySettings", "tag",
+            "sendThrough", "xhttpSettings", "splithttpSettings", "wsSettings", "httpupgradeSettings",
+            "grpcSettings", "authority", "host", "mode", "extra", "downloadSettings", "scMaxEachPostBytes"];
+def fold: explode | map(if . == 383 then 115 elif . == 8490 then 107 elif . >= 65 and . <= 90 then . + 32 else . end) | implode;
+def keycase_keys: if type == "object" then (to_entries[] | .key, (if .key == "headers" then empty else (.value | keycase_keys) end))
+                  elif type == "array" then (.[] | keycase_keys)
+                  else empty end;
+def keycase: (guard | map(ascii_downcase)) as $lower
+             | [keycase_keys | select(IN(guard[]) | not) | select(fold | IN($lower[]))] | sort
+             | if length == 0 then null else (.[0] as $k | [$k, guard[$lower | index([$k | fold])]]) end;
 def scrub_sockopt: walk(if type == "object"
                         then reduce ("sockopt", "echSockopt") as $k (.;
                                if (.[$k] | type) == "object"
@@ -388,13 +415,21 @@ _sub_stream() {
     if [[ $net == xhttp && -n ${_SUB_Q[extra]:-} ]]; then
         # What the extra holds is read here, where a skip can still be made;
         # the record program only sanitizes what survives.
-        local verdict
+        local verdict key canonical
         verdict=$(jq -rs "$_SUB_JQ_SANITIZE"'
             if length == 1 and (.[0] | type) == "object" then
-              .[0] | if deep_dialer then "chained" elif deep_insecure then "insecure" else "ok" end
+              .[0] | keycase as $kc
+              | if $kc != null then "keycase\t\($kc[0])\t\($kc[1])"
+                elif deep_dialer then "chained" elif deep_insecure then "insecure" else "ok" end
             else "invalid" end' <<< "${_SUB_Q[extra]}" 2>/dev/null) || verdict=invalid
         case $verdict in
             ok) ;;
+            keycase*)
+                # Neither name holds a tab: both fold to a name in guard.
+                IFS=$'\t' read -r _ key canonical <<< "$verdict"
+                _sub_skip invalid "key \"$key\" is spelled \"$canonical\""
+                return 1
+                ;;
             chained)
                 _sub_skip composite "chained"
                 return 1
@@ -755,6 +790,7 @@ _sub_xray_json() {
             | if ($proxies | length) == 0 then skip($raw; "unsupported"; "no proxy outbound")
               elif ($proxies | length) > 1 then skip($raw; "composite"; "\($proxies | length) proxy outbounds")
               else $proxies[0] as $ob
+              | ($ob | keycase) as $kc
               | ($ob.streamSettings | obj) as $ss
               | ($ob.settings | obj) as $settings
               | (($settings.vnext | if type == "array" then length else 0 end) as $v
@@ -766,7 +802,9 @@ _sub_xray_json() {
               | ($t.address | str | ltrimstr("[") | rtrimstr("]")) as $addr
               | ($t.port | if type == "number" and (tojson | explode | all(. >= 48 and . <= 57))
                               and . >= 1 and . <= 65535 then floor else null end) as $port
-              | if ($ob.protocol | IN("vless", "vmess", "trojan", "shadowsocks", "hysteria") | not) then
+              | if $kc != null then
+                  skip($raw; "invalid"; "key \"\($kc[0])\" is spelled \"\($kc[1])\"")
+                elif ($ob.protocol | IN("vless", "vmess", "trojan", "shadowsocks", "hysteria") | not) then
                   skip($raw; "unsupported"; "protocol \($ob.protocol)")
                 elif ($ob.proxySettings | obj | .tag | str) != "" or ($ob | deep_dialer) then
                   skip($raw; "composite"; "chained")

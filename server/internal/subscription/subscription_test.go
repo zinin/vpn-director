@@ -242,3 +242,20 @@ func TestDecode_BadPortDetailIsThePortAsWritten(t *testing.T) {
 		t.Fatalf("skipped %+v, want one skip detailed %s", res.Skipped, want)
 	}
 }
+
+// Xray reads "Sockopt" and "Mark" as sockopt and mark, so the entry is
+// invalid. Both keys are misspelled, and the detail names the first in byte
+// order: the key lib/subscription.sh names for the same body
+// (subscription.bats), whatever order a map walk takes.
+func TestDecode_KeyCaseDetail(t *testing.T) {
+	res, err := Decode(`{"remarks":"Sockopt","outbounds":[{"protocol":"vless",` +
+		`"settings":{"vnext":[{"address":"kc.example.com","port":443,"users":[{"id":"16161616-1616-4616-8616-161616161616","encryption":"none"}]}]},` +
+		`"streamSettings":{"network":"tcp","security":"none","Sockopt":{"Mark":256}}}]}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `key "Mark" is spelled "mark"`
+	if len(res.Skipped) != 1 || res.Skipped[0].Detail != want {
+		t.Fatalf("skipped %+v, want one skip detailed %s", res.Skipped, want)
+	}
+}

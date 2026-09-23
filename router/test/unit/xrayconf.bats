@@ -172,6 +172,26 @@ setup() {
     [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
 }
 
+# Xray loads its config with encoding/json, which matches a key to a field
+# whatever its case: a "DownloadSettings" is the download stream to it, and an
+# "Address" its address. A record stored before the importers refused such
+# spellings is read the same way, as downloadWithoutAddress in
+# service/xray.go reads it.
+@test "build_outbound: a DownloadSettings without an address -> error" {
+    server='{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"DownloadSettings":{}}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 1 ]
+    [[ $output == *'xrayconf: stored outbound: xhttp downloadSettings without an address'* ]]
+}
+
+@test "build_outbound: a downloadSettings with its Address -> ok" {
+    server='{"address":"oslo.example","port":443,"outbound":{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"downloadSettings":{"Address":"dl.example.com"}}}}}}'
+    run xrayconf_build_outbound <<< "$server"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s' "$output" | jq -r '.streamSettings.xhttpSettings.extra.downloadSettings.Address')" = "dl.example.com" ]
+    [ "$(printf '%s' "$output" | jq -r .tag)" = "proxy-out" ]
+}
+
 @test "generate: a stored outbound replaces the template's outbounds" {
     server='{"address":"198.51.100.12","port":2030,"outbound":{"protocol":"shadowsocks","settings":{"servers":[{"address":"198.51.100.12","port":2030,"method":"aes-256-gcm","password":"p"}]}}}'
     run xrayconf_generate "$PROJECT_ROOT/opt/etc/xray/config.json.template" <<< "$server"

@@ -14,9 +14,14 @@
 # downloadSettings in it names no address, as it does in serverOutbound in
 # service/xray.go: Xray leaves that destination nil and panics on the first
 # dial through it, and "xray run -test" never dials, so the test cannot catch
-# it. An outbound that is there but is no object - a string, a null - fails
-# (rc=1), as serverOutbound rejects it through DecodeOutbound: it is no legacy
-# record.
+# it. Both names are looked up as Xray reads them: it loads its config with
+# Go's encoding/json, which matches a key to a field whatever its case, so a
+# "DownloadSettings" is the download stream to it and an "Address" its
+# address - and a record stored before the importers refused such spellings
+# can hold either. fold is the one in lib/subscription.sh, the long s and the
+# Kelvin sign included. An outbound that is there but is no object - a
+# string, a null - fails (rc=1), as serverOutbound rejects it through
+# DecodeOutbound: it is no legacy record.
 # A record from before outbounds were stored is built from its flat VLESS
 # fields, and fails (rc=1) on an unsupported network (non-tcp) or security
 # (not tls/reality) instead of emitting a silently-broken outbound.
@@ -25,8 +30,11 @@ xrayconf_build_outbound() {
     local server_json net sec
     server_json="$(cat)"
     if printf '%s' "$server_json" | jq -e 'type == "object" and (.outbound | type) == "object"' >/dev/null 2>&1; then
-        if printf '%s' "$server_json" | jq -e '[.outbound | .. | objects | .downloadSettings? | objects
-                | select((.address | type) != "string" or .address == "")] | length > 0' >/dev/null 2>&1; then
+        if printf '%s' "$server_json" | jq -e '
+                def fold: explode | map(if . == 383 then 115 elif . == 8490 then 107 elif . >= 65 and . <= 90 then . + 32 else . end) | implode;
+                [.outbound | .. | objects | to_entries[] | select(.key | fold == "downloadsettings") | .value | objects
+                 | select([to_entries[] | select(.key | fold == "address") | .value | strings | select(. != "")] | length == 0)]
+                | length > 0' >/dev/null 2>&1; then
             printf 'xrayconf: stored outbound: xhttp downloadSettings without an address\n' >&2
             return 1
         fi

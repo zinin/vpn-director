@@ -44,7 +44,9 @@ and `server/internal/subscription`, which answer to the same cases in `testdata/
 generators insert it as stored, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
 httpupgrade, xhttp), VMess, Trojan, Shadowsocks, Hysteria2. They look for two shapes only, and refuse
 both: an `outbound` that is there but is no object (a string, a null — only a record without the key
-is a legacy one), and an xhttp `downloadSettings` anywhere in it that names no `address`. Xray gives
+is a legacy one), and an xhttp `downloadSettings` anywhere in it that names no `address` — both names
+found under the same folding Xray applies (below), since a record stored before the importers refused
+a `DownloadSettings` or an `Address` can still hold one. Xray gives
 that download stream no destination and dereferences it on the first dial (`splithttp` in 26.2.6):
 a panic that takes Xray down, and every Xray client with it. `xray run -test` never dials, so it
 passes such a config; the selection fails with the reason instead, and the watch walk moves on to
@@ -52,7 +54,15 @@ the next server.
 
 Sanitizing keeps routing ours, and it reads the whole outbound, not its top only: an xhttp `extra`
 holds whatever the subscription wrote, and Xray reads a whole `downloadSettings` stream config out of
-it. A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in it keeps `mark`,
+it. Every key the decoders, the sanitizer, the generators and the watch read is matched as Xray
+matches it: Xray loads its config with `encoding/json`, which folds case — the long s (U+017F) and
+the Kelvin sign (U+212A) included — so a key that folds to one of those names without being it
+(`Sockopt`, `MasterKeyLog`, `marK`) would pass every exact lookup and still reach Xray. Such a key
+makes the entry `invalid` (`key "Sockopt" is spelled "sockopt"`; with several, the first in byte
+order), except under `headers`, which Xray reads as a map: a header's name is the panel's to spell.
+The names are `guardedKeys` in Go and `guard` in the shell, and they grow with whatever a consumer
+starts reading.
+A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in it keeps `mark`,
 `interface`, `tproxy` or `customSockopt` — a foreign fwmark could collide with ours (0x100 Xray,
 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an interface would route around the WAN; a
 `sockopt` left empty goes too. `tlsSettings.echSockopt`, the socket the ECH config query is dialed

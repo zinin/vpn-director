@@ -84,6 +84,9 @@ func xrayEntry(raw interface{}) (entry, error) {
 		return e, composite(strconv.Itoa(len(proxies)) + " proxy outbounds")
 	}
 	ob := proxies[0]
+	if k, c := keyCase(ob); k != "" {
+		return e, invalid(`key "` + k + `" is spelled "` + c + `"`)
+	}
 	protocol := ob["protocol"].(string)
 	if !proxyProtocols[protocol] {
 		return e, unsupported("protocol " + protocol)

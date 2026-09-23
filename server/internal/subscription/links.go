@@ -251,6 +251,9 @@ func streamSettings(p params, defaultSecurity string) (map[string]interface{}, e
 			if err != nil {
 				return nil, invalid("xhttp extra is not a JSON object")
 			}
+			if k, c := keyCase(extra); k != "" {
+				return nil, invalid(`key "` + k + `" is spelled "` + c + `"`)
+			}
 			if hasDialerProxy(extra) {
 				return nil, composite("chained")
 			}
