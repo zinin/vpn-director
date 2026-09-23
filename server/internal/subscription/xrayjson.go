@@ -56,6 +56,10 @@ func decodeXrayJSON(body string) (Result, error) {
 // value only; the v2rayN vmess path, which builds its outbound from that
 // integer, keeps taking 443.0. The shell sees the number as jq prints it, so a
 // literal jq normalizes (4.43e2) is stored there with the normalized port.
+// encoding/json refuses nan, NaN, Infinity, .5, 1., +1 and 0443 as well
+// ("invalid JSON subscription", or an invalid entry inside an xhttp extra or a
+// vmess object), which jq reads as numbers, so the shell imports such a body;
+// it is documented and left, as the port literals are.
 // Xray lowercases a protocol, a network and a security before it reads them
 // (LoadWithID, TransportProtocol.Build and StreamConfig.Build in 26.2.6), so
 // every outbound's protocol, and every network and security of the proxy

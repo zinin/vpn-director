@@ -775,6 +775,15 @@ _sub_links() {
 # reads the literal itself (xrayEntry), so a literal jq normalizes is skipped
 # there and imported here with the normalized port: jq's number printing, the
 # same that words a vmess port "bad port 1E+100" where Go writes 1e100.
+# jq's number parsing is lenient where encoding/json is strict, too: it reads
+# nan, NaN, Infinity, .5, 1., +1 and 0443 as numbers - nan and NaN print as
+# null, Infinity as 1.7976931348623157e+308, .5 as 0.5, 1. and +1 as 1, 0443
+# as 443 - so a body, an xhttp extra or a vmess object holding one imports
+# here and is "invalid JSON subscription" in Go, or an invalid entry for the
+# extra or the vmess object. Only nan and Infinity would still be told apart
+# after parsing; the rest are ordinary numbers by then. No panel writes them,
+# and the value reaches Xray as a number or a null, so it is left as the port
+# literals are.
 # Xray lowercases a protocol, a network and a security before it reads them,
 # so every outbound's protocol, and every network and security of the proxy
 # ("headers" excepted), is lowercased (ASCII) before any check reads it and

@@ -430,3 +430,24 @@ A killed process exits 124 under coreutils and 143 under BusyBox. Xray prints
 its version banner before it loads the config, so `xrayconf_validate` reads
 that exit code — not the output — to tell a timeout
 (`xray config test timed out after 15s`) from a rejection.
+
+### jq reads number literals that are not JSON
+
+**Problem**: jq 1.8.1 takes number literals Go's `encoding/json` refuses:
+
+```bash
+printf '[nan, NaN, Infinity, .5, 1., +1, 0443]' | jq -c .
+# [null,null,1.7976931348623157e+308,0.5,1,1,443]
+```
+
+An Xray JSON body, an xhttp `extra` or a v2rayN vmess object holding one
+imports through `lib/subscription.sh` and is `invalid JSON subscription` (or an
+`invalid` entry) in the Go decoder — the bot, the Web UI and the watch. Only
+`nan` and `Infinity` can still be told apart after parsing (`isnan`,
+`isinfinite`); the rest are ordinary numbers by then, so parity would take a
+pass over the raw text before jq.
+
+**Rule**: the subscription decoders keep this divergence (see the comment
+above `_sub_xray_json`): no panel writes such a literal, and the value reaches
+Xray as a number or a null. Any other jq that reads untrusted JSON on the
+router inherits the same leniency.
