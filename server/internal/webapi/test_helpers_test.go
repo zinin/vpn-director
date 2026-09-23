@@ -64,6 +64,13 @@ type mockConfig struct {
 	savedCfg      *vpnconfig.VPNDirectorConfig // captured by UpdateVPNConfig
 	savedServers  []vpnconfig.Server           // captured by SaveServers
 	updateErr     error                        // returned by UpdateVPNConfig before fn runs, e.g. service.ErrConfigLockTimeout
+	// subs are the subscription files. UpdateVPNConfig serializes on upd as
+	// the flock does, and subsMu guards subs: RefreshAll runs one refresh per
+	// subscription at once.
+	subs    []vpnconfig.Subscription
+	subsErr error // LoadSubscriptions fails
+	upd     sync.Mutex
+	subsMu  sync.Mutex
 }
 
 func (m *mockConfig) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) {
@@ -75,11 +82,54 @@ func (m *mockConfig) SaveServers(servers []vpnconfig.Server) error {
 	return m.err
 }
 
+func (m *mockConfig) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	if m.subsErr != nil {
+		return nil, m.subsErr
+	}
+	out := make([]vpnconfig.Subscription, len(m.subs))
+	for i, s := range m.subs {
+		for j := range s.Servers {
+			s.Servers[j].Subscription = s.ID
+		}
+		out[i] = s
+	}
+	return out, nil
+}
+
+func (m *mockConfig) SaveSubscription(sub vpnconfig.Subscription) error {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for i := range m.subs {
+		if m.subs[i].ID == sub.ID {
+			m.subs[i] = sub
+			return nil
+		}
+	}
+	m.subs = append(m.subs, sub)
+	return nil
+}
+
+func (m *mockConfig) DeleteSubscription(id string) error {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for i := range m.subs {
+		if m.subs[i].ID == id {
+			m.subs = append(m.subs[:i:i], m.subs[i+1:]...)
+			return nil
+		}
+	}
+	return nil
+}
+
 // UpdateVPNConfig mirrors the real contract: a load failure (err or no cfg)
 // comes back wrapped in service.ErrConfigLoad before fn runs; an fn error
 // skips the save; otherwise the mutated cfg is recorded as savedCfg and
 // saveVPNCfgErr, if set, is returned after it.
 func (m *mockConfig) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	m.upd.Lock()
+	defer m.upd.Unlock()
 	if m.updateErr != nil {
 		return m.updateErr
 	}

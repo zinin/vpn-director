@@ -64,6 +64,7 @@ func (m *mockSender) AckCallback(callbackID string) error {
 // mockConfigStore for testing
 type mockConfigStore struct {
 	servers   []vpnconfig.Server
+	subs      []vpnconfig.Subscription
 	vpnConfig *vpnconfig.VPNDirectorConfig
 	err       error
 }
@@ -79,6 +80,12 @@ func (m *mockConfigStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) 
 func (m *mockConfigStore) SaveServers([]vpnconfig.Server) error {
 	return m.err
 }
+
+func (m *mockConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
+	return m.subs, m.err
+}
+func (m *mockConfigStore) SaveSubscription(vpnconfig.Subscription) error { return m.err }
+func (m *mockConfigStore) DeleteSubscription(string) error               { return m.err }
 
 func (m *mockConfigStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	if m.err != nil {

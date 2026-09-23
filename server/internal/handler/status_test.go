@@ -33,12 +33,19 @@ func (m *mockVPNDirector) Platform() (vpnconfig.PlatformInfo, error) {
 // mockConfigStore is used by servers_test.go (Task 5.3)
 type mockConfigStore struct {
 	servers []vpnconfig.Server
+	subs    []vpnconfig.Subscription
 	err     error
 }
 
 func (m *mockConfigStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) { return nil, m.err }
 func (m *mockConfigStore) LoadServers() ([]vpnconfig.Server, error)             { return m.servers, m.err }
 func (m *mockConfigStore) SaveServers([]vpnconfig.Server) error                 { return m.err }
+
+func (m *mockConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
+	return m.subs, m.err
+}
+func (m *mockConfigStore) SaveSubscription(vpnconfig.Subscription) error { return m.err }
+func (m *mockConfigStore) DeleteSubscription(string) error               { return m.err }
 
 // UpdateVPNConfig: this mock holds no vpn-director.json, like a router before
 // its first configure, so every update stops at the load step.

@@ -54,6 +54,7 @@ func (m *mockXrayGenerator) GenerateConfig(server vpnconfig.Server, _ ...service
 // trackingConfigStore extends mockConfigStore to track saves
 type trackingConfigStore struct {
 	servers          []vpnconfig.Server
+	subs             []vpnconfig.Subscription
 	vpnConfig        *vpnconfig.VPNDirectorConfig
 	loadErr          error
 	saveErr          error
@@ -72,6 +73,12 @@ func (m *trackingConfigStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, err
 func (m *trackingConfigStore) SaveServers([]vpnconfig.Server) error {
 	return m.saveErr
 }
+
+func (m *trackingConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
+	return m.subs, m.loadErr
+}
+func (m *trackingConfigStore) SaveSubscription(vpnconfig.Subscription) error { return m.saveErr }
+func (m *trackingConfigStore) DeleteSubscription(string) error               { return m.saveErr }
 
 func (m *trackingConfigStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	if m.loadErr != nil {

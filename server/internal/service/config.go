@@ -4,6 +4,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -153,13 +154,68 @@ func (s *ConfigService) lockConfig() (unlock func(), err error) {
 	}, nil
 }
 
-// LoadServers loads the servers list
-func (s *ConfigService) LoadServers() ([]vpnconfig.Server, error) {
+// SubscriptionsDir is where the data directory keeps the subscription files.
+func (s *ConfigService) SubscriptionsDir() (string, error) {
 	dataDir, err := s.DataDir()
+	if err != nil {
+		return "", err
+	}
+	return vpnconfig.SubscriptionsDir(dataDir), nil
+}
+
+// LoadSubscriptions reads every subscription, in order (vpnconfig.LoadSubscriptions).
+func (s *ConfigService) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
+	dir, err := s.SubscriptionsDir()
 	if err != nil {
 		return nil, err
 	}
-	return vpnconfig.LoadServers(filepath.Join(dataDir, "servers.json"))
+	return vpnconfig.LoadSubscriptions(dir)
+}
+
+// SaveSubscription writes one subscription file. The caller holds the config
+// lock. It also takes away the servers.json of earlier releases.
+func (s *ConfigService) SaveSubscription(sub vpnconfig.Subscription) error {
+	dataDir, err := s.DataDir()
+	if err != nil {
+		return err
+	}
+	if err := vpnconfig.SaveSubscription(vpnconfig.SubscriptionsDir(dataDir), sub); err != nil {
+		return err
+	}
+	s.removeLegacyServers(dataDir)
+	return nil
+}
+
+// DeleteSubscription removes one subscription file. The caller holds the
+// config lock. It also takes away the servers.json of earlier releases.
+func (s *ConfigService) DeleteSubscription(id string) error {
+	dataDir, err := s.DataDir()
+	if err != nil {
+		return err
+	}
+	if err := vpnconfig.DeleteSubscriptionFile(vpnconfig.SubscriptionsDir(dataDir), id); err != nil {
+		return err
+	}
+	s.removeLegacyServers(dataDir)
+	return nil
+}
+
+// removeLegacyServers is best effort: the subscription write it follows has
+// happened, and a servers.json left behind is read by nobody.
+func (s *ConfigService) removeLegacyServers(dataDir string) {
+	if err := vpnconfig.RemoveLegacyServers(dataDir); err != nil {
+		slog.Warn("Failed to remove the servers.json of an earlier release", "error", err)
+	}
+}
+
+// LoadServers is every server of every subscription, in subscription order,
+// each carrying its subscription's id (vpnconfig.AllServers).
+func (s *ConfigService) LoadServers() ([]vpnconfig.Server, error) {
+	subs, err := s.LoadSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	return vpnconfig.AllServers(subs), nil
 }
 
 // SaveServers saves the servers list (creates directory if needed)

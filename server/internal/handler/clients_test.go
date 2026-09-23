@@ -77,6 +77,10 @@ func (m *mockConfigClients) DataDir() (string, error)                 { return "
 func (m *mockConfigClients) DataDirOrDefault() string                 { return "/data" }
 func (m *mockConfigClients) ScriptsDir() string                       { return "/scripts" }
 
+func (m *mockConfigClients) LoadSubscriptions() ([]vpnconfig.Subscription, error) { return nil, nil }
+func (m *mockConfigClients) SaveSubscription(vpnconfig.Subscription) error        { return nil }
+func (m *mockConfigClients) DeleteSubscription(string) error                      { return nil }
+
 type mockVPNClients struct {
 	applyErr    error
 	platform    vpnconfig.PlatformInfo

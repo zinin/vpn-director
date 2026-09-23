@@ -33,6 +33,9 @@ func (s *stubStore) SaveServers(servers []vpnconfig.Server) error {
 	s.savedServers = servers
 	return nil
 }
+func (s *stubStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) { return nil, nil }
+func (s *stubStore) SaveSubscription(vpnconfig.Subscription) error        { return nil }
+func (s *stubStore) DeleteSubscription(string) error                      { return nil }
 func (s *stubStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	if s.err != nil {
 		return s.err
