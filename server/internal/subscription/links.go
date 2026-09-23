@@ -254,6 +254,10 @@ func streamSettings(p params, defaultSecurity string) (map[string]interface{}, e
 			if k, c := keyCase(extra); k != "" {
 				return nil, invalid(`key "` + k + `" is spelled "` + c + `"`)
 			}
+			// The extra is Xray's JSON, so its values are read lowered, as an
+			// Xray JSON entry's are: a "TLS" download stream is a tls one to
+			// sanitizeTLS.
+			lowerStreamNames(extra)
 			if hasDialerProxy(extra) {
 				return nil, composite("chained")
 			}

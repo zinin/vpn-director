@@ -67,7 +67,10 @@ The names are `guardedKeys` in Go and `guard` in the shell, and they grow with w
 starts reading. Values are read as Xray reads them too: an Xray JSON entry's `protocol`, and every
 `security` and `network` in its proxy outbound (`headers` excepted), are stored lowercased, since
 Xray lowercases all three before it looks — so `TLS` is a tls stream to the sanitizer, the label,
-`tcpChecked` and `keepHostname` alike. Share links already refuse another spelling as `unsupported`.
+`tcpChecked` and `keepHostname` alike. Share links already refuse another spelling of their `type`
+and `security` as `unsupported`; the `extra` an xhttp link carries is Xray's JSON, and its
+`security` and `network` values are lowercased the same way before any check reads them, so a
+`TLS` download stream there loses its `allowInsecure` as a `tls` one does.
 A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in it keeps `mark`,
 `interface`, `tproxy` or `customSockopt` — a foreign fwmark could collide with ours (0x100 Xray,
 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an interface would route around the WAN; a

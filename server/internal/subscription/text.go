@@ -224,9 +224,10 @@ func foldsTo(k string) string {
 // key in v, however deep: Xray lowercases a stream's network and security
 // before it reads them (TransportProtocol.Build and StreamConfig.Build in
 // 26.2.6), so "TLS" is a tls stream to it, and to every check here once
-// lowered. What a "headers" object holds is left alone: Xray reads it as a
-// map, and a header named network keeps its value. lower_names in
-// lib/subscription.sh is the twin.
+// lowered. xrayEntry runs it on the proxy outbound, streamSettings on the
+// extra of an xhttp link. What a "headers" object holds is left alone: Xray
+// reads it as a map, and a header named network keeps its value. lower_names
+// in lib/subscription.sh is the twin.
 func lowerStreamNames(v interface{}) {
 	switch t := v.(type) {
 	case map[string]interface{}:

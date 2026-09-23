@@ -1,0 +1,10 @@
+{
+  "total": 3,
+  "servers": [
+    {"address":"lv1.example.com","name":"Upper pinned","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"lv1.example.com","port":443,"users":[{"encryption":"none","id":"18181818-1818-4818-8818-181818181818"}]}]},"streamSettings":{"network":"xhttp","security":"tls","tlsSettings":{"serverName":"lv1.example.com"},"xhttpSettings":{"extra":{"downloadSettings":{"address":"dl.example.com","network":"xhttp","port":443,"security":"tls","tlsSettings":{"pinnedPeerCertSha256":"39ddf94fc84218d902db652725fbf4bb318aaea30637e0124b004ce7031f11e6","serverName":"dl.example.com"},"xhttpSettings":{"path":"/down"}}},"path":"/up"}}},"port":443},
+    {"address":"lv3.example.com","name":"Header kept","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"lv3.example.com","port":443,"users":[{"encryption":"none","id":"18181818-1818-4818-8818-181818181818"}]}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"dl.example.com","network":"xhttp","port":443,"security":"none"},"headers":{"network":"WAN"}},"path":"/up"}}},"port":443}
+  ],
+  "skipped": [
+    {"name":"Upper insecure","reason":"unsupported"}
+  ]
+}

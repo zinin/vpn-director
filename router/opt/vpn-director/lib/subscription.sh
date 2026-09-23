@@ -58,9 +58,11 @@ plugin obfs obfs-password pinSHA256 "
 #                  keyCase in server/internal/subscription/text.go is the twin.
 #   lower_names    Xray lowercases a stream's network and security before it
 #                  reads them, so every network and security value, however
-#                  deep, is lowercased (ASCII) - except what a "headers"
-#                  object holds, a map to Xray: a header named network keeps
-#                  its value. lowerStreamNames in text.go is the twin.
+#                  deep, is lowercased (ASCII) - in the proxy of an Xray JSON
+#                  entry and in the extra of an xhttp link alike - except
+#                  what a "headers" object holds, a map to Xray: a header
+#                  named network keeps its value. lowerStreamNames in text.go
+#                  is the twin.
 #   scrub_sockopt  a foreign fwmark could collide with ours (0x100 Xray, 0x01
 #                  firmware VPN, 0x00ff0000 Tunnel Director), and an interface
 #                  would route around the WAN; a sockopt left empty goes too.
@@ -145,7 +147,7 @@ def stream:
                                               + (if $mode == "multi" then {multiMode: true} else {} end))}
      elif $net == "xhttp" then {xhttpSettings: ({path: $path, host: $host, mode: $mode}
                                                 + (if $extra == "" then {} else
-                                                   {extra: ($extra | fromjson | drop_insecure | scrub_sockopt | drop_keylog)} end))}
+                                                   {extra: ($extra | fromjson | lower_names | drop_insecure | scrub_sockopt | drop_keylog)} end))}
      else {} end);
 '
 
@@ -426,11 +428,13 @@ _sub_stream() {
     esac
     if [[ $net == xhttp && -n ${_SUB_Q[extra]:-} ]]; then
         # What the extra holds is read here, where a skip can still be made;
-        # the record program only sanitizes what survives.
+        # the record program only sanitizes what survives. The extra is
+        # Xray's JSON, so its values are read lowered, as an Xray JSON
+        # entry's are: a "TLS" download stream is a tls one to deep_insecure.
         local verdict key canonical
         verdict=$(jq -rs "$_SUB_JQ_SANITIZE"'
             if length == 1 and (.[0] | type) == "object" then
-              .[0] | keycase as $kc
+              .[0] | keycase as $kc | lower_names
               | if $kc != null then "keycase\t\($kc[0])\t\($kc[1])"
                 elif deep_dialer then "chained" elif deep_insecure then "insecure" else "ok" end
             else "invalid" end' <<< "${_SUB_Q[extra]}" 2>/dev/null) || verdict=invalid
@@ -789,7 +793,8 @@ _sub_links() {
 # ("headers" excepted), is lowercased (ASCII) before any check reads it and
 # stored so: "TLS" is a tls stream to the sanitizer, the label, tcpChecked and
 # keepHostname alike. A share link that spells its type or security
-# otherwise is unsupported.
+# otherwise is unsupported; the extra an xhttp link carries is Xray's JSON,
+# and _sub_stream and the record program lower it the same way.
 _sub_xray_json() {
     local count out
     if ! count=$(jq -s 'length' <<< "$1" 2>/dev/null) || [[ $count != 1 ]]; then

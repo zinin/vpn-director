@@ -66,7 +66,8 @@ func decodeXrayJSON(body string) (Result, error) {
 // ("headers" excepted, lowerStreamNames), is lowercased before any check reads
 // it and stored so: "TLS" is a tls stream to the sanitizer, the label,
 // tcpChecked and keepHostname alike. A share link that spells its type or
-// security otherwise is unsupported.
+// security otherwise is unsupported; the extra an xhttp link carries is
+// Xray's JSON, and streamSettings lowers it the same way.
 func xrayEntry(raw interface{}) (entry, error) {
 	cfg, ok := raw.(map[string]interface{})
 	if !ok {
