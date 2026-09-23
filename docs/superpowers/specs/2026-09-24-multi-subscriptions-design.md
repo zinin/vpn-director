@@ -259,15 +259,16 @@ shorten this.
 
 ### 6.1 API
 
-Parameters travel in the body, as they do for `/api/clients`.
+As on `/api/clients`, a new item travels in the body and the item an action
+names goes in the query (`?id=`).
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/subscriptions` | Every subscription: `id`, `name`, `host`, `static`, the server count, `added`, `refreshed`, `error`. No link. |
 | POST | `/api/subscriptions` | Add `{url, name?}`; a saved link is refreshed instead. Answers today's import summary plus `id` and `name`. |
-| POST | `/api/subscriptions/refresh` | `{id}` refreshes one subscription, `{}` all of them in parallel; one result per subscription. |
-| POST | `/api/subscriptions/rename` | `{id, name}` |
-| DELETE | `/api/subscriptions` | `{id}`; the answer says whether the running server came from it. |
+| POST | `/api/subscriptions/refresh` | `?id=` refreshes one subscription, no id all of them in parallel; one result per subscription. |
+| POST | `/api/subscriptions/rename` | `?id=` and `{name}` |
+| DELETE | `/api/subscriptions` | `?id=`; the answer says whether the running server came from it. |
 | GET | `/api/servers` | The servers grouped by subscription, and `active` with `subscription`. |
 | POST | `/api/servers/active` | `{subscription, index, name, address, port}`, the index counted within that subscription. 409 "server list changed" as today, and also when the subscription is gone. |
 
@@ -321,7 +322,9 @@ deleted reads "<name> — not in any subscription".
   Cancel. Its state records the subscription beside the name, address and
   port; step 4 and the apply look the server up by all four. A server whose
   subscription was deleted is reported gone, as one a refresh dropped is today.
-- **`/servers`** groups by subscription, then by country as today, in pages.
+- **`/servers`** lists the servers under a header per subscription, numbered
+  within it, in pages as today. The reply to `/import <url>` keeps its summary
+  by country.
 - Notifications name servers as section 5.5 does. The help of `/start` and the
   bot's command list gain `/subs`.
 
