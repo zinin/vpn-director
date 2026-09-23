@@ -1145,8 +1145,11 @@ func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) b
 // address slot (vpnconfig.OutboundTarget). Where the source left the name to
 // the address, dialing an IP would change it, so the hostname goes there
 // instead: an empty tlsSettings.serverName, and for a stream without security
-// an empty Host of ws, httpupgrade or xhttp - with TLS, Xray takes that Host
-// from the server name.
+// an empty Host of ws or httpupgrade, an empty Host of the xhttpSettings or
+// splithttpSettings the record has - Xray reads the former over the latter
+// and drops the other - or an empty grpcSettings.authority, which a
+// cleartext gRPC stream otherwise takes from the address. With TLS, Xray
+// takes that Host, and gRPC's authority, from the server name.
 func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
 	ip := ""
 	for _, v := range s.IPs {
@@ -1188,7 +1191,12 @@ func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
 }
 
 // keepHostname writes host where the stream would otherwise take the name
-// from an address that is now an IP.
+// from an address that is now an IP. The xhttp Host goes into the
+// xhttpSettings or splithttpSettings the record has: Xray reads xhttpSettings
+// over splithttpSettings and drops the other, so a new xhttpSettings beside a
+// splithttpSettings would dial without its path, mode and extra. A cleartext
+// gRPC stream takes its :authority from the address when
+// grpcSettings.authority is empty, so the hostname goes there.
 func keepHostname(ob map[string]interface{}, host string) {
 	ss, _ := ob["streamSettings"].(map[string]interface{})
 	if ss == nil {
@@ -1213,6 +1221,21 @@ func keepHostname(ob map[string]interface{}, host string) {
 			key = "httpupgradeSettings"
 		case "xhttp", "splithttp":
 			key = "xhttpSettings"
+			if _, ok := ss[key].(map[string]interface{}); !ok {
+				if _, ok := ss["splithttpSettings"].(map[string]interface{}); ok {
+					key = "splithttpSettings"
+				}
+			}
+		case "grpc":
+			grpc, _ := ss["grpcSettings"].(map[string]interface{})
+			if grpc == nil {
+				grpc = map[string]interface{}{}
+				ss["grpcSettings"] = grpc
+			}
+			if authority, _ := grpc["authority"].(string); authority == "" {
+				grpc["authority"] = host
+			}
+			return
 		}
 		if key == "" {
 			return

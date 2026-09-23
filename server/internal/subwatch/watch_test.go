@@ -490,6 +490,47 @@ func TestServerForDial_KeepsTheHostnameWhereTheSourceLeftItToTheAddress(t *testi
 	if _, ok := ss["xhttpSettings"]; ok {
 		t.Fatalf("stream %v; REALITY gives xhttp its Host", ss)
 	}
+	// Xray reads xhttpSettings over splithttpSettings and drops the other, so
+	// the Host goes into the one the record has.
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"splithttp","splithttpSettings":{"path":"/secret","mode":"packet-up"}}}`)
+	if splithttp, _ := ss["splithttpSettings"].(map[string]interface{}); splithttp["host"] != "cdn.example" || splithttp["path"] != "/secret" {
+		t.Fatalf("splithttp %v", splithttp)
+	}
+	if _, ok := ss["xhttpSettings"]; ok {
+		t.Fatalf("stream %v; a new xhttpSettings would replace the splithttpSettings", ss)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/a"},"splithttpSettings":{"path":"/b"}}}`)
+	if xhttp, _ := ss["xhttpSettings"].(map[string]interface{}); xhttp["host"] != "cdn.example" {
+		t.Fatalf("xhttp %v", xhttp)
+	}
+	if splithttp, _ := ss["splithttpSettings"].(map[string]interface{}); splithttp["host"] != nil {
+		t.Fatalf("splithttp %v; Xray reads the xhttpSettings", splithttp)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"xhttp","security":"none"}}`)
+	if xhttp, _ := ss["xhttpSettings"].(map[string]interface{}); xhttp["host"] != "cdn.example" {
+		t.Fatalf("stream %v", ss)
+	}
+	// A cleartext gRPC stream takes its :authority from the address when
+	// grpcSettings names none; with TLS, Xray takes the server name.
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc"}}}`)
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "cdn.example" || grpc["serviceName"] != "svc" {
+		t.Fatalf("grpc %v", grpc)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","authority":"front.example"}}}`)
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "front.example" {
+		t.Fatalf("grpc %v; an explicit authority stays", grpc)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"grpc","security":"tls","grpcSettings":{"serviceName":"svc"}}}`)
+	if tls, _ := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "cdn.example" {
+		t.Fatalf("tls %v", tls)
+	}
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != nil {
+		t.Fatalf("grpc %v; with TLS the authority follows the server name", grpc)
+	}
+	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none"}}`)
+	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "cdn.example" {
+		t.Fatalf("stream %v", ss)
+	}
 }
 
 // An endpoint ban takes an address, not the name: a provider's host can resolve
