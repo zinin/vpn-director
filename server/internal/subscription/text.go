@@ -220,6 +220,44 @@ func foldsTo(k string) string {
 	return ""
 }
 
+// lowerStreamNames lowercases the string value of every security and network
+// key in v, however deep: Xray lowercases a stream's network and security
+// before it reads them (TransportProtocol.Build and StreamConfig.Build in
+// 26.2.6), so "TLS" is a tls stream to it, and to every check here once
+// lowered. What a "headers" object holds is left alone: Xray reads it as a
+// map, and a header named network keeps its value. lower_names in
+// lib/subscription.sh is the twin.
+func lowerStreamNames(v interface{}) {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, child := range t {
+			if k == "headers" {
+				continue
+			}
+			if s, ok := child.(string); ok && (k == "security" || k == "network") {
+				t[k] = asciiLower(s)
+				continue
+			}
+			lowerStreamNames(child)
+		}
+	case []interface{}:
+		for _, child := range t {
+			lowerStreamNames(child)
+		}
+	}
+}
+
+// asciiLower lowercases A-Z only, as jq's ascii_downcase does in the shell
+// twin: a value with any other letter matches nothing Xray knows either way.
+func asciiLower(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + 'a' - 'A'
+		}
+		return r
+	}, s)
+}
+
 // socketKeys are the keys that hold an Xray SocketConfig: a stream's sockopt,
 // and tlsSettings.echSockopt, the socket the ECH config query is dialed on.
 var socketKeys = []string{"sockopt", "echSockopt"}

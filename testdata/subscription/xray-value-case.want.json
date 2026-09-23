@@ -1,0 +1,13 @@
+{
+  "total": 6,
+  "servers": [
+    {"address":"vc1.example.com","name":"Upper vless","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"vc1.example.com","port":443,"users":[{"encryption":"none","id":"17171717-1717-4717-8717-171717171717"}]}]},"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"vc1.example.com"},"wsSettings":{"path":"/ws"}}},"port":443},
+    {"address":"vc2.example.com","name":"Helper case","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"vc2.example.com","port":443,"users":[{"encryption":"none","id":"17171717-1717-4717-8717-171717171717"}]}]},"streamSettings":{"network":"tcp","security":"none"}},"port":443},
+    {"address":"vc5.example.com","name":"Deep names","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"vc5.example.com","port":443,"users":[{"encryption":"none","id":"17171717-1717-4717-8717-171717171717"}]}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"extra":{"downloadSettings":{"address":"dl5.example.com","network":"xhttp","port":443,"security":"none"}},"path":"/up"}}},"port":443},
+    {"address":"vc6.example.com","name":"Header value kept","outbound":{"protocol":"vless","settings":{"vnext":[{"address":"vc6.example.com","port":443,"users":[{"encryption":"none","id":"17171717-1717-4717-8717-171717171717"}]}]},"streamSettings":{"network":"ws","security":"none","wsSettings":{"headers":{"network":"WAN"},"path":"/ws"}}},"port":443}
+  ],
+  "skipped": [
+    {"name":"Upper tls insecure","reason":"unsupported"},
+    {"name":"Upper reality short","reason":"invalid"}
+  ]
+}

@@ -64,7 +64,10 @@ the Kelvin sign (U+212A) included — so a key that folds to one of those names 
 makes the entry `invalid` (`key "Sockopt" is spelled "sockopt"`; with several, the first in byte
 order), except under `headers`, which Xray reads as a map: a header's name is the panel's to spell.
 The names are `guardedKeys` in Go and `guard` in the shell, and they grow with whatever a consumer
-starts reading.
+starts reading. Values are read as Xray reads them too: an Xray JSON entry's `protocol`, and every
+`security` and `network` in its proxy outbound (`headers` excepted), are stored lowercased, since
+Xray lowercases all three before it looks — so `TLS` is a tls stream to the sanitizer, the label,
+`tcpChecked` and `keepHostname` alike. Share links already refuse another spelling as `unsupported`.
 A stored outbound carries no `tag` and no `sendThrough`, and no `sockopt` in it keeps `mark`,
 `interface`, `tproxy` or `customSockopt` — a foreign fwmark could collide with ours (0x100 Xray,
 0x01 firmware VPN, 0x00ff0000 Tunnel Director), and an interface would route around the WAN; a

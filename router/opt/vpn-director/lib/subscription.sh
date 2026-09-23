@@ -56,6 +56,11 @@ plugin obfs obfs-password pinSHA256 "
 #                  name is the panel's to spell. fold spells the folding out
 #                  code point by code point, since no regex builtin is at hand.
 #                  keyCase in server/internal/subscription/text.go is the twin.
+#   lower_names    Xray lowercases a stream's network and security before it
+#                  reads them, so every network and security value, however
+#                  deep, is lowercased (ASCII) - except what a "headers"
+#                  object holds, a map to Xray: a header named network keeps
+#                  its value. lowerStreamNames in text.go is the twin.
 #   scrub_sockopt  a foreign fwmark could collide with ours (0x100 Xray, 0x01
 #                  firmware VPN, 0x00ff0000 Tunnel Director), and an interface
 #                  would route around the WAN; a sockopt left empty goes too.
@@ -91,6 +96,13 @@ def keycase_keys: if type == "object" then (to_entries[] | .key, (if .key == "he
 def keycase: (guard | map(ascii_downcase)) as $lower
              | [keycase_keys | select(IN(guard[]) | not) | select(fold | IN($lower[]))] | sort
              | if length == 0 then null else (.[0] as $k | [$k, guard[$lower | index([$k | fold])]]) end;
+def lower_names: if type == "object"
+                 then with_entries(if .key == "headers" then .
+                                   elif (.key == "security" or .key == "network") and (.value | type) == "string"
+                                   then .value |= ascii_downcase
+                                   else .value |= lower_names end)
+                 elif type == "array" then map(lower_names)
+                 else . end;
 def scrub_sockopt: walk(if type == "object"
                         then reduce ("sockopt", "echSockopt") as $k (.;
                                if (.[$k] | type) == "object"
@@ -763,6 +775,12 @@ _sub_links() {
 # reads the literal itself (xrayEntry), so a literal jq normalizes is skipped
 # there and imported here with the normalized port: jq's number printing, the
 # same that words a vmess port "bad port 1E+100" where Go writes 1e100.
+# Xray lowercases a protocol, a network and a security before it reads them,
+# so every outbound's protocol, and every network and security of the proxy
+# ("headers" excepted), is lowercased (ASCII) before any check reads it and
+# stored so: "TLS" is a tls stream to the sanitizer, the label, tcpChecked and
+# keepHostname alike. A share link that spells its type or security
+# otherwise is unsupported.
 _sub_xray_json() {
     local count out
     if ! count=$(jq -s 'length' <<< "$1" 2>/dev/null) || [[ $count != 1 ]]; then
@@ -785,12 +803,14 @@ _sub_xray_json() {
             skip(if type == "object" then (.remarks | rawname) else "" end; "invalid"; "not an Xray config")
           else
             (.remarks | rawname) as $raw
-            | [.outbounds[] | select(type == "object") | select((.protocol | type) == "string")
+            | [.outbounds[] | if type == "object" and (.protocol | type) == "string" then .protocol |= ascii_downcase else . end
+               | select(type == "object") | select((.protocol | type) == "string")
                | select(.protocol | IN("freedom", "blackhole", "dns", "loopback") | not)] as $proxies
             | if ($proxies | length) == 0 then skip($raw; "unsupported"; "no proxy outbound")
               elif ($proxies | length) > 1 then skip($raw; "composite"; "\($proxies | length) proxy outbounds")
               else $proxies[0] as $ob
               | ($ob | keycase) as $kc
+              | ($ob | lower_names) as $ob
               | ($ob.streamSettings | obj) as $ss
               | ($ob.settings | obj) as $settings
               | (($settings.vnext | if type == "array" then length else 0 end) as $v

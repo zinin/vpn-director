@@ -56,6 +56,13 @@ func decodeXrayJSON(body string) (Result, error) {
 // value only; the v2rayN vmess path, which builds its outbound from that
 // integer, keeps taking 443.0. The shell sees the number as jq prints it, so a
 // literal jq normalizes (4.43e2) is stored there with the normalized port.
+// Xray lowercases a protocol, a network and a security before it reads them
+// (LoadWithID, TransportProtocol.Build and StreamConfig.Build in 26.2.6), so
+// every outbound's protocol, and every network and security of the proxy
+// ("headers" excepted, lowerStreamNames), is lowercased before any check reads
+// it and stored so: "TLS" is a tls stream to the sanitizer, the label,
+// tcpChecked and keepHostname alike. A share link that spells its type or
+// security otherwise is unsupported.
 func xrayEntry(raw interface{}) (entry, error) {
 	cfg, ok := raw.(map[string]interface{})
 	if !ok {
@@ -72,8 +79,13 @@ func xrayEntry(raw interface{}) (entry, error) {
 	var proxies []map[string]interface{}
 	for _, o := range outbounds {
 		ob, _ := o.(map[string]interface{})
-		if protocol, ok := ob["protocol"].(string); ok && !helperProtocols[protocol] {
-			proxies = append(proxies, ob)
+		if protocol, ok := ob["protocol"].(string); ok {
+			// Xray lowercases the protocol: "Freedom" is a helper to it.
+			protocol = asciiLower(protocol)
+			ob["protocol"] = protocol
+			if !helperProtocols[protocol] {
+				proxies = append(proxies, ob)
+			}
 		}
 	}
 	switch len(proxies) {
@@ -87,6 +99,7 @@ func xrayEntry(raw interface{}) (entry, error) {
 	if k, c := keyCase(ob); k != "" {
 		return e, invalid(`key "` + k + `" is spelled "` + c + `"`)
 	}
+	lowerStreamNames(ob)
 	protocol := ob["protocol"].(string)
 	if !proxyProtocols[protocol] {
 		return e, unsupported("protocol " + protocol)

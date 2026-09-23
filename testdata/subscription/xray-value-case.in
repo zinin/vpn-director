@@ -1,0 +1,194 @@
+[
+  {
+    "remarks": "Upper vless",
+    "outbounds": [
+      {
+        "protocol": "VLESS",
+        "settings": {
+          "vnext": [
+            {
+              "address": "vc1.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "17171717-1717-4717-8717-171717171717",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "WS",
+          "security": "TLS",
+          "wsSettings": {
+            "path": "/ws"
+          },
+          "tlsSettings": {
+            "serverName": "vc1.example.com"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Helper case",
+    "outbounds": [
+      {
+        "tag": "direct",
+        "protocol": "Freedom"
+      },
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "vc2.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "17171717-1717-4717-8717-171717171717",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "none"
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Upper tls insecure",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "vc3.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "17171717-1717-4717-8717-171717171717",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "TLS",
+          "tlsSettings": {
+            "serverName": "vc3.example.com",
+            "allowInsecure": true
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Upper reality short",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "vc4.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "17171717-1717-4717-8717-171717171717",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "REALITY",
+          "realitySettings": {
+            "serverName": "www.example.org",
+            "publicKey": "f6LRmexNBjL839G7gr0JA4Eh5MtAV5gQTcaCp0wUsaE"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Deep names",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "vc5.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "17171717-1717-4717-8717-171717171717",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "security": "none",
+          "xhttpSettings": {
+            "path": "/up",
+            "extra": {
+              "downloadSettings": {
+                "network": "XHTTP",
+                "security": "NONE",
+                "address": "dl5.example.com",
+                "port": 443
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  {
+    "remarks": "Header value kept",
+    "outbounds": [
+      {
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "vc6.example.com",
+              "port": 443,
+              "users": [
+                {
+                  "id": "17171717-1717-4717-8717-171717171717",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "security": "none",
+          "wsSettings": {
+            "path": "/ws",
+            "headers": {
+              "network": "WAN"
+            }
+          }
+        }
+      }
+    ]
+  }
+]
