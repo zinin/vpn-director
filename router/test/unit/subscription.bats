@@ -133,3 +133,20 @@ check_fixtures() {
 "ABC"
 "100 off2zz plus!"'
 }
+
+# jq reads 4.43e2 as 443 - and without decNumber 443.0 as well - so a "port"
+# literal that is not plain digits is marked in the text before jq reads it.
+# Nothing else changes: not another key's number, not text inside a string.
+@test "_sub_mark_ports: marks a port literal that is not plain digits, and nothing else" {
+    run _sub_mark_ports <<< '{"port": 4.43e2, "a": {"port":443.0}, "b": [{"port" : 1e2}], "port2": 1.5, "c": "\"port\": 1.5", "port": 443, "d": "x\\", "port": -5, "e": "port", "f": 2.5}'
+    assert_success
+    assert_output '{"port": "\u0000port 4.43e2", "a": {"port":"\u0000port 443.0"}, "b": [{"port" : "\u0000port 1e2"}], "port2": 1.5, "c": "\"port\": 1.5", "port": 443, "d": "x\\", "port": "\u0000port -5", "e": "port", "f": 2.5}'
+}
+
+# A port marked outside the target - here the one the download half of an
+# xhttp stream dials - goes back into the stored outbound as the number it was.
+@test "subscription_decode: a marked port beside the target is stored as the number it was" {
+    run subscription_decode <<< '{"remarks":"Split","outbounds":[{"protocol":"vless","settings":{"vnext":[{"address":"sp.example.com","port":443,"users":[{"id":"12121212-1212-4212-8212-121212121212","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","extra":{"downloadSettings":{"address":"dl.example.com","port":8443.0}}}}}]}'
+    assert_success
+    [ "$(jq -c '.servers[0].outbound.streamSettings.xhttpSettings.extra.downloadSettings.port | [type, . == 8443]' <<< "$output")" = '["number",true]' ]
+}

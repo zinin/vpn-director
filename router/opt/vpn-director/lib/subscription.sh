@@ -713,6 +713,56 @@ _sub_links() {
     fi
 }
 
+# _sub_mark_ports: an Xray JSON body on stdin, printed back with every "port"
+# value written as a number that is not plain decimal digits - 443.0, 1e2,
+# 4.43e2, -5 - turned into the string "\u0000port <literal>", byte for byte
+# otherwise. jq cannot see a number as written: it keeps 443.0 and 1E+2, but
+# reads 4.43e2 as 443, and without decNumber every one of them as an integer.
+# Xray's port fields are uint16s, which encoding/json fills from plain digits
+# only, and the Go importer reads the literal (xrayEntry). A marked target
+# port is no number, so its entry is invalid; unmark_ports puts every other
+# marked value back as the number it was.
+_sub_mark_ports() {
+    LC_ALL=C gawk '
+        BEGIN { RS = "\""; instr = 0; tok = ""; port = 0 }
+        {
+            rec = $0
+            if (instr) {
+                tok = tok rec
+                # A quote after an odd run of backslashes is escaped: the
+                # string goes on past it.
+                n = 0
+                while (n < length(rec) && substr(rec, length(rec) - n, 1) == "\\") n++
+                if (n % 2 == 1) {
+                    tok = tok "\""
+                } else {
+                    port = (tok == "port")
+                    tok = ""
+                    instr = 0
+                }
+            } else {
+                if (port) {
+                    i = 1
+                    while (substr(rec, i, 1) ~ /[ \t\r\n]/) i++
+                    if (substr(rec, i, 1) == ":") {
+                        i++
+                        while (substr(rec, i, 1) ~ /[ \t\r\n]/) i++
+                        j = i
+                        while (substr(rec, j, 1) ~ /[-+.eE0-9]/) j++
+                        num = substr(rec, i, j - i)
+                        # Only a whole JSON number: text that is none stays
+                        # as it was, and jq refuses it as before.
+                        if (num ~ /^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$/ && num !~ /^[0-9]+$/)
+                            rec = substr(rec, 1, i - 1) "\"\\u0000port " num "\"" substr(rec, j)
+                    }
+                }
+                port = 0
+                instr = 1
+            }
+            printf "%s%s", rec, RT
+        }'
+}
+
 # _sub_xray_json <body>: an array of Xray configs, or one config (spec 6.5),
 # in one jq program: a record per config, its raw name kept NUL- and
 # control-free for the name filter, which drops those characters anyway. A
@@ -720,17 +770,26 @@ _sub_links() {
 # servers list - the one its protocol uses - is invalid: Xray dials the flat
 # address whenever one is set, while target reads the list, so the stored
 # address would name a host Xray does not dial (xrayEntry in
-# server/internal/subscription/xrayjson.go says the same).
+# server/internal/subscription/xrayjson.go says the same). So is a target port
+# not written as plain decimal digits: 443.0, 1e2 or 4.43e2 would import and
+# then fail "xray run -test", whose uint16 port takes none of them.
+# _sub_mark_ports makes such a literal visible to jq.
 _sub_xray_json() {
-    local count out
+    local count marked out
     if ! count=$(jq -s 'length' <<< "$1" 2>/dev/null) || [[ $count != 1 ]]; then
         printf 'invalid JSON subscription\n' >&2
         return 1
     fi
+    marked=$(_sub_mark_ports <<< "$1") || {
+        printf 'invalid JSON subscription\n' >&2
+        return 1
+    }
     out=$(jq -c "$_SUB_JQ_SANITIZE"'
         def obj: if type == "object" then . else {} end;
         def str: if type == "string" then . else "" end;
         def rawname: str | explode | map(select(. >= 32 and . != 127)) | implode;
+        def unmark_ports: walk(if type == "string" and startswith("\u0000port ")
+                               then ltrimstr("\u0000port ") | tonumber else . end);
         def target:
           (.settings | obj) as $s
           | (if .protocol == "vless" or .protocol == "vmess" then "vnext"
@@ -757,7 +816,8 @@ _sub_xray_json() {
                  elif . == "trojan" or . == "shadowsocks" then "servers" else "" end) as $listkey
               | ($ob | target) as $t
               | ($t.address | str | ltrimstr("[") | rtrimstr("]")) as $addr
-              | ($t.port | if type == "number" and . == floor and . >= 1 and . <= 65535 then floor else null end) as $port
+              | ($t.port | if type == "number" and (tojson | explode | all(. >= 48 and . <= 57))
+                              and . >= 1 and . <= 65535 then floor else null end) as $port
               | if ($ob.protocol | IN("vless", "vmess", "trojan", "shadowsocks", "hysteria") | not) then
                   skip($raw; "unsupported"; "protocol \($ob.protocol)")
                 elif ($ob.proxySettings | obj | .tag | str) != "" or ($ob | deep_dialer) then
@@ -780,7 +840,8 @@ _sub_xray_json() {
                      | del(.tag, .sendThrough)
                      | drop_insecure
                      | scrub_sockopt
-                     | drop_keylog)}
+                     | drop_keylog
+                     | unmark_ports)}
                 end
               end
           end;
@@ -788,7 +849,7 @@ _sub_xray_json() {
          elif type == "object" and (.outbounds | type) == "array" then [.]
          else [] end) as $configs
         | if ($configs | length) == 0 then "unrecognized" else ($configs[] | entry) end
-    ' <<< "$1") || {
+    ' <<< "$marked") || {
         printf 'invalid JSON subscription\n' >&2
         return 1
     }

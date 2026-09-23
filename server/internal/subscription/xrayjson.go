@@ -48,7 +48,13 @@ func decodeXrayJSON(body string) (Result, error) {
 // invalid: Xray dials the flat address whenever one is set - all four builders
 // replace the list with it (26.2.6) - while OutboundTarget reads the list, so
 // the stored address, its IPs and the watch's TCP checks would describe a host
-// Xray does not dial. _sub_xray_json in lib/subscription.sh skips it alike.
+// Xray does not dial. _sub_xray_json in lib/subscription.sh skips it alike. So
+// is a target port whose literal is not plain decimal digits: every outbound
+// port field is a uint16, which encoding/json does not fill from 443.0, 1e2 or
+// 4.43e2, and the entry keeps its literal as written, so it would import and
+// then fail "xray run -test" whenever it was selected. jsonPort reads the
+// value only; the v2rayN vmess path, which builds its outbound from that
+// integer, keeps taking 443.0.
 func xrayEntry(raw interface{}) (entry, error) {
 	cfg, ok := raw.(map[string]interface{})
 	if !ok {
@@ -112,6 +118,9 @@ func xrayEntry(raw interface{}) (entry, error) {
 	address = strings.TrimSuffix(strings.TrimPrefix(address, "["), "]")
 	number, _ := target["port"].(json.Number)
 	port, ok := jsonPort(number)
+	if literal := number.String(); literal == "" || strings.Trim(literal, "0123456789") != "" {
+		ok = false
+	}
 	if address == "" || !ok {
 		return e, invalid("bad address or port")
 	}
