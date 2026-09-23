@@ -10,9 +10,13 @@
 # xrayconf_build_outbound: reads one server JSON object on stdin,
 # prints the proxy-out outbound JSON object on stdout. A server an import
 # stored with its outbound gets that outbound, tagged: the import
-# (lib/subscription.sh) checked it. An outbound that is there but is no
-# object - a string, a null - fails (rc=1), as serverOutbound in
-# service/xray.go rejects it through DecodeOutbound: it is no legacy record.
+# (lib/subscription.sh) checked it. It fails (rc=1) all the same when an xhttp
+# downloadSettings in it names no address, as it does in serverOutbound in
+# service/xray.go: Xray leaves that destination nil and panics on the first
+# dial through it, and "xray run -test" never dials, so the test cannot catch
+# it. An outbound that is there but is no object - a string, a null - fails
+# (rc=1), as serverOutbound rejects it through DecodeOutbound: it is no legacy
+# record.
 # A record from before outbounds were stored is built from its flat VLESS
 # fields, and fails (rc=1) on an unsupported network (non-tcp) or security
 # (not tls/reality) instead of emitting a silently-broken outbound.
@@ -21,6 +25,11 @@ xrayconf_build_outbound() {
     local server_json net sec
     server_json="$(cat)"
     if printf '%s' "$server_json" | jq -e 'type == "object" and (.outbound | type) == "object"' >/dev/null 2>&1; then
+        if printf '%s' "$server_json" | jq -e '[.outbound | .. | objects | .downloadSettings? | objects
+                | select((.address | type) != "string" or .address == "")] | length > 0' >/dev/null 2>&1; then
+            printf 'xrayconf: stored outbound: xhttp downloadSettings without an address\n' >&2
+            return 1
+        fi
         printf '%s' "$server_json" | jq '.outbound + {tag: "proxy-out"}'
         return
     fi

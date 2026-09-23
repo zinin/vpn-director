@@ -424,6 +424,40 @@ func TestGenerateConfig_XrayRejectsTheConfig(t *testing.T) {
 	}
 }
 
+// storedXHTTP is a stored vless xhttp outbound whose extra carries the given
+// downloadSettings.
+func storedXHTTP(downloadSettings string) vpnconfig.Server {
+	return vpnconfig.Server{
+		Name: "Oslo", Address: "oslo.example", Port: 443,
+		Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},` +
+			`"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"path":"/x","extra":{"downloadSettings":` + downloadSettings + `}}}}`),
+	}
+}
+
+// Xray gives downloadSettings a destination only from its address, and
+// splithttp's dialer panics on a nil one at the first connection - which
+// "xray run -test" never makes. Such an outbound never replaces the running
+// config; one that names its address generates as any other.
+func TestGenerateConfig_DownloadSettingsWithoutAnAddress(t *testing.T) {
+	writeFakeXray(t, 0, "Configuration OK.")
+	svc, outputPath := testedService(t)
+	err := svc.GenerateConfig(storedXHTTP(`{"network":"xhttp"}`))
+	if err == nil || !strings.Contains(err.Error(), "downloadSettings without an address") {
+		t.Fatalf("err %v", err)
+	}
+	if content, _ := os.ReadFile(outputPath); string(content) != "previous\n" {
+		t.Fatalf("config.json %q; an outbound that crashes Xray must not replace it", content)
+	}
+
+	svc, outputPath = testedService(t)
+	if err := svc.GenerateConfig(storedXHTTP(`{"network":"xhttp","address":"dl.example.com","port":443}`)); err != nil {
+		t.Fatal(err)
+	}
+	if content, _ := os.ReadFile(outputPath); !strings.Contains(string(content), "dl.example.com") {
+		t.Fatalf("config.json %q; the outbound with its download address was not written", content)
+	}
+}
+
 // The test runs under the config lock: an xray that never answers is given
 // up on at the bound, and the error says it timed out rather than that Xray
 // rejected the config.

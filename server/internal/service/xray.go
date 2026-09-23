@@ -244,6 +244,9 @@ func serverOutbound(server vpnconfig.Server) (interface{}, error) {
 		if err != nil {
 			return nil, fmt.Errorf("stored outbound: %w", err)
 		}
+		if downloadWithoutAddress(ob) {
+			return nil, fmt.Errorf("stored outbound: xhttp downloadSettings without an address")
+		}
 		ob["tag"] = "proxy-out"
 		return ob, nil
 	}
@@ -251,6 +254,38 @@ func serverOutbound(server vpnconfig.Server) (interface{}, error) {
 		return nil, err
 	}
 	return buildOutbound(server), nil
+}
+
+// downloadWithoutAddress reports whether v, however deep, holds a
+// downloadSettings object whose address is not a non-empty string. Xray reads
+// an xhttp extra's downloadSettings as a stream config of its own and gives it
+// a destination only from an address (StreamConfig.Build in 26.2.6); without
+// one the destination stays nil, and splithttp's dialer dereferences it on the
+// first dial - a panic that takes Xray down, and every client with it. "xray
+// run -test" never dials, so such a config passes the test and replaces
+// config.json: the generator has to refuse it itself.
+// xrayconf_build_outbound in lib/xrayconf.sh refuses the same shape.
+func downloadWithoutAddress(v interface{}) bool {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		if download, ok := t["downloadSettings"].(map[string]interface{}); ok {
+			if address, _ := download["address"].(string); address == "" {
+				return true
+			}
+		}
+		for _, child := range t {
+			if downloadWithoutAddress(child) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, child := range t {
+			if downloadWithoutAddress(child) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // GenerateConfig parses the (valid-JSON) template and replaces outbounds
