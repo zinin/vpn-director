@@ -27,7 +27,8 @@ const MaxSubscriptionBody = 1 << 20
 var ErrSubscriptionURL = errors.New("invalid subscription URL")
 
 // DownloadError is a subscription that did not arrive: the connection, the
-// HTTP status or the size cap. The Web UI answers it with 502.
+// HTTP status, the size cap, or a deadline that ended while its servers
+// resolved. The Web UI answers it with 502.
 type DownloadError struct{ Err error }
 
 func (e *DownloadError) Error() string {
@@ -50,6 +51,10 @@ func downloadError(err error) error {
 	}
 	return &DownloadError{Err: err}
 }
+
+// errResolutionCutShort is a download whose context ended - in the daemons, by
+// its deadline - while its hosts resolved.
+var errResolutionCutShort = errors.New("resolving the servers took longer than the deadline")
 
 // BodyError is a subscription that arrived and holds no server the router can
 // use: nothing it decodes, or nothing whose host resolves. 400 in the Web UI.
@@ -74,9 +79,10 @@ func ValidateSubscriptionURL(raw string) error {
 }
 
 // DownloadSubscription fetches rawURL through client - the SSRF-hardened one -
-// then decodes the body and resolves every host over IPv4, bound to ctx. The
-// Web UI and the bot's /import download here; the watch has its own path (the
-// WAN, then the tunnel).
+// then decodes the body and resolves every host over IPv4, bound to ctx; a ctx
+// that ends during the resolution takes nothing. The Web UI and the bot's
+// /import download here; the watch has its own path (the WAN, then the
+// tunnel).
 func DownloadSubscription(ctx context.Context, client *http.Client, rawURL string) (subscription.Import, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
@@ -104,6 +110,10 @@ func DownloadSubscription(ctx context.Context, client *http.Client, rawURL strin
 		return imp, &BodyError{Err: err}
 	case imp.Parsed == 0:
 		return imp, &BodyError{Err: errors.New(imp.NoServers())}
+	case ctx.Err() != nil:
+		// Every lookup after the context ended failed at once: the servers
+		// resolved by then are not the subscription.
+		return subscription.Import{}, &DownloadError{Err: errResolutionCutShort}
 	case len(imp.Servers) == 0:
 		return imp, &BodyError{Err: errors.New("could not resolve IP for any server")}
 	}

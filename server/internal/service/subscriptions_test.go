@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -198,6 +199,88 @@ func TestDownloadSubscription_ABodyWithoutAServerSaysWhy(t *testing.T) {
 		if !errors.As(err, &be) || !strings.Contains(err.Error(), want) {
 			t.Errorf("%q: %v", body, err)
 		}
+	}
+}
+
+// cutShortText is what a download reads as when its context ended while the
+// hosts resolved.
+const cutShortText = "download failed: resolving the servers took longer than the deadline"
+
+// cutShortClient serves osloBody and ends the context it returns with the
+// body, so the resolution runs on a context that is over and every lookup
+// fails at once. The one host is an IP literal, which resolves without a
+// lookup: the list comes out whole, and must still not be taken.
+func cutShortClient(t *testing.T) (context.Context, *http.Client) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	base := subscriptionHost(t, serve(osloBody)).Transport
+	return ctx, &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		resp, err := base.RoundTrip(req)
+		if err == nil {
+			resp.Body = cancelAtEOF{resp.Body, cancel}
+		}
+		return resp, err
+	})}
+}
+
+// cancelAtEOF ends a context when the body it wraps ends.
+type cancelAtEOF struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (b cancelAtEOF) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.cancel()
+	}
+	return n, err
+}
+
+// A context that ends while the hosts resolve fails every lookup after it at
+// once, and what resolved before it is not the subscription: it did not
+// arrive in time.
+func TestDownloadSubscription_AResolutionTheDeadlineCutShortDidNotArrive(t *testing.T) {
+	ctx, client := cutShortClient(t)
+
+	imp, err := DownloadSubscription(ctx, client, publicLink)
+
+	var de *DownloadError
+	if !errors.As(err, &de) || err.Error() != cutShortText || len(imp.Servers) != 0 {
+		t.Fatalf("servers %d, err %v", len(imp.Servers), err)
+	}
+}
+
+func TestAddSubscription_AResolutionCutShortSavesNothing(t *testing.T) {
+	store := newMemConfigStore()
+	ctx, client := cutShortClient(t)
+
+	res := AddSubscription(ctx, store, client, publicLink, "")
+
+	var de *DownloadError
+	if !errors.As(res.Err, &de) || len(store.subs) != 0 || len(store.cfg.Xray.Servers) != 0 {
+		t.Fatalf("err %v, files %d, xray.servers %v", res.Err, len(store.subs), store.cfg.Xray.Servers)
+	}
+}
+
+func TestRefreshSubscription_AResolutionCutShortRecordsWhyAndKeepsTheList(t *testing.T) {
+	old := []vpnconfig.Server{{Name: "Old", Address: "old.example.com", Port: 443, IPs: []string{"192.0.2.1"}}}
+	store := newMemConfigStore(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha", URL: publicLink, Servers: old})
+	ctx, client := cutShortClient(t)
+
+	res := RefreshSubscription(ctx, store, client, "0a1b2c3d")
+
+	var de *DownloadError
+	if !errors.As(res.Err, &de) || res.Line() != "Alpha: "+cutShortText {
+		t.Fatalf("err %v, line %q", res.Err, res.Line())
+	}
+	s := store.subs[0]
+	if s.Error != cutShortText {
+		t.Fatalf("recorded error %q", s.Error)
+	}
+	if len(s.Servers) != 1 || s.Servers[0].Name != "Old" {
+		t.Fatalf("the list was replaced: %d servers", len(s.Servers))
 	}
 }
 
