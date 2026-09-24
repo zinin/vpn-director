@@ -202,7 +202,12 @@ func TestLongOpHandlers_ExtendWriteDeadline(t *testing.T) {
 		{"add exclude ip", "POST", "/api/excludes/ips", `{"ip":"1.2.3.4"}`, handleAddExcludeIP, applyDeadline},
 		{"delete exclude ip", "DELETE", "/api/excludes/ips?ip=1.2.3.4", "", handleDeleteExcludeIP, applyDeadline},
 		{"select server", "POST", "/api/servers/active", `{"index":0}`, handleSelectServer, applyDeadline},
-		{"import (rejected before download)", "POST", "/api/servers/import", `{"url":"http://insecure.example"}`, handleImportServers, importDeadline},
+		// The subscription routes extend through lockLongOp before any of them
+		// refuses: a link the daemons do not download, an id no file has.
+		{"add subscription (rejected before download)", "POST", "/api/subscriptions", `{"url":"http://insecure.example"}`, handleAddSubscription, importDeadline},
+		{"refresh subscription (unknown id)", "POST", "/api/subscriptions/refresh?id=0a1b2c3d", "", handleRefreshSubscriptions, importDeadline},
+		{"rename subscription (unknown id)", "POST", "/api/subscriptions/rename?id=0a1b2c3d", `{"name":"Main"}`, handleRenameSubscription, importDeadline},
+		{"delete subscription (unknown id)", "DELETE", "/api/subscriptions?id=0a1b2c3d", "", handleDeleteSubscription, importDeadline},
 		// The two update routes extend twice: githubDeadline before the flow
 		// call and deadlineSlack after it. This table sees the last one;
 		// TestUpdateHandlers_ReArmTheDeadlineAfterTheFlowCall pins both.

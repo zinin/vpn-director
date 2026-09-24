@@ -1,28 +1,25 @@
 package webapi
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/zinin/vpn-director/server/internal/service"
-	"github.com/zinin/vpn-director/server/internal/ssrf"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
 func TestHandleListServers_OK(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Config = &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "server1.example.com", Port: 443, UUID: "uuid-1", Name: "Server 1", IPs: []string{"1.1.1.1"}},
 			{Address: "server2.example.com", Port: 443, UUID: "uuid-2", Name: "Server 2", IPs: []string{"2.2.2.2"}},
-		},
+		}}},
 	}
 
 	handler := handleListServers(deps)
@@ -37,16 +34,21 @@ func TestHandleListServers_OK(t *testing.T) {
 	}
 
 	var resp struct {
-		Servers []vpnconfig.Server `json:"servers"`
+		Subscriptions []struct {
+			Servers []vpnconfig.Server `json:"servers"`
+		} `json:"subscriptions"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(resp.Servers) != 2 {
-		t.Errorf("expected 2 servers, got %d", len(resp.Servers))
+	if len(resp.Subscriptions) != 1 {
+		t.Fatalf("expected 1 subscription, got %d", len(resp.Subscriptions))
 	}
-	if resp.Servers[0].Name != "Server 1" {
-		t.Errorf("expected 'Server 1', got %q", resp.Servers[0].Name)
+	if len(resp.Subscriptions[0].Servers) != 2 {
+		t.Errorf("expected 2 servers, got %d", len(resp.Subscriptions[0].Servers))
+	}
+	if resp.Subscriptions[0].Servers[0].Name != "Server 1" {
+		t.Errorf("expected 'Server 1', got %q", resp.Subscriptions[0].Servers[0].Name)
 	}
 }
 
@@ -54,11 +56,11 @@ func TestHandleListServers_OK(t *testing.T) {
 // now stores passwords in the outbound, beside the UUID of a legacy record.
 func TestHandleListServers_ShowsTheProtocolAndNoCredentials(t *testing.T) {
 	deps := newTestDeps(t)
-	deps.Config = &mockConfig{servers: []vpnconfig.Server{
+	deps.Config = &mockConfig{subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 		{Address: "legacy.example.com", Port: 443, UUID: "secret-uuid", Name: "Legacy", IPs: []string{"1.1.1.1"}, Security: "reality", PublicKey: "secret-key"},
 		{Address: "hy.example.com", Port: 8443, Name: "Hy", IPs: []string{"2.2.2.2"},
 			Outbound: json.RawMessage(`{"protocol":"hysteria","settings":{"address":"hy.example.com","port":8443},"streamSettings":{"hysteriaSettings":{"auth":"secret-auth"}}}`)},
-	}}
+	}}}}
 	rec := httptest.NewRecorder()
 	handleListServers(deps).ServeHTTP(rec, httptest.NewRequest("GET", "/api/servers", nil))
 
@@ -69,19 +71,25 @@ func TestHandleListServers_ShowsTheProtocolAndNoCredentials(t *testing.T) {
 		}
 	}
 	var resp struct {
-		Servers []map[string]interface{} `json:"servers"`
+		Subscriptions []struct {
+			Servers []map[string]interface{} `json:"servers"`
+		} `json:"subscriptions"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	if len(resp.Servers) != 2 || resp.Servers[0]["protocol"] != "vless·reality" || resp.Servers[1]["protocol"] != "hysteria2" {
-		t.Fatalf("servers %v", resp.Servers)
+	if len(resp.Subscriptions) != 1 {
+		t.Fatalf("subscriptions %v", resp.Subscriptions)
+	}
+	servers := resp.Subscriptions[0].Servers
+	if len(servers) != 2 || servers[0]["protocol"] != "vless·reality" || servers[1]["protocol"] != "hysteria2" {
+		t.Fatalf("servers %v", servers)
 	}
 }
 
 func TestHandleListServers_Error(t *testing.T) {
 	deps := newTestDeps(t)
-	deps.Config = &mockConfig{err: errors.New("load failed")}
+	deps.Config = &mockConfig{subsErr: errors.New("load failed")}
 
 	handler := handleListServers(deps)
 
@@ -97,10 +105,10 @@ func TestHandleListServers_Error(t *testing.T) {
 
 func TestHandleSelectServer_OK(t *testing.T) {
 	mc := &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, UUID: "uuid-1", Name: "S1", IPs: []string{"1.1.1.1"}},
 			{Address: "s2.example.com", Port: 443, UUID: "uuid-2", Name: "S2", IPs: []string{"2.2.2.2"}},
-		},
+		}}},
 		cfg: &vpnconfig.VPNDirectorConfig{
 			Xray: vpnconfig.XrayConfig{
 				Servers: []string{"old-ip"},
@@ -113,7 +121,7 @@ func TestHandleSelectServer_OK(t *testing.T) {
 
 	handler := handleSelectServer(deps)
 
-	body := `{"index": 1, "name": "S2", "address": "s2.example.com", "port": 443}`
+	body := `{"subscription":"0a1b2c3d","index": 1, "name": "S2", "address": "s2.example.com", "port": 443}`
 	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -148,16 +156,16 @@ func TestHandleSelectServer_OK(t *testing.T) {
 // never asked for.
 func TestHandleSelectServer_RefusesAnIndexTheListNoLongerMatches(t *testing.T) {
 	mc := &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, UUID: "uuid-1", Name: "S1", IPs: []string{"1.1.1.1"}},
 			{Address: "s3.example.com", Port: 443, UUID: "uuid-3", Name: "S3", IPs: []string{"3.3.3.3"}},
-		},
+		}}},
 		cfg: &vpnconfig.VPNDirectorConfig{},
 	}
 	deps := newTestDeps(t)
 	deps.Config = mc
 
-	body := `{"index": 1, "name": "S2", "address": "s2.example.com", "port": 443}`
+	body := `{"subscription":"0a1b2c3d","index": 1, "name": "S2", "address": "s2.example.com", "port": 443}`
 	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 	handleSelectServer(deps).ServeHTTP(rec, req)
@@ -176,14 +184,14 @@ func TestHandleSelectServer_RefusesAnIndexTheListNoLongerMatches(t *testing.T) {
 func TestHandleSelectServer_IndexOutOfRange(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Config = &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, UUID: "uuid-1", Name: "S1", IPs: []string{"1.1.1.1"}},
-		},
+		}}},
 	}
 
 	handler := handleSelectServer(deps)
 
-	body := `{"index": 5}`
+	body := `{"subscription":"0a1b2c3d","index": 5}`
 	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -197,14 +205,14 @@ func TestHandleSelectServer_IndexOutOfRange(t *testing.T) {
 func TestHandleSelectServer_NegativeIndex(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Config = &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, UUID: "uuid-1", Name: "S1", IPs: []string{"1.1.1.1"}},
-		},
+		}}},
 	}
 
 	handler := handleSelectServer(deps)
 
-	body := `{"index": -1}`
+	body := `{"subscription":"0a1b2c3d","index": -1}`
 	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(body))
 	rec := httptest.NewRecorder()
 
@@ -217,9 +225,9 @@ func TestHandleSelectServer_NegativeIndex(t *testing.T) {
 
 func TestHandleSelectServer_RestartXraySurfacesTheShellLine(t *testing.T) {
 	mc := &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, UUID: "uuid-1", Name: "S1", IPs: []string{"1.1.1.1"}},
-		},
+		}}},
 		cfg: &vpnconfig.VPNDirectorConfig{},
 	}
 	deps := newTestDeps(t)
@@ -227,7 +235,7 @@ func TestHandleSelectServer_RestartXraySurfacesTheShellLine(t *testing.T) {
 	deps.VPN = &mockVPN{err: errors.New("xray: failed\nlast line of init")}
 
 	handler := handleSelectServer(deps)
-	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(`{"index":0,"name":"S1","address":"s1.example.com","port":443}`))
+	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(`{"subscription":"0a1b2c3d","index":0,"name":"S1","address":"s1.example.com","port":443}`))
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 
@@ -254,138 +262,6 @@ func TestHandleSelectServer_InvalidJSON(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHandleImportServers_InvalidURL(t *testing.T) {
-	deps := newTestDeps(t)
-
-	handler := handleImportServers(deps)
-
-	body := `{"url": "http://example.com/sub"}`
-	req := httptest.NewRequest("POST", "/api/servers/import", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	var resp map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if resp["error"] != "only https URLs are allowed" {
-		t.Errorf("unexpected error: %q", resp["error"])
-	}
-}
-
-func TestHandleImportServers_EmptyURL(t *testing.T) {
-	deps := newTestDeps(t)
-
-	handler := handleImportServers(deps)
-
-	body := `{"url": ""}`
-	req := httptest.NewRequest("POST", "/api/servers/import", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHandleImportServers_PrivateIP(t *testing.T) {
-	deps := newTestDeps(t)
-
-	handler := handleImportServers(deps)
-
-	body := `{"url": "https://192.168.1.1/sub"}`
-	req := httptest.NewRequest("POST", "/api/servers/import", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
-	}
-
-	var resp map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	if !strings.Contains(resp["error"], "private") {
-		t.Errorf("expected private IP error, got %q", resp["error"])
-	}
-}
-
-func TestHandleImportServers_LoopbackIP(t *testing.T) {
-	deps := newTestDeps(t)
-
-	handler := handleImportServers(deps)
-
-	body := `{"url": "https://127.0.0.1/sub"}`
-	req := httptest.NewRequest("POST", "/api/servers/import", strings.NewReader(body))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
-	}
-}
-
-func TestHandleImportServers_EmptyURLUsesSavedURL(t *testing.T) {
-	deps := newTestDeps(t)
-	deps.Config = &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{
-		Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://127.0.0.1/s/token"},
-	}}
-
-	handler := handleImportServers(deps)
-
-	req := httptest.NewRequest("POST", "/api/servers/import", strings.NewReader(`{"url":""}`))
-	rec := httptest.NewRecorder()
-
-	handler.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d: %s", rec.Code, rec.Body.String())
-	}
-	var resp map[string]string
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
-	}
-	// The loopback refusal comes before any network access and proves the
-	// saved link was the one checked.
-	if resp["error"] != "URL must not point to private or loopback addresses" {
-		t.Errorf("error %q, want the private/loopback refusal of the saved URL", resp["error"])
-	}
-}
-
-func TestDownloadErrMessage(t *testing.T) {
-	// A blocked-address error must NOT echo the resolved internal IP back to the
-	// client (the dial guard wraps ssrf.ErrBlockedAddress around the IP).
-	blocked := fmt.Errorf(`Get "https://evil.test": %w: 10.0.0.1`, ssrf.ErrBlockedAddress)
-	if got := downloadErrMessage(blocked); strings.Contains(got, "10.0.0.1") {
-		t.Errorf("downloadErrMessage leaked the resolved IP: %q", got)
-	}
-	// Non-SSRF errors keep their detail for diagnostics.
-	other := errors.New("dial tcp: i/o timeout")
-	if got := downloadErrMessage(other); !strings.Contains(got, "i/o timeout") {
-		t.Errorf("downloadErrMessage dropped diagnostic detail: %q", got)
-	}
-}
-
-func TestDownloadErrMessage_DropsURL(t *testing.T) {
-	err := &url.Error{Op: "Get", URL: "https://cdn.example/s/SECRET-TOKEN", Err: errors.New("timeout")}
-	got := downloadErrMessage(err)
-	if strings.Contains(got, "SECRET-TOKEN") {
-		t.Errorf("downloadErrMessage leaked the subscription URL: %q", got)
-	}
-	if !strings.Contains(got, "timeout") {
-		t.Errorf("downloadErrMessage dropped diagnostic detail: %q", got)
 	}
 }
 
@@ -453,74 +329,16 @@ func TestSyncXrayServers_MissingConfigIsSurfaced(t *testing.T) {
 	}
 }
 
-// An import says what it left out and why, and the page shows it: a
-// subscription that is all composite entries and TUIC imported nothing and
-// said only "no VLESS servers".
-func TestHandleImportServers_SaysWhatNothingCouldBeImportedFrom(t *testing.T) {
-	deps := newTestDeps(t)
-	deps.Config = &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
-	deps.ImportClient = subscriptionHost(t, "tuic://uuid:pw@203.0.113.10:443#TUIC\nssr://c29tZQ")
-
-	code, resp := postImport(t, deps, `{"url":"https://93.184.216.34/s/token"}`)
-
-	want := "no supported servers in subscription: 2 unsupported; TUIC: tuic; #2: ssr"
-	if code != http.StatusBadRequest || resp["error"] != want {
-		t.Fatalf("got %d %v, want 400 %q", code, resp, want)
-	}
-}
-
-func TestHandleImportServers_RefusesAnUnrecognizedBody(t *testing.T) {
-	deps := newTestDeps(t)
-	deps.Config = &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
-	deps.ImportClient = subscriptionHost(t, "<!doctype html><html>Open the app</html>")
-
-	code, resp := postImport(t, deps, `{"url":"https://93.184.216.34/s/token"}`)
-
-	if code != http.StatusBadRequest || resp["error"] != "unrecognized subscription format" {
-		t.Fatalf("got %d %v", code, resp)
-	}
-}
-
-func TestHandleImportServers_ReportsTheSkips(t *testing.T) {
-	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
-	deps := newTestDeps(t)
-	deps.Config = mc
-	deps.ImportClient = subscriptionHost(t, strings.Join([]string{
-		"vless://uuid-1@203.0.113.10:443?type=tcp#Oslo",
-		"vless://uuid-2@203.0.113.11:443?type=kcp#KCP",
-		"vless://uuid-3@127.0.0.1:1#Expired",
-	}, "\n"))
-
-	code, resp := postImport(t, deps, `{"url":"https://93.184.216.34/s/token"}`)
-
-	if code != http.StatusOK {
-		t.Fatalf("got %d %v", code, resp)
-	}
-	if resp["count"] != float64(1) || resp["total"] != float64(3) || resp["dns_errors"] != float64(0) {
-		t.Fatalf("response %v", resp)
-	}
-	skipped, _ := resp["skipped"].(map[string]interface{})
-	if skipped["unsupported"] != float64(1) || skipped["placeholder"] != float64(1) || skipped["composite"] != float64(0) {
-		t.Fatalf("skipped %v", skipped)
-	}
-	if resp["summary"] != "Imported 1 of 3 servers: 1 unsupported, 1 placeholder" {
-		t.Fatalf("summary %v", resp["summary"])
-	}
-	if len(mc.savedServers) != 1 || mc.savedServers[0].Name != "Oslo" || len(mc.savedServers[0].Outbound) == 0 {
-		t.Fatalf("saved %+v", mc.savedServers)
-	}
-}
-
 // The selection is recorded nowhere else. config.json holds only the outbound,
 // and a subscription puts many names behind one address:port - on the router
 // this was written for, eight names share the running endpoint - so the choice
 // has to be written down at the moment it is made.
 func TestHandleSelectServer_RecordsTheSelection(t *testing.T) {
 	mc := &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, UUID: "uuid-1", Name: "Амстердам", IPs: []string{"1.1.1.1"}},
 			{Address: "s2.example.com", Port: 8443, UUID: "uuid-2", Name: "Берлин", IPs: []string{"2.2.2.2"}},
-		},
+		}}},
 		cfg: &vpnconfig.VPNDirectorConfig{},
 	}
 	deps := newTestDeps(t)
@@ -528,7 +346,7 @@ func TestHandleSelectServer_RecordsTheSelection(t *testing.T) {
 
 	handler := handleSelectServer(deps)
 
-	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(`{"index": 1, "name": "Берлин", "address": "s2.example.com", "port": 8443}`))
+	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(`{"subscription":"0a1b2c3d","index": 1, "name": "Берлин", "address": "s2.example.com", "port": 8443}`))
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -551,9 +369,9 @@ func TestHandleSelectServer_RecordsTheSelection(t *testing.T) {
 // switch failed.
 func TestHandleSelectServer_RecordsNothingWhenGenerationFails(t *testing.T) {
 	mc := &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, UUID: "uuid-1", Name: "Амстердам", IPs: []string{"1.1.1.1"}},
-		},
+		}}},
 		cfg: &vpnconfig.VPNDirectorConfig{},
 	}
 	deps := newTestDeps(t)
@@ -562,7 +380,7 @@ func TestHandleSelectServer_RecordsNothingWhenGenerationFails(t *testing.T) {
 
 	handler := handleSelectServer(deps)
 
-	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(`{"index": 0, "name": "Амстердам", "address": "s1.example.com", "port": 443}`))
+	req := httptest.NewRequest("POST", "/api/servers/active", strings.NewReader(`{"subscription":"0a1b2c3d","index": 0, "name": "Амстердам", "address": "s1.example.com", "port": 443}`))
 	rec := httptest.NewRecorder()
 
 	handler.ServeHTTP(rec, req)
@@ -578,9 +396,9 @@ func TestHandleSelectServer_RecordsNothingWhenGenerationFails(t *testing.T) {
 func TestHandleListServers_ReportsTheActiveServer(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Config = &mockConfig{
-		servers: []vpnconfig.Server{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 			{Address: "s1.example.com", Port: 443, Name: "Амстердам", IPs: []string{"1.1.1.1"}},
-		},
+		}}},
 		cfg: &vpnconfig.VPNDirectorConfig{
 			Xray: vpnconfig.XrayConfig{
 				ActiveServer: &vpnconfig.ActiveServer{Name: "Амстердам", Address: "s1.example.com", Port: 443},
@@ -619,8 +437,10 @@ func TestHandleListServers_ReportsTheActiveServer(t *testing.T) {
 func TestHandleListServers_ActiveIsNullWhenNothingIsRecorded(t *testing.T) {
 	deps := newTestDeps(t)
 	deps.Config = &mockConfig{
-		servers: []vpnconfig.Server{{Address: "s1.example.com", Port: 443, Name: "Амстердам"}},
-		cfg:     &vpnconfig.VPNDirectorConfig{},
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
+			{Address: "s1.example.com", Port: 443, Name: "Амстердам"},
+		}}},
+		cfg: &vpnconfig.VPNDirectorConfig{},
 	}
 
 	handler := handleListServers(deps)
@@ -643,49 +463,6 @@ func TestHandleListServers_ActiveIsNullWhenNothingIsRecorded(t *testing.T) {
 	}
 }
 
-func TestHandleListServers_SubscriptionSaved(t *testing.T) {
-	deps := newTestDeps(t)
-	deps.Config = &mockConfig{
-		servers: []vpnconfig.Server{{Name: "S", Address: "a.example", Port: 443}},
-		cfg: &vpnconfig.VPNDirectorConfig{
-			Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://cdn.example/s/token"},
-		},
-	}
-	rec := httptest.NewRecorder()
-	handleListServers(deps).ServeHTTP(rec, httptest.NewRequest("GET", "/api/servers", nil))
-	if rec.Code != http.StatusOK {
-		t.Fatalf("code %d %s", rec.Code, rec.Body.String())
-	}
-	var resp struct {
-		SubscriptionSaved bool `json:"subscription_saved"`
-	}
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatal(err)
-	}
-	if !resp.SubscriptionSaved {
-		t.Fatal("expected subscription_saved")
-	}
-	if strings.Contains(rec.Body.String(), "cdn.example") {
-		t.Fatal("URL leaked")
-	}
-}
-
-func TestResolveSubscriptionURL(t *testing.T) {
-	cfg := &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://saved.example/s/a"}}
-	got, err := resolveSubscriptionURL("https://new.example/s/b", cfg)
-	if err != nil || got != "https://new.example/s/b" {
-		t.Fatalf("posted URL: %q %v", got, err)
-	}
-	got, err = resolveSubscriptionURL("", cfg)
-	if err != nil || got != "https://saved.example/s/a" {
-		t.Fatalf("saved: %q %v", got, err)
-	}
-	_, err = resolveSubscriptionURL("", &vpnconfig.VPNDirectorConfig{})
-	if err == nil {
-		t.Fatal("want error when nothing saved")
-	}
-}
-
 func TestSyncXrayServers_WritesSubscriptionURL(t *testing.T) {
 	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
 	if err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "https://cdn.example/s/token"); err != nil {
@@ -702,120 +479,67 @@ func TestSyncXrayServers_WritesSubscriptionURL(t *testing.T) {
 	}
 }
 
-type roundTripFunc func(*http.Request) (*http.Response, error)
+// Two subscriptions name a server Germany-1. The one the page showed in Beta
+// is the one that runs, and the record names Beta.
+func TestHandleSelectServer_TheSameNameInAnotherSubscription(t *testing.T) {
+	deps, mc := subsDeps(t, alphaBeta()...)
 
-func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+	code, resp := call(t, handleSelectServer(deps), "POST", "/api/servers/active",
+		`{"subscription":"1b2c3d4e","index":0,"name":"Germany-1","address":"198.51.100.20","port":8443}`)
 
-// subscriptionHost serves body as every subscription and returns a client that
-// takes every request there, whatever host the URL names: the import's own
-// checks see the public address a test posts.
-func subscriptionHost(t *testing.T, body string) *http.Client {
-	t.Helper()
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	t.Cleanup(srv.Close)
-	target, err := url.Parse(srv.URL)
-	if err != nil {
+	if code != http.StatusOK {
+		t.Fatalf("%d %v", code, resp)
+	}
+	a := mc.cfg.Xray.ActiveServer
+	if a == nil || a.Subscription != "1b2c3d4e" || a.Address != "198.51.100.20" {
+		t.Fatalf("active %+v", a)
+	}
+	// xray.servers covers every subscription.
+	if want := []string{"192.0.2.10", "192.0.2.11", "198.51.100.20"}; !reflect.DeepEqual(mc.cfg.Xray.Servers, want) {
+		t.Fatalf("xray.servers %v, want %v", mc.cfg.Xray.Servers, want)
+	}
+}
+
+// A subscription deleted, or an index that names another server in its list,
+// is a list that changed since the page was drawn.
+func TestHandleSelectServer_AChangedListIsAConflict(t *testing.T) {
+	deps, _ := subsDeps(t, alphaBeta()...)
+	for _, body := range []string{
+		`{"subscription":"ffffffff","index":0,"name":"Germany-1","address":"198.51.100.20","port":8443}`,
+		`{"subscription":"0a1b2c3d","index":0,"name":"Germany-1","address":"198.51.100.20","port":8443}`,
+	} {
+		if code, resp := call(t, handleSelectServer(deps), "POST", "/api/servers/active", body); code != http.StatusConflict {
+			t.Errorf("%s: %d %v", body, code, resp)
+		}
+	}
+}
+
+func TestHandleListServers_GroupsBySubscriptionAndNamesTheActive(t *testing.T) {
+	deps, mc := subsDeps(t, alphaBeta()...)
+	mc.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Subscription: "1b2c3d4e", Name: "Germany-1", Address: "198.51.100.20", Port: 8443}
+	rec := httptest.NewRecorder()
+
+	handleListServers(deps).ServeHTTP(rec, httptest.NewRequest("GET", "/api/servers", nil))
+
+	var resp struct {
+		Subscriptions []struct {
+			ID      string       `json:"id"`
+			Name    string       `json:"name"`
+			Servers []serverView `json:"servers"`
+		} `json:"subscriptions"`
+		Active *vpnconfig.ActiveServer `json:"active"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
 		t.Fatal(err)
 	}
-	base := srv.Client().Transport
-	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		clone := req.Clone(req.Context())
-		clone.URL.Scheme, clone.URL.Host = target.Scheme, target.Host
-		return base.RoundTrip(clone)
-	})}
-}
-
-var osloSubscription = base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443?type=tcp#Oslo"))
-
-// postImport posts body to the import handler and decodes the answer.
-func postImport(t *testing.T, deps *Deps, body string) (int, map[string]interface{}) {
-	t.Helper()
-	rec := httptest.NewRecorder()
-	handleImportServers(deps).ServeHTTP(rec, httptest.NewRequest("POST", "/api/servers/import", strings.NewReader(body)))
-	var resp map[string]interface{}
-	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
-		t.Fatalf("decode response: %v", err)
+	g := resp.Subscriptions
+	if len(g) != 2 || g[0].Name != "Alpha" || len(g[0].Servers) != 2 || g[1].ID != "1b2c3d4e" || g[1].Servers[0].Name != "Germany-1" {
+		t.Fatalf("%+v", g)
 	}
-	return rec.Code, resp
-}
-
-// A subscription over the 1 MiB cap was cut at the cap and decoded anyway, and
-// a list cut short was published as the subscription. The bot's watch refuses
-// such a body; so does the Web UI.
-func TestHandleImportServers_RefusesASubscriptionOverTheCap(t *testing.T) {
-	line := "vless://uuid-1@203.0.113.10:443?type=tcp#Oslo\n"
-	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
-	deps := newTestDeps(t)
-	deps.Config = mc
-	deps.ImportClient = subscriptionHost(t, base64.StdEncoding.EncodeToString([]byte(strings.Repeat(line, (1<<20)/len(line)))))
-
-	code, resp := postImport(t, deps, `{"url":"https://93.184.216.34/s/token"}`)
-
-	if code != http.StatusBadGateway || resp["error"] != "subscription exceeds 1 MiB" {
-		t.Fatalf("got %d %v, want 502 and the cap", code, resp)
+	if resp.Active == nil || resp.Active.Subscription != "1b2c3d4e" {
+		t.Fatalf("active %+v", resp.Active)
 	}
-	if mc.savedServers != nil {
-		t.Fatalf("saved %d servers out of a list cut at the cap", len(mc.savedServers))
-	}
-}
-
-// "servers saved" is said only when servers.json was written. A publication that
-// failed before it - a lock that could not be opened, an import or a re-import
-// against a config it could not read - wrote nothing, and was reported as saved.
-func TestHandleImportServers_SaysSavedOnlyWhenTheListWasWritten(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		mc    *mockConfig
-		body  string
-		saved bool
-	}{
-		{
-			name: "lock that cannot be opened",
-			mc:   &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}, updateErr: errors.New("open config lock: permission denied")},
-			body: `{"url":"https://93.184.216.34/s/token"}`,
-		},
-		{
-			name: "re-import against a config that does not load",
-			mc: &mockConfig{
-				cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{SubscriptionURL: "https://93.184.216.34/s/token"}},
-				err: errors.New("invalid character 'x' looking for beginning of value"),
-			},
-			body: `{"url":""}`,
-		},
-		{
-			name: "import against a config that does not load",
-			mc: &mockConfig{
-				cfg:       &vpnconfig.VPNDirectorConfig{},
-				updateErr: fmt.Errorf("%w: %w", service.ErrConfigLoad, errors.New("invalid character '}' looking for beginning of object key string")),
-			},
-			body: `{"url":"https://93.184.216.34/s/token"}`,
-		},
-		{
-			name:  "config write that fails after the list",
-			mc:    &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}, saveVPNCfgErr: errors.New("disk full")},
-			body:  `{"url":"https://93.184.216.34/s/token"}`,
-			saved: true,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			deps := newTestDeps(t)
-			deps.Config = tc.mc
-			deps.ImportClient = subscriptionHost(t, osloSubscription)
-
-			code, resp := postImport(t, deps, tc.body)
-
-			msg, _ := resp["error"].(string)
-			if code != http.StatusInternalServerError {
-				t.Fatalf("got %d %v, want 500", code, resp)
-			}
-			if said := strings.Contains(msg, "servers saved"); said != tc.saved {
-				t.Fatalf("error %q; servers.json written: %v", msg, tc.saved)
-			}
-			if wrote := tc.mc.savedServers != nil; wrote != tc.saved {
-				t.Fatalf("servers.json written: %v, want %v", wrote, tc.saved)
-			}
-		})
+	if strings.Contains(rec.Body.String(), "uuid-") || strings.Contains(rec.Body.String(), "/s/t") {
+		t.Fatalf("a credential or the link reached the page: %s", rec.Body)
 	}
 }

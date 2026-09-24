@@ -36,6 +36,10 @@ const (
 	// importDeadline covers the 10-second subscription download plus one DNS
 	// lookup per server; the import runs no shell command.
 	importDeadline = 2 * time.Minute
+	// subscriptionTimeout bounds the downloads of one subscription route and
+	// the resolution of every host in them. It stays inside importDeadline, so
+	// the route can still answer when it runs out.
+	subscriptionTimeout = 90 * time.Second
 	// githubDeadline covers the synchronous part of an update route: one
 	// GitHub API call under updater.APITimeout. POST /api/update answers 202
 	// as soon as the download goroutine is under way, so the script's own

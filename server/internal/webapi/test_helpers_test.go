@@ -2,7 +2,11 @@ package webapi
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -265,3 +269,30 @@ func newTestToken(t *testing.T, deps *Deps) string {
 	}
 	return token
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// subscriptionHost serves body as every subscription and returns a client that
+// takes every request there, whatever host the URL names: the import's own
+// checks see the public address a test posts.
+func subscriptionHost(t *testing.T, body string) *http.Client {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := srv.Client().Transport
+	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme, clone.URL.Host = target.Scheme, target.Host
+		return base.RoundTrip(clone)
+	})}
+}
+
+var osloSubscription = base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443?type=tcp#Oslo"))
