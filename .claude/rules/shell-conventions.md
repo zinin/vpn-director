@@ -451,3 +451,77 @@ pass over the raw text before jq.
 above `_sub_xray_json`): no panel writes such a literal, and the value reaches
 Xray as a number or a null. Any other jq that reads untrusted JSON on the
 router inherits the same leniency.
+
+### errexit is off inside a function on the left of `||` or `&&`
+
+**Problem**: bash ignores `set -e` in a command on the left of `||` or `&&` — and
+in an `if` or `while` condition, and after `!` — and a function called there
+runs its whole body that way. A `set -e` inside a subshell there changes
+nothing. A command that fails without a check of its own runs on, and the
+status that comes back is the last command's:
+
+```bash
+set -e
+f() { false; echo "ran on past false"; }
+f || echo "f failed"                # ran on past false
+( set -e; f ) || echo "f failed"    # ran on past false
+```
+
+An explicit `exit` still ends the function, so `abort` works anywhere; the stop
+at an unchecked failure is what goes.
+
+**Solution**: `import_server_list.sh` runs each menu action through
+`run_action`, called as a plain command. The action runs in a subshell, so its
+`abort` ends the action and not the menu:
+
+```bash
+run_action() {
+    set +e
+    ( set -e; "$@" )
+    ACTION_RC=$?
+    set -e
+}
+
+run_action menu_add
+if (( ACTION_RC != 0 )); then
+    exit "$ACTION_RC"
+fi
+```
+
+`set +e` keeps a failed action from ending the menu, and the subshell turns
+errexit back on for the action alone, which works only because nothing around
+the call ignores it.
+
+**Rule**: never `run_action … || …`, `run_action … && …`, `! run_action …` or
+`if run_action …`: the action then runs with errexit off, and `ACTION_RC` reads
+0 for an action whose `false` was followed by a successful command. Read
+`ACTION_RC` after the call instead.
+
+### Nothing that can pass 128 KiB goes to jq as an argument
+
+**Problem**: `execve` takes no single argument longer than 128 KiB
+(`MAX_ARG_STRLEN`, 32 pages). A byte more and the exec fails with `E2BIG`: jq
+never starts, bash prints `jq: Argument list too long`, and the status is 126.
+
+```bash
+s=$(head -c 131072 /dev/zero | tr '\0' a)
+jq -n --arg x "$s" '$x | length'    # /usr/bin/jq: Argument list too long (126)
+printf '%s' "$s" | jq -R length     # 131072
+```
+
+A subscription list with its outbounds gets there inside the limit of ten
+subscriptions: with 300-byte outbounds, about the median of the cases in
+`testdata/subscription/`, some 370 servers pass it — ten subscriptions of 37.
+
+**Solution**: hand such a value to jq on stdin (`<<< "$list"`) or from a file
+(`--slurpfile`, as `import_server_list.sh` hands over the resolved servers). A
+shell function's arguments never meet `execve`, so `lib/substore.sh` takes the
+list as a function argument and pipes it in: `substore_name_taken`,
+`substore_default_name` and `substore_ips` read it as `<<< "$1"`, and
+`substore.bats` runs them and `substore_sync_config` on a list past the limit.
+`substore_write` reads its one subscription the same way.
+
+**Rule**: `--arg` and `--argjson` are for values with a small bound — an id, a
+name, a time. `xray.servers`, the union of every address, still goes as
+`--argjson` (`substore_sync_config`, the last write of `configure.sh`): at 18
+bytes an address, it reaches the limit at about 7,300 addresses.
