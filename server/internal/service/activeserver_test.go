@@ -13,26 +13,18 @@ import (
 // whether it is inside the locked section, which is how the test below can
 // tell where the generation ran.
 type stubStore struct {
-	cfg              *vpnconfig.VPNDirectorConfig
-	err              error // fails before the closure runs, as a load or lock failure does
-	saveErr          error // fails after it, as the save step does
-	serversErr       error // fails the servers.json write
-	inClosure        bool
-	saved            bool
-	savedServers     []vpnconfig.Server
-	serversUnderLock bool
+	cfg       *vpnconfig.VPNDirectorConfig
+	err       error // fails before the closure runs, as a load or lock failure does
+	saveErr   error // fails after it, as the save step does
+	inClosure bool
+	saved     bool
 }
 
 func (s *stubStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) { return s.cfg, nil }
 func (s *stubStore) LoadServers() ([]vpnconfig.Server, error)             { return nil, nil }
-func (s *stubStore) SaveServers(servers []vpnconfig.Server) error {
-	s.serversUnderLock = s.inClosure
-	if s.serversErr != nil {
-		return s.serversErr
-	}
-	s.savedServers = servers
-	return nil
-}
+func (s *stubStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) { return nil, nil }
+func (s *stubStore) SaveSubscription(vpnconfig.Subscription) error        { return nil }
+func (s *stubStore) DeleteSubscription(string) error                      { return nil }
 func (s *stubStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	if s.err != nil {
 		return s.err
@@ -47,7 +39,6 @@ func (s *stubStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error)
 	return s.saveErr
 }
 func (s *stubStore) DataDir() (string, error) { return "", nil }
-func (s *stubStore) DataDirOrDefault() string { return "" }
 func (s *stubStore) ScriptsDir() string       { return "" }
 
 // stubXray notes whether the store was inside its locked section when the

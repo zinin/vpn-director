@@ -85,10 +85,14 @@ func registerProtectedRoutes(mux *http.ServeMux, deps *Deps) {
 	mux.HandleFunc("GET /api/version", handleVersion(deps))
 	mux.HandleFunc("GET /api/platform", handlePlatform(deps))
 
-	// Servers
+	// Servers and subscriptions
 	mux.HandleFunc("GET /api/servers", handleListServers(deps))
 	mux.HandleFunc("POST /api/servers/active", handleSelectServer(deps))
-	mux.HandleFunc("POST /api/servers/import", handleImportServers(deps))
+	mux.HandleFunc("GET /api/subscriptions", handleListSubscriptions(deps))
+	mux.HandleFunc("POST /api/subscriptions", handleAddSubscription(deps))
+	mux.HandleFunc("POST /api/subscriptions/refresh", handleRefreshSubscriptions(deps))
+	mux.HandleFunc("POST /api/subscriptions/rename", handleRenameSubscription(deps))
+	mux.HandleFunc("DELETE /api/subscriptions", handleDeleteSubscription(deps))
 
 	// Clients
 	mux.HandleFunc("GET /api/clients", handleListClients(deps))

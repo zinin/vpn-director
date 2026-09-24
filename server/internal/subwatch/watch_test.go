@@ -39,7 +39,40 @@ type fake struct {
 	applies  int
 	notes    []string
 	now      time.Time
-	picked   bool // Generate has written a walked outbound (liveImportWatch)
+	picked   bool                     // Generate has written a walked outbound (liveImportWatch)
+	subs     []vpnconfig.Subscription // the subscription files; nil takes baseSubs
+	noSubs   bool                     // no subscription at all
+}
+
+// baseSubs is the one subscription the older tests assume. Its id and name are
+// empty, so the ActiveServer records those tests write - which name no
+// subscription - still match its servers, and the messages name the servers
+// alone, as they did.
+func baseSubs() []vpnconfig.Subscription {
+	return []vpnconfig.Subscription{{URL: "https://cdn.example/s/token"}}
+}
+
+// cloneSubs hands out what production's LoadSubscriptions does: fresh copies,
+// every server carrying its subscription's id.
+func cloneSubs(subs []vpnconfig.Subscription) []vpnconfig.Subscription {
+	out := make([]vpnconfig.Subscription, len(subs))
+	for i, s := range subs {
+		s.Servers = append([]vpnconfig.Server(nil), s.Servers...)
+		for j := range s.Servers {
+			s.Servers[j].Subscription = s.ID
+		}
+		out[i] = s
+	}
+	return out
+}
+
+// subsOf serves servers as the one subscription of baseSubs.
+func subsOf(servers []vpnconfig.Server) func() ([]vpnconfig.Subscription, error) {
+	return func() ([]vpnconfig.Subscription, error) {
+		subs := baseSubs()
+		subs[0].Servers = servers
+		return cloneSubs(subs), nil
+	}
 }
 
 // cloneCfg hands out what production's LoadVPN does: a fresh parse, which a
@@ -70,6 +103,25 @@ func (f *fake) watch() *Watch {
 		Probe:  func(context.Context, int) error { return f.probeErr },
 		Notify: func(msg string) { f.notes = append(f.notes, msg) },
 		Now:    func() time.Time { return f.now },
+		LoadSubscriptions: func() ([]vpnconfig.Subscription, error) {
+			if f.noSubs {
+				return nil, nil
+			}
+			if f.subs == nil {
+				f.subs = baseSubs()
+			}
+			return cloneSubs(f.subs), nil
+		},
+		SaveSubscription: func(s vpnconfig.Subscription) error {
+			for i := range f.subs {
+				if f.subs[i].ID == s.ID {
+					f.subs[i] = s
+					return nil
+				}
+			}
+			f.subs = append(f.subs, s)
+			return nil
+		},
 	}
 }
 
@@ -104,8 +156,7 @@ func baseCfg() *vpnconfig.VPNDirectorConfig {
 			"ovpnc2": {Clients: []string{"192.168.1.3"}},
 		}},
 		Xray: vpnconfig.XrayConfig{
-			Clients:         []string{"192.168.1.8", "192.168.1.9"},
-			SubscriptionURL: "https://cdn.example/s/token",
+			Clients: []string{"192.168.1.8", "192.168.1.9"},
 		},
 	}
 }
@@ -138,7 +189,7 @@ func runningWatch(w *Watch) *Watch {
 }
 
 func TestTick_NotArmedDoesNothing(t *testing.T) {
-	f := &fake{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{Clients: []string{"192.168.1.8"}}}, now: time.Unix(0, 0)}
+	f := &fake{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{Clients: []string{"192.168.1.8"}}}, now: time.Unix(0, 0), noSubs: true}
 	f.watch().Tick(context.Background())
 	if f.applies != 0 {
 		t.Fatal("unarmed")
@@ -541,7 +592,6 @@ func TestTick_WalkTriesEveryAddressOfAServer(t *testing.T) {
 	var dialed []string
 	current := ""
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443, IPs: []string{"203.0.113.10", "", "203.0.113.11"}},
@@ -756,7 +806,6 @@ func TestTick_StopDuringTheWalkEndsItQuietly(t *testing.T) {
 			}
 			w := runningWatch(f.watch())
 			w.Stopped = func() bool { return stopped }
-			w.SaveServers = func([]vpnconfig.Server) error { return nil }
 			w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 				return []vpnconfig.Server{
 					{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -887,8 +936,9 @@ func TestTick_StopDuringTheRetargetPlatformLookupKeepsTheExit(t *testing.T) {
 }
 
 // The subscription download blocks for as long as the host takes, and what
-// follows it writes servers.json and xray.servers. A /stop finishing meanwhile
-// ends the wave, and the wave that never happened does not spend its window.
+// follows it writes the subscription files and xray.servers. A /stop
+// finishing meanwhile ends the wave, and the wave that never happened does not
+// spend its window.
 func TestTick_StopDuringTheSubscriptionFetchWritesNothing(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	stopped := false
@@ -896,9 +946,10 @@ func TestTick_StopDuringTheSubscriptionFetchWritesNothing(t *testing.T) {
 	fetches := 0
 	w := runningWatch(f.watch())
 	w.Stopped = func() bool { return stopped }
-	w.SaveServers = func([]vpnconfig.Server) error {
+	save := w.SaveSubscription
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
 		saves++
-		return nil
+		return save(s)
 	}
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		fetches++
@@ -934,9 +985,10 @@ func TestTick_AStopEndsAFetchThatIsStillRunning(t *testing.T) {
 	saves := 0
 	w := runningWatch(f.watch())
 	w.Stopped = stopped.Load
-	w.SaveServers = func([]vpnconfig.Server) error {
+	save := w.SaveSubscription
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
 		saves++
-		return nil
+		return save(s)
 	}
 	w.Generate = f.generateAll
 	w.Fetch = func(ctx context.Context, _ string) ([]vpnconfig.Server, error) {
@@ -991,7 +1043,6 @@ func TestTick_StopWhileGenerateWaitsForTheLockWritesNothing(t *testing.T) {
 	generated, restarts := 0, 0
 	w := runningWatch(f.watch())
 	w.Stopped = func() bool { return stopped }
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}}, nil
 	}
@@ -1033,7 +1084,6 @@ func TestTick_StopWhileTheReturnToPreferredWaitsWritesNothing(t *testing.T) {
 	generated := []string{}
 	w := runningWatch(f.watch())
 	w.Stopped = func() bool { return stopped }
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -1149,9 +1199,10 @@ func TestTick_StopWhileThePublicationWaitsWritesNothing(t *testing.T) {
 	w := runningWatch(f.watch())
 	w.Stopped = func() bool { return stopped }
 	w.UpdateVPN = stopWhileWriting(f, &stopped)
-	w.SaveServers = func([]vpnconfig.Server) error {
+	save := w.SaveSubscription
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
 		saves++
-		return nil
+		return save(s)
 	}
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443, IPs: []string{"203.0.113.10"}}}, nil
@@ -1197,7 +1248,6 @@ func TestTick_WalkStopsWhenContextCanceled(t *testing.T) {
 	}
 	generated := 0
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -1297,11 +1347,11 @@ func TestTick_UnarmedTickResetsTimer(t *testing.T) {
 	w := f.watch()
 	w.Tick(context.Background())
 
-	f.cfg.Xray.SubscriptionURL = ""
+	f.noSubs = true
 	f.now = f.now.Add(ProbeInterval)
 	w.Tick(context.Background())
 
-	f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/token"
+	f.noSubs = false
 	f.now = f.now.Add(10 * time.Minute)
 	w.Tick(context.Background())
 	if f.cfg.Xray.Failover != nil {
@@ -1312,19 +1362,18 @@ func TestTick_UnarmedTickResetsTimer(t *testing.T) {
 	}
 }
 
-// import_server_list.sh clears the saved link for a list from a file or a
-// plain-http link - an import a user makes over SSH while Xray is down. The
-// watch went idle with the link, and the failover it left behind kept its
-// clients on the tunnel for good.
-func TestTick_AFailoverOutlivesItsLinkAndStillRestores(t *testing.T) {
+// Every subscription can be deleted while Xray is down - from the Web UI, the
+// bot or over SSH. A watch that went idle with them would keep the failover it
+// left behind, and its clients on the tunnel, for good.
+func TestTick_AFailoverOutlivesItsSubscriptionsAndStillRestores(t *testing.T) {
 	f := &fake{cfg: committedCfg(), plat: connected("ovpnc2"), now: time.Unix(1_700_000_000, 0)}
-	f.cfg.Xray.SubscriptionURL = ""
+	f.noSubs = true
 	w := runningWatch(f.watch())
 
 	w.Tick(context.Background())
 
 	if f.cfg.Xray.Failover != nil {
-		t.Fatalf("failover %+v; a live outbound ends it, link or no link", f.cfg.Xray.Failover)
+		t.Fatalf("failover %+v; a live outbound ends it, subscription or none", f.cfg.Xray.Failover)
 	}
 	if !contains(f.cfg.Xray.Clients, "192.168.1.8") || contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
 		t.Fatalf("xray.clients %v, ovpnc2 %v", f.cfg.Xray.Clients, f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients)
@@ -1334,13 +1383,13 @@ func TestTick_AFailoverOutlivesItsLinkAndStillRestores(t *testing.T) {
 	}
 }
 
-// A failover with no link still follows its tunnel: gone for a minute with no
-// other exit, the clients go back to Xray as they do with one, and are told.
-// The message came from the next tick's death path, which a watch without a
-// link never reaches.
-func TestTick_AFailoverWithoutALinkStillLeavesATunnelThatWentDown(t *testing.T) {
+// A failover with no subscription still follows its tunnel: gone for a minute
+// with no other exit, the clients go back to Xray as they do with one, and are
+// told. The message came from the next tick's death path, which a watch without
+// a subscription never reaches.
+func TestTick_AFailoverWithoutASubscriptionStillLeavesATunnelThatWentDown(t *testing.T) {
 	f := &fake{cfg: committedCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
-	f.cfg.Xray.SubscriptionURL = ""
+	f.noSubs = true
 	f.plat = vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: false}}}
 	w := runningWatch(f.watch())
 
@@ -1354,11 +1403,11 @@ func TestTick_AFailoverWithoutALinkStillLeavesATunnelThatWentDown(t *testing.T) 
 	}
 }
 
-// With no link there is nothing to refresh: a dead outbound neither downloads
-// "" nor reports a refresh that failed, and the failover goes on.
-func TestTick_AFailoverWithoutALinkRefreshesNothing(t *testing.T) {
+// With no subscription there is nothing to refresh: a dead outbound neither
+// downloads anything nor reports a refresh that failed, and the failover goes on.
+func TestTick_AFailoverWithoutASubscriptionRefreshesNothing(t *testing.T) {
 	f := &fake{cfg: committedCfg(), plat: connected("ovpnc2"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
-	f.cfg.Xray.SubscriptionURL = ""
+	f.noSubs = true
 	w := runningWatch(f.watch())
 	fetches := 0
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
@@ -1369,7 +1418,7 @@ func TestTick_AFailoverWithoutALinkRefreshesNothing(t *testing.T) {
 	tickFor(w, f, 2*ImportRetry)
 
 	if fetches != 0 {
-		t.Fatalf("fetches %d with no saved link", fetches)
+		t.Fatalf("fetches %d with no subscription", fetches)
 	}
 	if n := countNotes(f.notes, "Subscription refresh failed"); n != 0 {
 		t.Fatalf("notes %v", f.notes)
@@ -1382,8 +1431,8 @@ func TestTick_AFailoverWithoutALinkRefreshesNothing(t *testing.T) {
 // A restore whose last apply failed is retried on the next tick. The JSON
 // already says restored, so nothing but a hook or the daily update would apply
 // it otherwise, and a retry that loses TPROXY is the one that puts the clients
-// back on the tunnel: a link cleared in between must not end it.
-func TestTick_ARestoreLeftPendingIsFinishedWithoutALink(t *testing.T) {
+// back on the tunnel: the last subscription deleted in between must not end it.
+func TestTick_ARestoreLeftPendingIsFinishedWithoutASubscription(t *testing.T) {
 	f := &fake{cfg: committedCfg(), plat: connected("ovpnc2"), now: time.Unix(1_700_000_000, 0)}
 	w := runningWatch(f.watch())
 	w.Apply = func() error {
@@ -1398,7 +1447,7 @@ func TestTick_ARestoreLeftPendingIsFinishedWithoutALink(t *testing.T) {
 		t.Fatalf("failover %+v, notes %v; the restore's last apply failed", f.cfg.Xray.Failover, f.notes)
 	}
 
-	f.cfg.Xray.SubscriptionURL = ""
+	f.noSubs = true
 	f.now = f.now.Add(ProbeInterval)
 	w.Tick(context.Background())
 
@@ -1446,7 +1495,6 @@ func TestTick_NoTunnelPickNotifiesSelectedServer(t *testing.T) {
 	}
 	generated := false
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
@@ -1484,7 +1532,6 @@ func TestTick_NoTunnelPickApplyFailureLeavesNothingPending(t *testing.T) {
 	}
 	generated, probes := false, 0
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
@@ -1706,7 +1753,6 @@ func TestTick_WalkAbandonsWhenANewerServerWasSelected(t *testing.T) {
 	}
 	generated := []string{}
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -1755,7 +1801,6 @@ func TestTick_WalkAbandonsWhenUserReselectsStartedServer(t *testing.T) {
 	}
 	generated := []string{}
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -1818,7 +1863,6 @@ func TestTick_WalkAbandonsWhenTheActiveServerIsSelectedAgain(t *testing.T) {
 	f.cfg.Xray.ActiveServer = running
 	generated, restarts := []string{}, 0
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		// The user re-selects the running server while the download is out.
 		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(running, vpnconfig.Server{
@@ -1862,7 +1906,6 @@ func TestTick_WalkDoesNotOverwriteASelectionMadeJustBeforeGenerate(t *testing.T)
 	manual := &vpnconfig.ActiveServer{Name: "Manual", Address: "manual.example", Port: 443}
 	generated, restarts := []string{}, 0
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}}, nil
 	}
@@ -1911,7 +1954,6 @@ func TestTick_NoLiveWalkDoesNotReturnOverASelectionMadeJustBeforeGenerate(t *tes
 	manual := &vpnconfig.ActiveServer{Name: "Manual", Address: "manual.example", Port: 443}
 	generated, restarts := []string{}, 0
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -1961,7 +2003,6 @@ func TestTick_WalkContinuesPastACandidateWhoseRecordWasNotSaved(t *testing.T) {
 	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
 	generated := []string{}
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Backup", Address: "backup.example", Port: 443},
@@ -2009,7 +2050,6 @@ func TestTick_WalkRestoresOnACandidateWhoseRecordWasNotSaved(t *testing.T) {
 	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
 	generated := []string{}
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Backup", Address: "backup.example", Port: 443}}, nil
 	}
@@ -2043,7 +2083,6 @@ func TestTick_NoLiveWalkReturnsToPreferredAfterAnUnsavedRecord(t *testing.T) {
 	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
 	generated := []string{}
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -2239,6 +2278,22 @@ func TestPickOrder_SameNameFirst(t *testing.T) {
 	}
 }
 
+func TestChosenIndex_TheNameFallbackStaysInItsSubscription(t *testing.T) {
+	servers := []vpnconfig.Server{
+		{Subscription: "aaaaaaaa", Name: "Germany-1", Address: "de-a.example", Port: 443},
+		{Subscription: "bbbbbbbb", Name: "Germany-1", Address: "de-b.example", Port: 443},
+	}
+	chosen := &vpnconfig.ActiveServer{Subscription: "bbbbbbbb", Name: "Germany-1", Address: "de-rotated.example", Port: 443}
+
+	if i := chosenIndex(servers, chosen); i != 1 {
+		t.Fatalf("chosenIndex %d, want 1", i)
+	}
+	// A record from before subscriptions names no server of one.
+	if i := chosenIndex(servers, &vpnconfig.ActiveServer{Name: "Germany-1", Address: "de-a.example", Port: 443}); i != -1 {
+		t.Fatalf("a record without a subscription matched %d", i)
+	}
+}
+
 // The walk starts from the name the user chose at the address it has today, and
 // an all-dead wave returns config.json to that server, not to the last one tried.
 func TestTick_TheChosenNameIsTriedFirstAtItsNewAddress(t *testing.T) {
@@ -2322,7 +2377,11 @@ func TestTick_ImportAndRestoreOnLiveServer(t *testing.T) {
 	generated := []string{}
 	liveAfter := ""
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { saved++; return nil }
+	save := w.SaveSubscription
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
+		saved++
+		return save(s)
+	}
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "new.example", Port: 443},
@@ -2385,7 +2444,6 @@ func TestTick_SameNameDeadWalksList(t *testing.T) {
 	generated := []string{}
 	liveAfter := ""
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "new.example", Port: 443},
@@ -2429,7 +2487,9 @@ func TestTick_SameNameDeadWalksList(t *testing.T) {
 	}
 }
 
-func TestTick_FailedFetchDoesNotSave(t *testing.T) {
+// A failed download keeps the list it would have replaced, and the wave writes
+// why into the subscription once.
+func TestTick_AFailedFetchKeepsTheListAndRecordsWhy(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
 		plat:     vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
@@ -2438,13 +2498,17 @@ func TestTick_FailedFetchDoesNotSave(t *testing.T) {
 	}
 	saved := 0
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { saved++; return nil }
+	save := w.SaveSubscription
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
+		saved++
+		return save(s)
+	}
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return nil, errors.New("cdn down")
 	}
 	tickUntilDead(w, f)
-	if saved != 0 {
-		t.Fatalf("saved %d", saved)
+	if saved != 1 || f.subs[0].Error != "cdn down" || f.subs[0].Servers != nil {
+		t.Fatalf("saved %d, subscription %+v; want its error written once and its list kept", saved, f.subs[0])
 	}
 	if f.cfg.Xray.Failover == nil {
 		t.Fatal("should stay failed over")
@@ -2473,7 +2537,6 @@ func TestTick_NoTunnelNoLiveNotifiesOncePerChannel(t *testing.T) {
 	}
 	fetches := 0
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		fetches++
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
@@ -2522,7 +2585,6 @@ func TestTick_TunnelImportOutcomesNotifyOnceEach(t *testing.T) {
 	}
 	fetches := 0
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		fetches++
 		if fetches == 1 {
@@ -2540,7 +2602,7 @@ func TestTick_TunnelImportOutcomesNotifyOnceEach(t *testing.T) {
 	want := []string{
 		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
 		"Subscription refresh failed; still on tunnel:ovpnc2",
-		"No live server in the subscription; still on tunnel:ovpnc2",
+		"No live server in any subscription; still on tunnel:ovpnc2",
 	}
 	if !reflect.DeepEqual(f.notes, want) {
 		t.Fatalf("notes %v, want %v", f.notes, want)
@@ -2556,7 +2618,6 @@ func TestTick_NewDeathAfterRestoreNotifiesMovedAgain(t *testing.T) {
 	}
 	generated, liveOnce := false, true
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
@@ -2583,7 +2644,7 @@ func TestTick_NewDeathAfterRestoreNotifiesMovedAgain(t *testing.T) {
 		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
 		"LAN clients back on Xray; server Oslo",
 		"Xray outbound is down; LAN clients moved to tunnel:ovpnc2",
-		"No live server in the subscription; still on tunnel:ovpnc2",
+		"No live server in any subscription; still on tunnel:ovpnc2",
 	}
 	if !reflect.DeepEqual(f.notes, want) {
 		t.Fatalf("notes %v, want %v", f.notes, want)
@@ -2599,7 +2660,6 @@ func TestTick_NewEpisodeAfterRestoreNotifiesRestoredAgain(t *testing.T) {
 	}
 	justGenerated := false
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
@@ -2677,7 +2737,6 @@ func failedOverCfg() *vpnconfig.VPNDirectorConfig {
 
 func liveImportWatch(f *fake) *Watch {
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10", "203.0.113.11"}},
@@ -2710,7 +2769,6 @@ func liveImportWatch(f *fake) *Watch {
 // events lists every Generate by server name and every restart as "restart".
 func recordingWalkWatch(f *fake, servers []vpnconfig.Server, generates func(vpnconfig.Server) bool, events *[]string) *Watch {
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) { return servers, nil }
 	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
@@ -2737,7 +2795,6 @@ func TestTick_NoLiveWavesBackOffImportRetry(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	fetches := 0
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		fetches++
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
@@ -2777,7 +2834,6 @@ func TestTick_RestoreResetsImportBackoff(t *testing.T) {
 	fetches := 0
 	var fetchErr error
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		fetches++
 		if fetchErr != nil {
@@ -2849,7 +2905,6 @@ func TestTick_FailedDownloadAfterNoLiveWaveResetsToFiveMinutes(t *testing.T) {
 	fetches := 0
 	fetchErr := error(nil)
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		fetches++
 		if fetchErr != nil {
@@ -3317,9 +3372,10 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 		fetches++
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}
-	w.SaveServers = func([]vpnconfig.Server) error {
+	save := w.SaveSubscription
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
 		saves++
-		return nil
+		return save(s)
 	}
 	w.Generate = func(_ vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := f.checkGuard(guard); err != nil {
@@ -3351,7 +3407,7 @@ func TestTick_FailedApplyRetrySkipsImport(t *testing.T) {
 		t.Fatalf("fetches %d; ImportRetry has not elapsed", fetches)
 	}
 	assertStagedOnTunnel(t, f.cfg)
-	if len(f.notes) != 1 || f.notes[0] != "No live server in the subscription" {
+	if len(f.notes) != 1 || f.notes[0] != "No live server in any subscription" {
 		t.Fatalf("notes %v", f.notes)
 	}
 
@@ -3427,7 +3483,6 @@ func TestTick_ImportSyncsXrayServers(t *testing.T) {
 		now:      time.Unix(1_700_000_000, 0),
 	}
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10", "203.0.113.11"}},
@@ -3445,8 +3500,8 @@ func TestTick_ImportSyncsXrayServers(t *testing.T) {
 }
 
 // The Web UI, /import and this wave all publish a list and the bypass IPs read
-// against it. Writing servers.json outside the config lock lets two waves
-// interleave into one file from each.
+// against it. Writing a subscription file outside the config lock lets two
+// waves interleave into one file from each.
 func TestTick_ImportPublishesServersUnderTheConfigLock(t *testing.T) {
 	f := &fake{
 		cfg:      failedOverCfg(),
@@ -3461,9 +3516,10 @@ func TestTick_ImportPublishesServersUnderTheConfigLock(t *testing.T) {
 		defer func() { inUpdate = false }()
 		return fn(f.cfg)
 	}
-	w.SaveServers = func([]vpnconfig.Server) error {
+	save := w.SaveSubscription
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
 		savedUnderLock = inUpdate
-		return nil
+		return save(s)
 	}
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443, IPs: []string{"203.0.113.10"}}}, nil
@@ -3472,184 +3528,7 @@ func TestTick_ImportPublishesServersUnderTheConfigLock(t *testing.T) {
 	w.Tick(context.Background())
 
 	if !savedUnderLock {
-		t.Fatal("servers.json must be written inside the config update the watch takes the lock with")
-	}
-}
-
-// The download can take longer than it takes someone to paste a new
-// subscription into the Web UI. Publishing this list then leaves a servers.json
-// from the old link beside the new one that is now saved, and the walk picks its
-// server out of it.
-func TestTick_ImportDoesNotPublishAfterTheSubscriptionChanged(t *testing.T) {
-	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
-	saves, fetches, generates := 0, 0, 0
-	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error {
-		saves++
-		return nil
-	}
-	w.Generate = func(vpnconfig.Server, func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
-		generates++
-		return true, f.seq(), nil
-	}
-	w.RestartXray = func() error { return nil }
-	w.AfterRestart = func(time.Duration) {}
-	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
-		fetches++
-		// A Web UI import saves another subscription while this one is in flight.
-		f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
-		return []vpnconfig.Server{{Name: "Oslo", Address: "old.example", Port: 443, IPs: []string{"203.0.113.10"}}}, nil
-	}
-
-	w.Tick(context.Background())
-
-	if saves != 0 || len(f.cfg.Xray.Servers) != 0 {
-		t.Fatalf("saves %d, xray.servers %v; a list from the old subscription must not be published", saves, f.cfg.Xray.Servers)
-	}
-	if generates != 0 {
-		t.Fatalf("generates %d; the walk must not run on a list the config no longer asks for", generates)
-	}
-
-	// The link that replaced it deserves a wave of its own, not the wait left
-	// over from the one that was thrown away.
-	w.Tick(context.Background())
-	if fetches != 2 {
-		t.Fatalf("fetches %d; the abandoned wave must not spend the import window", fetches)
-	}
-}
-
-// The same change landing once the walk is under way: the list it walks came from
-// a link that is no longer saved, and every server it goes on to write is one the
-// new subscription may not have. The walk ends where it is, writes and announces
-// nothing more, and the new link gets a wave of its own at once.
-func TestTick_WalkAbandonsWhenTheSavedLinkChanges(t *testing.T) {
-	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
-	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
-	generated, restarts, fetches := []string{}, 0, 0
-	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
-	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
-		fetches++
-		return []vpnconfig.Server{
-			{Name: "Oslo", Address: "oslo.example", Port: 443},
-			{Name: "Backup", Address: "backup.example", Port: 443},
-		}, nil
-	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
-		if err := f.checkGuard(guard); err != nil {
-			return false, f.seq(), err
-		}
-		generated = append(generated, s.Name)
-		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
-		return true, f.seq(), nil
-	}
-	w.RestartXray = func() error {
-		restarts++
-		if restarts == 1 {
-			// The Web UI imports another subscription while Oslo is being tried.
-			f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
-		}
-		return nil
-	}
-	w.AfterRestart = func(time.Duration) {}
-
-	w.Tick(context.Background())
-
-	if !reflect.DeepEqual(generated, []string{"Oslo"}) {
-		t.Fatalf("generated %v; nothing from the old list may follow the new link", generated)
-	}
-	if len(f.notes) != 0 {
-		t.Fatalf("notes %v; an abandoned walk announces nothing", f.notes)
-	}
-
-	w.Tick(context.Background())
-	if fetches != 2 {
-		t.Fatalf("fetches %d; the new link must not wait out the abandoned wave's window", fetches)
-	}
-}
-
-// The same link saved just before the walk writes the preferred server back: the
-// return is refused under the lock, the all-dead wave announces nothing, and the
-// new link gets its wave at once rather than the backed-off one.
-func TestTick_NoLiveWalkDoesNotReturnAfterTheLinkChanged(t *testing.T) {
-	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
-	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
-	generated, fetches := []string{}, 0
-	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
-	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
-		fetches++
-		return []vpnconfig.Server{
-			{Name: "Oslo", Address: "oslo.example", Port: 443},
-			{Name: "Backup", Address: "backup.example", Port: 443},
-		}, nil
-	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
-		if fetches == 1 && len(generated) == 2 {
-			// Saved while the return to Oslo waits for the lock.
-			f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
-		}
-		if err := f.checkGuard(guard); err != nil {
-			return false, f.seq(), err
-		}
-		generated = append(generated, s.Name)
-		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
-		return true, f.seq(), nil
-	}
-	w.RestartXray = func() error { return nil }
-	w.AfterRestart = func(time.Duration) {}
-
-	w.Tick(context.Background())
-
-	if !reflect.DeepEqual(generated, []string{"Oslo", "Backup"}) {
-		t.Fatalf("generated %v; the return must not write after the link changed", generated)
-	}
-	if len(f.notes) != 0 {
-		t.Fatalf("notes %v; an abandoned walk announces nothing", f.notes)
-	}
-	w.Tick(context.Background())
-	if fetches != 2 {
-		t.Fatalf("fetches %d; the new link must not wait out the backoff of the abandoned wave", fetches)
-	}
-}
-
-// And while the probe of a candidate succeeds: the server is one of the old list,
-// and the walk that found it ends without the restore. The next tick's health
-// probe finds the live outbound either way.
-func TestTick_WalkDoesNotRestoreOnTheOldListAfterTheLinkChanged(t *testing.T) {
-	f := &fake{cfg: failedOverCfg(), now: time.Unix(1_700_000_000, 0)}
-	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
-	generated := []string{}
-	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
-	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
-		return []vpnconfig.Server{{Name: "Backup", Address: "backup.example", Port: 443}}, nil
-	}
-	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
-		if err := f.checkGuard(guard); err != nil {
-			return false, f.seq(), err
-		}
-		generated = append(generated, s.Name)
-		f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
-		return true, f.seq(), nil
-	}
-	w.RestartXray = func() error { return nil }
-	w.AfterRestart = func(time.Duration) {}
-	w.Probe = func(context.Context, int) error {
-		if len(generated) == 0 {
-			return errProbe
-		}
-		f.cfg.Xray.SubscriptionURL = "https://cdn.example/s/other"
-		return nil
-	}
-
-	w.Tick(context.Background())
-
-	if f.cfg.Xray.Failover == nil {
-		t.Fatal("the walk restored on a server of a link that is no longer saved")
-	}
-	if len(f.notes) != 0 {
-		t.Fatalf("notes %v; an abandoned walk announces nothing", f.notes)
+		t.Fatal("the subscription file must be written inside the config update the watch takes the lock with")
 	}
 }
 
@@ -3663,7 +3542,6 @@ func TestTick_WalkAbandonsWhenASelectionLandsRightAfterGenerate(t *testing.T) {
 	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4}
 	generated := []string{}
 	w := runningWatch(f.watch())
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{
 			{Name: "Oslo", Address: "oslo.example", Port: 443},
@@ -4192,7 +4070,6 @@ func TestTick_APickWithoutAFallbackStartsTheGraceAgain(t *testing.T) {
 	f := &fake{cfg: baseCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	generated, dead := false, false
 	w := f.watch()
-	w.SaveServers = func([]vpnconfig.Server) error { return nil }
 	w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return []vpnconfig.Server{{Name: "Oslo", Address: "new.example", Port: 443}}, nil
 	}

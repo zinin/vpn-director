@@ -1,0 +1,32 @@
+{
+  "id": "0a1b2c3d",
+  "name": "Alpha",
+  "url": "https://sub.example.com/s/fixture-token",
+  "added": "2026-09-24T18:00:00Z",
+  "refreshed": "2026-09-24T18:05:00Z",
+  "error": "download failed: HTTP 403",
+  "servers": [
+    {
+      "address": "a.example.com",
+      "port": 443,
+      "name": "Oslo",
+      "ips": ["192.0.2.10"],
+      "outbound": {
+        "protocol": "vless",
+        "settings": {"vnext": [{"address": "a.example.com", "port": 443, "users": [{"id": "00000000-0000-4000-8000-000000000001", "encryption": "none"}]}]},
+        "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"serverName": "a.example.com"}}
+      }
+    },
+    {
+      "address": "b.example.com",
+      "port": 443,
+      "name": "Germany-1",
+      "ips": ["192.0.2.11"],
+      "outbound": {
+        "protocol": "vless",
+        "settings": {"vnext": [{"address": "b.example.com", "port": 443, "users": [{"id": "00000000-0000-4000-8000-000000000002", "encryption": "none"}]}]},
+        "streamSettings": {"network": "tcp", "security": "tls", "tlsSettings": {"serverName": "b.example.com"}}
+      }
+    }
+  ]
+}

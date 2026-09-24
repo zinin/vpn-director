@@ -46,9 +46,10 @@ const (
 	msgNoTunnel         = "Xray outbound is down; no Tunnel Director fallback"
 	msgFallbackNotReady = "Xray outbound is down; Tunnel Director fallback is not ready"
 	msgRefreshFailed    = "Subscription refresh failed"
-	msgRefreshFailedOn  = "Subscription refresh failed; still on tunnel:%s"
-	msgNoLive           = "No live server in the subscription"
-	msgNoLiveOn         = "No live server in the subscription; still on tunnel:%s"
+	msgStillOnTunnel    = "; still on tunnel:%s"
+	msgRefreshFailedOn  = msgRefreshFailed + msgStillOnTunnel
+	msgNoLive           = "No live server in any subscription"
+	msgNoLiveOn         = msgNoLive + msgStillOnTunnel
 	msgRestored         = "LAN clients back on Xray; server %s"
 	msgPicked           = "Subscription refreshed; selected server %s"
 	msgReturned         = "Xray back on the preferred server %s"
@@ -68,23 +69,25 @@ const (
 )
 
 type Watch struct {
-	LoadVPN       func() (*vpnconfig.VPNDirectorConfig, error)
-	LoadPlatform  func() (vpnconfig.PlatformInfo, error)
-	UpdateVPN     func(func(*vpnconfig.VPNDirectorConfig) error) error
-	Apply         func() error
-	RestartXray   func() error
-	SaveServers   func([]vpnconfig.Server) error
-	Generate      func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error)
-	Probe         func(ctx context.Context, socksPort int) error
-	Fetch         func(ctx context.Context, url string) ([]vpnconfig.Server, error)
-	LoadServers   func() ([]vpnconfig.Server, error)
-	Reachable     func(ctx context.Context, ip string, port int) bool // nil => no TCP checks: no fast death, no return
-	Notify        func(msg string)
-	Now           func() time.Time
-	AfterRestart  func(time.Duration)
-	FallbackReady func(tunnel string) bool // nil => ready; false keeps Xray membership
-	TPROXYReady   func() bool              // nil => ready; false keeps fallback membership after restore
-	Stopped       func() bool              // nil => not stopped; true skips apply/restart after /stop
+	LoadVPN      func() (*vpnconfig.VPNDirectorConfig, error)
+	LoadPlatform func() (vpnconfig.PlatformInfo, error)
+	UpdateVPN    func(func(*vpnconfig.VPNDirectorConfig) error) error
+	Apply        func() error
+	RestartXray  func() error
+	// LoadSubscriptions reads every subscription; SaveSubscription writes one.
+	// The watch writes only inside UpdateVPN, through vpnconfig's operations.
+	LoadSubscriptions func() ([]vpnconfig.Subscription, error)
+	SaveSubscription  func(vpnconfig.Subscription) error
+	Generate          func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error)
+	Probe             func(ctx context.Context, socksPort int) error
+	Fetch             func(ctx context.Context, url string) ([]vpnconfig.Server, error)
+	Reachable         func(ctx context.Context, ip string, port int) bool // nil => no TCP checks: no fast death, no return
+	Notify            func(msg string)
+	Now               func() time.Time
+	AfterRestart      func(time.Duration)
+	FallbackReady     func(tunnel string) bool // nil => ready; false keeps Xray membership
+	TPROXYReady       func() bool              // nil => ready; false keeps fallback membership after restore
+	Stopped           func() bool              // nil => not stopped; true skips apply/restart after /stop
 
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
@@ -162,9 +165,10 @@ func (w *Watch) Tick(ctx context.Context) {
 		slog.Warn("Failed to load VPN Director config for the subscription watch", "error", err)
 		return
 	}
+	subs := w.subscriptionCount()
 	// A restore whose last apply failed is work the watch has started, as a
-	// failover is: neither waits for a saved link or for Xray clients.
-	if !vpnconfig.Armed(cfg) && !w.pendingApply {
+	// failover is: neither waits for a subscription or for Xray clients.
+	if !vpnconfig.Armed(cfg, subs) && !w.pendingApply {
 		w.resetFail()
 		return
 	}
@@ -194,7 +198,7 @@ func (w *Watch) Tick(ctx context.Context) {
 			}
 			done, committed, refused := w.commitRestore(cfg, probedServer(cfg))
 			if done && committed {
-				w.announceRestored(activeName(cfg))
+				w.announceRestored(w.activeLabel(cfg))
 			} else if errors.Is(refused, errSuperseded) {
 				slog.Info("Restore put off; a newer server was selected after the probe")
 			}
@@ -267,14 +271,14 @@ func (w *Watch) Tick(ctx context.Context) {
 				}
 				w.settled()
 				if attempt.committed {
-					w.announceRestored(activeName(cfg))
+					w.announceRestored(w.activeLabel(cfg))
 				}
 			}
 		}
 	}
 	// A pending restore is all an unarmed watch finishes: a failover of its own
-	// needs a link to refresh and Xray clients to move.
-	if !vpnconfig.Armed(cfg) {
+	// needs a subscription to walk and Xray clients to move.
+	if !vpnconfig.Armed(cfg, subs) {
 		w.resetFail()
 		return
 	}
@@ -566,7 +570,7 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 	} else {
 		slog.Warn("Failover tunnel "+gone+" and there is no other exit; the Xray clients go back to Xray", "tunnel", id)
 		// Announced here, not by the death path on the next tick: a watch
-		// whose link is gone does not reach it.
+		// with no subscription left does not reach it.
 		w.notify(noteNoTunnel, msgNoTunnel)
 	}
 	w.resetFallbackState()
@@ -599,7 +603,7 @@ func (w *Watch) fallbackCarries(cfg *vpnconfig.VPNDirectorConfig) bool {
 }
 
 func sameServer(s vpnconfig.Server, a *vpnconfig.ActiveServer) bool {
-	if a == nil || s.Name != a.Name {
+	if a == nil || s.Subscription != a.Subscription || s.Name != a.Name {
 		return false
 	}
 	if a.Address == "" && a.Port == 0 {
@@ -613,26 +617,28 @@ func activeID(a *vpnconfig.ActiveServer) string {
 		return ""
 	}
 	if a.Address == "" && a.Port == 0 {
-		return a.Name
+		return a.Subscription + "\x1f" + a.Name
 	}
-	return a.Name + "\x1f" + a.Address + "\x1f" + strconv.Itoa(a.Port)
+	return a.Subscription + "\x1f" + a.Name + "\x1f" + a.Address + "\x1f" + strconv.Itoa(a.Port)
 }
 
 func serverID(s vpnconfig.Server) string {
-	return s.Name + "\x1f" + s.Address + "\x1f" + strconv.Itoa(s.Port)
+	return s.Subscription + "\x1f" + s.Name + "\x1f" + s.Address + "\x1f" + strconv.Itoa(s.Port)
 }
 
-// chosenIndex is where servers has the server a names: the entry with its name,
-// address and port, or else the first entry with its name - a subscription that
-// rotates endpoints gives a name a new address every day, and the name is what
-// the user chose. -1 when the list has neither.
+// chosenIndex is where servers has the server a names: the entry of its
+// subscription with its name, address and port, or else the first entry of its
+// subscription with its name - a subscription that rotates endpoints gives a
+// name a new address every day, and the name is what the user chose. Another
+// subscription's server of the same name is never it. -1 when the list has
+// neither.
 func chosenIndex(servers []vpnconfig.Server, a *vpnconfig.ActiveServer) int {
 	if a == nil || a.Name == "" {
 		return -1
 	}
 	byName := -1
 	for i, s := range servers {
-		if s.Name != a.Name {
+		if s.Subscription != a.Subscription || s.Name != a.Name {
 			continue
 		}
 		if sameServer(s, a) {
@@ -703,14 +709,9 @@ func failoverTunnel(cfg *vpnconfig.VPNDirectorConfig) string {
 // server the walk did not put there.
 var errSuperseded = errors.New("a newer server was selected")
 
-// walkOwns is nil while the walk may still write, and otherwise why not: the
-// saved link is no longer the one its list came from - a server of the old
-// list may be gone from the new one, and the new link deserves a wave of its
-// own - or active_server names a server the walk did not record.
-func walkOwns(cfg *vpnconfig.VPNDirectorConfig, rawURL, started, lastRecorded string, expectedSeq int) error {
-	if err := vpnconfig.SubscriptionUnchanged(rawURL)(cfg); err != nil {
-		return err
-	}
+// walkOwns is nil while the walk may still write, and errSuperseded once
+// active_server names a server the walk did not record.
+func walkOwns(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string, expectedSeq int) error {
 	if superseded(cfg, started, lastRecorded, expectedSeq) {
 		return errSuperseded
 	}
@@ -719,7 +720,7 @@ func walkOwns(cfg *vpnconfig.VPNDirectorConfig, rawURL, started, lastRecorded st
 
 // walkOwnsNow is walkOwns on a fresh read of the config, for the checks of
 // the walk that write nothing themselves.
-func (w *Watch) walkOwnsNow(rawURL, started, lastRecorded string, expectedSeq int) error {
+func (w *Watch) walkOwnsNow(started, lastRecorded string, expectedSeq int) error {
 	if w.LoadVPN == nil {
 		return nil
 	}
@@ -727,42 +728,46 @@ func (w *Watch) walkOwnsNow(rawURL, started, lastRecorded string, expectedSeq in
 	if err != nil {
 		return nil
 	}
-	return walkOwns(cfg, rawURL, started, lastRecorded, expectedSeq)
+	return walkOwns(cfg, started, lastRecorded, expectedSeq)
 }
 
 // walkGuard is the guard every write of the walk carries. It runs under the
 // config lock Generate takes, after whatever wait that lock cost: a /stop that
 // finished meanwhile refuses the write there - a new config.json and
 // active_server on a stopped router would take effect on the next manual
-// apply - and so do a newly saved link and a Web UI or /xray selection that
-// committed after the walk last read the config, instead of being written over.
-func (w *Watch) walkGuard(rawURL, started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
+// apply - and so does a Web UI or /xray selection that committed after the
+// walk last read the config, instead of being written over. With sub set, the
+// server's subscription must still exist with link, the one the walk read: a
+// server of a subscription deleted meanwhile is not written
+// (vpnconfig.ErrSubscriptionGone).
+func (w *Watch) walkGuard(sub, link, started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
 	return func(cfg *vpnconfig.VPNDirectorConfig) error {
 		if w.stopped() {
 			return errStopped
 		}
-		return walkOwns(cfg, rawURL, started, lastRecorded, expectedSeq)
+		if err := walkOwns(cfg, started, lastRecorded, expectedSeq); err != nil {
+			return err
+		}
+		if sub != "" && !w.subscriptionHolds(sub, link) {
+			return vpnconfig.ErrSubscriptionGone
+		}
+		return nil
 	}
 }
 
-// endsWalk is an error after which the walk writes nothing more: a stop, a newer
-// selection, or a link saved since the wave downloaded its own.
+// endsWalk is an error after which the walk writes nothing more: a stop or a
+// newer selection.
 func endsWalk(err error) bool {
-	return errors.Is(err, errStopped) || errors.Is(err, errSuperseded) || errors.Is(err, vpnconfig.ErrSubscriptionChanged)
+	return errors.Is(err, errStopped) || errors.Is(err, errSuperseded)
 }
 
-// walkEnded reports whether err ends the walk, and settles what that leaves: a
-// newly saved link gets its wave at once rather than the window this one spent.
-func (w *Watch) walkEnded(err error, prevImport time.Time) bool {
+// walkEnded reports whether err ends the walk.
+func (w *Watch) walkEnded(err error) bool {
 	if !endsWalk(err) {
 		return false
 	}
-	switch {
-	case errors.Is(err, errSuperseded):
+	if errors.Is(err, errSuperseded) {
 		slog.Info("Subscription walk abandoned; a newer server was selected")
-	case errors.Is(err, vpnconfig.ErrSubscriptionChanged):
-		slog.Info("Subscription walk abandoned; the saved link changed")
-		w.lastImport = prevImport
 	}
 	return true
 }
@@ -797,17 +802,21 @@ func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string, 
 	return true
 }
 
+// maybeImportAndPick runs a wave on the import cadence (spec 5.2): every
+// subscription with a link downloads at once, each list that arrives is
+// published, and the walk looks for a live server across every subscription.
 func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.Fetch == nil || w.stopped() {
 		return
 	}
-	rawURL := ""
-	if cfg != nil {
-		rawURL = cfg.Xray.SubscriptionURL
+	subs, err := w.loadSubscriptions()
+	if err != nil {
+		slog.Warn("Failed to read the subscriptions for a refresh", "error", err)
+		return
 	}
-	if rawURL == "" {
-		// A failover outlives its link - import_server_list.sh clears it for a
-		// list from a file - and is still seen through, but nothing refreshes.
+	if len(subs) == 0 {
+		// A failover outlives its subscriptions and is still seen through, but
+		// nothing refreshes and nothing is walked.
 		return
 	}
 	now := w.Now()
@@ -817,64 +826,124 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	prevImport := w.lastImport
 	w.lastImport = now
 
-	fetchCtx, cancel := context.WithTimeout(ctx, FetchTimeout)
-	servers, err := w.Fetch(fetchCtx, rawURL)
-	cancel()
-	// The download blocks for as long as the subscription host takes. A /stop
-	// that finished meanwhile ends the wave before servers.json is written, and
-	// a wave that did not happen leaves its window to the next one.
-	if w.stopped() {
+	failed, walk := w.refreshSubscriptions(ctx, subs)
+	// The downloads block for as long as the slowest host takes. A /stop that
+	// finished meanwhile ends the wave before anything more is written, and a
+	// wave that did not happen leaves its window to the next one.
+	if w.stopped() || ctx.Err() != nil {
 		w.lastImport = prevImport
 		return
 	}
-	if err != nil || len(servers) == 0 {
-		// A *url.Error carries the whole subscription URL, token included.
-		var ue *url.Error
-		if errors.As(err, &ue) {
-			err = ue.Err
-		}
-		slog.Warn("Subscription refresh failed", "servers", len(servers), "error", err)
-		// An all-dead walk may have backed this off to 10/20/30m. A failed
-		// download retries every ImportRetry; keep that, not the walk backoff.
+	if !walk {
+		// Some subscription failed and none was published - every download
+		// failing, the WAN most likely, is the usual case - and a walk would
+		// cost an Xray restart per server for nothing. An all-dead walk may
+		// have backed the waves off to 10/20/30m; a failed download retries
+		// every ImportRetry.
 		w.importRetry = 0
-		w.notifyRefreshFailed(cfg)
+		w.notifyRefreshFailed(cfg, failed)
 		return
 	}
-	// servers.json and xray.servers are published together, under the config
-	// lock, so this wave cannot end up beside half of a Web UI or /import one.
-	// The same lock is where the saved link is checked: a download takes longer
-	// than it takes someone to paste another subscription, and publishing this
-	// list then leaves it beside a link that did not produce it.
-	var update func(func(*vpnconfig.VPNDirectorConfig) error) error
-	if w.UpdateVPN != nil {
-		update = w.update
-	}
-	if err := vpnconfig.PublishServers(update, w.SaveServers, servers, "", vpnconfig.SubscriptionUnchanged(rawURL)); err != nil {
-		if errors.Is(err, errStopped) {
-			// Refused under the lock: the wave did not happen.
-			w.lastImport = prevImport
-			return
-		}
-		if errors.Is(err, vpnconfig.ErrSubscriptionChanged) {
-			slog.Info("Subscription refresh abandoned; the saved link is no longer the one that was downloaded")
-			// The link that replaced it deserves a wave of its own rather than
-			// the wait left over from the one thrown away.
-			w.lastImport = prevImport
-			return
-		}
-		if errors.Is(err, vpnconfig.ErrSaveServers) {
-			slog.Warn("Failed to save the refreshed subscription servers", "error", err)
-		} else {
-			slog.Warn("Failed to sync xray.servers after the subscription refresh", "error", err)
-		}
-		w.notifyRefreshFailed(cfg)
-		return
-	}
-	slog.Info("Subscription refreshed", "servers", len(servers))
 	if w.Generate == nil {
 		return
 	}
+	// The lists as published: this wave's downloads, and the last list of each
+	// subscription whose download failed - a provider's panel can be down
+	// while its servers work.
+	subs, err = w.loadSubscriptions()
+	if err != nil {
+		slog.Warn("Failed to read the subscriptions for the walk", "error", err)
+		return
+	}
+	if len(subs) == 0 {
+		return
+	}
+	w.walk(ctx, cfg, subs)
+}
 
+// refreshSubscriptions downloads every subscription of subs that has a link,
+// all at once, each within FetchTimeout, and publishes each list that arrived
+// under that subscription's guard: it still exists with the link downloaded
+// (vpnconfig.RefreshSubscription). A download that fails leaves the list and
+// records why, unless a refresh from elsewhere succeeded meanwhile. failed
+// names the subscriptions whose download or publication failed; walk is false
+// when some failed and none was published. A list dropped because its
+// subscription was deleted while it downloaded is neither. A stop or an ended
+// context returns at once, writing nothing more: the caller looks for both
+// before it reads either result.
+func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subscription) (failed []string, walk bool) {
+	type download struct {
+		servers []vpnconfig.Server
+		err     error
+	}
+	results := make([]download, len(subs))
+	var wg sync.WaitGroup
+	links := 0
+	for i, s := range subs {
+		if s.Static() {
+			continue
+		}
+		links++
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			fetchCtx, cancel := context.WithTimeout(ctx, FetchTimeout)
+			defer cancel()
+			servers, err := w.Fetch(fetchCtx, s.URL)
+			if err == nil && len(servers) == 0 {
+				err = errors.New("no servers")
+			}
+			results[i] = download{servers, err}
+		}()
+	}
+	wg.Wait()
+	if links == 0 {
+		return nil, true
+	}
+	published := 0
+	for i, s := range subs {
+		if s.Static() {
+			continue
+		}
+		if ctx.Err() != nil || w.stopped() {
+			return failed, false
+		}
+		if err := results[i].err; err != nil {
+			// A *url.Error carries the whole subscription URL, token included.
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				err = ue.Err
+			}
+			slog.Warn("Subscription refresh failed", "subscription", s.Name, "error", err)
+			failed = append(failed, s.Name)
+			rerr := vpnconfig.RecordSubscriptionError(w.update, w.files(), s.ID, s.URL, s.Refreshed, err.Error())
+			if rerr != nil && !errors.Is(rerr, errStopped) && !errors.Is(rerr, vpnconfig.ErrSubscriptionGone) {
+				slog.Warn("Failed to record why the subscription did not refresh", "subscription", s.Name, "error", rerr)
+			}
+			continue
+		}
+		_, err := vpnconfig.RefreshSubscription(w.update, w.files(), s.ID, s.URL, results[i].servers, w.Now())
+		switch {
+		case err == nil:
+			published++
+			slog.Info("Subscription refreshed", "subscription", s.Name, "servers", len(results[i].servers))
+		case errors.Is(err, errStopped):
+			return failed, false
+		case errors.Is(err, vpnconfig.ErrSubscriptionGone):
+			slog.Info("Subscription refresh dropped; the subscription was deleted while it downloaded", "subscription", s.Name)
+		default:
+			slog.Warn("Failed to publish the refreshed subscription", "subscription", s.Name, "error", err)
+			failed = append(failed, s.Name)
+		}
+	}
+	return failed, published > 0 || len(failed) == 0
+}
+
+// walk tries the servers of subs in walkOrder, each address once per outbound
+// (dialKey), and brings the clients back to Xray on the first live one. With
+// none live it returns Xray to the server the user chose and backs the next
+// wave off.
+func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription) {
 	var active, chosen *vpnconfig.ActiveServer
 	if cfg != nil {
 		active = cfg.Xray.ActiveServer
@@ -887,13 +956,15 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	}
 	started := activeID(active)
 	startedSeq := vpnconfig.ActiveSeq(active)
-	_, socks := vpnconfig.XrayInboundPorts(cfg)
-	if socks == 0 {
-		socks = defaultSOCKSPort
+	socks := w.socksPort(cfg)
+	names := subscriptionNames(subs)
+	links := make(map[string]string, len(subs))
+	for _, s := range subs {
+		links[s.ID] = s.URL
 	}
-	order := pickOrder(servers, chosen)
+	order, chosenFirst := walkOrder(subs, chosen)
 	var preferred *vpnconfig.Server
-	if chosenIndex(servers, chosen) >= 0 {
+	if chosenFirst {
 		preferred = &order[0]
 	}
 	tried := 0
@@ -905,12 +976,29 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	// lastSeq is the counter of the walk's own last record, or the one it
 	// started from: any other value in the config is someone else's write.
 	lastSeq := startedSeq
+	gone := map[string]bool{}
+	seen := map[string]bool{}
 	for _, s := range perAddress(order) {
 		if ctx.Err() != nil || w.stopped() {
 			return
 		}
-		generated, seq, err := w.Generate(s, w.walkGuard(rawURL, started, lastRecorded, lastSeq))
-		if w.walkEnded(err, prevImport) {
+		if gone[s.Subscription] {
+			continue
+		}
+		// A copy whose dialKey the walk has written already is that server
+		// again. A copy the guard refused or that did not generate was not
+		// tried, and leaves its twins their turn.
+		key := dialKey(s)
+		if key != "" && seen[key] {
+			continue
+		}
+		generated, seq, err := w.Generate(s, w.walkGuard(s.Subscription, links[s.Subscription], started, lastRecorded, lastSeq))
+		if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
+			slog.Info("Walk skips a subscription deleted while it runs", "subscription", names[s.Subscription])
+			gone[s.Subscription] = true
+			continue
+		}
+		if w.walkEnded(err) {
 			return
 		}
 		if err != nil || !generated {
@@ -918,6 +1006,9 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		}
 		if !generated {
 			continue
+		}
+		if key != "" {
+			seen[key] = true
 		}
 		lastGenerated = serverID(s)
 		if err == nil {
@@ -940,35 +1031,36 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 			slog.Debug("Subscription server probe failed", "server", s.Name, "ips", s.IPs, "error", err)
 			continue
 		}
-		slog.Info("Subscription server picked", "server", s.Name, "ips", s.IPs)
+		name := label(names, s.Subscription, s.Name)
+		slog.Info("Subscription server picked", "server", name, "ips", s.IPs)
 		w.lastPicked = &s
-		if w.walkEnded(w.walkOwnsNow(rawURL, started, lastRecorded, lastSeq), prevImport) {
+		if w.walkEnded(w.walkOwnsNow(started, lastRecorded, lastSeq)) {
 			return
 		}
 		// Only a committed failover left Xray. Staged clients never left, so
-		// "back on Xray" would be a false message. The walk's guard goes with
-		// the restore's writes: a selection that commits after the look above
-		// puts another server in place of the one just probed.
-		done, committed, refused := w.commitRestore(cfg, w.walkGuard(rawURL, started, lastRecorded, lastSeq))
-		if w.walkEnded(refused, prevImport) || !done {
+		// "back on Xray" would be a false message. The restore does not look
+		// at the subscription (spec 5.4): the server runs and answers.
+		done, committed, refused := w.commitRestore(cfg, w.walkGuard("", "", started, lastRecorded, lastSeq))
+		if w.walkEnded(refused) || !done {
 			return
 		}
 		if committed {
-			w.announceRestored(s.Name)
+			w.announceRestored(name)
 		} else {
-			w.notify(noteRestored, fmt.Sprintf(msgPicked, s.Name))
+			w.notify(noteRestored, fmt.Sprintf(msgPicked, name))
 		}
 		return
 	}
 	if w.stopped() {
 		return
 	}
-	slog.Info("No live server in the subscription", "tried", tried)
-	if w.walkEnded(w.walkOwnsNow(rawURL, started, lastRecorded, lastSeq), prevImport) {
+	slog.Info("No live server in any subscription", "tried", tried)
+	if w.walkEnded(w.walkOwnsNow(started, lastRecorded, lastSeq)) {
 		return
 	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
-		if w.walkEnded(w.returnToPreferred(*preferred, w.walkGuard(rawURL, started, lastRecorded, lastSeq)), prevImport) {
+		guard := w.walkGuard(preferred.Subscription, links[preferred.Subscription], started, lastRecorded, lastSeq)
+		if w.walkEnded(w.returnToPreferred(*preferred, guard)) {
 			return
 		}
 		if w.stopped() {
@@ -998,11 +1090,17 @@ func (w *Watch) importInterval() time.Duration {
 // so without this the next wave would start from the last server tried rather
 // than the user's. No probe and no restore: the walk has just found it down.
 // The error is one that ends the walk - the guard refused and nothing was
-// written, or a stop skipped the restart - and nil otherwise.
+// written, or a stop skipped the restart - and nil otherwise. A preferred
+// server whose subscription was deleted meanwhile is not written back: there
+// is nothing to return to.
 func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) error {
 	generated, _, err := w.Generate(s, guard)
 	if endsWalk(err) {
 		return err
+	}
+	if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
+		slog.Info("No return to the preferred server; its subscription was deleted", "server", s.Name)
+		return nil
 	}
 	if err != nil || !generated {
 		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
@@ -1038,14 +1136,19 @@ func (w *Watch) stopped() bool {
 // update is UpdateVPN with the stop marker checked inside the locked callback,
 // after whatever the wait for the config lock cost. The check made before that
 // wait says nothing about the router after it, and a write that lands on a
-// stopped router takes effect on its next manual apply.
+// stopped router takes effect on its next manual apply. A watch without
+// UpdateVPN has no config to write: fn runs on none.
 func (w *Watch) update(fn func(*vpnconfig.VPNDirectorConfig) error) error {
-	return w.UpdateVPN(func(cfg *vpnconfig.VPNDirectorConfig) error {
+	locked := func(cfg *vpnconfig.VPNDirectorConfig) error {
 		if w.stopped() {
 			return errStopped
 		}
 		return fn(cfg)
-	})
+	}
+	if w.UpdateVPN == nil {
+		return locked(nil)
+	}
+	return w.UpdateVPN(locked)
 }
 
 func (w *Watch) apply() error {
@@ -1505,12 +1608,12 @@ func committedFailover(cfg *vpnconfig.VPNDirectorConfig) bool {
 	return cfg != nil && cfg.Xray.Failover != nil && !vpnconfig.FailoverStaged(cfg)
 }
 
-func (w *Watch) notifyRefreshFailed(cfg *vpnconfig.VPNDirectorConfig) {
+func (w *Watch) notifyRefreshFailed(cfg *vpnconfig.VPNDirectorConfig, names []string) {
+	msg := refreshFailedText(names)
 	if committedFailover(cfg) {
-		w.notify(noteRefreshFailed, fmt.Sprintf(msgRefreshFailedOn, failoverTunnel(cfg)))
-		return
+		msg += fmt.Sprintf(msgStillOnTunnel, failoverTunnel(cfg))
 	}
-	w.notify(noteRefreshFailed, msgRefreshFailed)
+	w.notify(noteRefreshFailed, msg)
 }
 
 func (w *Watch) notifyNoLive(cfg *vpnconfig.VPNDirectorConfig) {
@@ -1622,7 +1725,7 @@ func (w *Watch) deadReason(now time.Time) string {
 }
 
 // settled is a working outbound: the three minutes start again from its next
-// miss, the next death refreshes the subscription at once, and the first look
+// miss, the next death refreshes the subscriptions at once, and the first look
 // for the preferred server waits ReturnCheck at least.
 func (w *Watch) settled() {
 	w.resetFail()
@@ -1650,13 +1753,6 @@ func (w *Watch) resetFallbackState() {
 func (w *Watch) announceRestored(server string) {
 	slog.Info("Xray clients restored", "server", server)
 	w.notify(noteRestored, fmt.Sprintf(msgRestored, server))
-}
-
-func activeName(cfg *vpnconfig.VPNDirectorConfig) string {
-	if cfg != nil && cfg.Xray.ActiveServer != nil {
-		return cfg.Xray.ActiveServer.Name
-	}
-	return "unknown"
 }
 
 // uncarried is the effective Xray clients Tunnel Director cannot carry: they
@@ -1724,4 +1820,102 @@ func (w *Watch) notify(kind noteKind, msg string) {
 	if route {
 		w.lastImportKind = noteNone
 	}
+}
+
+// loadSubscriptions is every subscription, or none without LoadSubscriptions.
+func (w *Watch) loadSubscriptions() ([]vpnconfig.Subscription, error) {
+	if w.LoadSubscriptions == nil {
+		return nil, nil
+	}
+	return w.LoadSubscriptions()
+}
+
+// loadServers is every server of every subscription, each carrying its
+// subscription's id: the list the reach look and the returns search.
+func (w *Watch) loadServers() ([]vpnconfig.Server, error) {
+	subs, err := w.loadSubscriptions()
+	if err != nil {
+		return nil, err
+	}
+	return vpnconfig.AllServers(subs), nil
+}
+
+// subscriptionCount is how many subscriptions there are, for Armed.
+// Subscriptions that cannot be read count as one: they may well be there, and
+// a watch with Xray clients still fails them over when Xray dies. The wave and
+// the walk then find nothing to read and do nothing.
+func (w *Watch) subscriptionCount() int {
+	subs, err := w.loadSubscriptions()
+	if err != nil {
+		slog.Warn("Failed to read the subscriptions", "error", err)
+		return 1
+	}
+	return len(subs)
+}
+
+// files is the subscription files, for vpnconfig's operations.
+func (w *Watch) files() vpnconfig.SubscriptionFiles {
+	return vpnconfig.SubscriptionFiles{
+		Load: w.loadSubscriptions,
+		Save: func(s vpnconfig.Subscription) error {
+			if w.SaveSubscription == nil {
+				return nil
+			}
+			return w.SaveSubscription(s)
+		},
+	}
+}
+
+// subscriptionHolds reports whether subscription id still exists with link.
+// Subscriptions that cannot be read say nothing, and refuse nothing.
+func (w *Watch) subscriptionHolds(id, link string) bool {
+	subs, err := w.loadSubscriptions()
+	if err != nil {
+		return true
+	}
+	i := vpnconfig.FindSubscription(subs, id)
+	return i >= 0 && subs[i].URL == link
+}
+
+// subscriptionNames maps each subscription's id to its name.
+func subscriptionNames(subs []vpnconfig.Subscription) map[string]string {
+	names := make(map[string]string, len(subs))
+	for _, s := range subs {
+		names[s.ID] = s.Name
+	}
+	return names
+}
+
+// label is how a message names a server: "<subscription> / <server>", or the
+// server alone when its subscription has no name to show.
+func label(names map[string]string, sub, name string) string {
+	if n := names[sub]; n != "" {
+		return n + " / " + name
+	}
+	return name
+}
+
+// activeLabel names the server active_server records, as the messages name servers.
+func (w *Watch) activeLabel(cfg *vpnconfig.VPNDirectorConfig) string {
+	if cfg == nil || cfg.Xray.ActiveServer == nil {
+		return "unknown"
+	}
+	a := cfg.Xray.ActiveServer
+	subs, _ := w.loadSubscriptions()
+	return label(subscriptionNames(subs), a.Subscription, a.Name)
+}
+
+// refreshFailedText is the message for a wave in which no download arrived,
+// with the names of the subscriptions that failed.
+func refreshFailedText(names []string) string {
+	var shown []string
+	for _, n := range names {
+		if n != "" {
+			shown = append(shown, n)
+		}
+	}
+	if len(shown) == 0 {
+		return msgRefreshFailed
+	}
+	return msgRefreshFailed + ": " + strings.Join(shown, ", ")
 }

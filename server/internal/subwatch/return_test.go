@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -55,7 +56,7 @@ func newReturnRig(servers []vpnconfig.Server) *returnRig {
 		live: map[string]bool{},
 	}
 	w := runningWatch(r.f.watch())
-	w.LoadServers = func() ([]vpnconfig.Server, error) { return servers, nil }
+	w.LoadSubscriptions = subsOf(servers)
 	w.Reachable = func(_ context.Context, ip string, _ int) bool { return r.up[ip] || controlUp(ip) }
 	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		if err := r.f.checkGuard(guard); err != nil {
@@ -782,5 +783,103 @@ func TestTick_AReturnNoDialCanSeeBacksOffWhenItFails(t *testing.T) {
 	r.tick()
 	if n := r.attempts(); n != 2 {
 		t.Fatalf("attempts %d at %v, want the next attempt", n, ReturnRetry)
+	}
+}
+
+// A subscription deleted while a return looks at its server: the switch is
+// refused under the lock, and nothing is written.
+func TestTick_AReturnWritesNoServerOfADeletedSubscription(t *testing.T) {
+	r := newReturnRig(returnServers())
+	subs := []vpnconfig.Subscription{{ID: "aaaaaaaa", Name: "Alpha", URL: "https://a.example/s/token", Servers: returnServers()}}
+	r.f.cfg.Xray.ActiveServer.Subscription = "aaaaaaaa"
+	r.f.cfg.Xray.PreferredServer.Subscription = "aaaaaaaa"
+	deleted := false
+	r.w.LoadSubscriptions = func() ([]vpnconfig.Subscription, error) {
+		if deleted {
+			return nil, nil
+		}
+		return cloneSubs(subs), nil
+	}
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	r.w.Reachable = func(_ context.Context, ip string, _ int) bool {
+		deleted = true // the user deletes Alpha while the return looks at Oslo
+		return r.up[ip] || controlUp(ip)
+	}
+
+	r.tick()
+
+	if len(r.events) != 0 {
+		t.Fatalf("events %v; a server of a deleted subscription was written", r.events)
+	}
+}
+
+// The first walk record after the update parks the active_server of the
+// release before - which names no subscription - in preferred_server. No
+// server matches it, so there is nothing to return to, and the look that finds
+// so every ReturnCheck says nothing.
+func TestTick_APreferredServerFromBeforeSubscriptionsIsNothingToReturnTo(t *testing.T) {
+	logs := captureLog(t)
+	r := newReturnRig(returnServers())
+	subs := []vpnconfig.Subscription{{ID: "aaaaaaaa", Name: "Alpha", URL: "https://a.example/s/token", Servers: returnServers()}}
+	r.w.LoadSubscriptions = func() ([]vpnconfig.Subscription, error) { return cloneSubs(subs), nil }
+	r.f.cfg.Xray.ActiveServer.Subscription = "aaaaaaaa"
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+
+	r.tick()
+	r.f.now = r.f.now.Add(ReturnCheck)
+	r.tick()
+
+	if len(r.events) != 0 {
+		t.Fatalf("events %v; a record from before subscriptions names no server", r.events)
+	}
+	if strings.Contains(logs.String(), "level=INFO") || strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("log %q; nothing to return to is nothing to say", logs.String())
+	}
+}
+
+// The user deletes the preferred server's subscription while the return probes
+// the first of its addresses, which does not answer. The switch to the second
+// address is refused, and Xray goes back to the server that ran before - the
+// way back is not held to the subscription, though Madrid's went too - rather
+// than staying on the address its probe just found dead.
+func TestTick_AReturnWhoseSubscriptionGoesMidAttemptRollsBack(t *testing.T) {
+	servers := returnServers()
+	servers[0].IPs = []string{osloIP, osloIP2}
+	r := newReturnRig(servers)
+	subs := []vpnconfig.Subscription{{ID: "aaaaaaaa", Name: "Alpha", URL: "https://a.example/s/token", Servers: servers}}
+	r.f.cfg.Xray.ActiveServer.Subscription = "aaaaaaaa"
+	r.f.cfg.Xray.PreferredServer.Subscription = "aaaaaaaa"
+	deleted := false
+	r.w.LoadSubscriptions = func() ([]vpnconfig.Subscription, error) {
+		if deleted {
+			return nil, nil
+		}
+		return cloneSubs(subs), nil
+	}
+	r.up[osloIP] = true
+	r.up[osloIP2] = true
+	r.live[madridIP] = true
+	r.onProbe = func() {
+		if r.running == osloIP {
+			deleted = true // the user deletes Alpha while the return probes Oslo
+		}
+	}
+
+	r.tick()
+
+	want := []string{"Oslo@" + osloIP, "restart", "Madrid@" + madridIP, "restart"}
+	if !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v: no second switch to Oslo, and the way back", r.events, want)
+	}
+	if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Madrid" {
+		t.Fatalf("active %+v, want Madrid back", a)
+	}
+	if len(r.f.notes) != 0 {
+		t.Fatalf("notes %v; nothing returned", r.f.notes)
+	}
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v, want %v: the attempt failed", r.w.returnRetry, ReturnRetry)
 	}
 }

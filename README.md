@@ -26,10 +26,11 @@ curl -fsSL \
 
 After installation:
 
-1. Import the servers of your subscription (optional):
+1. Add the servers of your subscriptions (optional). The script is a menu: add, refresh, rename and delete subscriptions — up to ten, each a link or a file:
    ```bash
    /opt/vpn-director/import_server_list.sh
    ```
+   A new subscription is named after the link's host, or after the file's name without its extension, unless you give it a name. A file or a plain-http link is kept as a static list, which nothing refreshes.
 
 2. Run the configuration wizard:
    ```bash
@@ -113,7 +114,7 @@ After installation, configs are located at:
 /opt/vpn-director/vpn-director.sh --wait apply        # Wait up to 120 s for a running instance instead of skipping
 /opt/vpn-director/vpn-director.sh --unless-stopped apply  # Skip if "stop" has run since (the bot's subscription watch)
 
-# Import servers
+# Subscriptions: add, refresh, rename, delete
 /opt/vpn-director/import_server_list.sh
 ```
 
@@ -135,7 +136,7 @@ A self-signed TLS certificate is generated automatically during installation. Yo
 | Tab | Description |
 |-----|-------------|
 | **Status** | VPN Director operational overview |
-| **Servers** | Xray server management, switch active server |
+| **Servers** | Subscriptions (add, refresh, rename, delete) and their Xray servers, switch active server |
 | **Clients** | LAN client routing assignment (pause/resume/delete) |
 | **Exclusions** | Country and IP/CIDR exclusion lists |
 | **Logs** | Log viewer (bot, vpn, xray, webui) |
@@ -199,7 +200,8 @@ Remote management via Telegram with username-based authorization.
 | `/status` | VPN Director status |
 | `/xray` | Switch Xray server |
 | `/servers` | Server list |
-| `/import <url>` | Import a subscription (auto-syncs xray.servers) |
+| `/import <url> [name]` | Add a subscription, or refresh the one saved with that link; /import alone refreshes them all |
+| `/subs` | Subscriptions: refresh, rename, delete |
 | `/exclude` | Manage excluded IPs/CIDRs |
 | `/clients` | Manage VPN clients |
 | `/configure` | Configuration wizard |
@@ -225,6 +227,8 @@ The `/configure` command starts a 4-step wizard:
 Traffic from specified LAN clients is transparently redirected through Xray using TPROXY. Xray reaches the server you select with the protocol your subscription gives it.
 
 Subscriptions it reads: share links (`vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://` / `hy2://`), base64-encoded or plain, and Xray JSON - the array of Xray configs panels such as Remnawave and Marzban give Xray clients. An entry Xray cannot run - TUIC, SSR, a balancer, a chained config - is skipped, and the import says why.
+
+Up to ten subscriptions live side by side; you pick the running server from any of them. When it dies, the bot's subscription watch moves the clients onto a Tunnel Director tunnel, refreshes every subscription at once and walks their servers — the chosen one and two more of its subscription, then one server of each subscription in turn — until one answers, and brings the clients back on it.
 
 ### Tunnel Director
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
@@ -85,7 +87,7 @@ func TestGetSubscription_CapsBody(t *testing.T) {
 	t.Cleanup(wan.Close)
 
 	body, err := getSubscription(context.Background(), hostClient(wan), wan.URL)
-	if err == nil || !strings.Contains(err.Error(), "subscription body exceeds 1 MiB") {
+	if err == nil || !strings.Contains(err.Error(), "subscription exceeds 1 MiB") {
 		t.Fatalf("err %v, want the 1 MiB cap", err)
 	}
 	if body != nil {
@@ -111,6 +113,9 @@ func TestFetchSub_RejectsNonHTTPS(t *testing.T) {
 	servers, err := (&Bot{}).fetchSub(context.Background(), "http://cdn.example/s/token", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "https") {
 		t.Fatalf("err %v, want an https error", err)
+	}
+	if !errors.Is(err, service.ErrSubscriptionURL) || err.Error() != "invalid subscription URL: use an https:// link" {
+		t.Fatalf("err %q, want the daemons' invalid subscription URL", err)
 	}
 	if strings.Contains(err.Error(), "cdn.example") {
 		t.Fatalf("error %q carries the subscription URL", err)
@@ -265,7 +270,7 @@ func TestFetchServers_WANSuccessDoesNotUseTunnelLookup(t *testing.T) {
 	}))
 	t.Cleanup(wan.Close)
 	looked := 0
-	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), nil, nil, func(host string) ([]net.IP, error) {
+	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), knownTunnel(nil), nil, func(host string) ([]net.IP, error) {
 		looked++
 		return nil, errors.New("tunnel lookup must not run")
 	})
@@ -292,7 +297,7 @@ func TestFetchServers_TunnelFetchUsesTunnelLookup(t *testing.T) {
 	t.Cleanup(tun.Close)
 
 	looked := []string{}
-	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(tun), nil, func(host string) ([]net.IP, error) {
+	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), knownTunnel(hostClient(tun)), nil, func(host string) ([]net.IP, error) {
 		looked = append(looked, host)
 		return []net.IP{net.ParseIP("203.0.113.50")}, nil
 	})
@@ -317,7 +322,7 @@ func TestFetchServers_WANSuccessUsesTheWANLookup(t *testing.T) {
 	t.Cleanup(wan.Close)
 
 	looked := []string{}
-	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), nil,
+	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), knownTunnel(nil),
 		func(host string) ([]net.IP, error) {
 			looked = append(looked, host)
 			return []net.IP{net.ParseIP("203.0.113.50")}, nil
@@ -349,7 +354,7 @@ func TestFetchServers_EachHostResolvesWhereItCan(t *testing.T) {
 	t.Cleanup(wan.Close)
 	tunnelAsked := []string{}
 
-	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(wan),
+	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), knownTunnel(hostClient(wan)),
 		func(host string) ([]net.IP, error) {
 			if host == "a.example.invalid" {
 				return []net.IP{net.ParseIP("203.0.113.10")}, nil
@@ -417,13 +422,79 @@ func TestFetchServers_AResolutionTheContextEndedReturnsNoList(t *testing.T) {
 				wanLookup = func(string) ([]net.IP, error) { return nil, errors.New("WAN lookup must not run") }
 			}
 
-			servers, err := fetchServers(ctx, "https://cdn.example/s/token", hostClient(wan), hostClient(tun), wanLookup, tunnelLookup)
+			servers, err := fetchServers(ctx, "https://cdn.example/s/token", hostClient(wan), knownTunnel(hostClient(tun)), wanLookup, tunnelLookup)
 
 			if !errors.Is(err, context.Canceled) {
 				t.Fatalf("err %v, want the context's", err)
 			}
 			if servers != nil {
 				t.Fatalf("servers %+v; a list cut short must not come back", servers)
+			}
+		})
+	}
+}
+
+// The fetch deadline can end the resolution too. The watch records what the
+// fetch returns in the subscription's error, which the Web UI and /subs show:
+// it reads as the daemons word a resolution their deadline cut short, not as
+// "context deadline exceeded".
+func TestFetchServers_AResolutionTheDeadlineCutShortReadsAsTheDaemonsSayIt(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte(
+		"vless://uuid-1@a.example.invalid:443#A\nvless://uuid-2@b.example.invalid:443#B"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	// a resolves; the deadline passes while b is being looked up.
+	lookup := func(host string) ([]net.IP, error) {
+		if host == "a.example.invalid" {
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	servers, err := fetchServers(ctx, "https://cdn.example/s/token", hostClient(wan), knownTunnel(nil), lookup, lookup)
+
+	if servers != nil {
+		t.Fatalf("servers %+v; a list cut short must not come back", servers)
+	}
+	if err == nil || err.Error() != "download failed: resolving the servers took longer than the deadline" {
+		t.Fatalf("err %v, want the daemons' words", err)
+	}
+	if !errors.Is(err, service.ErrResolutionCutShort) {
+		t.Fatalf("err %v, want service.ErrResolutionCutShort", err)
+	}
+}
+
+// The watch records a download that failed in the subscription's error, which
+// the Web UI and /subs show: it reads as the daemons' own download failures
+// read, and a refusal of the dial guard names no internal address.
+func TestFetchServers_ADownloadThatFailedReadsAsTheDaemonsSayIt(t *testing.T) {
+	blocked := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("dial tcp4 10.0.0.1:443: %w: 10.0.0.1", ssrf.ErrBlockedAddress)
+	})}
+	forbidden := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(forbidden.Close)
+	const blockedText = "download failed: URL resolved to a private or reserved address"
+	for _, tc := range []struct {
+		name        string
+		wan, tunnel *http.Client
+		want        string
+	}{
+		{"refused over the WAN", blocked, nil, blockedText},
+		{"refused over the tunnel", hostClient(forbidden), blocked, blockedText},
+		{"an HTTP status", hostClient(forbidden), nil, "download failed: HTTP 403"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := fetchServers(context.Background(), "https://cdn.example/s/token", tc.wan, knownTunnel(tc.tunnel), nil, nil)
+
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("err %v, want %q", err, tc.want)
 			}
 		})
 	}
@@ -440,7 +511,7 @@ func TestFetchServers_TunnelTakesOverWhenNothingResolvesOnWAN(t *testing.T) {
 	tun := httptest.NewServer(http.HandlerFunc(serve))
 	t.Cleanup(tun.Close)
 
-	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), hostClient(tun),
+	servers, err := fetchServers(context.Background(), "https://cdn.example/s/token", hostClient(wan), knownTunnel(hostClient(tun)),
 		func(host string) ([]net.IP, error) { return nil, errors.New("no answer") },
 		func(host string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.50")}, nil })
 	if err != nil {
@@ -448,5 +519,118 @@ func TestFetchServers_TunnelTakesOverWhenNothingResolvesOnWAN(t *testing.T) {
 	}
 	if len(servers) != 1 || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.50"}) {
 		t.Fatalf("servers %+v; the tunnel path must take over a WAN body nothing resolved", servers)
+	}
+}
+
+// knownTunnel is a tunnel found already: c, or none when c is nil.
+func knownTunnel(c *http.Client) func() *http.Client {
+	return func() *http.Client { return c }
+}
+
+// Finding the tunnel runs vpn-director.sh platform, and a wave of the watch
+// fetches every subscription at once: a download the WAN serves, whose hosts
+// resolve there, looks for no tunnel.
+func TestFetchServers_TheWANAloneLooksForNoTunnel(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	asked := 0
+	tunnel := func() *http.Client {
+		asked++
+		return nil
+	}
+
+	servers, err := fetchServers(context.Background(), wan.URL, hostClient(wan), tunnel,
+		func(string) ([]net.IP, error) { return []net.IP{net.ParseIP("203.0.113.50")}, nil }, nil)
+
+	if err != nil || len(servers) != 1 {
+		t.Fatalf("servers %+v, err %v", servers, err)
+	}
+	if asked != 0 {
+		t.Fatalf("the tunnel was looked for %d times while the WAN served", asked)
+	}
+}
+
+// A /stop, a bot shutdown or the fetch deadline ends the context, and the WAN
+// download fails with it. Finding the tunnel runs vpn-director.sh platform,
+// which the context does not bound, and the wave waits for every fetch: a
+// fetch whose context has ended looks for no tunnel.
+func TestFetchServers_AnEndedContextLooksForNoTunnel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	wan := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, req.Context().Err()
+	})}
+	asked := 0
+	tunnel := func() *http.Client {
+		asked++
+		return nil
+	}
+
+	servers, err := fetchServers(ctx, "https://cdn.example/s/token", wan, tunnel, nil, nil)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want the context's", err)
+	}
+	if servers != nil {
+		t.Fatalf("servers %+v", servers)
+	}
+	if asked != 0 {
+		t.Fatalf("the tunnel was looked for %d times after the context ended", asked)
+	}
+}
+
+// countingPlatform counts the vpn-director.sh platform runs.
+type countingPlatform struct {
+	service.VPNDirector
+	runs int
+}
+
+func (p *countingPlatform) Platform() (vpnconfig.PlatformInfo, error) {
+	p.runs++
+	return vpnconfig.PlatformInfo{}, nil
+}
+
+// A fetch finds its tunnel when it first asks for it, and once: the client and
+// the lookup share that one platform run.
+func TestLazyTunnel_FindsTheTunnelOnceAndOnlyWhenAskedFor(t *testing.T) {
+	plat := &countingPlatform{}
+	client, lookup := lazyTunnel(context.Background(), configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat)
+	if plat.runs != 0 {
+		t.Fatalf("%d platform runs before the tunnel was asked for", plat.runs)
+	}
+
+	if c := client(); c != nil {
+		t.Fatal("a tunnel client where there is no tunnel")
+	}
+	if ips, err := lookup("oslo.example.invalid"); err == nil {
+		t.Fatalf("a lookup without a tunnel answered %v", ips)
+	}
+	client()
+
+	if plat.runs != 1 {
+		t.Fatalf("%d platform runs, want 1", plat.runs)
+	}
+}
+
+// A host the WAN resolver does not answer is asked of the tunnel's. Once the
+// context has ended the lookup answers the context's error and finds no
+// tunnel: that would run vpn-director.sh platform, which the context does not
+// bound.
+func TestLazyTunnel_AnEndedContextLooksForNoTunnel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	plat := &countingPlatform{}
+	_, lookup := lazyTunnel(ctx, configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat)
+
+	ips, err := lookup("example.com")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("lookup answered %v, err %v, want the context's", ips, err)
+	}
+	if plat.runs != 0 {
+		t.Fatalf("%d platform runs after the context ended", plat.runs)
 	}
 }

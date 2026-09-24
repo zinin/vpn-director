@@ -20,8 +20,11 @@ load_wizard() {
     XRAY_CLIENTS_LIST="192.168.50.10"
     XRAY_EXCLUDE_SETS_LIST="ru"
     TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.50.20"],"exclude":["ru"]}}'
-    SERVERS_FILE="$BATS_TEST_TMPDIR/servers.json"
-    printf '%s' '[{"address":"1.2.3.4","ips":["1.2.3.4"]}]' > "$SERVERS_FILE"
+    SUBS_JSON='[{"id":"0a1b2c3d","name":"Main","servers":[{"name":"Oslo","address":"1.2.3.4","port":443,"ips":["1.2.3.4"]}]}]'
+    SELECTED_SUBSCRIPTION_ID="0a1b2c3d"
+    # Where check_subscriptions found them: step 5 reads xray.servers from the
+    # files there, not from SUBS_JSON.
+    SUB_DIR="$VPD_DIR/data/subscriptions"
 }
 
 # write_daemon_config stands in for the config as the daemons left it: a
@@ -35,6 +38,15 @@ write_daemon_config() {
         .xray.exclude_sets = ["de"] |
         .tunnel_director.tunnels = {"ovpnc1": {"clients": ["10.0.0.9"], "exclude": []}}' \
         "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+}
+
+# write_subscriptions <subs_json> writes each subscription of the list to its
+# file in SUB_DIR, as import_server_list.sh and the daemons leave them.
+write_subscriptions() {
+    local sub
+    while IFS= read -r sub; do
+        substore_write "$SUB_DIR" "$sub"
+    done < <(jq -c '.[]' <<< "$1")
 }
 
 @test "step_generate_configs: keeps the jwt_secret the Web UI generated" {
@@ -238,13 +250,15 @@ write_daemon_config() {
     assert_output "10.0.0.9"
 }
 
+# In the test's own shell, not through run: the exit of run's subshell would
+# release the lock whether the step did or not. Step 6 restarts Xray, and a
+# process that inherited the lock would hold it for as long as it runs.
 @test "step_generate_configs: releases the config lock when it is done" {
     load_wizard
     write_daemon_config
 
-    run step_generate_configs
+    step_generate_configs > /dev/null
 
-    assert_success
     run flock -n "$VPD_DIR/.vpn-director.json.lock" true
     assert_success
 }
@@ -270,8 +284,8 @@ write_daemon_config() {
     run step_generate_configs
 
     assert_success
-    run jq -r '.xray.active_server | "\(.name)|\(.address)|\(.port)"' "$VPD_DIR/vpn-director.json"
-    assert_output "Осло, Норвегия, Extra|1.2.3.4|443"
+    run jq -r '.xray.active_server | "\(.name)|\(.address)|\(.port)|\(.subscription)"' "$VPD_DIR/vpn-director.json"
+    assert_output "Осло, Норвегия, Extra|1.2.3.4|443|0a1b2c3d"
 }
 
 # The subscription watch keeps the server the user chose while its walk has
@@ -292,8 +306,9 @@ write_daemon_config() {
 }
 
 # The Web UI serves this file over /api/config. The record names the server and
-# stops there; the subscription UUID and the REALITY material stay in
-# servers.json and in the Xray config, which nobody hands to a browser.
+# its subscription and stops there; the server's UUID and the REALITY material
+# stay in the subscription's file and in the Xray config, which nobody hands to
+# a browser.
 @test "step_generate_configs: keeps credentials out of the recorded server" {
     load_wizard
     write_daemon_config
@@ -302,7 +317,7 @@ write_daemon_config() {
 
     assert_success
     run jq -r '.xray.active_server | keys | join(",")' "$VPD_DIR/vpn-director.json"
-    assert_output "address,name,port"
+    assert_output "address,name,port,subscription"
 }
 
 # An import stores the server's outbound; the wizard writes it into config.json.
@@ -337,13 +352,14 @@ write_daemon_config() {
 
 @test "step_select_xray_server: lists each server with its protocol" {
     load_wizard
-    cat > "$SERVERS_FILE" <<'JSON'
+    SUBS_JSON=$(jq -c '[{id: "0a1b2c3d", name: "Main", servers: .}]' <<'JSON'
 [{"name":"Legacy","address":"legacy.example.com","port":443,"ips":["1.2.3.4"],"security":"reality"},
  {"name":"Old TLS","address":"old.example.com","port":443,"ips":["1.2.3.5"]},
  {"name":"Oslo WS","address":"oslo.example.com","port":443,"ips":["1.2.3.6"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"tls"}}},
  {"name":"Canada SS","address":"ss.example.com","port":2030,"ips":["1.2.3.7"],"outbound":{"protocol":"shadowsocks"}},
  {"name":"Gaming","address":"hy.example.com","port":8443,"ips":["1.2.3.8"],"outbound":{"protocol":"hysteria","streamSettings":{"network":"hysteria","security":"tls"}}}]
 JSON
+)
 
     run step_select_xray_server <<< "3"
 
@@ -361,12 +377,13 @@ JSON
 # so it does to an outbound that names no protocol.
 @test "step_select_xray_server: an outbound it cannot read is listed as ?" {
     load_wizard
-    cat > "$SERVERS_FILE" <<'JSON'
+    SUBS_JSON=$(jq -c '[{id: "0a1b2c3d", name: "Main", servers: .}]' <<'JSON'
 [{"name":"Broken","address":"broken.example.com","port":443,"ips":["1.2.3.4"],"outbound":{"protocol":"vless","streamSettings":"tcp"}},
  {"name":"Null","address":"null.example.com","port":443,"ips":["1.2.3.5"],"outbound":null},
  {"name":"Oslo WS","address":"oslo.example.com","port":443,"ips":["1.2.3.6"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"tls"}}},
  {"name":"No protocol","address":"noproto.example.com","port":443,"ips":["1.2.3.7"],"outbound":{"streamSettings":{"network":"ws","security":"tls"}}}]
 JSON
+)
 
     run step_select_xray_server <<< "3"
 
@@ -379,20 +396,161 @@ JSON
 
 # A name and an outbound are subscription text: an escape sequence in either
 # must not reach the terminal. The wizard's own colours are escape sequences
-# too, so they are switched off: any ESC left in the output came from
-# servers.json.
-@test "step_select_xray_server: control characters from servers.json do not reach the terminal" {
+# too, so they are switched off: any ESC left in the output came from the list.
+@test "step_select_xray_server: control characters from a subscription do not reach the terminal" {
     load_wizard
     RED='' GREEN='' YELLOW='' BLUE='' NC=''
-    cat > "$SERVERS_FILE" <<'JSON'
+    SUBS_JSON=$(jq -c '[{id: "0a1b2c3d", name: "Main", servers: .}]' <<'JSON'
 [{"name":"Bad\u001b[31mName","address":"bad.example.com","port":443,"ips":["1.2.3.4"],"outbound":{"protocol":"vless","streamSettings":{"network":"ws","security":"\u001b]0;owned\u0007tls"}}}]
 JSON
+)
 
     run step_select_xray_server <<< "1"
 
     assert_success
     refute_output --partial $'\x1b'
     assert_output --partial "1) Bad[31mName [vless·ws·]0;ownedtls]"
+}
+
+two_subscriptions='[
+  {"id":"0a1b2c3d","name":"Alpha","servers":[
+    {"name":"Oslo","address":"a.example.com","port":443,"ips":["192.0.2.10"]},
+    {"name":"Germany-1","address":"b.example.com","port":443,"ips":["192.0.2.11"]}]},
+  {"id":"1b2c3d4e","name":"Beta","servers":[
+    {"name":"Germany-1","address":"198.51.100.20","port":8443,"ips":["198.51.100.20"]}]}]'
+
+@test "step_select_xray_server: with several subscriptions it asks for the subscription first" {
+    load_wizard
+    SUBS_JSON=$(jq -c . <<< "$two_subscriptions")
+
+    run step_select_xray_server < <(printf '2\n1\n')
+
+    assert_success
+    assert_output --partial "1) Alpha (2 servers)"
+    assert_output --partial "2) Beta (1 servers)"
+    assert_output --partial "Selected: Germany-1 (198.51.100.20)"
+}
+
+# Both subscriptions have a Germany-1. The server picked from Beta is Beta's, and
+# Beta is the subscription step 5 records with it: the Web UI, the bot and the
+# watch then find the server that runs in the subscription the user chose.
+@test "step_select_xray_server: a name two subscriptions share is the chosen subscription's" {
+    load_wizard
+    SUBS_JSON=$(jq -c . <<< "$two_subscriptions")
+
+    step_select_xray_server < <(printf '2\n1\n') > /dev/null
+
+    assert_equal "$SELECTED_SUBSCRIPTION_ID" "1b2c3d4e"
+    assert_equal "$(jq -r '"\(.address):\(.port)"' <<< "$SELECTED_SERVER_JSON")" "198.51.100.20:8443"
+}
+
+# A name is the user's text, and a "|" in it is part of the name, not the start
+# of the next column.
+@test "step_select_xray_server: a subscription name with a | is shown whole" {
+    load_wizard
+    SUBS_JSON=$(jq -c '.[1].name = "Beta | Premium"' <<< "$two_subscriptions")
+
+    run step_select_xray_server < <(printf '2\n1\n')
+
+    assert_success
+    assert_output --partial "2) Beta | Premium (1 servers)"
+}
+
+# With errexit off, as bats "run" leaves it, only read's own status ends the
+# prompt when the answers run out: an input that ends must end the wizard, not
+# ask again for ever. timeout turns a prompt that loops into a failure.
+@test "step_select_xray_server: an input that ends ends the wizard at either prompt" {
+    local subs
+    for subs in "$two_subscriptions" \
+        '[{"id":"0a1b2c3d","name":"Main","servers":[{"name":"Oslo","address":"1.2.3.4","port":443,"ips":["1.2.3.4"]}]}]'; do
+        run timeout 10 bash -c '
+            VPD_DIR="$SCRIPTS_DIR"
+            . "$VPD_DIR/configure.sh" --source-only
+            set +e
+            SUBS_JSON=$1
+            step_select_xray_server <<< "9" > /dev/null 2>&1
+        ' _ "$subs"
+
+        assert_failure 1
+    done
+}
+
+@test "step_select_xray_server: one subscription goes straight to its servers" {
+    load_wizard
+
+    run step_select_xray_server <<< "1"
+
+    assert_success
+    refute_output --partial "Select subscription"
+    assert_output --partial "1) Oslo [vless·tls]"
+}
+
+@test "step_generate_configs: xray.servers covers every subscription" {
+    load_wizard
+    write_daemon_config
+    SUBS_JSON=$(jq -c . <<< "$two_subscriptions")
+    write_subscriptions "$SUBS_JSON"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.xray.servers' "$VPD_DIR/vpn-director.json"
+    assert_output '["192.0.2.10","192.0.2.11","198.51.100.20"]'
+}
+
+# The wizard reads the subscriptions when it starts and writes the config at
+# step 5, minutes later. A refresh in between - by the watch, the Web UI or the
+# bot - has written its addresses to xray.servers, and the list the wizard
+# started with must not take them back out of TPROXY_BYPASS.
+@test "step_generate_configs: xray.servers comes from the files as step 5 finds them" {
+    load_wizard
+    write_daemon_config
+    # Main as a refresh left it while the wizard was open: Oslo has moved.
+    write_subscriptions '[{"id":"0a1b2c3d","name":"Main","servers":[{"name":"Oslo","address":"192.0.2.44","port":443,"ips":["192.0.2.44"]}]}]'
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.xray.servers' "$VPD_DIR/vpn-director.json"
+    assert_output '["192.0.2.44"]'
+}
+
+@test "check_subscriptions: reads the shared fixtures" {
+    load_wizard
+    mkdir -p "$VPD_DIR/data/subscriptions"
+    cp "$PROJECT_ROOT/../testdata/substore/"*.json "$VPD_DIR/data/subscriptions/"
+    jq --arg d "$VPD_DIR/data" '.data_dir = $d' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    SUB_DIR=""
+
+    check_subscriptions > /dev/null
+
+    # Step 5 reads xray.servers from there.
+    assert_equal "$SUB_DIR" "$VPD_DIR/data/subscriptions"
+    [[ $(jq -c '[.[].name]' <<< "$SUBS_JSON") == '["Beta","Alpha","Gamma"]' ]]
+}
+
+# A subscription can list no server: a file made by hand, say, or one whose list
+# was never set, which the daemons write as "servers": null. Offered, it would
+# ask for a server in [1-0] for ever.
+@test "check_subscriptions: a subscription without servers is not offered" {
+    load_wizard
+    jq --arg d "$VPD_DIR/data" '.data_dir = $d' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    write_subscriptions '[{"id":"3c4d5e6f","name":"Empty","servers":null}]'
+
+    run check_subscriptions
+
+    assert_failure
+    assert_output --partial "No subscription with servers"
+}
+
+@test "check_subscriptions: no subscription sends the user to the import" {
+    load_wizard
+    jq --arg d "$VPD_DIR/data" '.data_dir = $d' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+
+    run check_subscriptions
+
+    assert_failure
+    assert_output --partial "Run import_server_list.sh first"
 }
 
 # ============================================================================

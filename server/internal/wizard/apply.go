@@ -143,29 +143,23 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 		}
 	}
 
-	// Server IPs (unique, non-empty, sorted) — collect ALL IPs from ALL servers
-	seen := make(map[string]bool)
-	var serverIPs []string
-	for _, s := range servers {
-		for _, ip := range s.IPs {
-			if ip != "" && !seen[ip] {
-				seen[ip] = true
-				serverIPs = append(serverIPs, ip)
-			}
-		}
-	}
-	sort.Strings(serverIPs)
-
 	// Exclude IPs from wizard state
 	excludeIPs := state.GetExcludeIPs()
 
 	// Update config under the cross-process lock
 	var ports service.InboundPorts
 	err = a.config.UpdateVPNConfig(func(vpnCfg *vpnconfig.VPNDirectorConfig) error {
+		// Every IP of every server, read again under the lock: a refresh, or a
+		// wave of the subscription watch, may have published since the read
+		// above, and the platform call and the wait for the lock lie between.
+		all, err := a.config.LoadServers()
+		if err != nil {
+			return err
+		}
 		vpnCfg.Xray.Clients = xrayClients
 		vpnCfg.Xray.ExcludeSets = excl
 		vpnCfg.Xray.ExcludeIPs = excludeIPs
-		vpnCfg.Xray.Servers = serverIPs
+		vpnCfg.Xray.Servers = vpnconfig.ServerIPs(all)
 		for name, tunnel := range tunnels {
 			if existing, ok := vpnCfg.TunnelDirector.Tunnels[name]; ok {
 				tunnel.Gateway = existing.Gateway

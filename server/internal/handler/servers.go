@@ -23,20 +23,38 @@ func NewServersHandler(deps *Deps) *ServersHandler {
 	return &ServersHandler{deps: deps}
 }
 
-// HandleServers handles /servers command - loads servers from config, builds paginated list
+// serverLine is one server on a /servers page: its subscription's name and its
+// number within that subscription.
+type serverLine struct {
+	sub    string
+	number int
+	server vpnconfig.Server
+}
+
+// serverLines is every server of subs, in subscription order.
+func serverLines(subs []vpnconfig.Subscription) []serverLine {
+	var lines []serverLine
+	for _, sub := range subs {
+		for i, s := range sub.Servers {
+			lines = append(lines, serverLine{sub: sub.Name, number: i + 1, server: s})
+		}
+	}
+	return lines
+}
+
+// HandleServers handles /servers: every server, a header per subscription, in pages.
 func (h *ServersHandler) HandleServers(msg *tgbotapi.Message) {
-	servers, err := h.deps.Config.LoadServers()
+	subs, err := h.deps.Config.LoadSubscriptions()
 	if err != nil {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Error: %v", err)))
 		return
 	}
-
-	if len(servers) == 0 {
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("No servers. Use /import to add servers."))
+	lines := serverLines(subs)
+	if len(lines) == 0 {
+		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("No servers. Use /import to add a subscription."))
 		return
 	}
-
-	text, keyboard := buildServersPage(servers, 0)
+	text, keyboard := buildServersPage(lines, len(subs), 0)
 	h.deps.Sender.SendWithKeyboard(msg.Chat.ID, text, keyboard)
 }
 
@@ -50,24 +68,21 @@ func (h *ServersHandler) HandleCallback(cb *tgbotapi.CallbackQuery) {
 		return
 	}
 
-	chatID := cb.Message.Chat.ID
-	data := cb.Data
-
-	// Parse page number from "servers:page:N"
 	var page int
-	if _, err := fmt.Sscanf(data, "servers:page:%d", &page); err != nil {
+	if _, err := fmt.Sscanf(cb.Data, "servers:page:%d", &page); err != nil {
 		// noop button clicked
 		return
 	}
-
-	// Load servers
-	servers, err := h.deps.Config.LoadServers()
-	if err != nil || len(servers) == 0 {
+	subs, err := h.deps.Config.LoadSubscriptions()
+	if err != nil {
 		return
 	}
-
-	text, keyboard := buildServersPage(servers, page)
-	h.deps.Sender.EditMessage(chatID, cb.Message.MessageID, text, keyboard)
+	lines := serverLines(subs)
+	if len(lines) == 0 {
+		return
+	}
+	text, keyboard := buildServersPage(lines, len(subs), page)
+	h.deps.Sender.EditMessage(cb.Message.Chat.ID, cb.Message.MessageID, text, keyboard)
 }
 
 // extractCountry extracts country name from server name format "Country, City"
@@ -119,35 +134,30 @@ func groupServersByCountry(servers []vpnconfig.Server) string {
 	return strings.Join(parts, ", ")
 }
 
-// buildServersPage builds paginated server list with navigation keyboard
-func buildServersPage(servers []vpnconfig.Server, page int) (string, tgbotapi.InlineKeyboardMarkup) {
-	// Guard clause for empty servers list
-	if len(servers) == 0 {
+// buildServersPage builds one page of the list, a header wherever a
+// subscription starts and at the top of the page, with the navigation keyboard.
+func buildServersPage(lines []serverLine, subCount, page int) (string, tgbotapi.InlineKeyboardMarkup) {
+	if len(lines) == 0 {
 		return "No servers available\\.", tgbotapi.NewInlineKeyboardMarkup()
 	}
 
-	totalPages := (len(servers) + serversPerPage - 1) / serversPerPage
-	if page < 0 {
-		page = 0
-	}
-	if page >= totalPages {
-		page = totalPages - 1
-	}
-
+	totalPages := (len(lines) + serversPerPage - 1) / serversPerPage
+	page = max(0, min(page, totalPages-1))
 	start := page * serversPerPage
-	end := start + serversPerPage
-	if end > len(servers) {
-		end = len(servers)
-	}
+	end := min(start+serversPerPage, len(lines))
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("🖥 *Servers* \\(%d\\), page %d/%d:\n",
-		len(servers), page+1, totalPages))
+	sb.WriteString(fmt.Sprintf("🖥 *Servers* \\(%d\\) in %d subscriptions, page %d/%d:\n",
+		len(lines), subCount, page+1, totalPages))
 
 	for i := start; i < end; i++ {
-		s := servers[i]
+		l := lines[i]
+		if i == start || l.sub != lines[i-1].sub {
+			sb.WriteString("\n*" + telegram.EscapeMarkdownV2(l.sub) + "*\n")
+		}
+		s := l.server
 		sb.WriteString(fmt.Sprintf("%d\\. %s — %s \\(%s\\) · %s\n",
-			i+1,
+			l.number,
 			telegram.EscapeMarkdownV2(s.Name),
 			telegram.EscapeMarkdownV2(s.Address),
 			telegram.EscapeMarkdownV2(strings.Join(s.IPs, ", ")),
@@ -156,21 +166,16 @@ func buildServersPage(servers []vpnconfig.Server, page int) (string, tgbotapi.In
 
 	// Navigation buttons
 	var buttons []tgbotapi.InlineKeyboardButton
-
 	if page > 0 {
 		buttons = append(buttons,
 			tgbotapi.NewInlineKeyboardButtonData("← Prev", fmt.Sprintf("servers:page:%d", page-1)))
 	}
-
 	buttons = append(buttons,
 		tgbotapi.NewInlineKeyboardButtonData(fmt.Sprintf("%d/%d", page+1, totalPages), "servers:noop"))
-
 	if page < totalPages-1 {
 		buttons = append(buttons,
 			tgbotapi.NewInlineKeyboardButtonData("Next →", fmt.Sprintf("servers:page:%d", page+1)))
 	}
 
-	keyboard := tgbotapi.NewInlineKeyboardMarkup(buttons)
-
-	return sb.String(), keyboard
+	return sb.String(), tgbotapi.NewInlineKeyboardMarkup(buttons)
 }

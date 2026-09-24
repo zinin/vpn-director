@@ -240,10 +240,9 @@ func TestHandleConfig_OK(t *testing.T) {
 				JWTSecret: "super-secret-key",
 			},
 			Xray: vpnconfig.XrayConfig{
-				Clients:         []string{"192.168.50.10"},
-				ExcludeSets:     []string{"ru"},
-				SubscriptionURL: "https://cdn.example/s/token",
-				Failover:        &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}},
+				Clients:     []string{"192.168.50.10"},
+				ExcludeSets: []string{"ru"},
+				Failover:    &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}},
 			},
 		},
 	}
@@ -275,9 +274,6 @@ func TestHandleConfig_OK(t *testing.T) {
 	}
 	if resp.DataDir != "/opt/vpn-director/data" {
 		t.Errorf("expected data_dir '/opt/vpn-director/data', got %q", resp.DataDir)
-	}
-	if resp.Xray.SubscriptionURL != "" {
-		t.Errorf("expected SubscriptionURL to be redacted, got %q", resp.Xray.SubscriptionURL)
 	}
 	if len(resp.Xray.Clients) != 1 || resp.Xray.Clients[0] != "192.168.50.10" {
 		t.Errorf("expected Xray.Clients unchanged, got %v", resp.Xray.Clients)

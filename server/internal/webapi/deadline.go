@@ -19,7 +19,7 @@ const (
 	// deadlineSlack is the margin on top of a command's own timeout. Spec 5.3
 	// says 30 s, which turned out to be negative margin in two places: a shell
 	// command can hold its pipes for another shell.waitDelay (10 s) after the
-	// timeout fires, and a mutation waits up to service.configLockTimeout
+	// timeout fires, and a mutation waits up to service.ConfigLockTimeout
 	// (30 s) for the config lock before the command even starts.
 	deadlineSlack  = 60 * time.Second
 	applyDeadline  = service.ApplyTimeout + deadlineSlack
@@ -33,9 +33,15 @@ const (
 	// 30 s WriteTimeout with five seconds to spare; the extension means
 	// raising ExternalIPTimeout cannot silently put the route back over.
 	ipDeadline = service.ExternalIPTimeout + deadlineSlack
-	// importDeadline covers the 10-second subscription download plus one DNS
-	// lookup per server; the import runs no shell command.
-	importDeadline = 2 * time.Minute
+	// subscriptionTimeout bounds the downloads of one subscription route and
+	// the resolution of every host in them.
+	subscriptionTimeout = 90 * time.Second
+	// importDeadline covers a subscription route, which runs no shell command.
+	// Once subscriptionTimeout has ended its downloads, the publication - or
+	// the record of why a download failed - can still wait
+	// service.ConfigLockTimeout for the config lock, which the downloads'
+	// context does not bound. deadlineSlack is the margin on top, as above.
+	importDeadline = subscriptionTimeout + service.ConfigLockTimeout + deadlineSlack
 	// githubDeadline covers the synchronous part of an update route: one
 	// GitHub API call under updater.APITimeout. POST /api/update answers 202
 	// as soon as the download goroutine is under way, so the script's own

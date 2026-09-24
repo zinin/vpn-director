@@ -4,19 +4,21 @@ load 'test_helper'
 
 # The decoding itself - every scheme, container and skip reason - is
 # router/test/unit/subscription.bats, on the cases the Go importer shares.
-# This file is the script around it: resolution, the report and publication.
+# This file is the script around it: resolution, the report and the
+# subscription menu.
 
 # ============================================================================
 # step_parse_servers: resolution and the list it leaves for publication
 # ============================================================================
 
-# decode_into_result reads a subscription the way step_get_subscription does.
+# decode_into_result reads a subscription the way fetch_subscription does.
 decode_into_result() {
     SUB_RESULT=$(printf '%s' "$1" | subscription_decode)
 }
 
-# step_parse_servers leaves the list in $SERVERS_TMP for step_publish_servers,
-# so these call it directly: "run" would keep the variable in its subshell.
+# step_parse_servers leaves the list in $SERVERS_TMP for publish_add and
+# publish_refresh, so these call it directly: "run" would keep the variable in
+# its subshell.
 @test "step_parse_servers: every server keeps its outbound and gets its IPs" {
     load_import_server_list
     VPD_CONFIG="$BATS_TEST_TMPDIR/vpn-director.json"
@@ -78,7 +80,42 @@ decode_into_result() {
 }
 
 # ============================================================================
-# Publishing: servers.json, xray.servers and the link a refresh fetches
+# The host of a link: a subscription's default name and the menu's column
+# ============================================================================
+
+# What Go's url.Hostname gives: a query right after the host - where a link
+# may carry its token - and the brackets of an IPv6 address are no part of it.
+@test "link_host: the host of a link, as Go's url.Hostname gives it" {
+    load_import_server_list
+
+    run link_host 'https://sub.example.com?token=abc'
+    assert_output "sub.example.com"
+    run link_host 'https://user:pw@[2001:db8::1]:443/s'
+    assert_output "2001:db8::1"
+    run link_host 'http://cdn.example:8080/s/b#top'
+    assert_output "cdn.example"
+}
+
+# The menu shows the host of a link, never the link: its path or its query
+# carries the token.
+@test "show_subscriptions: a line each, with the host in place of the link" {
+    load_import_server_list
+
+    run show_subscriptions '[
+        {"id": "0a1b2c3d", "name": "Alpha", "url": "https://sub.example.com/s/secret-token", "refreshed": "2026-09-24T18:05:00Z", "servers": [{}, {}]},
+        {"id": "0a1b2c3e", "name": "Beta", "url": "https://panel.example.net?token=secret-token", "error": "Failed to download the subscription", "servers": [{}]},
+        {"id": "0a1b2c3f", "name": "Gamma", "refreshed": "2026-09-24T18:00:00Z", "servers": []}]'
+
+    assert_success
+    assert_line "  1) Alpha   sub.example.com   2 servers   refreshed 2026-09-24 18:05 UTC"
+    assert_line "  2) Beta   panel.example.net   1 servers   error: Failed to download the subscription"
+    assert_line "  3) Gamma   static list   0 servers   refreshed 2026-09-24 18:00 UTC"
+    refute_output --partial "secret-token"
+}
+
+# ============================================================================
+# The menu: the subscription files, xray.servers and what the previous
+# release left behind
 # ============================================================================
 
 # load_import_into points VPD_DIR and VPD_CONFIG at a scratch directory, the way
@@ -90,8 +127,9 @@ load_import_into() {
     load_import_server_list
 }
 
-# write_imported_state stands in for a router with an earlier import: its list,
-# the bypass set built from it and the link the Web UI saved it from.
+# write_imported_state stands in for a router the previous release imported
+# to: its single list, the bypass set built from it and the link the Web UI
+# saved it from.
 write_imported_state() {
     mkdir -p "$VPD_DIR/data"
     printf '%s\n' '[{"address":"9.9.9.9","port":443,"uuid":"old","name":"Old","ips":["9.9.9.9"]}]' \
@@ -132,10 +170,38 @@ serve_list_file() {
     export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
 }
 
-# run_import runs import_server_list.sh the way a user does, the answer to its
-# prompt on stdin.
+# run_import runs import_server_list.sh the way a user does: each argument is
+# the answer to one prompt, and the end of the input quits the menu.
 run_import() {
-    run env IMPORT_TEST_MODE=0 bash "$SCRIPTS_DIR/import_server_list.sh" <<< "$1"
+    run env IMPORT_TEST_MODE=0 bash "$SCRIPTS_DIR/import_server_list.sh" < <(printf '%s\n' "$@")
+}
+
+# subs_dir is where the scratch router keeps its subscriptions.
+subs_dir() {
+    printf '%s/data/subscriptions' "$VPD_DIR"
+}
+
+# write_config writes a config the way configure.sh leaves one: a data
+# directory, the Web UI's secret and one Xray client.
+write_config() {
+    mkdir -p "$VPD_DIR/data"
+    jq -n --arg data "$VPD_DIR/data" '{data_dir: $data, webui: {jwt_secret: "secret"}, xray: {clients: ["192.168.50.10"]}}' > "$VPD_CONFIG"
+}
+
+# write_list_file_named <file> <link...> writes another list file.
+write_list_file_named() {
+    local file=$1
+    shift
+    printf '%s\n' "$@" > "$file"
+}
+
+# serve_failing_download puts a curl first on PATH that fails every download,
+# as a host that answers 403 does.
+serve_failing_download() {
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    printf '#!/bin/sh\nexit 22\n' > "$BATS_TEST_TMPDIR/bin/curl"
+    chmod +x "$BATS_TEST_TMPDIR/bin/curl"
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
 }
 
 # hold_config_lock takes the lock the daemons and configure.sh take, the way
@@ -152,173 +218,410 @@ release_config_lock() {
     kill "$LOCK_HOLDER" 2>/dev/null || true
 }
 
-# The watch, the Web UI and /import publish a list with the bypass set built
-# from it; a list imported here left TPROXY bypassing the previous list's
-# addresses until configure.sh ran. servers.json holds every server's UUID, and
-# the daemons write it 0600.
-@test "import_server_list.sh publishes the list with its bypass set" {
+# A first run has no subscription: the menu opens on Add. The list becomes a
+# subscription file, 600 in a 700 directory, and xray.servers follows it.
+@test "import_server_list.sh: a first run adds a subscription and brings the config in step" {
     load_import_into
-    write_imported_state
+    write_config
     write_list_file
 
-    run_import "$BATS_TEST_TMPDIR/servers.txt"
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
 
     assert_success
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["A","B","C"]'
+    run bash -c "ls '$(subs_dir)' | wc -l"
+    assert_output "1"
+    run bash -c "jq -c '[.name, has(\"url\"), [.servers[].name]]' '$(subs_dir)'/*.json"
+    assert_output '["servers",false,["A","B","C"]]'
     run jq -c '[.xray.servers, .xray.clients, .webui.jwt_secret]' "$VPD_CONFIG"
     assert_output '[["1.2.3.4","5.6.7.8"],["192.168.50.10"],"secret"]'
-    run stat -c %a "$VPD_DIR/data/servers.json" "$VPD_CONFIG"
-    assert_output $'600\n600'
-    run ls -A "$VPD_DIR/data"
-    assert_output "servers.json"
+    run bash -c "stat -c %a '$(subs_dir)' '$(subs_dir)'/*.json"
+    assert_output $'700\n600'
 }
 
-# The bot's subscription watch re-imports xray.subscription_url when the Xray
-# outbound dies, and the Web UI and /import re-import it on request. A list
-# imported here from another link was replaced by the old link's on the next
-# refresh: the link goes with the list.
-@test "import_server_list.sh saves an https link with its list" {
+@test "import_server_list.sh: an https link is saved and names the subscription after its host" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+
+    run_import "https://cdn.example/s/b" ""
+
+    assert_success
+    run bash -c "jq -c '[.name, .url]' '$(subs_dir)'/*.json"
+    assert_output '["cdn.example","https://cdn.example/s/b"]'
+}
+
+# Go reads a scheme in any case, and the Web UI and the bot save a link as it
+# was written: "Https://" is a link here too, never a file path echoed with
+# its token.
+@test "import_server_list.sh: a link whose scheme has capitals is a link, saved as written" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+
+    run_import "Https://cdn.example/s/secret-token" ""
+
+    assert_success
+    refute_output --partial "secret-token"
+    run bash -c "jq -c '[.name, .url]' '$(subs_dir)'/*.json"
+    assert_output '["cdn.example","Https://cdn.example/s/secret-token"]'
+}
+
+@test "import_server_list.sh: a name given is the subscription's name" {
+    load_import_into
+    write_config
+    write_list_file
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "  My List  "
+
+    assert_success
+    run bash -c "jq -r '.name' '$(subs_dir)'/*.json"
+    assert_output "My List"
+}
+
+# The single list and link of the previous release go with the first
+# subscription written; the rest of the config stays.
+@test "import_server_list.sh: removes servers.json and xray.subscription_url of the previous release" {
     load_import_into
     write_imported_state
     write_list_file
-    serve_list_file
 
-    run_import "https://cdn.example/s/b"
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
 
     assert_success
-    run jq -r '.xray.subscription_url' "$VPD_CONFIG"
-    assert_output "https://cdn.example/s/b"
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["A","B","C"]'
+    [[ ! -e $VPD_DIR/data/servers.json ]]
+    run jq -c '[(.xray | has("subscription_url")), .xray.clients]' "$VPD_CONFIG"
+    assert_output '[false,["192.168.50.10"]]'
 }
 
-# Neither the watch nor the Web UI fetches a file or a plain-http link, and the
-# saved link is no longer what the list came from.
-@test "import_server_list.sh clears the saved link for a file or an http link" {
+@test "import_server_list.sh: Add puts a second subscription beside the first" {
     load_import_into
+    write_config
+    write_list_file
+    write_list_file_named "$BATS_TEST_TMPDIR/other.txt" 'vless://uuid-d@9.9.9.9:443?type=tcp&security=tls#D'
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+
+    run_import a "$BATS_TEST_TMPDIR/other.txt" "Beta" q
+
+    assert_success
+    # Both were added within one second, and the random ids order them then.
+    run bash -c "source '$LIB_DIR/substore.sh'; substore_list '$(subs_dir)' | jq -c '[.[].name] | sort'"
+    assert_output '["Alpha","Beta"]'
+    run jq -c '.xray.servers' "$VPD_CONFIG"
+    assert_output '["1.2.3.4","5.6.7.8","9.9.9.9"]'
+}
+
+@test "import_server_list.sh: the same https link refreshes its subscription" {
+    load_import_into
+    write_config
     write_list_file
     serve_list_file
-    for input in "$BATS_TEST_TMPDIR/servers.txt" "http://cdn.example/s/b"; do
-        write_imported_state
+    run_import "https://cdn.example/s/b" "Alpha"
 
-        run_import "$input"
+    run_import a "https://cdn.example/s/b" "" q
 
-        assert_success
-        run jq -c '.xray | has("subscription_url")' "$VPD_CONFIG"
-        assert_output "false"
-    done
+    assert_success
+    assert_output --partial "saved already"
+    run bash -c "ls '$(subs_dir)' | wc -l"
+    assert_output "1"
+    run bash -c "jq -r '.name' '$(subs_dir)'/*.json"
+    assert_output "Alpha"
 }
 
-# Before configure.sh has run there is no config, and nothing refreshes a list.
-@test "import_server_list.sh creates no config" {
+@test "import_server_list.sh: refuses a name another subscription has, whatever its case" {
+    load_import_into
+    write_config
+    write_list_file
+    write_list_file_named "$BATS_TEST_TMPDIR/other.txt" 'vless://uuid-d@9.9.9.9:443?type=tcp&security=tls#D'
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+
+    run_import a "$BATS_TEST_TMPDIR/other.txt" "ALPHA" q
+
+    assert_output --partial "Another subscription is named ALPHA"
+    run bash -c "ls '$(subs_dir)' | wc -l"
+    assert_output "1"
+}
+
+# A refresh whose download fails keeps the list and says why in the file,
+# as the daemons do.
+@test "import_server_list.sh: Refresh records why a download failed and keeps the list" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+    run_import "https://cdn.example/s/b" "Alpha"
+    serve_failing_download
+
+    run_import r 1 q
+
+    run bash -c "jq -c '[.error, (.servers | length)]' '$(subs_dir)'/*.json"
+    assert_output '["Failed to download the subscription",3]'
+}
+
+# A link the Web UI or the bot saved with capitals in its scheme is refreshed
+# as a link, and why it failed is recorded without it.
+@test "import_server_list.sh: Refresh takes a saved link whose scheme has capitals for a link" {
+    load_import_into
+    write_config
+    mkdir -p "$(subs_dir)"
+    jq -n '{id: "0a1b2c3d", name: "Alpha", url: "Https://cdn.example/s/secret-token",
+            added: "2026-09-24T18:00:00Z", refreshed: "2026-09-24T18:00:00Z", servers: []}' > "$(subs_dir)/0a1b2c3d.json"
+    serve_failing_download
+
+    run_import r 1 q
+
+    refute_output --partial "secret-token"
+    run jq -r '.error' "$(subs_dir)/0a1b2c3d.json"
+    assert_output "Failed to download the subscription"
+}
+
+# A refresh that fails and cannot say why in its file - another writer holds
+# the lock, or the file cannot be written - says so, as the daemons do.
+@test "import_server_list.sh: warns when it cannot record why a refresh failed" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+    run_import "https://cdn.example/s/b" "Alpha"
+    serve_failing_download
+    hold_config_lock
+    export VPD_CONFIG_LOCK_WAIT=1
+
+    run_import r 1 q
+    release_config_lock
+
+    assert_output --partial "Failed to record why the subscription did not refresh: the config is locked by the Web UI or the bot"
+
+    # mktemp fails, and with it the write of the file.
+    mkdir -p "$BATS_TEST_TMPDIR/nomktemp"
+    printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/nomktemp/mktemp"
+    chmod +x "$BATS_TEST_TMPDIR/nomktemp/mktemp"
+    PATH="$BATS_TEST_TMPDIR/nomktemp:$PATH" run_import r 1 q
+
+    assert_output --partial "Failed to record why the subscription did not refresh"
+    refute_output --partial "locked"
+    run bash -c "jq -c '.error' '$(subs_dir)'/*.json"
+    assert_output "null"
+}
+
+# R) refreshes every subscription with a link, one after another, and a
+# static list has nothing to refresh. The loop reads the subscriptions on its
+# stdin: a refresh that read stdin too would end it after the first.
+@test "import_server_list.sh: Refresh all refreshes every subscription with a link" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+    run_import "https://cdn.example/s/a" "Alpha"
+    run_import a "https://panel.example/s/b" "Beta" q
+    run_import a "$BATS_TEST_TMPDIR/servers.txt" "Gamma" q
+    write_list_file_named "$BATS_TEST_TMPDIR/servers.txt" 'vless://uuid-d@203.0.113.9:443?type=tcp&security=tls#D'
+
+    run_import R q
+
+    assert_success
+    assert_output --partial "Refreshed Alpha: 1 servers"
+    assert_output --partial "Refreshed Beta: 1 servers"
+    assert_output --partial "Refreshed 2 of 2 subscriptions"
+    run bash -c "jq -c '[.name, [.servers[].name]]' '$(subs_dir)'/*.json | sort"
+    assert_output $'["Alpha",["D"]]\n["Beta",["D"]]\n["Gamma",["A","B","C"]]'
+}
+
+# Deleted while its download runs: the list is not published, and the file
+# is not brought back.
+@test "import_server_list.sh: a subscription deleted while it downloads stays deleted" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+    run_import "https://cdn.example/s/b" "Alpha"
+    printf '#!/bin/sh\nrm -f "%s"/*.json\ncat "%s"\n' "$(subs_dir)" "$BATS_TEST_TMPDIR/servers.txt" > "$BATS_TEST_TMPDIR/bin/curl"
+
+    run_import r 1 q
+
+    assert_output --partial "deleted or changed while it downloaded"
+    run bash -c "ls -A '$(subs_dir)'"
+    assert_output ""
+}
+
+@test "import_server_list.sh: Rename" {
+    load_import_into
+    write_config
+    write_list_file
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+
+    run_import n 1 "Main" q
+
+    assert_success
+    run bash -c "jq -r '.name' '$(subs_dir)'/*.json"
+    assert_output "Main"
+}
+
+# The choice the watch kept from the deleted subscription ends with it; the
+# running Xray is left alone, and the user is told.
+@test "import_server_list.sh: Delete ends the choice kept from it and warns about the running server" {
+    load_import_into
+    write_config
+    write_list_file
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+    local id
+    id=$(jq -r '.id' "$(subs_dir)"/*.json)
+    jq --arg id "$id" '.xray.active_server = {subscription: $id, name: "A"} | .xray.preferred_server = {subscription: $id, name: "B"}' \
+        "$VPD_CONFIG" > "$VPD_CONFIG.new" && mv "$VPD_CONFIG.new" "$VPD_CONFIG"
+
+    run_import d 1 y q
+
+    assert_success
+    assert_output --partial "The running Xray server came from Alpha"
+    run bash -c "ls -A '$(subs_dir)'"
+    assert_output ""
+    run jq -c '[(.xray | has("preferred_server")), .xray.active_server.name, .xray.servers]' "$VPD_CONFIG"
+    assert_output '[false,"A",[]]'
+}
+
+# A subscription file that cannot be removed ends the Delete with a message,
+# as every other store call that fails does, and nothing is deleted.
+@test "import_server_list.sh: Delete says so when the subscription file cannot be removed" {
+    load_import_into
+    write_config
+    write_list_file
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+    local real_rm
+    real_rm=$(command -v rm)
+
+    # rm fails on a subscription file and removes anything else.
+    mkdir -p "$BATS_TEST_TMPDIR/norm"
+    printf '#!/bin/sh\nfor arg in "$@"; do\n    case $arg in */subscriptions/*.json) exit 1 ;; esac\ndone\nexec "%s" "$@"\n' \
+        "$real_rm" > "$BATS_TEST_TMPDIR/norm/rm"
+    chmod +x "$BATS_TEST_TMPDIR/norm/rm"
+    PATH="$BATS_TEST_TMPDIR/norm:$PATH" run_import d 1 y q
+
+    assert_output --partial "Failed to delete Alpha; nothing was deleted"
+    run bash -c "jq -r '.name' '$(subs_dir)'/*.json"
+    assert_output "Alpha"
+}
+
+# A link pasted where the menu wants a choice or a number, and a link of
+# another scheme - a single share link - where it wants a subscription: none
+# is echoed. A link carries a token or a key, and a share link of another
+# scheme not even its host: a vmess link's "host" is its whole base64 payload,
+# the server's id in it.
+@test "import_server_list.sh: never echoes an answer that holds a link" {
+    load_import_into
+    write_config
+    write_list_file
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+    # {"add":"203.0.113.5","port":"443","id":"secret-uuid","ps":"X"}
+    local payload=eyJhZGQiOiIyMDMuMC4xMTMuNSIsInBvcnQiOiI0NDMiLCJpZCI6InNlY3JldC11dWlkIiwicHMiOiJYIn0=
+
+    run_import "https://cdn.example/s/secret-token" d "https://cdn.example/s/secret-token" \
+        a "vless://secret-token@203.0.113.5:443?type=tcp#X" a "vmess://$payload" q
+
+    assert_success
+    refute_output --partial "secret-token"
+    refute_output --partial "$payload"
+    assert_output --partial "Unsupported link: only http and https links are downloaded"
+}
+
+# The Web UI, the bot and configure.sh write under one lock, and so does the
+# watch. Nothing is written before the lock is held.
+@test "import_server_list.sh: publishes nothing while another writer holds the config lock" {
+    load_import_into
+    write_config
+    write_list_file
+    hold_config_lock
+    export VPD_CONFIG_LOCK_WAIT=1
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
+    release_config_lock
+
+    assert_failure
+    assert_output --partial "nothing was imported"
+    [[ ! -e $(subs_dir) ]] || [[ -z $(ls -A "$(subs_dir)") ]]
+    run jq -c '.xray | has("servers")' "$VPD_CONFIG"
+    assert_output "false"
+}
+
+@test "import_server_list.sh: a list without a usable server adds nothing" {
+    load_import_into
+    write_config
+    printf '%s\n' 'vless://uuid@5.6.7.8:99999?type=tcp#Bad' > "$BATS_TEST_TMPDIR/servers.txt"
+
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
+
+    assert_failure
+    [[ ! -e $(subs_dir) ]] || [[ -z $(ls -A "$(subs_dir)") ]]
+}
+
+# Before configure.sh has run there is no config, and none is created.
+@test "import_server_list.sh: creates no config" {
     load_import_into
     mkdir -p "$VPD_DIR/data"
     jq -n --arg data "$VPD_DIR/data" '{data_dir: $data}' > "$VPD_DIR/vpn-director.json.template"
     write_list_file
 
-    run_import "$BATS_TEST_TMPDIR/servers.txt"
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
 
     assert_success
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
+    run bash -c "jq -c '[.servers[].name]' '$(subs_dir)'/*.json"
     assert_output '["A","B","C"]'
     [[ ! -e $VPD_CONFIG ]]
-}
-
-# The Web UI, the bot and configure.sh write under one lock, and the watch
-# publishes a refreshed list under it. A list written before the lock was held
-# could land beside another import's bypass set or link, and one written ahead
-# of a lock that never came was left beside the old link, whose list the next
-# refresh brought back.
-@test "import_server_list.sh publishes nothing while another writer holds the config lock" {
-    load_import_into
-    write_imported_state
-    write_list_file
-    hold_config_lock
-    export VPD_CONFIG_LOCK_WAIT=1
-
-    run_import "$BATS_TEST_TMPDIR/servers.txt"
-    release_config_lock
-
-    assert_failure
-    assert_output --partial "nothing was imported"
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["Old"]'
-    run jq -c '[.xray.servers, .xray.subscription_url]' "$VPD_CONFIG"
-    assert_output '[["9.9.9.9"],"https://old.example/s/a"]'
-    run ls -A "$VPD_DIR/data"
-    assert_output "servers.json"
-}
-
-# A failed import keeps the list the router has, as the Web UI and /import do.
-@test "import_server_list.sh keeps the previous list when the new one has no usable server" {
-    load_import_into
-    write_imported_state
-    printf '%s\n' 'vless://uuid@5.6.7.8:99999?type=tcp#Bad' > "$BATS_TEST_TMPDIR/servers.txt"
-
-    run_import "$BATS_TEST_TMPDIR/servers.txt"
-
-    assert_failure
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["Old"]'
 }
 
 # The new provider serves no links at all: its subscription is an array of
 # Xray configs. The proxy outbound of each is the server; a config with more
 # than one proxy is skipped as composite.
-@test "import_server_list.sh imports an Xray JSON subscription" {
+@test "import_server_list.sh: imports an Xray JSON subscription" {
     load_import_into
-    write_imported_state
+    write_config
     cat > "$BATS_TEST_TMPDIR/servers.txt" <<'JSON'
 [{"remarks": "Oslo", "outbounds": [{"tag": "proxy", "protocol": "trojan", "settings": {"servers": [{"address": "198.51.100.10", "port": 443, "password": "p"}]}, "streamSettings": {"network": "tcp", "security": "tls"}}, {"tag": "direct", "protocol": "freedom"}]},
  {"remarks": "Auto", "outbounds": [{"protocol": "vless", "settings": {"address": "198.51.100.11", "port": 443, "id": "u"}}, {"protocol": "vless", "settings": {"address": "198.51.100.12", "port": 443, "id": "u"}}]}]
 JSON
 
-    run_import "$BATS_TEST_TMPDIR/servers.txt"
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
 
     assert_success
     assert_output --partial "Skipping Auto: composite (2 proxy outbounds)"
-    run jq -c '[.[] | [.name, .outbound.protocol, .outbound.settings.servers[0].password, .ips]]' "$VPD_DIR/data/servers.json"
+    run bash -c "jq -c '[.servers[] | [.name, .outbound.protocol, .outbound.settings.servers[0].password, .ips]]' '$(subs_dir)'/*.json"
     assert_output '[["Oslo","trojan","p",["198.51.100.10"]]]'
     run jq -c '.xray.servers' "$VPD_CONFIG"
     assert_output '["198.51.100.10"]'
 }
 
-# An HTML page - what some panels answer a browser with - is no subscription;
-# the list the router has stays.
-@test "import_server_list.sh refuses a body it cannot read and keeps the previous list" {
+# An HTML page - what some panels answer a browser with - is no subscription.
+@test "import_server_list.sh: refuses a body it cannot read" {
     load_import_into
-    write_imported_state
+    write_config
     printf '%s\n' '<!doctype html><html><body>Open this link in your VPN app</body></html>' > "$BATS_TEST_TMPDIR/servers.txt"
 
-    run_import "$BATS_TEST_TMPDIR/servers.txt"
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
 
     assert_failure
     assert_output --partial "Cannot read the subscription: unrecognized subscription format"
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["Old"]'
+    [[ ! -e $(subs_dir) ]] || [[ -z $(ls -A "$(subs_dir)") ]]
 }
 
-# The bot's /import and the Web UI refuse a subscription over 1 MiB rather
-# than cut it short, and so does the router: the list it has stays.
-@test "import_server_list.sh refuses a subscription file over 1 MiB" {
+# The daemons refuse a subscription over 1 MiB rather than cut it short, and
+# so does the router.
+@test "import_server_list.sh: refuses a subscription file over 1 MiB" {
     load_import_into
-    write_imported_state
+    write_config
     write_oversized_list
 
-    run_import "$BATS_TEST_TMPDIR/servers.txt"
+    run_import "$BATS_TEST_TMPDIR/servers.txt" ""
 
     assert_failure 1
     assert_output --partial "exceeds 1 MiB"
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["Old"]'
+    [[ ! -e $(subs_dir) ]] || [[ -z $(ls -A "$(subs_dir)") ]]
 }
 
 # curl --max-filesize stops a transfer it knows to be too large with exit 63:
 # the subscription's size, not a download that failed.
-@test "import_server_list.sh refuses a download curl stops at 1 MiB" {
+@test "import_server_list.sh: refuses a download curl stops at 1 MiB" {
     load_import_into
-    write_imported_state
+    write_config
     mkdir -p "$BATS_TEST_TMPDIR/bin"
     cat > "$BATS_TEST_TMPDIR/bin/curl" <<MOCK
 #!/bin/sh
@@ -328,28 +631,26 @@ MOCK
     chmod +x "$BATS_TEST_TMPDIR/bin/curl"
     export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
 
-    run_import "https://cdn.example/s/big"
+    run_import "https://cdn.example/s/big" ""
 
     assert_failure 1
     assert_output --partial "exceeds 1 MiB"
     run cat "$BATS_TEST_TMPDIR/curl.args"
     assert_output --partial -- "--max-filesize 1048576"
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["Old"]'
+    [[ ! -e $(subs_dir) ]] || [[ -z $(ls -A "$(subs_dir)") ]]
 }
 
 # curl before 8.4.0 does not stop a transfer whose size it did not know in
 # advance, so what it downloaded is measured again.
-@test "import_server_list.sh refuses a download over 1 MiB that curl let through" {
+@test "import_server_list.sh: refuses a download over 1 MiB that curl let through" {
     load_import_into
-    write_imported_state
+    write_config
     write_oversized_list
     serve_list_file
 
-    run_import "https://cdn.example/s/big"
+    run_import "https://cdn.example/s/big" ""
 
     assert_failure 1
     assert_output --partial "exceeds 1 MiB"
-    run jq -c '[.[].name]' "$VPD_DIR/data/servers.json"
-    assert_output '["Old"]'
+    [[ ! -e $(subs_dir) ]] || [[ -z $(ls -A "$(subs_dir)") ]]
 }

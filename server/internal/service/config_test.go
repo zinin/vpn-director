@@ -3,6 +3,7 @@ package service
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -82,26 +83,6 @@ func TestConfigService_DataDir_Error(t *testing.T) {
 	_, err := svc.DataDir()
 	if err == nil {
 		t.Error("expected error for missing config, got nil")
-	}
-}
-
-func TestConfigService_SaveServers_CreatesDir(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create config with data_dir pointing to non-existent directory
-	dataDir := filepath.Join(tmpDir, "newdata")
-	configPath := filepath.Join(tmpDir, "vpn-director.json")
-	os.WriteFile(configPath, []byte(`{"data_dir": "`+dataDir+`"}`), 0644)
-
-	svc := NewConfigService(tmpDir, filepath.Join(tmpDir, "data"))
-	err := svc.SaveServers(nil)
-	if err != nil {
-		t.Fatalf("SaveServers() error: %v", err)
-	}
-
-	// Directory should exist now
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		t.Error("SaveServers should create data directory")
 	}
 }
 
@@ -266,5 +247,80 @@ func TestConfigService_DataDir_ResolvesARelativeValueAgainstTheConfig(t *testing
 	}
 	if want := filepath.Join(dir, "data"); dataDir != want {
 		t.Errorf("DataDir() = %q, want %q", dataDir, want)
+	}
+}
+
+// newStoreWithData is a ConfigService whose config names dataDir.
+func newStoreWithData(t *testing.T) (*ConfigService, string) {
+	t.Helper()
+	dir := t.TempDir()
+	data := filepath.Join(dir, "data")
+	writeTestConfig(t, dir, fmt.Sprintf(`{"data_dir": %q}`, data))
+	return NewConfigService(dir, filepath.Join(dir, "default-data")), data
+}
+
+func TestConfigService_SubscriptionsLiveInTheDataDirectory(t *testing.T) {
+	svc, data := newStoreWithData(t)
+	sub := vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha", URL: "https://sub.example.com/s/t",
+		Servers: []vpnconfig.Server{{Name: "Oslo", Address: "a.example.com", Port: 443, IPs: []string{"192.0.2.10"}}}}
+
+	if err := svc.SaveSubscription(sub); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(data, "subscriptions", "0a1b2c3d.json")); err != nil {
+		t.Fatal(err)
+	}
+	subs, err := svc.LoadSubscriptions()
+	if err != nil || len(subs) != 1 || subs[0].Name != "Alpha" {
+		t.Fatalf("subs %+v, err %v", subs, err)
+	}
+	servers, err := svc.LoadServers()
+	if err != nil || len(servers) != 1 || servers[0].Subscription != "0a1b2c3d" {
+		t.Fatalf("servers %+v, err %v", servers, err)
+	}
+	if err := svc.DeleteSubscription("0a1b2c3d"); err != nil {
+		t.Fatal(err)
+	}
+	if subs, err := svc.LoadSubscriptions(); err != nil || len(subs) != 0 {
+		t.Fatalf("after delete: %+v, %v", subs, err)
+	}
+}
+
+// servers.json is the single list of earlier releases. Nothing reads it now,
+// and the first write of a subscription takes it away.
+func TestConfigService_ASubscriptionWriteRemovesTheOldServerList(t *testing.T) {
+	svc, data := newStoreWithData(t)
+	if err := os.MkdirAll(data, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "servers.json"), []byte("[]"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := svc.SaveSubscription(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(data, "servers.json")); !os.IsNotExist(err) {
+		t.Fatal("servers.json survived the first subscription write")
+	}
+}
+
+// A router fresh from the previous release has servers.json and no
+// subscription: nothing reads the old list, and no server is listed.
+func TestConfigService_NoSubscriptionListsNoServer(t *testing.T) {
+	svc, data := newStoreWithData(t)
+	if err := os.MkdirAll(data, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "servers.json"), []byte(`[{"name":"Old","address":"a.example.com","port":443}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	servers, err := svc.LoadServers()
+
+	if err != nil || len(servers) != 0 {
+		t.Fatalf("servers %+v, err %v", servers, err)
 	}
 }

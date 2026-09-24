@@ -83,10 +83,11 @@ func handleConfig(deps *Deps) http.HandlerFunc {
 			return
 		}
 
-		// Make a shallow copy to avoid mutating the original.
+		// Make a shallow copy to avoid mutating the original. Only jwt_secret
+		// needs blanking now: the subscription links, which carry their
+		// tokens, live in their own files.
 		redacted := *cfg
 		redacted.WebUI.JWTSecret = ""
-		redacted.Xray.SubscriptionURL = ""
 
 		jsonOK(w, &redacted)
 	}

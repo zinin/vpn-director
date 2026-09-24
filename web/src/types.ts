@@ -44,16 +44,6 @@ export interface OkResponse {
   ok: boolean
 }
 
-export interface ImportResponse {
-  ok: boolean
-  count: number
-  total: number
-  skipped: Record<'unsupported' | 'composite' | 'invalid' | 'placeholder', number>
-  dns_errors: number
-  /** "Imported 32 of 40 servers: 7 composite, 1 DNS error" */
-  summary: string
-}
-
 export interface IPResponse {
   ip: string
 }
@@ -65,15 +55,65 @@ export interface ActiveServer {
   name: string
   address: string
   port: number
+  /** The id of the server's subscription. A record from before subscriptions
+   *  has none and matches no server. */
+  subscription?: string
 }
 
-/** Go marshals a nil slice as null and none of these four fields carry
- *  omitempty, so an empty router answers with null, not []. The `?? []` guards
- *  at the call sites are load-bearing; the nullable type keeps them that way. */
-export interface ServersResponse {
+/** One subscription's servers, as GET /api/servers groups them. */
+export interface SubscriptionServers {
+  id: string
+  name: string
   servers: Server[] | null
+}
+
+/** Go marshals a nil slice as null: the `?? []` guards at the call sites are
+ *  load-bearing, and the nullable types keep them that way. */
+export interface ServersResponse {
+  subscriptions: SubscriptionServers[] | null
   active: ActiveServer | null
-  subscription_saved?: boolean
+}
+
+/** A subscription as GET /api/subscriptions shows it: the host stands in for
+ *  the link, whose path carries the token. A static list has no link. */
+export interface Subscription {
+  id: string
+  name: string
+  host: string
+  static: boolean
+  servers: number
+  added: string
+  refreshed: string
+  error?: string
+}
+
+export interface SubscriptionsResponse {
+  subscriptions: Subscription[] | null
+}
+
+/** One add or refresh. summary is the line to show, e.g.
+ *  "Alpha: Imported 32 of 40 servers: 7 composite, 1 DNS error". */
+export interface SubscriptionResult {
+  ok?: boolean
+  id: string
+  name: string
+  existed: boolean
+  summary: string
+  error?: string
+  count?: number
+  total?: number
+  skipped?: Record<'unsupported' | 'composite' | 'invalid' | 'placeholder', number>
+  dns_errors?: number
+}
+
+export interface RefreshResponse {
+  results: SubscriptionResult[] | null
+}
+
+export interface DeleteSubscriptionResponse {
+  ok: boolean
+  /** The running server came from the deleted subscription. */
+  active_removed: boolean
 }
 
 export interface ClientsResponse {

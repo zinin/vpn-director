@@ -18,8 +18,7 @@ func sample() *VPNDirectorConfig {
 			"wgc1":   {Clients: []string{"192.168.1.4"}},
 		}},
 		Xray: XrayConfig{
-			Clients:         []string{"192.168.1.8", "192.168.1.9", "192.168.1.3"},
-			SubscriptionURL: "https://cdn.example/s/token",
+			Clients: []string{"192.168.1.8", "192.168.1.9", "192.168.1.3"},
 		},
 	}
 }
@@ -92,27 +91,34 @@ func TestEffectiveXrayClients_DropsPaused(t *testing.T) {
 
 func TestArmed(t *testing.T) {
 	cfg := sample()
-	if !Armed(cfg) {
-		t.Fatal("url + clients")
+	if !Armed(cfg, 1) {
+		t.Fatal("subscription + clients")
 	}
 	cfg.Xray.Clients = nil
-	if Armed(cfg) {
-		t.Fatal("url but no clients and no failover")
+	if Armed(cfg, 1) {
+		t.Fatal("subscription but no clients and no failover")
 	}
 	cfg.Xray.Failover = &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}}
-	if !Armed(cfg) {
+	if !Armed(cfg, 1) {
 		t.Fatal("failover arms even with empty xray.clients")
 	}
-	// import_server_list.sh clears the link for a list from a file; the
-	// failover it lands on still has to end.
-	cfg.Xray.SubscriptionURL = ""
-	if !Armed(cfg) {
-		t.Fatal("failover arms even with no url")
+	// Every subscription can be deleted while the failover lasts; it still
+	// has to end.
+	if !Armed(cfg, 0) {
+		t.Fatal("failover arms even with no subscription")
 	}
 	cfg.Xray.Failover = nil
 	cfg.Xray.Clients = []string{"192.168.1.8"}
-	if Armed(cfg) {
-		t.Fatal("clients but no url and no failover")
+	if Armed(cfg, 0) {
+		t.Fatal("clients but no subscription and no failover")
+	}
+}
+
+// A link saved by an earlier release arms nothing: only subscription files do.
+func TestArmed_NeedsASubscription(t *testing.T) {
+	cfg := &VPNDirectorConfig{Xray: XrayConfig{Clients: []string{"192.168.1.8"}}}
+	if Armed(cfg, 0) || !Armed(cfg, 1) {
+		t.Fatalf("Armed(0) %v, Armed(1) %v", Armed(cfg, 0), Armed(cfg, 1))
 	}
 }
 
@@ -428,16 +434,13 @@ func TestEnsureFailoverStaged_PutsSnapshotOnXrayAndTunnel(t *testing.T) {
 	}
 }
 
-func TestXrayConfig_OmitsSubscriptionURLAndFailoverWhenEmpty(t *testing.T) {
+func TestXrayConfig_OmitsFailoverWhenEmpty(t *testing.T) {
 	out, err := json.Marshal(VPNDirectorConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := string(out)
-	for _, k := range []string{"subscription_url", "failover"} {
-		if strings.Contains(s, k) {
-			t.Errorf("marshalled %s, want no %q", s, k)
-		}
+	if s := string(out); strings.Contains(s, "failover") {
+		t.Errorf("marshalled %s, want no %q", s, "failover")
 	}
 }
 

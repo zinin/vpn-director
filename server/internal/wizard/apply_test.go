@@ -54,6 +54,7 @@ func (m *mockXrayGenerator) GenerateConfig(server vpnconfig.Server, _ ...service
 // trackingConfigStore extends mockConfigStore to track saves
 type trackingConfigStore struct {
 	servers          []vpnconfig.Server
+	subs             []vpnconfig.Subscription
 	vpnConfig        *vpnconfig.VPNDirectorConfig
 	loadErr          error
 	saveErr          error
@@ -62,6 +63,9 @@ type trackingConfigStore struct {
 }
 
 func (m *trackingConfigStore) LoadServers() ([]vpnconfig.Server, error) {
+	if m.subs != nil {
+		return vpnconfig.AllServers(m.subs), m.loadErr
+	}
 	return m.servers, m.loadErr
 }
 
@@ -69,9 +73,11 @@ func (m *trackingConfigStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, err
 	return m.vpnConfig, m.loadErr
 }
 
-func (m *trackingConfigStore) SaveServers([]vpnconfig.Server) error {
-	return m.saveErr
+func (m *trackingConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
+	return m.subs, m.loadErr
 }
+func (m *trackingConfigStore) SaveSubscription(vpnconfig.Subscription) error { return m.saveErr }
+func (m *trackingConfigStore) DeleteSubscription(string) error               { return m.saveErr }
 
 func (m *trackingConfigStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	if m.loadErr != nil {
@@ -90,10 +96,6 @@ func (m *trackingConfigStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConf
 
 func (m *trackingConfigStore) DataDir() (string, error) {
 	return "/opt/vpn-director/data", m.loadErr
-}
-
-func (m *trackingConfigStore) DataDirOrDefault() string {
-	return "/opt/vpn-director/data"
 }
 
 func (m *trackingConfigStore) ScriptsDir() string {
@@ -1103,13 +1105,13 @@ func TestApplier_Apply_DetachesFromTheFailoverWhatItDoesNotKeepOnXray(t *testing
 	}
 }
 
-// pickedServer runs the server step on servers and picks the one at idx, as a
-// user does in step 1.
+// pickedServer runs the server step on store and picks the server at idx of
+// subscription 0a1b2c3d, as a user does in step 1.
 func pickedServer(t *testing.T, store service.ConfigStore, idx int) *State {
 	t.Helper()
 	state := &State{ChatID: 123, Step: StepSelectServer, Exclusions: map[string]bool{}}
 	NewServerStep(&StepDeps{Sender: &mockSender{}, Config: store}, nil).HandleCallback(&tgbotapi.CallbackQuery{
-		Data:    fmt.Sprintf("server:%d", idx),
+		Data:    fmt.Sprintf("server:0a1b2c3d:%d", idx),
 		Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}},
 	}, state)
 	return state
@@ -1131,13 +1133,13 @@ func wizardServers(names ...string) []vpnconfig.Server {
 // step 1. Its old index then names a server the user never chose.
 func TestApplier_Apply_GeneratesThePickedServerAfterTheListMoved(t *testing.T) {
 	store := &trackingConfigStore{
-		servers: wizardServers("Oslo", "Paris"),
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo", "Paris")}},
 		vpnConfig: &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{
 			Tunnels: map[string]vpnconfig.TunnelConfig{},
 		}},
 	}
 	state := pickedServer(t, store, 1)
-	store.servers = wizardServers("Berlin", "Oslo", "Paris")
+	store.subs = []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Berlin", "Oslo", "Paris")}}
 	xrayGen := &mockXrayGenerator{}
 
 	_ = NewApplier(&trackingManager{}, &trackingSender{}, store, &mockVPNDirector{}, xrayGen).Apply(123, state)
@@ -1147,17 +1149,58 @@ func TestApplier_Apply_GeneratesThePickedServerAfterTheListMoved(t *testing.T) {
 	}
 }
 
+// publishingStore publishes a list while the apply waits for the config lock:
+// a refresh, or a wave of the subscription watch, got it first.
+type publishingStore struct {
+	*trackingConfigStore
+	publish func(*trackingConfigStore)
+}
+
+func (p *publishingStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	if publish := p.publish; publish != nil {
+		p.publish = nil
+		publish(p.trackingConfigStore)
+	}
+	return p.trackingConfigStore.UpdateVPNConfig(fn)
+}
+
+// The apply reads the lists, asks the platform, and only then waits for the
+// config lock. xray.servers is the union as it stands under the lock: the
+// addresses of a list published meanwhile stay in TPROXY_BYPASS.
+func TestApplier_Apply_KeepsAListPublishedWhileItWaitedForTheLock(t *testing.T) {
+	store := &trackingConfigStore{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo")}},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{
+			Tunnels: map[string]vpnconfig.TunnelConfig{},
+		}},
+	}
+	state := pickedServer(t, store, 0)
+	published := &publishingStore{trackingConfigStore: store, publish: func(s *trackingConfigStore) {
+		s.subs = append(s.subs, vpnconfig.Subscription{ID: "1b2c3d4e", Name: "Beta", Servers: []vpnconfig.Server{
+			{Name: "Riga", Address: "riga.example", Port: 443, IPs: []string{"198.51.100.20"}},
+		}})
+	}}
+
+	if err := NewApplier(&trackingManager{}, &trackingSender{}, published, &mockVPNDirector{}, &mockXrayGenerator{}).Apply(123, state); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := strings.Join(store.savedConfig.Xray.Servers, ","); got != "198.51.100.20,203.0.113.10" {
+		t.Fatalf("xray.servers %s, want 198.51.100.20,203.0.113.10", got)
+	}
+}
+
 // A refresh that dropped the picked server leaves nothing to generate: the
 // server at its old index is one the user never chose.
 func TestApplier_Apply_SkipsAPickedServerTheListNoLongerHas(t *testing.T) {
 	store := &trackingConfigStore{
-		servers: wizardServers("Oslo", "Paris"),
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo", "Paris")}},
 		vpnConfig: &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{
 			Tunnels: map[string]vpnconfig.TunnelConfig{},
 		}},
 	}
 	state := pickedServer(t, store, 1)
-	store.servers = wizardServers("Oslo", "Berlin")
+	store.subs = []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo", "Berlin")}}
 	xrayGen := &mockXrayGenerator{}
 	sender := &trackingSender{}
 	vpn := &mockVPNDirector{}

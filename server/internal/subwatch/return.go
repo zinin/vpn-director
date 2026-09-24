@@ -47,7 +47,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		}
 		return
 	}
-	if w.LoadServers == nil || w.Reachable == nil || w.Generate == nil {
+	if w.LoadSubscriptions == nil || w.Reachable == nil || w.Generate == nil {
 		return
 	}
 	if w.returnFails >= ReturnFailsMax {
@@ -57,7 +57,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		return
 	}
 	active, preferred := cfg.Xray.ActiveServer, cfg.Xray.PreferredServer
-	if active == nil || active.Name == preferred.Name {
+	if active == nil || (active.Subscription == preferred.Subscription && active.Name == preferred.Name) {
 		return
 	}
 	now := w.Now()
@@ -65,11 +65,12 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		return
 	}
 	w.returnNotBefore = now.Add(ReturnCheck)
-	servers, err := w.LoadServers()
+	subs, err := w.loadSubscriptions()
 	if err != nil {
-		slog.Warn("Failed to load servers.json for the return to the preferred server", "error", err)
+		slog.Warn("Failed to read the subscriptions for the return to the preferred server", "error", err)
 		return
 	}
+	servers := vpnconfig.AllServers(subs)
 	i := chosenIndex(servers, preferred)
 	if i < 0 {
 		return
@@ -84,7 +85,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if len(candidates) == 0 || ctx.Err() != nil || w.stopped() {
 		return
 	}
-	w.tryReturn(ctx, cfg, servers, candidates)
+	w.tryReturn(ctx, cfg, subs, servers, candidates)
 }
 
 // tryReturn switches Xray to each candidate copy of the preferred server in
@@ -92,13 +93,21 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // the server that ran before - the address the walk picked first, when this
 // process remembers it - and holds the next attempt back. That way back is
 // known before the first switch, and an attempt without one is put off. Every
-// write carries the walk's guard: a stop, a newly saved link or a selection
-// made meanwhile refuses it, and the attempt ends there.
-func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, servers, candidates []vpnconfig.Server) {
+// write carries the walk's guard: a stop or a selection made meanwhile refuses
+// it, and the attempt ends there. A switch to the preferred server is refused
+// too once its subscription is deleted; nobody else wrote, so the attempt
+// fails as a dead one does, and goes back to the server that ran before if it
+// has left it.
+func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, servers, candidates []vpnconfig.Server) {
 	before := cfg.Xray.ActiveServer
+	links := make(map[string]string, len(subs))
+	for _, s := range subs {
+		links[s.ID] = s.URL
+	}
+	names := subscriptionNames(subs)
 	sw := &switcher{
 		w:       w,
-		rawURL:  cfg.Xray.SubscriptionURL,
+		links:   links,
 		started: activeID(before),
 		seq:     vpnconfig.ActiveSeq(before),
 		socks:   w.socksPort(cfg),
@@ -110,20 +119,24 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 	}
 	slog.Info("Returning to the preferred server", "server", candidates[0].Name, "from", before.Name)
 	for _, c := range candidates {
-		live, ended := sw.to(ctx, c)
+		live, ended, gone := sw.to(ctx, c, true)
 		if ended {
 			return
+		}
+		if gone {
+			slog.Info("Return to the preferred server abandoned; its subscription was deleted", "server", c.Name)
+			break
 		}
 		if live {
 			// A stop or a selection can land while the probe waits; the walk
 			// makes the same look before it announces.
-			if w.stopped() || endsWalk(w.walkOwnsNow(sw.rawURL, sw.started, sw.lastRecorded, sw.seq)) {
+			if w.stopped() || endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
 				return
 			}
 			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
 			w.lastPicked = &c
 			w.lastReturn = w.Now()
-			w.notify(noteReturned, fmt.Sprintf(msgReturned, c.Name))
+			w.notify(noteReturned, fmt.Sprintf(msgReturned, label(names, c.Subscription, c.Name)))
 			return
 		}
 	}
@@ -132,7 +145,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		return
 	}
 	for _, c := range back {
-		live, ended := sw.to(ctx, c)
+		live, ended, _ := sw.to(ctx, c, false)
 		if ended {
 			return
 		}
@@ -150,7 +163,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 // counter it moved to - which the guard of the next compares with the config.
 type switcher struct {
 	w            *Watch
-	rawURL       string
+	links        map[string]string // subscription id -> the link the attempt read
 	started      string
 	lastRecorded string
 	seq          int
@@ -158,22 +171,33 @@ type switcher struct {
 	wrote        bool // a config.json has been written
 }
 
-// to writes c as the running server, restarts Xray and probes it. live is a
-// probe that passed; ended is a write the guard refused, a restart a stop
-// skipped, or a context or stop that ended the attempt, after which nothing
-// more may be written.
-func (s *switcher) to(ctx context.Context, c vpnconfig.Server) (live, ended bool) {
+// to writes c as the running server, restarts Xray and probes it. With holds,
+// c's subscription must still exist with the link the attempt read: gone is a
+// switch the guard refused because that subscription was deleted meanwhile.
+// Nothing was written for it, and nobody else wrote either, so the way back
+// stays open - and is not held to that check itself: it is the server that
+// ran. live is a probe that passed; ended is a write the guard refused for a
+// stop or a newer selection, a restart a stop skipped, or a context or stop
+// that ended the attempt, after which nothing more may be written.
+func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended, gone bool) {
 	w := s.w
 	if ctx.Err() != nil || w.stopped() {
-		return false, true
+		return false, true, false
 	}
-	generated, seq, err := w.Generate(c, w.walkGuard(s.rawURL, s.started, s.lastRecorded, s.seq))
+	sub, link := "", ""
+	if holds {
+		sub, link = c.Subscription, s.links[c.Subscription]
+	}
+	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq))
 	if endsWalk(err) {
-		return false, true
+		return false, true, false
+	}
+	if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
+		return false, false, true
 	}
 	if !generated {
 		slog.Warn("Generating Xray config for server failed", "server", c.Name, "error", err)
-		return false, false
+		return false, false, false
 	}
 	s.wrote = true
 	if err == nil {
@@ -181,35 +205,35 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server) (live, ended bool
 	}
 	s.seq = seq
 	if ctx.Err() != nil {
-		return false, true
+		return false, true, false
 	}
 	if err := w.restartXray(); err != nil {
 		if errors.Is(err, errStopped) {
-			return false, true
+			return false, true, false
 		}
 		slog.Warn("Xray restart failed", "server", c.Name, "error", err)
-		return false, false
+		return false, false, false
 	}
 	w.AfterRestart(SettleAfterRestart)
 	if err := w.Probe(ctx, s.socks); err != nil {
 		// A probe a cancelled context or a stop cut short says nothing about
 		// the server.
 		if ctx.Err() != nil || w.stopped() {
-			return false, true
+			return false, true, false
 		}
 		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, "error", err)
-		return false, false
+		return false, false, false
 	}
-	return true, false
+	return true, false, false
 }
 
 // rollbackOrder is where a failed return goes back to: the server that ran
 // before, before - its copy the walk picked or a return proved first, the
 // address it ran on, when this process remembers it, then every other address
-// its servers.json entry lists. The remembered copy leads even when a list
-// imported since no longer has its address: Xray passed its probe on it.
-// Empty when servers.json no longer lists that server and nothing is
-// remembered: there is no way back.
+// its entry in its subscription's list names. The remembered copy leads even
+// when a list imported since no longer has its address: Xray passed its probe
+// on it. Empty when its subscription's list no longer has that server and
+// nothing is remembered: there is no way back.
 func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, last *vpnconfig.Server) []vpnconfig.Server {
 	var copies []vpnconfig.Server
 	if j := chosenIndex(servers, before); j >= 0 {

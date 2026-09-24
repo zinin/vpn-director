@@ -2,7 +2,11 @@ package webapi
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -62,17 +66,60 @@ type mockConfig struct {
 	err           error
 	saveVPNCfgErr error                        // independent error for the save step of UpdateVPNConfig
 	savedCfg      *vpnconfig.VPNDirectorConfig // captured by UpdateVPNConfig
-	savedServers  []vpnconfig.Server           // captured by SaveServers
 	updateErr     error                        // returned by UpdateVPNConfig before fn runs, e.g. service.ErrConfigLockTimeout
+	// subs are the subscription files. UpdateVPNConfig serializes on upd as
+	// the flock does, and subsMu guards subs: RefreshAll runs one refresh per
+	// subscription at once.
+	subs    []vpnconfig.Subscription
+	subsErr error // LoadSubscriptions fails
+	upd     sync.Mutex
+	subsMu  sync.Mutex
 }
 
 func (m *mockConfig) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) {
 	return m.cfg, m.err
 }
 func (m *mockConfig) LoadServers() ([]vpnconfig.Server, error) { return m.servers, m.err }
-func (m *mockConfig) SaveServers(servers []vpnconfig.Server) error {
-	m.savedServers = servers
-	return m.err
+
+func (m *mockConfig) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	if m.subsErr != nil {
+		return nil, m.subsErr
+	}
+	out := make([]vpnconfig.Subscription, len(m.subs))
+	for i, s := range m.subs {
+		for j := range s.Servers {
+			s.Servers[j].Subscription = s.ID
+		}
+		out[i] = s
+	}
+	return out, nil
+}
+
+func (m *mockConfig) SaveSubscription(sub vpnconfig.Subscription) error {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for i := range m.subs {
+		if m.subs[i].ID == sub.ID {
+			m.subs[i] = sub
+			return nil
+		}
+	}
+	m.subs = append(m.subs, sub)
+	return nil
+}
+
+func (m *mockConfig) DeleteSubscription(id string) error {
+	m.subsMu.Lock()
+	defer m.subsMu.Unlock()
+	for i := range m.subs {
+		if m.subs[i].ID == id {
+			m.subs = append(m.subs[:i:i], m.subs[i+1:]...)
+			return nil
+		}
+	}
+	return nil
 }
 
 // UpdateVPNConfig mirrors the real contract: a load failure (err or no cfg)
@@ -80,6 +127,8 @@ func (m *mockConfig) SaveServers(servers []vpnconfig.Server) error {
 // skips the save; otherwise the mutated cfg is recorded as savedCfg and
 // saveVPNCfgErr, if set, is returned after it.
 func (m *mockConfig) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	m.upd.Lock()
+	defer m.upd.Unlock()
 	if m.updateErr != nil {
 		return m.updateErr
 	}
@@ -97,7 +146,6 @@ func (m *mockConfig) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error
 }
 
 func (m *mockConfig) DataDir() (string, error) { return "/tmp/test-data", m.err }
-func (m *mockConfig) DataDirOrDefault() string { return "/tmp/test-data" }
 func (m *mockConfig) ScriptsDir() string       { return "/tmp/test-scripts" }
 
 // mockXray implements service.XrayGenerator for testing.
@@ -215,3 +263,30 @@ func newTestToken(t *testing.T, deps *Deps) string {
 	}
 	return token
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
+// subscriptionHost serves body as every subscription and returns a client that
+// takes every request there, whatever host the URL names: the import's own
+// checks see the public address a test posts.
+func subscriptionHost(t *testing.T, body string) *http.Client {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	target, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := srv.Client().Transport
+	return &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		clone := req.Clone(req.Context())
+		clone.URL.Scheme, clone.URL.Host = target.Scheme, target.Host
+		return base.RoundTrip(clone)
+	})}
+}
+
+var osloSubscription = base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443?type=tcp#Oslo"))

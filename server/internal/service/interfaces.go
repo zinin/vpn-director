@@ -37,7 +37,14 @@ var ErrConfigLockTimeout = errors.New("config lock timeout")
 type ConfigStore interface {
 	LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error)
 	LoadServers() ([]vpnconfig.Server, error)
-	SaveServers([]vpnconfig.Server) error
+	// LoadSubscriptions reads every subscription file, ordered by when it was
+	// added; LoadServers is their servers, flattened in that order.
+	LoadSubscriptions() ([]vpnconfig.Subscription, error)
+	// SaveSubscription and DeleteSubscription write one subscription file.
+	// Call them only inside UpdateVPNConfig, so every write to the files
+	// happens under the config lock - vpnconfig's subscription operations do.
+	SaveSubscription(vpnconfig.Subscription) error
+	DeleteSubscription(id string) error
 	// UpdateVPNConfig runs fn under an exclusive cross-process lock:
 	// lock, load, fn, save, unlock. Readers stay lock-free because Save is
 	// atomic. A load failure comes back wrapped in ErrConfigLoad, an error
@@ -48,7 +55,6 @@ type ConfigStore interface {
 	// UpdateVPNConfig, so no code path can skip the lock.
 	UpdateVPNConfig(fn func(cfg *vpnconfig.VPNDirectorConfig) error) error
 	DataDir() (string, error)
-	DataDirOrDefault() string
 	ScriptsDir() string
 }
 

@@ -3,6 +3,8 @@ package wizard
 import (
 	"sync"
 	"testing"
+
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
 func TestManager_StartAndGet(t *testing.T) {
@@ -247,5 +249,18 @@ func TestManager_StartOverwritesPrevious(t *testing.T) {
 	// Old state should not be the same object
 	if state1 == state2 {
 		t.Error("new Start should create new state object")
+	}
+}
+
+func TestState_PickedIndexTellsSubscriptionsApart(t *testing.T) {
+	servers := []vpnconfig.Server{
+		{Subscription: "0a1b2c3d", Name: "Germany-1", Address: "de.example.com", Port: 443},
+		{Subscription: "1b2c3d4e", Name: "Germany-1", Address: "de.example.com", Port: 443},
+	}
+	s := NewManager().Start(123)
+	s.PickServer(0, servers[1]) // a stale hint: the pick is Beta's
+
+	if got := s.PickedIndex(servers); got != 1 {
+		t.Fatalf("PickedIndex %d, want 1", got)
 	}
 }

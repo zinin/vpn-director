@@ -38,7 +38,8 @@ outbound goes into it as `outbounds[0]`, tagged `proxy-out`:
 - Go: `service/xray.go` (`serverOutbound` + `encoding/json`) — used by the Web UI, the bot wizard,
   `/xray` and the subscription watch.
 
-An import stores each server's Xray outbound in `servers.json` (`outbound`): converted from a share
+An import stores each server's Xray outbound in its subscription's file
+(`<data_dir>/subscriptions/<id>.json`, `servers[].outbound`): converted from a share
 link, or taken from an Xray JSON subscription — the decoders are `lib/subscription.sh`
 and `server/internal/subscription`, which answer to the same cases in `testdata/subscription/`. The
 generators insert it as stored, so any protocol and transport Xray runs works: VLESS (tcp, ws, grpc,
@@ -119,7 +120,7 @@ In `vpn-director.json`:
 | JSON Path | Default | Purpose |
 |-----------|---------|---------|
 | `xray.clients` | `[]` | LAN IPs/CIDRs to proxy (JSON array) |
-| `xray.servers` | `[]` | Xray server IPs to exclude (avoid loops) |
+| `xray.servers` | `[]` | Xray server IPs to exclude (avoid loops): every address of every subscription, recomputed whenever a list is added, refreshed or deleted |
 | `xray.exclude_sets` | `[]` | Country codes/ipsets to skip |
 | `advanced.xray.tproxy_port` | `12345` | Xray dokodemo-door port |
 | `advanced.xray.route_table` | `100` | ip route table number |

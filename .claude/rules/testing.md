@@ -62,6 +62,7 @@ router/test/
 │   ├── install.bats
 │   ├── configure.bats
 │   ├── subscription.bats    # lib/subscription.sh on the shared cases in testdata/subscription
+│   ├── substore.bats        # lib/substore.sh on the shared files in testdata/substore
 │   └── xrayconf.bats        # lib/xrayconf.sh
 ├── integration/             # Integration tests
 │   ├── vpn_director.bats    # Tests for vpn-director.sh CLI
@@ -174,6 +175,15 @@ failure — it just cannot say which one.
 and `teardown()` calls `_cleanup_tmp` in its place. If you add a helper that
 sources a module some other way, keep the trap.
 
+## Gotcha: a sourced script can replace a bats helper
+
+A script the bats tests source must not define a function named like a bats
+helper — `fail`, `run`, `load`, `skip`, `assert_*`, `refute_*`: sourcing it
+replaces the helper, and failing assertions lose their diff (bats-assert
+reports through `fail`; `import_server_list.bats` printed `$1: unbound
+variable` instead). `import_server_list.sh` names its own `abort` for that
+reason.
+
 ## Shared subscription cases
 
 `testdata/subscription/` at the repository root holds `<case>.in` (a body as served) and
@@ -185,3 +195,8 @@ and both decoders must pass it. The cases are synthetic — documentation addres
 the formats Xray checks — because the repository is public and a provider's real hosts would be a
 ready blocklist. Entware's jq has no regex builtins; `subscription.bats` fails when
 `lib/subscription.sh` uses one.
+
+`testdata/substore/` holds synthetic subscription files. `router/test/unit/substore.bats` and
+`server/internal/vpnconfig/substore_test.go` both read them and must list them alike — the same
+order, the same names — and both apply the same name rules to the same inputs. Entware's jq has no
+regex builtins; `substore.bats` fails when `lib/substore.sh` uses one.

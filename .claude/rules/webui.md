@@ -7,11 +7,13 @@ paths: "server/internal/webapi/**/*, server/internal/auth/**/*, server/cmd/webui
 HTTPS interface for VPN Director, served by the `webui` daemon. Shares the
 `internal/service` layer with the Telegram bot; both write `vpn-director.json`
 only through `ConfigService.UpdateVPNConfig`, which holds a `flock`.
-`configure.sh` is the third writer of that file and takes the same lock
-(`.vpn-director.json.lock`) around its read-modify-write; it rebuilds the
+`configure.sh` and `import_server_list.sh` write that file too and take the
+same lock (`.vpn-director.json.lock`, through `substore_lock` of
+`lib/substore.sh`) around their read-modify-writes. `configure.sh` rebuilds the
 config from the existing one merged under the template, so the fields the
 daemons own — `jwt_secret`, `exclude_ips`, `paused_clients` — survive a wizard
-run.
+run, and takes `xray.servers` from the subscription files it reads under that
+lock.
 
 ## Architecture
 
@@ -26,7 +28,7 @@ server/internal/
 │   ├── apply.go             # Config write + apply, shared by the mutating handlers
 │   ├── response.go          # jsonOK / jsonError / decodeJSON
 │   ├── errline.go           # Last error line of a shell failure, for the client
-│   └── handler_*.go         # status, servers, clients, excludes, logs, auth, update
+│   └── handler_*.go         # status, servers, subscriptions, clients, excludes, logs, auth, update
 └── auth/
     ├── shadow.go            # /etc/shadow verification, Fingerprint
     └── jwt.go               # HS256 issue and validation
@@ -47,14 +49,19 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET | `/api/ip` | External IP |
 | GET | `/api/version` | Build version and commit |
 | GET | `/api/platform` | `vpn-director.sh platform`: firmware, password file, LAN/WAN interfaces, tunnels; 503 when the script cannot answer |
-| GET | `/api/servers` | Xray server list — name, address, port, IPs and the protocol label (`vless·reality`, `ss`, `hysteria2`), no credentials — plus `active`, the recorded server, and `subscription_saved` |
-| POST | `/api/servers/active`, `/api/servers/import` | Select the active server (`index` plus the `name`, `address` and `port` the page showed there; 409 "server list changed" when the list has another server at that index); import a subscription (`url` empty reuses the saved URL; a body over 1 MiB is refused; the answer carries `count`, `total`, `skipped` by reason, `dns_errors` and the `summary` the page shows) |
+| GET | `/api/servers` | The servers grouped by subscription — `subscriptions`, each with `id`, `name` and its `servers`: name, address, port, IPs and the protocol label (`vless·reality`, `ss`, `hysteria2`), no credentials — plus `active`, the recorded server with its `subscription` |
+| POST | `/api/servers/active` | Select the active server: `subscription`, the `index` within it, and the `name`, `address` and `port` the page showed there; 409 "server list changed" when the subscription is gone or has another server at that index |
+| GET | `/api/subscriptions` | Every subscription: `id`, `name`, `host`, `static`, `servers` (the count), `added`, `refreshed`, `error`. No link |
+| POST | `/api/subscriptions` | Add `{url, name?}`; a saved link is refreshed instead, and renamed when a free name is given. A body over 1 MiB is refused; the answer carries `count`, `total`, `skipped` by reason, `dns_errors` and the `summary` the page shows, plus `id`, `name` and `existed` |
+| POST | `/api/subscriptions/refresh` | `?id=` refreshes one subscription (404 when it is gone, 400 for a static list), no id every one with a link, in parallel; `results`, one per subscription, each with its `summary` and the counts or its `error` |
+| POST | `/api/subscriptions/rename` | `?id=` and `{name}`; 400 for a name the rules refuse or another subscription has |
+| DELETE | `/api/subscriptions` | `?id=`; `active_removed` says the running server came from it |
 | GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config |
 | POST | `/api/clients/pause`, `/api/clients/resume` | Pause and resume a client |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |
 | GET/POST/DELETE | `/api/excludes/ips` | Excluded IPs and CIDRs |
 | GET | `/api/logs` | One source (`?source=`) or every source at once |
-| GET | `/api/config` | `vpn-director.json` with `jwt_secret` and `subscription_url` blanked |
+| GET | `/api/config` | `vpn-director.json` with `jwt_secret` blanked — subscription links live in their own files |
 | GET | `/api/update/check` | Latest release; `?force=1` pierces the 30-minute cache |
 | POST | `/api/update` | Starts the unified update, answers 202 |
 | GET | `/api/update/status` | Whether an update is running |
@@ -81,47 +88,76 @@ short of restarting Xray; true with an error means the opposite — `config.json
 was written and only the record was not — so the caller logs and carries on
 rather than sending the user back to redo a switch that worked.
 
-The record holds name, address and port only: `/api/config` hands this file to
-the browser, so the UUID and the REALITY material stay out. It is absent, and
-`active` is `null`, until something selects a server.
+The record holds the name, address and port, and `subscription`, the id of the
+server's subscription: two subscriptions can name a server alike, and only the
+one in the chosen subscription is the running one. A record from before
+subscriptions has no `subscription` and matches no server. No credential goes
+in: `/api/config` hands this file to the browser, so the UUID and the REALITY
+material stay out. It is absent, and `active` is `null`, until something
+selects a server.
 
-`xray.preferred_server`, in the same three fields, is the server the user chose
+`xray.preferred_server`, in the same fields, is the server the user chose
 while the bot's subscription walk has `active_server` on another one (see
 `telegram-bot.md`). A selection is a new choice, so all three Go paths clear it
-and `configure.sh` deletes it.
+and `configure.sh` deletes it; the delete of its subscription clears it too,
+from the daemons and from `import_server_list.sh` alike.
 
 Client and exclusion mutations go through `updateAndApply`: the change is
 written under the config lock and `vpn-director.sh apply` runs immediately
-after, as the bot does. The two server routes are the exception —
+after, as the bot does. The server and subscription routes are the exception.
 `/api/servers/active` regenerates `config.json`, rewrites `xray.servers` under
-the lock and restarts Xray instead of applying, and `/api/servers/import` only
-writes `servers.json` and `xray.servers`, both inside one config-lock update
-(`vpnconfig.PublishServers`), because `SaveServers` takes no lock of its own and
-`Deps.OpMutex` does not reach the bot's `/import` or the subscription watch.
-A re-import from the saved link (empty `url`) goes through `service.PublishImport`,
-which publishes only while `xray.subscription_url` is still the link it downloaded:
-another importer may save a different subscription meanwhile, and the list would
-then sit beside a link that did not produce it. The refusal is a 409 and writes
-nothing; the bot's `/import` without arguments does the same.
-All of them serialize on `Deps.OpMutex`.
+the lock and restarts Xray instead of applying. The subscription routes apply
+nothing: every change to a subscription file happens inside a config-lock
+update, and an add, a refresh and a delete recompute `xray.servers` in it (a
+rename and a recorded error change no address and recompute nothing), through
+`service.AddSubscription`, `RefreshSubscription`, `RefreshAllSubscriptions`,
+`RenameSubscription` and `DeleteSubscription` — the functions the bot's
+`/import` and `/subs` call too — because a subscription file takes no lock of
+its own and `Deps.OpMutex` does not reach the bot or the subscription watch.
+Every reader of the files — both daemons, the watch, `configure.sh` and
+`import_server_list.sh` — skips with a warning a file that is broken or whose
+id is not its name, and ignores a file not named `<id>.json`, a temp or backup
+file among them, so that no reader fails because of one. A refresh publishes
+only while its subscription still
+exists with the link it downloaded (`vpnconfig.ErrSubscriptionGone` otherwise,
+and nothing is written): it may have been deleted meanwhile, or deleted and its
+link added again under another id, and the list would bring it back. A refresh
+whose download failed is a result (200) that says why, and the subscription
+records it in its `error`, unless a refresh that succeeded meanwhile has moved
+its `refreshed`. Every write of a subscription also deletes the `servers.json`
+of earlier releases (`vpnconfig.RemoveLegacyServers`), and the next config
+write of a daemon drops `xray.subscription_url`, whose Go field is gone. All of
+them serialize on `Deps.OpMutex`, and the subscription routes extend the write
+deadline to `importDeadline`: `subscriptionTimeout` (90 s) for the downloads,
+`service.ConfigLockTimeout` (30 s) for the lock the publication then waits for,
+and `deadlineSlack` (60 s) — 180 s.
 
-An import says the servers were saved only when `servers.json` was written. A
-failure after that point carries `vpnconfig.ErrServersSaved` — the write of the
-config beside the list failed (`vpnconfig.PublishServers`), or there is no
-`vpn-director.json` at all and `service.PublishServers` kept the list anyway —
-and every other failure published nothing: the config lock, a config that is
-there but does not load (it names the data directory the list belongs in, so an
-import that named its link refuses too), a refusal, the write of `servers.json`
-itself. A subscription body over 1 MiB is refused before it is
-decoded, as the bot's `/import` and the subscription watch refuse it: cut at the
-cap, base64 decodes to a shorter list, which would be published as the
-subscription.
+An add says the subscription is saved only when its file was written; a
+failure after that point carries `vpnconfig.ErrServersSaved` — the config write
+beside the file failed — and answers "subscription saved, but xray.servers sync
+failed: …". Every other failure saved nothing: the config lock ("config is
+busy; nothing was saved"), a config that is missing or does not load (it names
+the data directory the subscriptions belong in), a refusal, the write of the
+file itself. A refresh in that state reads "<name>: list saved, but
+xray.servers sync failed: <cause>" (`service.SubscriptionResult.ErrorText`; the
+bot says the same), and a delete answers "subscription deleted, but
+xray.servers sync failed: <cause>", with a sentence more when the running
+server came from it. An add checks the limit of ten, and whether another
+subscription has its name, only under the lock, after its download: a refused
+add costs the download. A subscription body over 1 MiB is refused before it is
+decoded, as the bot's `/import` and the subscription watch refuse it: cut at
+the cap, base64 decodes to a shorter list, which would be published as the
+subscription. A download whose deadline ends while its hosts resolve is refused
+too — a `*service.DownloadError`, "download failed: resolving the servers took
+longer than the deadline", 502 for an add — and publishes nothing: the servers
+resolved by then are not the subscription.
 
-`POST /api/servers/active` names the server as well as its index. The bot's
-subscription watch or an import in another tab can refresh the list between the
-page load and the click, and the index then names another server: the route
-answers 409 "server list changed" and switches nothing, and the Servers tab
-reloads the list.
+`POST /api/servers/active` names the subscription and the server as well as
+the index, counted within that subscription. The bot's subscription watch or a
+refresh in another tab can replace a list between the page load and the click,
+and the index then names another server; a subscription deleted meanwhile is
+gone altogether. Either way the route answers 409 "server list changed" and
+switches nothing, and the Servers tab reloads the list.
 
 ## Authentication
 
@@ -141,8 +177,9 @@ reloads the list.
   lockout.
 - `jwt_secret` is generated on first start when empty and written back under
   the config lock. It is never rewritten, which is what lets a login session
-  survive an update. `GET /api/config` blanks `jwt_secret` and `subscription_url`
-  (the latter is a secret: the subscription token sits in the path).
+  survive an update. `GET /api/config` blanks `jwt_secret`. Subscription links,
+  whose paths carry tokens, are never in the config: they live in their own
+  files, and no answer carries one — `GET /api/subscriptions` shows the host.
 - The file paths in `vpn-director.json` — `data_dir`, `webui.cert_file`,
   `webui.key_file` — are read against **the config file's own directory** when
   they are relative (`paths.Resolve`). They cannot be read against the working
@@ -167,7 +204,8 @@ keeps the directory it was started in — `DevPaths` are relative to `server/`, 
 Plain HTTP instead of TLS, `server/testdata/dev/` for config, shadow and logs,
 `devmode.Executor` instead of real shell commands, and an `admin`/`admin`
 shadow file created on first run. `testdata/dev/vpn-director.json` is
-gitignored.
+gitignored, and so is `testdata/dev/data/`, the dev `data_dir`: a subscription
+added in dev mode is written there, link and all.
 
 ## Build with embed
 

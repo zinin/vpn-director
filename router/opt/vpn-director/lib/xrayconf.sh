@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 ###############################################################################
 # lib/xrayconf.sh - Build Xray proxy-out outbound + config.json from a server
-# JSON object (as stored in servers.json), and have Xray test the result.
+# JSON object (as a subscription file stores it), and have Xray test the
+# result.
 # Pure jq transforms; no side effects on source. Used by configure.sh;
 # unit-tested via bats.
 # Mirrors the Go generator in server/internal/service/xray.go — keep both in sync.
