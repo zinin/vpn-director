@@ -251,6 +251,23 @@ release_config_lock() {
     assert_output '["cdn.example","https://cdn.example/s/b"]'
 }
 
+# Go reads a scheme in any case, and the Web UI and the bot save a link as it
+# was written: "Https://" is a link here too, never a file path echoed with
+# its token.
+@test "import_server_list.sh: a link whose scheme has capitals is a link, saved as written" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+
+    run_import "Https://cdn.example/s/secret-token" ""
+
+    assert_success
+    refute_output --partial "secret-token"
+    run bash -c "jq -c '[.name, .url]' '$(subs_dir)'/*.json"
+    assert_output '["cdn.example","Https://cdn.example/s/secret-token"]'
+}
+
 @test "import_server_list.sh: a name given is the subscription's name" {
     load_import_into
     write_config
@@ -342,6 +359,75 @@ release_config_lock() {
     assert_output '["Failed to download the subscription",3]'
 }
 
+# A link the Web UI or the bot saved with capitals in its scheme is refreshed
+# as a link, and why it failed is recorded without it.
+@test "import_server_list.sh: Refresh takes a saved link whose scheme has capitals for a link" {
+    load_import_into
+    write_config
+    mkdir -p "$(subs_dir)"
+    jq -n '{id: "0a1b2c3d", name: "Alpha", url: "Https://cdn.example/s/secret-token",
+            added: "2026-09-24T18:00:00Z", refreshed: "2026-09-24T18:00:00Z", servers: []}' > "$(subs_dir)/0a1b2c3d.json"
+    serve_failing_download
+
+    run_import r 1 q
+
+    refute_output --partial "secret-token"
+    run jq -r '.error' "$(subs_dir)/0a1b2c3d.json"
+    assert_output "Failed to download the subscription"
+}
+
+# A refresh that fails and cannot say why in its file - another writer holds
+# the lock, or the file cannot be written - says so, as the daemons do.
+@test "import_server_list.sh: warns when it cannot record why a refresh failed" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+    run_import "https://cdn.example/s/b" "Alpha"
+    serve_failing_download
+    hold_config_lock
+    export VPD_CONFIG_LOCK_WAIT=1
+
+    run_import r 1 q
+    release_config_lock
+
+    assert_output --partial "Failed to record why the subscription did not refresh: the config is locked by the Web UI or the bot"
+
+    # mktemp fails, and with it the write of the file.
+    mkdir -p "$BATS_TEST_TMPDIR/nomktemp"
+    printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/nomktemp/mktemp"
+    chmod +x "$BATS_TEST_TMPDIR/nomktemp/mktemp"
+    PATH="$BATS_TEST_TMPDIR/nomktemp:$PATH" run_import r 1 q
+
+    assert_output --partial "Failed to record why the subscription did not refresh"
+    refute_output --partial "locked"
+    run bash -c "jq -c '.error' '$(subs_dir)'/*.json"
+    assert_output "null"
+}
+
+# R) refreshes every subscription with a link, one after another, and a
+# static list has nothing to refresh. The loop reads the subscriptions on its
+# stdin: a refresh that read stdin too would end it after the first.
+@test "import_server_list.sh: Refresh all refreshes every subscription with a link" {
+    load_import_into
+    write_config
+    write_list_file
+    serve_list_file
+    run_import "https://cdn.example/s/a" "Alpha"
+    run_import a "https://panel.example/s/b" "Beta" q
+    run_import a "$BATS_TEST_TMPDIR/servers.txt" "Gamma" q
+    write_list_file_named "$BATS_TEST_TMPDIR/servers.txt" 'vless://uuid-d@203.0.113.9:443?type=tcp&security=tls#D'
+
+    run_import R q
+
+    assert_success
+    assert_output --partial "Refreshed Alpha: 1 servers"
+    assert_output --partial "Refreshed Beta: 1 servers"
+    assert_output --partial "Refreshed 2 of 2 subscriptions"
+    run bash -c "jq -c '[.name, [.servers[].name]]' '$(subs_dir)'/*.json | sort"
+    assert_output $'["Alpha",["D"]]\n["Beta",["D"]]\n["Gamma",["A","B","C"]]'
+}
+
 # Deleted while its download runs: the list is not published, and the file
 # is not brought back.
 @test "import_server_list.sh: a subscription deleted while it downloads stays deleted" {
@@ -392,6 +478,23 @@ release_config_lock() {
     assert_output ""
     run jq -c '[(.xray | has("preferred_server")), .xray.active_server.name, .xray.servers]' "$VPD_CONFIG"
     assert_output '[false,"A",[]]'
+}
+
+# A link pasted where the menu wants a choice or a number, and a link of
+# another scheme - a single share link - where it wants a subscription: none
+# is echoed, the host at most. A link carries a token or a key.
+@test "import_server_list.sh: never echoes an answer that holds a link" {
+    load_import_into
+    write_config
+    write_list_file
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+
+    run_import "https://cdn.example/s/secret-token" d "https://cdn.example/s/secret-token" \
+        a "vless://secret-token@203.0.113.5:443?type=tcp#X" q
+
+    assert_success
+    refute_output --partial "secret-token"
+    assert_output --partial "Unsupported link to 203.0.113.5"
 }
 
 # The Web UI, the bot and configure.sh write under one lock, and so does the

@@ -58,9 +58,9 @@ read_input() {
     read -r INPUT_RESULT || INPUT_RESULT=""
 }
 
-# fail <message> - logs <message> as an error, leaves it in $FAIL_REASON_FILE
+# abort <message> - logs <message> as an error, leaves it in $FAIL_REASON_FILE
 # for a refresh to record, and ends the action it runs in.
-fail() {
+abort() {
     log -l ERROR "$1"
     if [[ -n ${FAIL_REASON_FILE:-} ]]; then
         printf '%s' "$1" > "$FAIL_REASON_FILE"
@@ -69,7 +69,7 @@ fail() {
 }
 
 # run_action <function> [args] - runs one action in a subshell with errexit
-# on: its fail or exit ends the action and not the menu. ACTION_RC is its
+# on: its abort or exit ends the action and not the menu. ACTION_RC is its
 # status. Never call it on the left of || or &&: bash turns errexit off inside.
 run_action() {
     set +e
@@ -96,10 +96,20 @@ JQ_HOST='def host:
     | if . == "" then . else split("@") | last end
     | if startswith("[") then .[1:] | upto("]") else upto(":") end;'
 
-# link_host <link> - the host of <link>, the default name of a subscription
-# added from it.
+# link_host <link> - the host of <link> without control characters: the
+# default name of a subscription added from it, and all a message shows of it.
 link_host() {
-    jq -Rr "$JQ_HOST"' host' <<< "$1"
+    jq -Rr "$JQ_PRINTABLE$JQ_HOST"' host | printable' <<< "$1"
+}
+
+# link_scheme <input> - "https" or "http" when <input> is a link of that
+# scheme, in any case: Go's url.Parse reads "Https://" as https, and the Web
+# UI and the bot save a link as it was written. Nothing for anything else.
+link_scheme() {
+    case $1 in
+        [Hh][Tt][Tt][Pp][Ss]://*) printf 'https\n' ;;
+        [Hh][Tt][Tt][Pp]://*) printf 'http\n' ;;
+    esac
 }
 
 ###############################################################################
@@ -145,36 +155,43 @@ fetch_subscription() {
     SUB_INPUT=$1
 
     if [[ -z "$SUB_INPUT" ]]; then
-        fail "No input provided"
+        abort "No input provided"
     fi
 
     # The largest subscription taken, in bytes: 1 MiB, the cap of the daemons'
     # download (service.MaxSubscriptionBody). A larger one is refused, never
     # cut short: cut, a base64 list decodes to a shorter one.
     local -r max_bytes=1048576
-    local content rc=0
-    case "$SUB_INPUT" in
-        http://*|https://*)
+    local content rc=0 host
+    case $(link_scheme "$SUB_INPUT") in
+        http|https)
             log "Downloading from URL..."
             content=$(curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize "$max_bytes" "$SUB_INPUT") || rc=$?
             if (( rc == 63 )); then
                 # curl's "maximum file size exceeded"
-                fail "Subscription exceeds 1 MiB; nothing was imported"
+                abort "Subscription exceeds 1 MiB; nothing was imported"
             elif (( rc != 0 )); then
-                fail "Failed to download the subscription"
+                abort "Failed to download the subscription"
             fi
             # curl before 8.4.0 does not stop a transfer whose size it did not
             # know in advance.
             if (( $(printf '%s' "$content" | wc -c) > max_bytes )); then
-                fail "Subscription exceeds 1 MiB; nothing was imported"
+                abort "Subscription exceeds 1 MiB; nothing was imported"
             fi
             ;;
         *)
             if [[ ! -f "$SUB_INPUT" ]]; then
-                fail "File not found: $SUB_INPUT"
+                if [[ $SUB_INPUT == *://* ]]; then
+                    # A link of another scheme - a share link pasted in place
+                    # of its subscription, say - shows its host alone: the
+                    # rest of it can be a token or a key.
+                    host=$(link_host "$SUB_INPUT")
+                    abort "Unsupported link${host:+ to $host}: only http and https links are downloaded"
+                fi
+                abort "File not found: $SUB_INPUT"
             fi
             if (( $(wc -c < "$SUB_INPUT") > max_bytes )); then
-                fail "Subscription exceeds 1 MiB; nothing was imported"
+                abort "Subscription exceeds 1 MiB; nothing was imported"
             fi
             content=$(cat "$SUB_INPUT")
             ;;
@@ -183,7 +200,7 @@ fetch_subscription() {
     local err
     err=$(tmp_file)
     if ! SUB_RESULT=$(printf '%s' "$content" | subscription_decode 2>"$err"); then
-        fail "Cannot read the subscription: $(cat "$err")"
+        abort "Cannot read the subscription: $(cat "$err")"
     fi
 
     local skipped line
@@ -196,7 +213,7 @@ fetch_subscription() {
     fi
 
     if [[ $(printf '%s' "$SUB_RESULT" | jq '.servers | length') -eq 0 ]]; then
-        fail "No supported servers in subscription"
+        abort "No supported servers in subscription"
     fi
 }
 
@@ -251,7 +268,7 @@ step_parse_servers() {
     fi
 
     if [[ "$SERVER_COUNT" -eq 0 ]]; then
-        fail "No servers could be resolved"
+        abort "No servers could be resolved"
     fi
 }
 
@@ -270,11 +287,11 @@ now() {
 store_and_sync() {
     if ! substore_write "$SUB_DIR" "$1"; then
         substore_unlock
-        fail "Failed to write the subscription; nothing was saved"
+        abort "Failed to write the subscription; nothing was saved"
     fi
     if ! substore_sync_config "$VPD_CONFIG" "$(substore_list "$SUB_DIR")"; then
         substore_unlock
-        fail "The subscription is saved, but $VPD_CONFIG was not updated"
+        abort "The subscription is saved, but $VPD_CONFIG was not updated"
     fi
     rm -f "$DATA_DIR/servers.json"
     substore_unlock
@@ -286,10 +303,10 @@ store_and_sync() {
 # list, always a new one. <base> names a new subscription when <name> is empty.
 publish_add() {
     local input=$1 name=$2 base=$3 url="" subs id sub stamp
-    [[ $input == https://* ]] && url=$input
+    [[ $(link_scheme "$input") == https ]] && url=$input
     stamp=$(now)
     if ! substore_lock "$VPD_CONFIG"; then
-        fail "Config is locked by the Web UI or the bot; nothing was imported. Run the import again"
+        abort "Config is locked by the Web UI or the bot; nothing was imported. Run the import again"
     fi
     subs=$(substore_list "$SUB_DIR")
     id=""
@@ -301,7 +318,7 @@ publish_add() {
         if [[ -n $name && $name != "$(jq -r '.name' <<< "$sub")" ]]; then
             if substore_name_taken "$subs" "$name" "$id"; then
                 substore_unlock
-                fail "Another subscription is named $name; nothing was imported"
+                abort "Another subscription is named $name; nothing was imported"
             fi
             sub=$(jq -c --arg n "$name" '.name = $n' <<< "$sub")
         fi
@@ -309,13 +326,13 @@ publish_add() {
     else
         if (( $(jq length <<< "$subs") >= SUBSTORE_MAX )); then
             substore_unlock
-            fail "There are $SUBSTORE_MAX subscriptions already; delete one first"
+            abort "There are $SUBSTORE_MAX subscriptions already; delete one first"
         fi
         if [[ -z $name ]]; then
             name=$(substore_default_name "$subs" "$base")
         elif substore_name_taken "$subs" "$name"; then
             substore_unlock
-            fail "Another subscription is named $name; nothing was imported"
+            abort "Another subscription is named $name; nothing was imported"
         fi
         id=$(substore_new_id "$SUB_DIR")
         # The fields in the order the daemons write them, the list last.
@@ -334,12 +351,12 @@ publish_add() {
 publish_refresh() {
     local id=$1 url=$2 name=$3 sub
     if ! substore_lock "$VPD_CONFIG"; then
-        fail "Config is locked by the Web UI or the bot; $name was not refreshed"
+        abort "Config is locked by the Web UI or the bot; $name was not refreshed"
     fi
     sub=$(jq -c --arg id "$id" --arg u "$url" 'first(.[] | select(.id == $id and .url == $u)) // empty' <<< "$(substore_list "$SUB_DIR")")
     if [[ -z $sub ]]; then
         substore_unlock
-        fail "$name was deleted or changed while it downloaded; nothing was written"
+        abort "$name was deleted or changed while it downloaded; nothing was written"
     fi
     store_and_sync "$(jq -c --slurpfile servers "$SERVERS_TMP" --arg now "$(now)" \
         '.refreshed = $now | del(.error) | .servers = $servers[0]' <<< "$sub")"
@@ -348,14 +365,19 @@ publish_refresh() {
 
 # record_refresh_error <id> <link> <refreshed> <reason> - notes why a refresh
 # failed; the list stays. Nothing is written when the subscription is gone,
-# has another link, or was refreshed since <refreshed> by someone else.
+# has another link, or was refreshed since <refreshed> by someone else. A lock
+# or a write that fails is a WARN, as it is to the daemons: the file then
+# still reads as refreshed.
 record_refresh_error() {
     local id=$1 url=$2 seen=$3 reason=$4 sub
-    substore_lock "$VPD_CONFIG" || return 0
+    if ! substore_lock "$VPD_CONFIG"; then
+        log -l WARN "Failed to record why the subscription did not refresh: the config is locked by the Web UI or the bot"
+        return 0
+    fi
     sub=$(jq -c --arg id "$id" --arg u "$url" --arg seen "$seen" \
         'first(.[] | select(.id == $id and .url == $u and (.refreshed // "") == $seen)) // empty' <<< "$(substore_list "$SUB_DIR")")
-    if [[ -n $sub ]]; then
-        substore_write "$SUB_DIR" "$(jq -c --arg r "$reason" '.error = $r' <<< "$sub")" || true
+    if [[ -n $sub ]] && ! substore_write "$SUB_DIR" "$(jq -c --arg r "$reason" '.error = $r' <<< "$sub")"; then
+        log -l WARN "Failed to record why the subscription did not refresh"
     fi
     substore_unlock
 }
@@ -377,18 +399,19 @@ show_subscriptions() {
 }
 
 # pick_subscription <subs_json> <prompt> - asks for a number of the list and
-# prints the id at it; fails for an answer that is no number of it. 10# reads
+# prints the id at it; fails for an answer that is no number of it, and does
+# not repeat that answer: a link pasted there carries its token. 10# reads
 # "08" as eight, where bash would take it for octal.
 pick_subscription() {
     local count
     count=$(jq length <<< "$1")
-    (( count > 0 )) || fail "There is no subscription yet"
+    (( count > 0 )) || abort "There is no subscription yet"
     read_input "$2 [1-$count]"
     if [[ $INPUT_RESULT =~ ^[0-9]+$ ]] && (( 10#$INPUT_RESULT >= 1 && 10#$INPUT_RESULT <= count )); then
         jq -r ".[$((10#$INPUT_RESULT - 1))].id" <<< "$1"
         return 0
     fi
-    fail "There is no subscription number $INPUT_RESULT"
+    abort "There is no subscription with that number"
 }
 
 # menu_add - asks for a link or a file and a name, downloads and resolves the
@@ -396,13 +419,13 @@ pick_subscription() {
 menu_add() {
     local base name=""
     step_get_subscription
-    case $SUB_INPUT in
-        http://*|https://*) base=$(link_host "$SUB_INPUT") ;;
+    case $(link_scheme "$SUB_INPUT") in
+        http|https) base=$(link_host "$SUB_INPUT") ;;
         *) base=${SUB_INPUT##*/}; base=${base%.*} ;;
     esac
     read_input "Name (Enter for $base)"
     if [[ -n $INPUT_RESULT ]]; then
-        name=$(substore_clean_name "$INPUT_RESULT") || fail "The name was refused; nothing was imported"
+        name=$(substore_clean_name "$INPUT_RESULT") || abort "The name was refused; nothing was imported"
     fi
     step_parse_servers
     publish_add "$SUB_INPUT" "$name" "$base"
@@ -445,7 +468,7 @@ linked_subscriptions() {
 menu_refresh() {
     local linked id
     linked=$(linked_subscriptions "$1")
-    [[ $(jq length <<< "$linked") -gt 0 ]] || fail "No subscription has a link to refresh"
+    [[ $(jq length <<< "$linked") -gt 0 ]] || abort "No subscription has a link to refresh"
     show_subscriptions "$linked"
     id=$(pick_subscription "$linked" "Refresh subscription")
     refresh_one "$(jq -c --arg id "$id" 'first(.[] | select(.id == $id))' <<< "$linked")"
@@ -467,17 +490,17 @@ menu_rename() {
     local subs=$1 id sub name
     id=$(pick_subscription "$subs" "Rename subscription")
     read_input "New name"
-    name=$(substore_clean_name "$INPUT_RESULT") || fail "The name was refused; nothing was renamed"
-    substore_lock "$VPD_CONFIG" || fail "Config is locked by the Web UI or the bot; nothing was renamed"
+    name=$(substore_clean_name "$INPUT_RESULT") || abort "The name was refused; nothing was renamed"
+    substore_lock "$VPD_CONFIG" || abort "Config is locked by the Web UI or the bot; nothing was renamed"
     subs=$(substore_list "$SUB_DIR")
     sub=$(jq -c --arg id "$id" 'first(.[] | select(.id == $id)) // empty' <<< "$subs")
     if [[ -z $sub ]]; then
         substore_unlock
-        fail "That subscription is gone"
+        abort "That subscription is gone"
     fi
     if substore_name_taken "$subs" "$name" "$id"; then
         substore_unlock
-        fail "Another subscription is named $name"
+        abort "Another subscription is named $name"
     fi
     store_and_sync "$(jq -c --arg n "$name" '.name = $n' <<< "$sub")"
     log "Renamed to $name"
@@ -492,12 +515,12 @@ menu_delete() {
         log "Nothing was deleted"
         return 0
     fi
-    substore_lock "$VPD_CONFIG" || fail "Config is locked by the Web UI or the bot; nothing was deleted"
+    substore_lock "$VPD_CONFIG" || abort "Config is locked by the Web UI or the bot; nothing was deleted"
     substore_delete "$SUB_DIR" "$id"
     if ! substore_sync_config "$VPD_CONFIG" "$(substore_list "$SUB_DIR")" \
         "if (.xray.preferred_server.subscription // \"\") == \"$id\" then del(.xray.preferred_server) else . end"; then
         substore_unlock
-        fail "$name is deleted, but $VPD_CONFIG was not updated"
+        abort "$name is deleted, but $VPD_CONFIG was not updated"
     fi
     rm -f "$DATA_DIR/servers.json"
     if [[ -f $VPD_CONFIG ]]; then
@@ -524,7 +547,8 @@ menu() {
             n) run_action menu_rename "$subs" ;;
             d) run_action menu_delete "$subs" ;;
             q|Q|"") return 0 ;;
-            *) printf 'Unknown choice: %s\n' "$INPUT_RESULT" ;;
+            # Not repeated: a link pasted here carries its token.
+            *) printf 'Unknown choice; answer a, r, R, n, d or q\n' ;;
         esac
     done
 }
