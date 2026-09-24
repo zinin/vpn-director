@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -265,70 +264,6 @@ func TestHandleSelectServer_InvalidJSON(t *testing.T) {
 	}
 }
 
-func TestSyncXrayServers_SaveError(t *testing.T) {
-	mc := &mockConfig{
-		cfg:           &vpnconfig.VPNDirectorConfig{},
-		saveVPNCfgErr: errors.New("disk full"),
-	}
-
-	err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
-
-	if err == nil {
-		t.Fatal("expected error when saving config fails, got nil")
-	}
-}
-
-func TestSyncXrayServers_LoadError(t *testing.T) {
-	mc := &mockConfig{err: errors.New("load failed")}
-
-	err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
-
-	if err == nil {
-		t.Fatal("expected error when LoadVPNConfig fails, got nil")
-	}
-}
-
-func TestSyncXrayServers_Success(t *testing.T) {
-	mc := &mockConfig{
-		cfg: &vpnconfig.VPNDirectorConfig{
-			Xray: vpnconfig.XrayConfig{Servers: []string{"stale-ip"}},
-		},
-	}
-
-	err := service.PublishServers(mc, []vpnconfig.Server{
-		{IPs: []string{"2.2.2.2"}},
-		{IPs: []string{"1.1.1.1"}},
-	}, "")
-
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if mc.savedCfg == nil {
-		t.Fatal("expected config to be saved")
-	}
-	if joined := strings.Join(mc.savedCfg.Xray.Servers, ","); joined != "1.1.1.1,2.2.2.2" {
-		t.Errorf("Xray.Servers = %q, want sorted all IPs 1.1.1.1,2.2.2.2", joined)
-	}
-}
-
-func TestSyncXrayServers_MissingConfigIsSurfaced(t *testing.T) {
-	// An absent vpn-director.json used to be skipped silently. UpdateVPNConfig
-	// reports it as service.ErrConfigLoad, and the import handler turns that
-	// into "servers saved, but xray.servers sync failed": a stale xray.servers
-	// leaves the proxy's own endpoints out of the TPROXY bypass set, which the
-	// caller must learn about rather than read as success.
-	mc := &mockConfig{cfg: nil}
-
-	err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "")
-
-	if !errors.Is(err, service.ErrConfigLoad) {
-		t.Fatalf("expected a service.ErrConfigLoad failure when config is absent, got %v", err)
-	}
-	if mc.savedCfg != nil {
-		t.Error("expected no save when config is absent")
-	}
-}
-
 // The selection is recorded nowhere else. config.json holds only the outbound,
 // and a subscription puts many names behind one address:port - on the router
 // this was written for, eight names share the running endpoint - so the choice
@@ -460,22 +395,6 @@ func TestHandleListServers_ActiveIsNullWhenNothingIsRecorded(t *testing.T) {
 	}
 	if got, ok := resp["active"]; !ok || string(got) != "null" {
 		t.Errorf("active = %s (present: %v), want null", got, ok)
-	}
-}
-
-func TestSyncXrayServers_WritesSubscriptionURL(t *testing.T) {
-	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
-	if err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, "https://cdn.example/s/token"); err != nil {
-		t.Fatal(err)
-	}
-	if mc.savedCfg.Xray.SubscriptionURL != "https://cdn.example/s/token" {
-		t.Fatalf("got %q", mc.savedCfg.Xray.SubscriptionURL)
-	}
-	if err := service.PublishServers(mc, []vpnconfig.Server{{IPs: []string{"1.1.1.1"}}}, ""); err != nil {
-		t.Fatal(err)
-	}
-	if mc.savedCfg.Xray.SubscriptionURL != "https://cdn.example/s/token" {
-		t.Fatal("empty url must not clear the saved link")
 	}
 }
 

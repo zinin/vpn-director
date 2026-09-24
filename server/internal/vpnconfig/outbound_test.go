@@ -80,7 +80,7 @@ func TestServerLabel(t *testing.T) {
 }
 
 // A record an import writes now carries no UUID of its own; the empty field
-// must not appear in servers.json.
+// must not appear in its subscription's file.
 func TestServer_NoEmptyUUIDInTheFile(t *testing.T) {
 	out, err := json.Marshal(Server{Name: "Oslo", Address: "oslo.example", Port: 443, Outbound: json.RawMessage(`{"protocol":"trojan"}`)})
 	if err != nil {

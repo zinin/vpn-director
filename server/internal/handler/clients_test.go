@@ -72,7 +72,6 @@ func (m *mockConfigClients) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig
 }
 
 func (m *mockConfigClients) LoadServers() ([]vpnconfig.Server, error) { return nil, nil }
-func (m *mockConfigClients) SaveServers(s []vpnconfig.Server) error   { return nil }
 func (m *mockConfigClients) DataDir() (string, error)                 { return "/data", nil }
 func (m *mockConfigClients) DataDirOrDefault() string                 { return "/data" }
 func (m *mockConfigClients) ScriptsDir() string                       { return "/scripts" }

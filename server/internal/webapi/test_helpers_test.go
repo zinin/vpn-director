@@ -66,7 +66,6 @@ type mockConfig struct {
 	err           error
 	saveVPNCfgErr error                        // independent error for the save step of UpdateVPNConfig
 	savedCfg      *vpnconfig.VPNDirectorConfig // captured by UpdateVPNConfig
-	savedServers  []vpnconfig.Server           // captured by SaveServers
 	updateErr     error                        // returned by UpdateVPNConfig before fn runs, e.g. service.ErrConfigLockTimeout
 	// subs are the subscription files. UpdateVPNConfig serializes on upd as
 	// the flock does, and subsMu guards subs: RefreshAll runs one refresh per
@@ -81,10 +80,6 @@ func (m *mockConfig) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) {
 	return m.cfg, m.err
 }
 func (m *mockConfig) LoadServers() ([]vpnconfig.Server, error) { return m.servers, m.err }
-func (m *mockConfig) SaveServers(servers []vpnconfig.Server) error {
-	m.savedServers = servers
-	return m.err
-}
 
 func (m *mockConfig) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
 	m.subsMu.Lock()

@@ -37,7 +37,6 @@ var ErrConfigLockTimeout = errors.New("config lock timeout")
 type ConfigStore interface {
 	LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error)
 	LoadServers() ([]vpnconfig.Server, error)
-	SaveServers([]vpnconfig.Server) error
 	// LoadSubscriptions reads every subscription file, ordered by when it was
 	// added; LoadServers is their servers, flattened in that order.
 	LoadSubscriptions() ([]vpnconfig.Subscription, error)

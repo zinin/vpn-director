@@ -220,13 +220,3 @@ func (s *ConfigService) LoadServers() ([]vpnconfig.Server, error) {
 	}
 	return vpnconfig.AllServers(subs), nil
 }
-
-// SaveServers saves the servers list (creates directory if needed)
-// Uses DataDirOrDefault() to allow saving even without vpn-director.json
-func (s *ConfigService) SaveServers(servers []vpnconfig.Server) error {
-	dataDir := s.DataDirOrDefault()
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		return err
-	}
-	return vpnconfig.SaveServers(filepath.Join(dataDir, "servers.json"), servers)
-}

@@ -43,9 +43,9 @@ func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnc
 
 // GenerateAndRecordWalkedServer is the subscription walk's switch: config.json
 // from generate (the walk has replaced Address with a resolved IPv4), identity
-// recorded as active_server so the Web UI badge still matches servers.json, and
-// the user's own choice kept beside it while the walk is away from it
-// (vpnconfig.RecordWalkedServer).
+// recorded as active_server so the Web UI badge still matches its
+// subscription's list, and the user's own choice kept beside it while the walk
+// is away from it (vpnconfig.RecordWalkedServer).
 //
 // A non-nil guard runs first, under the same lock, on the config that lock
 // protects; its error writes nothing and comes back as is. The watch passes one

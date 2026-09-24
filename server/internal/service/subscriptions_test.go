@@ -42,7 +42,6 @@ func (m *memConfigStore) LoadServers() ([]vpnconfig.Server, error) {
 	subs, _ := m.LoadSubscriptions()
 	return vpnconfig.AllServers(subs), nil
 }
-func (m *memConfigStore) SaveServers([]vpnconfig.Server) error { return errors.New("no servers.json") }
 func (m *memConfigStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	m.upd.Lock()
 	defer m.upd.Unlock()

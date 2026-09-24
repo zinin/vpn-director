@@ -434,16 +434,13 @@ func TestEnsureFailoverStaged_PutsSnapshotOnXrayAndTunnel(t *testing.T) {
 	}
 }
 
-func TestXrayConfig_OmitsSubscriptionURLAndFailoverWhenEmpty(t *testing.T) {
+func TestXrayConfig_OmitsFailoverWhenEmpty(t *testing.T) {
 	out, err := json.Marshal(VPNDirectorConfig{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := string(out)
-	for _, k := range []string{"subscription_url", "failover"} {
-		if strings.Contains(s, k) {
-			t.Errorf("marshalled %s, want no %q", s, k)
-		}
+	if s := string(out); strings.Contains(s, "failover") {
+		t.Errorf("marshalled %s, want no %q", s, "failover")
 	}
 }
 

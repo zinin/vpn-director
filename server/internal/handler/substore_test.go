@@ -37,7 +37,6 @@ func (m *subsStore) LoadServers() ([]vpnconfig.Server, error) {
 	subs, _ := m.LoadSubscriptions()
 	return vpnconfig.AllServers(subs), nil
 }
-func (m *subsStore) SaveServers([]vpnconfig.Server) error { return nil }
 func (m *subsStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	m.upd.Lock()
 	defer m.upd.Unlock()

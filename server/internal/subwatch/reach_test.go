@@ -45,9 +45,9 @@ func controlUp(ip string) bool {
 	return ip == "1.1.1.1" || ip == "8.8.8.8"
 }
 
-// reachWatch is f's watch with servers as servers.json and a TCP check that
-// finds the addresses up names reachable, and the control addresses too unless
-// up names them.
+// reachWatch is f's watch with servers as its subscription's list and a TCP
+// check that finds the addresses up names reachable, and the control addresses
+// too unless up names them.
 func reachWatch(f *fake, servers []vpnconfig.Server, up map[string]bool) *Watch {
 	w := f.watch()
 	w.LoadSubscriptions = subsOf(servers)
@@ -163,7 +163,7 @@ func TestTick_NoReachAnswerKeepsThreeMinutes(t *testing.T) {
 		name  string
 		setup func(w *Watch)
 	}{
-		{"server not in servers.json", func(w *Watch) {
+		{"server not in the subscription files", func(w *Watch) {
 			w.LoadSubscriptions = subsOf([]vpnconfig.Server{{Name: "Paris", Address: "paris.example", Port: 443, IPs: []string{"203.0.113.30"}}})
 		}},
 		{"hostname nothing resolved", func(w *Watch) {

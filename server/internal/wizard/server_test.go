@@ -84,10 +84,6 @@ func (m *mockConfigStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) 
 	return m.vpnConfig, m.err
 }
 
-func (m *mockConfigStore) SaveServers([]vpnconfig.Server) error {
-	return m.err
-}
-
 func (m *mockConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
 	return m.subs, m.err
 }

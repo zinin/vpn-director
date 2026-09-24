@@ -7,10 +7,10 @@ import (
 	"sort"
 )
 
-// Server is one entry of servers.json. An import writes Name, Address, Port,
-// IPs and Outbound, the Xray outbound the server runs on. The flat VLESS fields
-// below are what imports wrote before Outbound existed: a record that has no
-// Outbound is still read, and generated from them.
+// Server is one entry of a subscription file's servers. An import writes Name,
+// Address, Port, IPs and Outbound, the Xray outbound the server runs on. The
+// flat VLESS fields below are what imports wrote before Outbound existed: a
+// record that has no Outbound is still read, and generated from them.
 type Server struct {
 	Address     string          `json:"address"`
 	Port        int             `json:"port"`
@@ -84,13 +84,12 @@ type TunnelDirectorConfig struct {
 }
 
 type XrayConfig struct {
-	Clients         []string      `json:"clients"`
-	Servers         []string      `json:"servers"`
-	ExcludeIPs      []string      `json:"exclude_ips"`
-	ExcludeSets     []string      `json:"exclude_sets"`
-	ActiveServer    *ActiveServer `json:"active_server,omitempty"`
-	SubscriptionURL string        `json:"subscription_url,omitempty"`
-	Failover        *XrayFailover `json:"failover,omitempty"`
+	Clients      []string      `json:"clients"`
+	Servers      []string      `json:"servers"`
+	ExcludeIPs   []string      `json:"exclude_ips"`
+	ExcludeSets  []string      `json:"exclude_sets"`
+	ActiveServer *ActiveServer `json:"active_server,omitempty"`
+	Failover     *XrayFailover `json:"failover,omitempty"`
 	// PreferredServer is the server the user chose while the subscription walk
 	// has active_server on another one, and absent otherwise (RecordWalkedServer).
 	PreferredServer *ActiveServer `json:"preferred_server,omitempty"`
@@ -299,23 +298,6 @@ func CollectClients(cfg *VPNDirectorConfig) []ClientInfo {
 	}
 
 	return clients
-}
-
-func LoadServers(path string) ([]Server, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var servers []Server
-	return servers, json.Unmarshal(data, &servers)
-}
-
-func SaveServers(path string, servers []Server) error {
-	data, err := json.MarshalIndent(servers, "", "  ")
-	if err != nil {
-		return err
-	}
-	return writeFileAtomic(path, append(data, '\n'))
 }
 
 func LoadVPNDirectorConfig(path string) (*VPNDirectorConfig, error) {

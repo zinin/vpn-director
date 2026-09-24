@@ -936,8 +936,9 @@ func TestTick_StopDuringTheRetargetPlatformLookupKeepsTheExit(t *testing.T) {
 }
 
 // The subscription download blocks for as long as the host takes, and what
-// follows it writes servers.json and xray.servers. A /stop finishing meanwhile
-// ends the wave, and the wave that never happened does not spend its window.
+// follows it writes the subscription files and xray.servers. A /stop
+// finishing meanwhile ends the wave, and the wave that never happened does not
+// spend its window.
 func TestTick_StopDuringTheSubscriptionFetchWritesNothing(t *testing.T) {
 	f := &fake{cfg: failedOverCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	stopped := false
@@ -3499,8 +3500,8 @@ func TestTick_ImportSyncsXrayServers(t *testing.T) {
 }
 
 // The Web UI, /import and this wave all publish a list and the bypass IPs read
-// against it. Writing servers.json outside the config lock lets two waves
-// interleave into one file from each.
+// against it. Writing a subscription file outside the config lock lets two
+// waves interleave into one file from each.
 func TestTick_ImportPublishesServersUnderTheConfigLock(t *testing.T) {
 	f := &fake{
 		cfg:      failedOverCfg(),
@@ -3527,7 +3528,7 @@ func TestTick_ImportPublishesServersUnderTheConfigLock(t *testing.T) {
 	w.Tick(context.Background())
 
 	if !savedUnderLock {
-		t.Fatal("servers.json must be written inside the config update the watch takes the lock with")
+		t.Fatal("the subscription file must be written inside the config update the watch takes the lock with")
 	}
 }
 

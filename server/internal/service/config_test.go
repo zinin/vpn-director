@@ -86,26 +86,6 @@ func TestConfigService_DataDir_Error(t *testing.T) {
 	}
 }
 
-func TestConfigService_SaveServers_CreatesDir(t *testing.T) {
-	tmpDir := t.TempDir()
-
-	// Create config with data_dir pointing to non-existent directory
-	dataDir := filepath.Join(tmpDir, "newdata")
-	configPath := filepath.Join(tmpDir, "vpn-director.json")
-	os.WriteFile(configPath, []byte(`{"data_dir": "`+dataDir+`"}`), 0644)
-
-	svc := NewConfigService(tmpDir, filepath.Join(tmpDir, "data"))
-	err := svc.SaveServers(nil)
-	if err != nil {
-		t.Fatalf("SaveServers() error: %v", err)
-	}
-
-	// Directory should exist now
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		t.Error("SaveServers should create data directory")
-	}
-}
-
 func writeTestConfig(t *testing.T, dir, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, "vpn-director.json"), []byte(content), 0644); err != nil {

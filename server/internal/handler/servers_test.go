@@ -9,43 +9,6 @@ import (
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
-// mockSenderWithKeyboard tracks keyboard sent
-type mockSenderWithKeyboard struct {
-	lastChatID   int64
-	lastText     string
-	lastKeyboard tgbotapi.InlineKeyboardMarkup
-	lastMsgID    int
-	lastAckID    string
-}
-
-func (m *mockSenderWithKeyboard) Send(chatID int64, text string) error {
-	m.lastChatID = chatID
-	m.lastText = text
-	return nil
-}
-func (m *mockSenderWithKeyboard) SendPlain(chatID int64, text string) error     { return nil }
-func (m *mockSenderWithKeyboard) SendLongPlain(chatID int64, text string) error { return nil }
-func (m *mockSenderWithKeyboard) SendWithKeyboard(chatID int64, text string, kb tgbotapi.InlineKeyboardMarkup) error {
-	m.lastChatID = chatID
-	m.lastText = text
-	m.lastKeyboard = kb
-	return nil
-}
-func (m *mockSenderWithKeyboard) SendCodeBlock(chatID int64, header, content string) error {
-	return nil
-}
-func (m *mockSenderWithKeyboard) EditMessage(chatID int64, msgID int, text string, kb tgbotapi.InlineKeyboardMarkup) error {
-	m.lastChatID = chatID
-	m.lastMsgID = msgID
-	m.lastText = text
-	m.lastKeyboard = kb
-	return nil
-}
-func (m *mockSenderWithKeyboard) AckCallback(callbackID string) error {
-	m.lastAckID = callbackID
-	return nil
-}
-
 // Tests for helper functions (migrated from handlers_test.go)
 
 func TestExtractCountry(t *testing.T) {

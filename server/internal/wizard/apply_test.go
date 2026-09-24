@@ -73,10 +73,6 @@ func (m *trackingConfigStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, err
 	return m.vpnConfig, m.loadErr
 }
 
-func (m *trackingConfigStore) SaveServers([]vpnconfig.Server) error {
-	return m.saveErr
-}
-
 func (m *trackingConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
 	return m.subs, m.loadErr
 }

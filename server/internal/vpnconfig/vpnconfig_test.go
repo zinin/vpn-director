@@ -9,106 +9,6 @@ import (
 	"testing"
 )
 
-func TestLoadServers_FileNotFound(t *testing.T) {
-	_, err := LoadServers("/nonexistent/path/to/servers.json")
-	if err == nil {
-		t.Fatal("expected error for non-existent file")
-	}
-	if !os.IsNotExist(err) {
-		t.Errorf("expected os.IsNotExist error, got: %v", err)
-	}
-}
-
-func TestLoadServers_InvalidJSON(t *testing.T) {
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "servers.json")
-
-	err := os.WriteFile(path, []byte("not valid json"), 0644)
-	if err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-
-	_, err = LoadServers(path)
-	if err == nil {
-		t.Fatal("expected error for invalid JSON")
-	}
-}
-
-func TestLoadServers_ValidServers(t *testing.T) {
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "servers.json")
-
-	jsonContent := `[
-		{"address": "server1.com", "port": 443, "uuid": "uuid1", "name": "Server 1", "ips": ["1.2.3.4"]},
-		{"address": "server2.com", "port": 443, "uuid": "uuid2", "name": "Server 2", "ips": ["5.6.7.8"]}
-	]`
-
-	err := os.WriteFile(path, []byte(jsonContent), 0644)
-	if err != nil {
-		t.Fatalf("failed to write test file: %v", err)
-	}
-
-	servers, err := LoadServers(path)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if len(servers) != 2 {
-		t.Fatalf("expected 2 servers, got %d", len(servers))
-	}
-
-	if servers[0].Name != "Server 1" {
-		t.Errorf("expected first server name 'Server 1', got '%s'", servers[0].Name)
-	}
-
-	if len(servers[1].IPs) != 1 || servers[1].IPs[0] != "5.6.7.8" {
-		t.Errorf("expected second server IPs ['5.6.7.8'], got %v", servers[1].IPs)
-	}
-}
-
-func TestSaveServers_RoundTrip(t *testing.T) {
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "servers.json")
-
-	original := []Server{
-		{Address: "server1.com", Port: 443, UUID: "uuid1", Name: "Server 1", IPs: []string{"1.2.3.4"}},
-		{Address: "server2.com", Port: 8443, UUID: "uuid2", Name: "Server 2", IPs: []string{"5.6.7.8"}},
-	}
-
-	err := SaveServers(path, original)
-	if err != nil {
-		t.Fatalf("unexpected error saving: %v", err)
-	}
-
-	loaded, err := LoadServers(path)
-	if err != nil {
-		t.Fatalf("unexpected error loading: %v", err)
-	}
-
-	if !reflect.DeepEqual(original, loaded) {
-		t.Errorf("round-trip failed: original %+v != loaded %+v", original, loaded)
-	}
-}
-
-func TestSaveServers_EmptySlice(t *testing.T) {
-	tmpDir := t.TempDir()
-	path := filepath.Join(tmpDir, "servers.json")
-
-	err := SaveServers(path, []Server{})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	loaded, err := LoadServers(path)
-	if err != nil {
-		t.Fatalf("unexpected error loading: %v", err)
-	}
-
-	if len(loaded) != 0 {
-		t.Errorf("expected empty slice, got %d servers", len(loaded))
-	}
-}
-
 func TestLoadVPNDirectorConfig_FileNotFound(t *testing.T) {
 	_, err := LoadVPNDirectorConfig("/nonexistent/path/to/config.json")
 	if err == nil {
@@ -557,15 +457,14 @@ func TestSaveVPNDirectorConfig_AtomicAndPrivate(t *testing.T) {
 	assertNoTempFiles(t, dir)
 }
 
-func TestSaveServers_AtomicAndPrivate(t *testing.T) {
+func TestSaveSubscription_AtomicAndPrivate(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "servers.json")
 
-	if err := SaveServers(path, []Server{{Address: "a", Port: 443, UUID: "u"}}); err != nil {
+	if err := SaveSubscription(dir, Subscription{ID: "0a1b2c3d", Name: "Alpha"}); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
-	info, err := os.Stat(path)
+	info, err := os.Stat(filepath.Join(dir, "0a1b2c3d.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -666,11 +565,10 @@ func TestXrayConfig_OmitsTheActiveServerUntilOneIsSelected(t *testing.T) {
 	}
 }
 
-func TestXrayConfig_PersistsSubscriptionURLAndFailover(t *testing.T) {
+func TestXrayConfig_PersistsFailover(t *testing.T) {
 	cfg := VPNDirectorConfig{
 		Xray: XrayConfig{
-			SubscriptionURL: "https://cdn.example/s/token",
-			Failover:        &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}},
+			Failover: &XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8"}},
 		},
 	}
 	out, err := json.Marshal(cfg)
@@ -678,18 +576,12 @@ func TestXrayConfig_PersistsSubscriptionURLAndFailover(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := string(out)
-	if !strings.Contains(s, `"subscription_url":"https://cdn.example/s/token"`) {
-		t.Errorf("missing subscription_url: %s", s)
-	}
 	if !strings.Contains(s, `"failover"`) || !strings.Contains(s, `"ovpnc2"`) {
 		t.Errorf("missing failover: %s", s)
 	}
 	var got VPNDirectorConfig
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatal(err)
-	}
-	if got.Xray.SubscriptionURL != cfg.Xray.SubscriptionURL {
-		t.Errorf("url %q", got.Xray.SubscriptionURL)
 	}
 	if got.Xray.Failover == nil || got.Xray.Failover.Tunnel != "ovpnc2" {
 		t.Errorf("failover %+v", got.Xray.Failover)
@@ -850,5 +742,34 @@ func TestNewActiveServer_RecordsTheSubscription(t *testing.T) {
 	}
 	if !strings.Contains(string(data), `"subscription":"0a1b2c3d"`) || strings.Contains(string(data), "secret") {
 		t.Fatalf("marshaled %s", data)
+	}
+}
+
+// An earlier release kept the one subscription link in xray.subscription_url.
+// Nothing reads it now, and the next write of the config by a daemon drops it:
+// a link carries its subscription's token.
+func TestSaveVPNDirectorConfig_DropsTheLinkOfEarlierReleases(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpn-director.json")
+	if err := os.WriteFile(path, []byte(`{"data_dir":"/data","xray":{"clients":["192.168.1.8"],"subscription_url":"https://sub.example.com/s/secret-token"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadVPNDirectorConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveVPNDirectorConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "subscription_url") || strings.Contains(string(data), "secret-token") {
+		t.Fatalf("the old link survived a write: %s", data)
+	}
+	if !strings.Contains(string(data), "192.168.1.8") {
+		t.Fatalf("the write lost the config: %s", data)
 	}
 }

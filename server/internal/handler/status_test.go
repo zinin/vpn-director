@@ -3,13 +3,10 @@ package handler
 
 import (
 	"errors"
-	"fmt"
-	"os"
 	"strings"
 	"testing"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -30,36 +27,6 @@ func (m *mockVPNDirector) Update() error           { return nil }
 func (m *mockVPNDirector) Platform() (vpnconfig.PlatformInfo, error) {
 	return vpnconfig.PlatformInfo{}, nil
 }
-
-// mockConfigStore is used by servers_test.go (Task 5.3)
-type mockConfigStore struct {
-	servers []vpnconfig.Server
-	subs    []vpnconfig.Subscription
-	err     error
-}
-
-func (m *mockConfigStore) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) { return nil, m.err }
-func (m *mockConfigStore) LoadServers() ([]vpnconfig.Server, error)             { return m.servers, m.err }
-func (m *mockConfigStore) SaveServers([]vpnconfig.Server) error                 { return m.err }
-
-func (m *mockConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
-	return m.subs, m.err
-}
-func (m *mockConfigStore) SaveSubscription(vpnconfig.Subscription) error { return m.err }
-func (m *mockConfigStore) DeleteSubscription(string) error               { return m.err }
-
-// UpdateVPNConfig: this mock holds no vpn-director.json, like a router before
-// its first configure, so every update stops at the load step.
-func (m *mockConfigStore) UpdateVPNConfig(func(*vpnconfig.VPNDirectorConfig) error) error {
-	if m.err != nil {
-		return fmt.Errorf("%w: %w", service.ErrConfigLoad, m.err)
-	}
-	return fmt.Errorf("%w: %w", service.ErrConfigLoad, os.ErrNotExist)
-}
-
-func (m *mockConfigStore) DataDir() (string, error) { return "/data", m.err }
-func (m *mockConfigStore) DataDirOrDefault() string { return "/data" }
-func (m *mockConfigStore) ScriptsDir() string       { return "/scripts" }
 
 func TestStatusHandler_HandleStatus(t *testing.T) {
 	sender := &mockSender{}

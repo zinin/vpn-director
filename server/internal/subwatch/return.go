@@ -230,10 +230,10 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 // rollbackOrder is where a failed return goes back to: the server that ran
 // before, before - its copy the walk picked or a return proved first, the
 // address it ran on, when this process remembers it, then every other address
-// its servers.json entry lists. The remembered copy leads even when a list
-// imported since no longer has its address: Xray passed its probe on it.
-// Empty when servers.json no longer lists that server and nothing is
-// remembered: there is no way back.
+// its entry in its subscription's list names. The remembered copy leads even
+// when a list imported since no longer has its address: Xray passed its probe
+// on it. Empty when its subscription's list no longer has that server and
+// nothing is remembered: there is no way back.
 func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, last *vpnconfig.Server) []vpnconfig.Server {
 	var copies []vpnconfig.Server
 	if j := chosenIndex(servers, before); j >= 0 {
