@@ -262,8 +262,8 @@ func TestLogsDeadline_TracksTheNumberOfSources(t *testing.T) {
 // for. Each shell command can also hold its pipes for shell.waitDelay after
 // the timeout fires, and a mutation waits for the config lock first.
 func TestDeadlines_CoverTheirWorstCase(t *testing.T) {
-	const waitDelay = 10 * time.Second  // shell.waitDelay
-	const configLock = 30 * time.Second // service.configLockTimeout
+	const waitDelay = 10 * time.Second // shell.waitDelay
+	const configLock = service.ConfigLockTimeout
 
 	deps := newTestDeps(t)
 	cases := []struct {
@@ -276,6 +276,11 @@ func TestDeadlines_CoverTheirWorstCase(t *testing.T) {
 		{"status", statusDeadline, service.StatusTimeout + waitDelay},
 		{"logs", logsDeadline(deps), time.Duration(len(deps.LogPaths)) * (service.TailTimeout + waitDelay)},
 		{"external ip", ipDeadline, service.ExternalIPTimeout + waitDelay},
+		// A subscription route's downloads and resolution end with
+		// subscriptionTimeout; the publication, or the record of why a download
+		// failed, then waits for the config lock outside it.
+		{"subscription add and refresh", importDeadline, subscriptionTimeout + configLock},
+		{"subscription rename and delete", importDeadline, configLock},
 	}
 	for _, c := range cases {
 		if c.deadline <= c.worstCase {

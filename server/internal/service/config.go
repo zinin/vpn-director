@@ -15,7 +15,10 @@ import (
 )
 
 const (
-	configLockTimeout = 30 * time.Second
+	// ConfigLockTimeout is how long UpdateVPNConfig waits for the config lock
+	// before it gives up with ErrConfigLockTimeout. The Web UI's write
+	// deadlines count it in.
+	ConfigLockTimeout = 30 * time.Second
 	configLockPoll    = 50 * time.Millisecond
 )
 
@@ -39,7 +42,7 @@ func NewConfigService(scriptsDir, defaultDataDir string, configPath ...string) *
 		scriptsDir:     scriptsDir,
 		defaultDataDir: defaultDataDir,
 		configPath:     filepath.Join(scriptsDir, "vpn-director.json"),
-		lockTimeout:    configLockTimeout,
+		lockTimeout:    ConfigLockTimeout,
 		lockPoll:       configLockPoll,
 	}
 	if len(configPath) > 0 && configPath[0] != "" {

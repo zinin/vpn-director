@@ -32,7 +32,7 @@ func NewXrayService(templatePath, outputPath string) *XrayService {
 }
 
 // xrayTestTimeout bounds one "xray run -test"; a router needs a second or two.
-// It stays well under configLockTimeout, because the test runs inside
+// It stays well under ConfigLockTimeout, because the test runs inside
 // UpdateVPNConfig: a bound as long as the lock's would let a single hung xray
 // use up the entire wait every other writer is willing to sit through, so an
 // apply or an import beside it would fail with "config is busy" instead of
