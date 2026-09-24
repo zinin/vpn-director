@@ -12,6 +12,8 @@ Thumbs.db
 
 # Dev testdata
 server/testdata/dev/vpn-director.json
+# The dev data_dir: a subscription added in dev mode is written there, link and all
+server/testdata/dev/data/
 
 # Superpowers brainstorming
 .superpowers/

@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 /opt/vpn-director/vpn-director.sh restart xray        # Restart Xray TPROXY only
 /opt/vpn-director/vpn-director.sh restart xray-process  # Restart the Xray process, TPROXY rules kept
 
-# Import servers
+# Subscriptions: add, refresh, rename, delete (a menu)
 /opt/vpn-director/import_server_list.sh
 ```
 
@@ -61,6 +61,8 @@ cd server && go run ./cmd/webui --dev
 | `router/opt/vpn-director/lib/xrayconf.sh` | Xray config.json from a server's stored outbound (legacy VLESS records built), `xray run -test` before it replaces the live one |
 | `router/opt/vpn-director/lib/subscription.sh` | Subscription decoder: share links (vless, vmess, trojan, ss, hysteria2), base64 or plain, and Xray JSON, into servers with a ready outbound |
 | `testdata/subscription/` | Cases both subscription decoders (shell and Go) must decode alike |
+| `router/opt/vpn-director/lib/substore.sh` | Subscription files (`<data_dir>/subscriptions/<id>.json`): order, ids, names, the write under the config lock; the twin of `vpnconfig/substore.go` |
+| `testdata/substore/` | Synthetic subscription files both stores (shell and Go) must list alike |
 | `router/opt/etc/init.d/S99vpn-director` | Entware init.d script for startup |
 | `router/jffs/scripts/firewall-start` | Asuswrt-Merlin hook for firewall reload |
 | `router/jffs/scripts/wan-event` | Asuswrt-Merlin hook for WAN events |
@@ -114,7 +116,7 @@ cd server && go run ./cmd/webui --dev
 | `/opt/vpn-director/telegram-bot.json` | Telegram bot config (token, allowed users) |
 | `/opt/vpn-director/certs/server.{crt,key}` | Self-signed TLS certificate for the Web UI |
 
-**Data storage**: `data_dir` in vpn-director.json (default: `/opt/vpn-director/data`) — servers.json, ipset dumps
+**Data storage**: `data_dir` in vpn-director.json (default: `/opt/vpn-director/data`) — `subscriptions/<id>.json` (a file per subscription: its link, its status, its servers), ipset dumps
 
 **Web UI settings**: the `webui` section of `vpn-director.json` — `port` (8444), `cert_file`, `key_file`, `jwt_secret` (auto-generated when empty), `log_level` (`debug|info|warn|error`).
 
