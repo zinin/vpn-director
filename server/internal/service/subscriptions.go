@@ -138,9 +138,22 @@ func (r SubscriptionResult) Line() string {
 		name = "subscription"
 	}
 	if r.Err != nil {
-		return name + ": " + r.Err.Error()
+		return name + ": " + r.ErrorText()
 	}
 	return name + ": " + r.Import.Summary()
+}
+
+// ErrorText is what a failed result says, without its name; empty for a
+// success. A failure after the file was written says the list is saved: the
+// new list is out, and only xray.servers beside it is stale.
+func (r SubscriptionResult) ErrorText() string {
+	switch {
+	case r.Err == nil:
+		return ""
+	case errors.Is(r.Err, vpnconfig.ErrServersSaved):
+		return "list saved, but xray.servers sync failed: " + r.Err.Error()
+	}
+	return r.Err.Error()
 }
 
 // SubscriptionFilesOf is store's subscription files, for vpnconfig's operations.

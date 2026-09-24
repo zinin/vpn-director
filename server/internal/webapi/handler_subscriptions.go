@@ -44,7 +44,7 @@ func importClient(deps *Deps) *http.Client {
 func resultView(r service.SubscriptionResult) map[string]interface{} {
 	v := map[string]interface{}{"id": r.ID, "name": r.Name, "existed": r.Existed, "summary": r.Line()}
 	if r.Err != nil {
-		v["error"] = r.Err.Error()
+		v["error"] = r.ErrorText()
 		return v
 	}
 	v["count"] = len(r.Import.Servers)
@@ -78,7 +78,7 @@ func subscriptionErrorStatus(err error) int {
 
 // subscriptionErrorText is what the page shows for err. A failure after the
 // file was written says the subscription is saved: the user must not redo an
-// add that happened.
+// add that happened. A delete words that case itself.
 func subscriptionErrorText(err error) string {
 	switch {
 	case errors.Is(err, vpnconfig.ErrServersSaved):
@@ -238,6 +238,17 @@ func handleDeleteSubscription(deps *Deps) http.HandlerFunc {
 		defer unlock()
 
 		active, err := service.DeleteSubscription(deps.Config, id)
+		if errors.Is(err, vpnconfig.ErrServersSaved) {
+			// The file is gone and only the config beside it is stale: the
+			// user must not read the delete as failed, nor miss that the
+			// running server came from it.
+			msg := "subscription deleted, but xray.servers sync failed: " + err.Error()
+			if active {
+				msg += ". The running server came from it; select another server."
+			}
+			jsonError(w, http.StatusInternalServerError, msg)
+			return
+		}
 		if err != nil {
 			jsonError(w, subscriptionErrorStatus(err), subscriptionErrorText(err))
 			return

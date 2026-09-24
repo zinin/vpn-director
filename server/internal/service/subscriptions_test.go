@@ -311,6 +311,17 @@ func TestRefreshSubscription_AFailedDownloadRecordsWhyAndKeepsTheList(t *testing
 	}
 }
 
+// A failure after the file was written says the list is saved: the new list
+// is out, and only xray.servers beside it is stale. The Web UI and the bot
+// both show this line.
+func TestSubscriptionResult_ALineSaysTheListWasSaved(t *testing.T) {
+	res := SubscriptionResult{ID: "0a1b2c3d", Name: "Alpha", Existed: true, Err: vpnconfig.ServersSaved(errors.New("disk full"))}
+
+	if got, want := res.Line(), "Alpha: list saved, but xray.servers sync failed: disk full"; got != want {
+		t.Fatalf("line %q, want %q", got, want)
+	}
+}
+
 func TestRefreshSubscription_UnknownAndStatic(t *testing.T) {
 	store := newMemConfigStore(vpnconfig.Subscription{ID: "1b2c3d4e", Name: "Beta"})
 	if res := RefreshSubscription(context.Background(), store, nil, "0a1b2c3d"); !errors.Is(res.Err, vpnconfig.ErrSubscriptionGone) {

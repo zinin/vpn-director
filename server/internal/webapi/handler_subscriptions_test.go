@@ -277,6 +277,29 @@ func TestHandleRefreshSubscriptions_AFailedDownloadIsAResult(t *testing.T) {
 	}
 }
 
+// A refresh whose config write fails after the file says the list is saved:
+// the new list is out, and only xray.servers beside it is stale.
+func TestHandleRefreshSubscriptions_SaysTheListWasSavedWhenOnlyTheConfigFailed(t *testing.T) {
+	deps, mc := subsDeps(t, vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha", URL: "https://93.184.216.34/s/a",
+		Servers: []vpnconfig.Server{{Name: "Old", IPs: []string{"192.0.2.1"}}}})
+	deps.ImportClient = subscriptionHost(t, osloSubscription)
+	mc.saveVPNCfgErr = errors.New("disk full")
+
+	code, resp := call(t, handleRefreshSubscriptions(deps), "POST", "/api/subscriptions/refresh?id=0a1b2c3d", "")
+
+	results, _ := resp["results"].([]interface{})
+	if code != http.StatusOK || len(results) != 1 {
+		t.Fatalf("%d %v", code, resp)
+	}
+	r := results[0].(map[string]interface{})
+	if r["error"] != "list saved, but xray.servers sync failed: disk full" || r["summary"] != "Alpha: list saved, but xray.servers sync failed: disk full" {
+		t.Fatalf("result %v", r)
+	}
+	if s := mc.subs[0]; len(s.Servers) != 1 || s.Servers[0].Name != "Oslo" {
+		t.Fatalf("file: %d servers", len(s.Servers))
+	}
+}
+
 // Every subscription with a link refreshes at once, and the answer keeps the
 // subscription order, which the page's table has too.
 func TestHandleRefreshSubscriptions_AllAnswersEveryLinkInOrder(t *testing.T) {
@@ -340,6 +363,43 @@ func TestHandleDeleteSubscription_SaysTheRunningServerCameFromIt(t *testing.T) {
 	}
 	if code, resp := call(t, h, "DELETE", "/api/subscriptions?id=0a1b2c3d", ""); code != http.StatusNotFound {
 		t.Fatalf("again: %d %v", code, resp)
+	}
+}
+
+// A delete whose config write fails after the file is gone says it deleted:
+// only xray.servers beside it is stale. The user still hears when the running
+// server came from it.
+func TestHandleDeleteSubscription_SaysDeletedWhenOnlyTheConfigFailed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		active *vpnconfig.ActiveServer
+		want   string
+	}{
+		{
+			name:   "the running server came from it",
+			active: &vpnconfig.ActiveServer{Subscription: "0a1b2c3d", Name: "Oslo", Address: "a.example.com", Port: 443},
+			want:   "subscription deleted, but xray.servers sync failed: disk full. The running server came from it; select another server.",
+		},
+		{
+			name:   "the running server came from another",
+			active: &vpnconfig.ActiveServer{Subscription: "1b2c3d4e", Name: "Germany-1", Address: "198.51.100.20", Port: 8443},
+			want:   "subscription deleted, but xray.servers sync failed: disk full",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			deps, mc := subsDeps(t, alphaBeta()...)
+			mc.cfg.Xray.ActiveServer = tc.active
+			mc.saveVPNCfgErr = errors.New("disk full")
+
+			code, resp := call(t, handleDeleteSubscription(deps), "DELETE", "/api/subscriptions?id=0a1b2c3d", "")
+
+			if code != http.StatusInternalServerError || resp["error"] != tc.want {
+				t.Fatalf("got %d %v, want 500 %q", code, resp, tc.want)
+			}
+			if len(mc.subs) != 1 || mc.subs[0].ID != "1b2c3d4e" {
+				t.Fatalf("%d files left", len(mc.subs))
+			}
+		})
 	}
 }
 
