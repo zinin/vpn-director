@@ -178,7 +178,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		xrayHandler := handler.NewXrayHandler(deps)
 		excludeHandler := handler.NewExcludeHandler(deps)
 		clientsHandler := handler.NewClientsHandler(deps)
-		b.router = NewRouter(statusHandler, serversHandler, importHandler, miscHandler, updateHandler, wizardHandler, xrayHandler, excludeHandler, clientsHandler)
+		subsHandler := handler.NewSubsHandler(deps)
+		b.router = NewRouter(statusHandler, serversHandler, importHandler, miscHandler, updateHandler, wizardHandler, xrayHandler, excludeHandler, clientsHandler, subsHandler)
 	}
 
 	if err := b.Connect(cfg); err != nil {
@@ -273,7 +274,8 @@ func (b *Bot) RegisterCommands() error {
 		{Command: "status", Description: "Xray status"},
 		{Command: "xray", Description: "Switch Xray server"},
 		{Command: "servers", Description: "Server list"},
-		{Command: "import", Description: "Import servers from URL"},
+		{Command: "import", Description: "Add a subscription, or refresh them all"},
+		{Command: "subs", Description: "Subscriptions: refresh, rename, delete"},
 		{Command: "configure", Description: "Configuration wizard"},
 		{Command: "exclude", Description: "Manage excluded IPs"},
 		{Command: "clients", Description: "Manage VPN clients"},

@@ -69,6 +69,16 @@ type ClientsRouterHandler interface {
 	HandleTextInput(msg *tgbotapi.Message)
 }
 
+// SubsRouterHandler defines methods for /subs and its rename prompt.
+type SubsRouterHandler interface {
+	HandleSubs(msg *tgbotapi.Message)
+	HandleCancel(msg *tgbotapi.Message)
+	HandleCallback(cb *tgbotapi.CallbackQuery)
+	// HandleTextInput takes the name a rename waits for and reports whether it did.
+	HandleTextInput(msg *tgbotapi.Message) bool
+	ClearState(chatID int64)
+}
+
 // Router routes messages and callbacks to appropriate handlers
 type Router struct {
 	status  StatusRouterHandler
@@ -80,6 +90,7 @@ type Router struct {
 	xray    XrayRouterHandler
 	exclude ExcludeRouterHandler
 	clients ClientsRouterHandler
+	subs    SubsRouterHandler
 }
 
 // NewRouter creates a new Router with all handlers
@@ -93,6 +104,7 @@ func NewRouter(
 	xray XrayRouterHandler,
 	exclude ExcludeRouterHandler,
 	clients ClientsRouterHandler,
+	subs SubsRouterHandler,
 ) *Router {
 	return &Router{
 		status:  status,
@@ -104,11 +116,17 @@ func NewRouter(
 		xray:    xray,
 		exclude: exclude,
 		clients: clients,
+		subs:    subs,
 	}
 }
 
 // RouteMessage routes a message to the appropriate handler based on command
 func (r *Router) RouteMessage(msg *tgbotapi.Message) {
+	// Any command ends a rename that waits for its name: the next text is no
+	// longer an answer to it.
+	if r.subs != nil && msg.IsCommand() {
+		r.subs.ClearState(msg.Chat.ID)
+	}
 	switch msg.Command() {
 	case "start":
 		r.misc.HandleStart(msg)
@@ -144,7 +162,16 @@ func (r *Router) RouteMessage(msg *tgbotapi.Message) {
 		r.exclude.ClearState(msg.Chat.ID)
 		r.wizard.ClearState(msg.Chat.ID)
 		r.clients.HandleClients(msg)
+	case "subs":
+		r.subs.HandleSubs(msg)
+	case "cancel":
+		r.subs.HandleCancel(msg)
 	default:
+		// A rename waiting for its name takes the text first: its prompt is
+		// the last question the user was asked.
+		if r.subs != nil && r.subs.HandleTextInput(msg) {
+			return
+		}
 		// Non-command messages go to clients, exclude, and wizard text handlers.
 		// All handlers check their own manager state, so multi-dispatch
 		// is safe — only one will have active state.
@@ -174,6 +201,10 @@ func (r *Router) RouteCallback(cb *tgbotapi.CallbackQuery) {
 	}
 	if strings.HasPrefix(cb.Data, "clients:") {
 		r.clients.HandleCallback(cb)
+		return
+	}
+	if strings.HasPrefix(cb.Data, "subs:") {
+		r.subs.HandleCallback(cb)
 		return
 	}
 	r.wizard.HandleCallback(cb)

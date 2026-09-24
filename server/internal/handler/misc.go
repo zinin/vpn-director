@@ -32,7 +32,8 @@ Commands:
 /status \- VPN Director status
 /xray \- quick server switch
 /servers \- server list
-/import \[url\] \- import servers
+/subs \- subscriptions: refresh, rename, delete
+/import \[url\] \[name\] \- add a subscription; alone: refresh them all
 /configure \- configuration
 /restart \- restart VPN Director
 /stop \- stop VPN Director

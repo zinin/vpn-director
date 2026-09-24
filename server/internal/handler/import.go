@@ -2,169 +2,118 @@
 package handler
 
 import (
+	"context"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
-	"github.com/zinin/vpn-director/server/internal/subscription"
 	"github.com/zinin/vpn-director/server/internal/telegram"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
-// ImportHandler handles /import command
+// importTimeout bounds one /import, or one refresh from /subs: the downloads
+// and the resolution of every host in them.
+const importTimeout = 3 * time.Minute
+
+// ImportHandler handles /import. "/import <url> [name]" adds a subscription -
+// or refreshes the one saved with that link - and "/import" alone refreshes
+// every subscription that has a link.
 type ImportHandler struct {
-	deps        *Deps
-	httpClient  *http.Client
-	maxBodySize int64
+	deps       *Deps
+	httpClient *http.Client
 }
 
-// NewImportHandler creates a new ImportHandler with default timeout and size limits
+// NewImportHandler creates an ImportHandler that downloads through the
+// SSRF-hardened client.
 func NewImportHandler(deps *Deps) *ImportHandler {
-	return &ImportHandler{
-		deps:        deps,
-		httpClient:  ssrf.NewClient(30 * time.Second), // SSRF-hardened (validates resolved IP at dial time)
-		maxBodySize: 1 << 20,                          // 1MB
-	}
+	return &ImportHandler{deps: deps, httpClient: ssrf.NewClient(30 * time.Second)}
 }
 
-// HandleImport handles /import command - downloads and imports a subscription
+// HandleImport handles /import.
 func (h *ImportHandler) HandleImport(msg *tgbotapi.Message) {
-	args := msg.CommandArguments()
-	fetchURL := args
-	if fetchURL == "" {
-		cfg, err := h.deps.Config.LoadVPNConfig()
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("Config load error: "+err.Error()))
-			return
-		}
-		if err == nil && cfg != nil {
-			fetchURL = cfg.Xray.SubscriptionURL
-		}
-	}
-	if fetchURL == "" {
-		h.deps.Sender.Send(msg.Chat.ID, "Usage: `/import [url]`")
+	chatID := msg.Chat.ID
+	ctx, cancel := context.WithTimeout(context.Background(), importTimeout)
+	defer cancel()
+
+	args := strings.TrimSpace(msg.CommandArguments())
+	if args == "" {
+		h.refreshAll(ctx, chatID)
 		return
 	}
-
-	// Validate URL scheme
-	parsedURL, err := url.Parse(fetchURL)
-	if err != nil || parsedURL.Scheme != "https" {
-		h.deps.Sender.Send(msg.Chat.ID, "Invalid URL\\. Use https://")
+	// The name is the rest of the line: it may hold spaces.
+	rawURL, name, _ := strings.Cut(args, " ")
+	h.deps.Sender.Send(chatID, telegram.EscapeMarkdownV2("Loading the subscription..."))
+	res := service.AddSubscription(ctx, h.deps.Config, h.httpClient, rawURL, strings.TrimSpace(name))
+	if res.Err != nil {
+		h.deps.Sender.Send(chatID, telegram.EscapeMarkdownV2(importFailure(res.Err)))
 		return
 	}
+	h.deps.Sender.Send(chatID, importReport(res))
+}
 
-	h.deps.Sender.Send(msg.Chat.ID, "Loading server list\\.\\.\\.")
-
-	// Download subscription
-	resp, err := h.httpClient.Get(fetchURL)
+// refreshAll refreshes every subscription that has a link, a line each.
+func (h *ImportHandler) refreshAll(ctx context.Context, chatID int64) {
+	subs, err := h.deps.Config.LoadSubscriptions()
 	if err != nil {
-		// A *url.Error carries the whole URL, and a saved link's token must
-		// not reach the chat.
-		var ue *url.Error
-		if errors.As(err, &ue) {
-			err = ue.Err
+		h.deps.Sender.Send(chatID, telegram.EscapeMarkdownV2("Error: "+err.Error()))
+		return
+	}
+	linked := 0
+	for _, s := range subs {
+		if !s.Static() {
+			linked++
 		}
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Download error: %v", err)))
+	}
+	if linked == 0 {
+		h.deps.Sender.Send(chatID, "Usage: `/import <url> [name]` adds a subscription; `/import` alone refreshes them all")
 		return
 	}
-	defer resp.Body.Close()
-
-	// Check status code
-	if resp.StatusCode != http.StatusOK {
-		h.deps.Sender.Send(msg.Chat.ID, fmt.Sprintf("Error: HTTP %d", resp.StatusCode))
-		return
-	}
-
-	// One byte past the cap tells a list that is too long from one that fits
-	// exactly: cut at the cap, base64 decodes to a shorter list, and that would
-	// be published as the subscription.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, h.maxBodySize+1))
+	h.deps.Sender.Send(chatID, telegram.EscapeMarkdownV2(fmt.Sprintf("Refreshing %d subscriptions...", linked)))
+	results, err := service.RefreshAllSubscriptions(ctx, h.deps.Config, h.httpClient)
 	if err != nil {
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Read error: %v", err)))
+		h.deps.Sender.Send(chatID, telegram.EscapeMarkdownV2("Error: "+err.Error()))
 		return
 	}
-	if int64(len(body)) > h.maxBodySize {
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("Error: subscription exceeds 1 MiB; nothing was imported"))
-		return
+	lines := make([]string, 0, len(results))
+	for _, r := range results {
+		lines = append(lines, r.Line())
 	}
+	h.deps.Sender.Send(chatID, telegram.EscapeMarkdownV2(strings.Join(lines, "\n")))
+}
 
-	// Decode the subscription and resolve IPs for each server
-	result, err := subscription.DecodeAndResolve(string(body))
-	if err != nil {
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("Error: "+err.Error()))
-		return
+// importFailure is what /import says when an add failed. Only a failure after
+// the file was written says the subscription is saved; every other one saved
+// nothing.
+func importFailure(err error) string {
+	if errors.Is(err, vpnconfig.ErrServersSaved) {
+		return fmt.Sprintf("Warning: the subscription is saved, but xray.servers sync failed: %v", err)
 	}
-	if result.Parsed == 0 {
-		lines := []string{"No supported servers in subscription"}
-		if counts := result.Counts(); counts != "" {
-			lines = append(lines, counts)
-		}
-		lines = append(lines, result.Details(3)...)
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(strings.Join(lines, "\n")))
-		return
-	}
+	return fmt.Sprintf("Import failed, nothing was imported: %v", err)
+}
 
-	if len(result.Servers) == 0 {
-		h.deps.Sender.Send(msg.Chat.ID, "Could not resolve IP for any server")
-		return
+// importReport is the reply to an add: what came in, by country, and what was
+// left out and why.
+func importReport(res service.SubscriptionResult) string {
+	imp := res.Import
+	counts := imp.Counts()
+	head := fmt.Sprintf("%s: Imported %d servers:", res.Name, len(imp.Servers))
+	if counts != "" {
+		head = fmt.Sprintf("%s: Imported %d of %d servers:", res.Name, len(imp.Servers), imp.Total)
 	}
-
-	// servers.json and the xray.servers bypass list go out together, under the
-	// config lock, so a Web UI import or the watch cannot leave one of ours
-	// beside one of theirs. A missing vpn-director.json is not an error here:
-	// /import works before the first configure, and the wizard writes
-	// xray.servers itself.
-	// "Imported" is said only for a list that was written. The lock, a config
-	// a re-import cannot read and a refusal all fail before it.
-	err = service.PublishImport(h.deps.Config, result.Servers, args, fetchURL)
-	switch {
-	case err == nil:
-	case errors.Is(err, vpnconfig.ErrServersSaved):
-		// Only the config beside the list is missing. With no config at all
-		// there is nothing to keep in step with.
-		if !errors.Is(err, service.ErrConfigLoad) {
-			h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
-				fmt.Sprintf("Warning: servers imported but xray.servers sync failed: %v", err)))
-		}
-	case errors.Is(err, vpnconfig.ErrSubscriptionChanged):
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
-			"The saved subscription changed while downloading; nothing was imported. Run /import again."))
-		return
-	case errors.Is(err, vpnconfig.ErrSaveServers):
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Save error: %v", err)))
-		return
-	default:
-		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(
-			fmt.Sprintf("Import failed, nothing was imported: %v", err)))
-		return
-	}
-
-	// Build response with grouped stats: what was left out, and why, under the
-	// country list.
 	var sb strings.Builder
-	counts := result.Counts()
+	sb.WriteString(telegram.EscapeMarkdownV2(head) + "\n")
+	sb.WriteString(telegram.EscapeMarkdownV2(groupServersByCountry(imp.Servers)))
 	if counts != "" {
-		sb.WriteString(fmt.Sprintf("Imported %d of %d servers:\n", len(result.Servers), result.Total))
-	} else {
-		sb.WriteString(fmt.Sprintf("Imported %d servers:\n", len(result.Servers)))
+		lines := append([]string{counts}, imp.Details(3)...)
+		sb.WriteString("\n\n" + telegram.EscapeMarkdownV2(strings.Join(lines, "\n")))
 	}
-
-	groupedStr := groupServersByCountry(result.Servers)
-	sb.WriteString(telegram.EscapeMarkdownV2(groupedStr))
-
-	if counts != "" {
-		lines := append([]string{counts}, result.Details(3)...)
-		sb.WriteString("\n\n")
-		sb.WriteString(telegram.EscapeMarkdownV2(strings.Join(lines, "\n")))
+	if res.Existed {
+		sb.WriteString("\n\n" + telegram.EscapeMarkdownV2("The link was saved already; its list was refreshed."))
 	}
-
-	h.deps.Sender.Send(msg.Chat.ID, sb.String())
+	return sb.String()
 }
