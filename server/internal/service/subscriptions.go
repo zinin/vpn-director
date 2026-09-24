@@ -54,9 +54,10 @@ func NewDownloadError(err error) error {
 	return &DownloadError{Err: err}
 }
 
-// errResolutionCutShort is a download whose context ended - in the daemons, by
-// its deadline - while its hosts resolved.
-var errResolutionCutShort = errors.New("resolving the servers took longer than the deadline")
+// ErrResolutionCutShort is a download whose context ended - in the daemons, by
+// its deadline - while its hosts resolved. The watch's own fetch returns it
+// too, when its deadline ends the resolution.
+var ErrResolutionCutShort = errors.New("resolving the servers took longer than the deadline")
 
 // BodyError is a subscription that arrived and holds no server the router can
 // use: nothing it decodes, or nothing whose host resolves. 400 in the Web UI.
@@ -120,7 +121,7 @@ func DownloadSubscription(ctx context.Context, client *http.Client, rawURL strin
 	case ctx.Err() != nil:
 		// Every lookup after the context ended failed at once: the servers
 		// resolved by then are not the subscription.
-		return subscription.Import{}, &DownloadError{Err: errResolutionCutShort}
+		return subscription.Import{}, &DownloadError{Err: ErrResolutionCutShort}
 	case len(imp.Servers) == 0:
 		return imp, &BodyError{Err: errors.New("could not resolve IP for any server")}
 	}

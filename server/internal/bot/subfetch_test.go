@@ -14,6 +14,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
@@ -86,7 +87,7 @@ func TestGetSubscription_CapsBody(t *testing.T) {
 	t.Cleanup(wan.Close)
 
 	body, err := getSubscription(context.Background(), hostClient(wan), wan.URL)
-	if err == nil || !strings.Contains(err.Error(), "subscription body exceeds 1 MiB") {
+	if err == nil || !strings.Contains(err.Error(), "subscription exceeds 1 MiB") {
 		t.Fatalf("err %v, want the 1 MiB cap", err)
 	}
 	if body != nil {
@@ -112,6 +113,9 @@ func TestFetchSub_RejectsNonHTTPS(t *testing.T) {
 	servers, err := (&Bot{}).fetchSub(context.Background(), "http://cdn.example/s/token", nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "https") {
 		t.Fatalf("err %v, want an https error", err)
+	}
+	if !errors.Is(err, service.ErrSubscriptionURL) || err.Error() != "invalid subscription URL: use an https:// link" {
+		t.Fatalf("err %q, want the daemons' invalid subscription URL", err)
 	}
 	if strings.Contains(err.Error(), "cdn.example") {
 		t.Fatalf("error %q carries the subscription URL", err)
@@ -427,6 +431,41 @@ func TestFetchServers_AResolutionTheContextEndedReturnsNoList(t *testing.T) {
 				t.Fatalf("servers %+v; a list cut short must not come back", servers)
 			}
 		})
+	}
+}
+
+// The fetch deadline can end the resolution too. The watch records what the
+// fetch returns in the subscription's error, which the Web UI and /subs show:
+// it reads as the daemons word a resolution their deadline cut short, not as
+// "context deadline exceeded".
+func TestFetchServers_AResolutionTheDeadlineCutShortReadsAsTheDaemonsSayIt(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte(
+		"vless://uuid-1@a.example.invalid:443#A\nvless://uuid-2@b.example.invalid:443#B"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	// a resolves; the deadline passes while b is being looked up.
+	lookup := func(host string) ([]net.IP, error) {
+		if host == "a.example.invalid" {
+			return []net.IP{net.ParseIP("203.0.113.10")}, nil
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	servers, err := fetchServers(ctx, "https://cdn.example/s/token", hostClient(wan), knownTunnel(nil), lookup, lookup)
+
+	if servers != nil {
+		t.Fatalf("servers %+v; a list cut short must not come back", servers)
+	}
+	if err == nil || err.Error() != "download failed: resolving the servers took longer than the deadline" {
+		t.Fatalf("err %v, want the daemons' words", err)
+	}
+	if !errors.Is(err, service.ErrResolutionCutShort) {
+		t.Fatalf("err %v, want service.ErrResolutionCutShort", err)
 	}
 }
 

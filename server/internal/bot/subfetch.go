@@ -48,14 +48,14 @@ func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([
 		return nil, err
 	}
 	if len(body) > maxSubscriptionBody {
-		return nil, fmt.Errorf("subscription body exceeds 1 MiB")
+		return nil, fmt.Errorf("subscription exceeds 1 MiB")
 	}
 	return body, nil
 }
 
 func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) ([]vpnconfig.Server, error) {
 	if u, err := url.Parse(rawURL); err != nil || u.Scheme != "https" {
-		return nil, fmt.Errorf("subscription URL must use https")
+		return nil, fmt.Errorf("%w: use an https:// link", service.ErrSubscriptionURL)
 	}
 	wan := ssrf.NewClient(10 * time.Second)
 	// IPv4 only and bound to ctx: an AF_UNSPEC lookup of every hostname in the
@@ -98,17 +98,19 @@ func lazyTunnel(ctx context.Context, cfgSvc service.ConfigStore, vpnSvc service.
 // answer used to make the whole list count as resolved, and the servers only
 // the tunnel's resolver knew were dropped from it. A context that ends during
 // the resolution fails every lookup after it at once, and what resolved before
-// that is not the subscription: the context's error comes back instead of a
-// list cut short. A download that failed reads as the daemons' own
-// (service.DownloadError): the watch records it in the subscription's error,
-// which the Web UI and /subs show. tunnel is asked for the tunnel's client only
-// once the WAN falls short, and answers nil when there is none.
+// that is not the subscription: the fetch returns the daemons' "resolving the
+// servers took longer than the deadline" when its deadline ended it, and the
+// context's error when it was cancelled - never a list cut short. A download
+// that failed reads as the daemons' own (service.DownloadError): the watch
+// records it in the subscription's error, which the Web UI and /subs show.
+// tunnel is asked for the tunnel's client only once the WAN falls short, and
+// answers nil when there is none.
 func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel func() *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
 	body, err := getSubscription(ctx, wan, rawURL)
 	if err == nil {
 		servers, rerr := serversFromSubscriptionLookup(body, eitherLookup(ctx, wanLookup, tunnelLookup))
 		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
+			return nil, cutShort(cerr)
 		}
 		if rerr == nil {
 			return servers, nil
@@ -134,9 +136,19 @@ func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel f
 	}
 	servers, err := serversFromSubscriptionLookup(body, tunnelLookup)
 	if cerr := ctx.Err(); cerr != nil {
-		return nil, cerr
+		return nil, cutShort(cerr)
 	}
 	return servers, err
+}
+
+// cutShort is the error of a fetch whose context ended during the resolution:
+// the daemons' own when the deadline ended it, the context's when it was
+// cancelled - a stop or a shutdown.
+func cutShort(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return &service.DownloadError{Err: service.ErrResolutionCutShort}
+	}
+	return err
 }
 
 // eitherLookup asks first, and second for a host first does not answer with an
