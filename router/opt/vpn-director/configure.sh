@@ -44,6 +44,9 @@ XRAY_CONFIG_DIR="${XRAY_CONFIG_DIR:-/opt/etc/xray}"
 # Library: Xray config generator (self-contained pure-jq; no common.sh needed)
 . "$VPD_DIR/lib/xrayconf.sh"
 
+# Library: the subscription files (self-contained, like xrayconf.sh)
+. "$VPD_DIR/lib/substore.sh"
+
 # Platform contract: the tunnels this router has (platform_tunnels,
 # platform_tunnel_info). platform.sh alone, not common.sh: the contract
 # functions never log, and common.sh would install its temp-file EXIT trap
@@ -53,6 +56,7 @@ XRAY_CONFIG_DIR="${XRAY_CONFIG_DIR:-/opt/etc/xray}"
 # Temporary storage for parsed data
 XRAY_CLIENTS_LIST=""
 TUN_DIR_TUNNELS_JSON='{}'
+SELECTED_SUBSCRIPTION_ID=""
 SELECTED_SERVER_ADDRESS=""
 SELECTED_SERVER_PORT=""
 SELECTED_SERVER_JSON=""
@@ -128,12 +132,13 @@ confirm() {
 
 # jq that drops control characters - C0, DEL and C1 - from a string; the twin
 # of JQ_PRINTABLE in import_server_list.sh. A server's name, address and label
-# are subscription text, and would otherwise take an escape sequence to the
+# are subscription text, and a subscription's name comes from a file that can
+# be edited by hand: either would otherwise take an escape sequence to the
 # terminal.
 JQ_PRINTABLE='def printable: explode | map(select(. >= 32 and (. < 127 or . > 159))) | implode;'
 
 ###############################################################################
-# Get data directory and validate servers
+# Get data directory and read the subscriptions
 ###############################################################################
 
 get_data_dir() {
@@ -146,24 +151,24 @@ get_data_dir() {
     jq -r '.data_dir // "/opt/vpn-director/data"' "$config_file"
 }
 
-check_servers_file() {
+# check_subscriptions - reads the subscriptions that have servers into
+# SUBS_JSON, and stops the wizard when there is none. SUB_DIR, where they are,
+# is read again at step 5.
+check_subscriptions() {
     DATA_DIR=$(get_data_dir)
-    SERVERS_FILE="$DATA_DIR/servers.json"
+    SUB_DIR=$(substore_dir "$DATA_DIR")
+    SUBS_JSON=$(substore_list "$SUB_DIR" | jq -c 'map(select((.servers // []) | length > 0))')
 
-    if [[ ! -f $SERVERS_FILE ]]; then
-        print_error "Server list not found: $SERVERS_FILE"
+    local subs servers
+    subs=$(jq length <<< "$SUBS_JSON")
+    servers=$(jq '[.[].servers[]] | length' <<< "$SUBS_JSON")
+    if [[ $subs -eq 0 ]]; then
+        print_error "No subscription with servers in $SUB_DIR"
         print_info "Run import_server_list.sh first"
         exit 1
     fi
 
-    SERVER_COUNT=$(jq length "$SERVERS_FILE")
-    if [[ $SERVER_COUNT -eq 0 ]]; then
-        print_error "Server list is empty"
-        print_info "Run import_server_list.sh again"
-        exit 1
-    fi
-
-    print_success "Found $SERVER_COUNT servers in $SERVERS_FILE"
+    print_success "Found $servers servers in $subs subscription(s)"
 }
 
 ###############################################################################
@@ -172,6 +177,35 @@ check_servers_file() {
 
 step_select_xray_server() {
     print_header "Step 1: Select Xray Server"
+
+    # The subscription first, when there is more than one, as the bot asks it;
+    # then a server of that subscription. Two subscriptions can name a server
+    # alike, and the one that runs is the one in the subscription chosen here.
+    local count k=0 servers_json
+    count=$(jq length <<< "$SUBS_JSON")
+    if [[ $count -gt 1 ]]; then
+        printf "Subscriptions:\n\n"
+        # The name comes last: it is the user's text, and a "|" in it must not
+        # start another column.
+        i=1
+        jq -r "$JQ_PRINTABLE"' .[] | "\(.servers | length)|\(.name | printable)"' <<< "$SUBS_JSON" | \
+        while IFS='|' read -r n name; do
+            printf "  %2d) %s (%s servers)\n" "$i" "$name" "$n"
+            i=$((i + 1))
+        done
+        printf "\n"
+        while true; do
+            printf "Select subscription [1-%d]: " "$count"
+            read -r choice
+            if [[ $choice -ge 1 ]] 2>/dev/null && [[ $choice -le $count ]] 2>/dev/null; then
+                break
+            fi
+            print_error "Invalid choice. Enter a number between 1 and $count"
+        done
+        k=$((choice - 1))
+    fi
+    SELECTED_SUBSCRIPTION_ID=$(jq -r ".[$k].id" <<< "$SUBS_JSON")
+    servers_json=$(jq -c ".[$k].servers" <<< "$SUBS_JSON")
 
     printf "Available servers:\n\n"
 
@@ -202,13 +236,13 @@ step_select_xray_server() {
               else [$p] + (if $n == "" or $n == "tcp" or $n == "raw" then [] else [$n] end)
                         + (if $s == "" or $s == "none" then [] else [$s] end) | join("·") end
           ) catch "?";
-        .[] | "\(.name | printable)|\(.address | printable)|\((.ips // []) | join(", "))|\(protocol_label | printable)"' "$SERVERS_FILE" | \
+        .[] | "\(.name | printable)|\(.address | printable)|\((.ips // []) | join(", "))|\(protocol_label | printable)"' <<< "$servers_json" | \
     while IFS='|' read -r name address ip label; do
         printf "  %2d) %s [%s]\n      %s -> %s\n\n" "$i" "$name" "$label" "$address" "$ip"
         i=$((i + 1))
     done
 
-    total=$(jq length "$SERVERS_FILE")
+    total=$(jq length <<< "$servers_json")
 
     while true; do
         printf "Select server [1-%d]: " "$total"
@@ -222,10 +256,10 @@ step_select_xray_server() {
 
     # Get selected server data (jq uses 0-based index)
     idx=$((choice - 1))
-    SELECTED_SERVER_ADDRESS=$(jq -r ".[$idx].address" "$SERVERS_FILE")
-    SELECTED_SERVER_PORT=$(jq -r ".[$idx].port" "$SERVERS_FILE")
-    SELECTED_SERVER_JSON=$(jq -c ".[$idx]" "$SERVERS_FILE")
-    selected_name=$(jq -r "$JQ_PRINTABLE .[$idx].name | printable" "$SERVERS_FILE")
+    SELECTED_SERVER_ADDRESS=$(jq -r ".[$idx].address" <<< "$servers_json")
+    SELECTED_SERVER_PORT=$(jq -r ".[$idx].port" <<< "$servers_json")
+    SELECTED_SERVER_JSON=$(jq -c ".[$idx]" <<< "$servers_json")
+    selected_name=$(jq -r "$JQ_PRINTABLE .[$idx].name | printable" <<< "$servers_json")
 
     print_success "Selected: $selected_name ($SELECTED_SERVER_ADDRESS)"
 }
@@ -520,37 +554,33 @@ step_generate_configs() {
         xray_exclude_json=$(printf '%s\n' ${XRAY_EXCLUDE_SETS_LIST//,/ } | jq -R . | jq -s .)
     fi
 
-    # Build xray servers array from servers.json (unique IPs)
-    xray_servers_json="[]"
-    if [[ -f "$SERVERS_FILE" ]]; then
-        xray_servers_json=$(jq '[.[].ips[]] | unique' "$SERVERS_FILE")
-    fi
-
     # Which server config.json is about to be built from. Nothing else records
     # it, and it cannot be read back out of config.json afterwards: a
     # subscription routinely puts a dozen names behind one address:port. Only
-    # the three fields that identify the server to a reader - the Web UI serves
-    # this file over /api/config, so the uuid and the REALITY material stay out.
+    # the fields that identify the server to a reader - its subscription, name,
+    # address and port; the Web UI serves this file over /api/config, so the
+    # uuid and the REALITY material stay out.
     xray_active_server_json=$(printf '%s' "$SELECTED_SERVER_JSON" \
-        | jq -c '{name: (.name // ""), address: (.address // ""), port: (.port // 0)}')
+        | jq -c --arg sub "${SELECTED_SUBSCRIPTION_ID:-}" \
+            '{name: (.name // ""), address: (.address // ""), port: (.port // 0)}
+             + (if $sub == "" then {} else {subscription: $sub} end)')
 
     # The Web UI and the bot serialise their writes on this lock
-    # (service.ConfigService.LockPath). The wizard is the third writer over the
-    # same file: without the lock a daemon write landing between the read and
-    # the rename below is lost. Thirty seconds matches the Go side's timeout.
-    # BusyBox flock has no -w, hence the loop.
-    exec 9>"$VPD_DIR/.vpn-director.json.lock"
-    _cfg_lock_waited=0
-    until flock -n 9; do
-        if [[ $_cfg_lock_waited -ge ${VPD_CONFIG_LOCK_WAIT:-30} ]]; then
-            print_error "Config is locked by the Web UI or the bot; try again"
-            exec 9>&-
-            exit 1
-        fi
-        [[ $_cfg_lock_waited -eq 0 ]] && print_info "Waiting for the config lock..."
-        sleep 1
-        _cfg_lock_waited=$((_cfg_lock_waited + 1))
-    done
+    # (service.ConfigService.LockPath), and so does import_server_list.sh:
+    # every write to subscriptions/ happens under it. The wizard is one more
+    # writer over the same file: without the lock a daemon write landing
+    # between the read and the rename below is lost. substore_lock waits
+    # thirty seconds, as the Go side does.
+    if ! substore_lock "$VPD_DIR/vpn-director.json"; then
+        print_error "Config is locked by the Web UI or the bot; try again"
+        exit 1
+    fi
+
+    # xray.servers (TPROXY_BYPASS): every address of every subscription. Read
+    # from the files, which nobody changes while the lock is held, and not from
+    # SUBS_JSON: that is the list as the wizard started, and a refresh since
+    # then must keep the addresses it wrote.
+    xray_servers_json=$(substore_ips "$(substore_list "$SUB_DIR")")
 
     # The wizard owns five fields; everything else in the file belongs to the
     # daemons and to the user: the jwt_secret the Web UI generates on its first
@@ -593,8 +623,7 @@ step_generate_configs() {
         print_success "Generated $XRAY_CONFIG_DIR/config.json"
     else
         rm -f "$_xray_cfg_tmp"
-        flock -u 9
-        exec 9>&-
+        substore_unlock
         print_error "Failed to generate an Xray config for this server, or Xray rejected it; kept existing config.json"
         exit 1
     fi
@@ -641,13 +670,11 @@ step_generate_configs() {
         > "$_vpd_cfg_tmp"; then
         chmod 600 "$_vpd_cfg_tmp"
         mv -f "$_vpd_cfg_tmp" "$VPD_DIR/vpn-director.json"
-        flock -u 9
-        exec 9>&-
+        substore_unlock
         print_success "Generated $VPD_DIR/vpn-director.json"
     else
         rm -f "$_vpd_cfg_tmp"
-        flock -u 9
-        exec 9>&-
+        substore_unlock
         print_error "Failed to generate vpn-director.json; kept the existing config"
         exit 1
     fi
@@ -681,7 +708,7 @@ main() {
     print_header "VPN Director Configuration"
     printf "This wizard will configure Xray TPROXY and Tunnel Director.\n\n"
 
-    check_servers_file                # Validate servers.json exists
+    check_subscriptions               # Validate that a subscription exists
     step_select_xray_server           # Step 1
     step_configure_xray_exclusions    # Step 2
     step_configure_clients            # Step 3
