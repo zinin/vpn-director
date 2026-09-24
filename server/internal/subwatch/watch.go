@@ -599,7 +599,7 @@ func (w *Watch) fallbackCarries(cfg *vpnconfig.VPNDirectorConfig) bool {
 }
 
 func sameServer(s vpnconfig.Server, a *vpnconfig.ActiveServer) bool {
-	if a == nil || s.Name != a.Name {
+	if a == nil || s.Subscription != a.Subscription || s.Name != a.Name {
 		return false
 	}
 	if a.Address == "" && a.Port == 0 {
@@ -613,26 +613,28 @@ func activeID(a *vpnconfig.ActiveServer) string {
 		return ""
 	}
 	if a.Address == "" && a.Port == 0 {
-		return a.Name
+		return a.Subscription + "\x1f" + a.Name
 	}
-	return a.Name + "\x1f" + a.Address + "\x1f" + strconv.Itoa(a.Port)
+	return a.Subscription + "\x1f" + a.Name + "\x1f" + a.Address + "\x1f" + strconv.Itoa(a.Port)
 }
 
 func serverID(s vpnconfig.Server) string {
-	return s.Name + "\x1f" + s.Address + "\x1f" + strconv.Itoa(s.Port)
+	return s.Subscription + "\x1f" + s.Name + "\x1f" + s.Address + "\x1f" + strconv.Itoa(s.Port)
 }
 
-// chosenIndex is where servers has the server a names: the entry with its name,
-// address and port, or else the first entry with its name - a subscription that
-// rotates endpoints gives a name a new address every day, and the name is what
-// the user chose. -1 when the list has neither.
+// chosenIndex is where servers has the server a names: the entry of its
+// subscription with its name, address and port, or else the first entry of its
+// subscription with its name - a subscription that rotates endpoints gives a
+// name a new address every day, and the name is what the user chose. Another
+// subscription's server of the same name is never it. -1 when the list has
+// neither.
 func chosenIndex(servers []vpnconfig.Server, a *vpnconfig.ActiveServer) int {
 	if a == nil || a.Name == "" {
 		return -1
 	}
 	byName := -1
 	for i, s := range servers {
-		if s.Name != a.Name {
+		if s.Subscription != a.Subscription || s.Name != a.Name {
 			continue
 		}
 		if sameServer(s, a) {

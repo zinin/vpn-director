@@ -2239,6 +2239,22 @@ func TestPickOrder_SameNameFirst(t *testing.T) {
 	}
 }
 
+func TestChosenIndex_TheNameFallbackStaysInItsSubscription(t *testing.T) {
+	servers := []vpnconfig.Server{
+		{Subscription: "aaaaaaaa", Name: "Germany-1", Address: "de-a.example", Port: 443},
+		{Subscription: "bbbbbbbb", Name: "Germany-1", Address: "de-b.example", Port: 443},
+	}
+	chosen := &vpnconfig.ActiveServer{Subscription: "bbbbbbbb", Name: "Germany-1", Address: "de-rotated.example", Port: 443}
+
+	if i := chosenIndex(servers, chosen); i != 1 {
+		t.Fatalf("chosenIndex %d, want 1", i)
+	}
+	// A record from before subscriptions names no server of one.
+	if i := chosenIndex(servers, &vpnconfig.ActiveServer{Name: "Germany-1", Address: "de-a.example", Port: 443}); i != -1 {
+		t.Fatalf("a record without a subscription matched %d", i)
+	}
+}
+
 // The walk starts from the name the user chose at the address it has today, and
 // an all-dead wave returns config.json to that server, not to the last one tried.
 func TestTick_TheChosenNameIsTriedFirstAtItsNewAddress(t *testing.T) {
