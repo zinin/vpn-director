@@ -183,6 +183,12 @@ func (r *Router) RouteMessage(msg *tgbotapi.Message) {
 
 // RouteCallback routes a callback query to the appropriate handler
 func (r *Router) RouteCallback(cb *tgbotapi.CallbackQuery) {
+	// A button outside /subs ends a rename that waits for its name, as a
+	// command does: it can ask a question of its own (clients:add,
+	// exclip:add, the wizard's text steps), and the next text answers that.
+	if r.subs != nil && cb.Message != nil && cb.Message.Chat != nil && !strings.HasPrefix(cb.Data, "subs:") {
+		r.subs.ClearState(cb.Message.Chat.ID)
+	}
 	if strings.HasPrefix(cb.Data, "servers:") {
 		r.servers.HandleCallback(cb)
 		return

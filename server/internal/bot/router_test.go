@@ -506,6 +506,43 @@ func TestRouter_APendingRenameTakesTheTextFirst(t *testing.T) {
 	}
 }
 
+// A button outside /subs ends a rename that waits for its name: clients:add
+// asks for an address, and the address must not rename the subscription.
+func TestRouter_AButtonOutsideSubsEndsARename(t *testing.T) {
+	s, c := &mockSubsHandler{}, &mockClientsHandler{}
+	router := &Router{subs: s, clients: c}
+
+	router.RouteCallback(&tgbotapi.CallbackQuery{
+		Data:    "clients:add",
+		Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}},
+	})
+
+	if s.cleared != 1 {
+		t.Errorf("ClearState called %d times, want 1", s.cleared)
+	}
+	if !c.callbackCalled {
+		t.Error("expected clients.HandleCallback to be called")
+	}
+}
+
+// A button of /subs itself leaves the rename to the subs handler.
+func TestRouter_ASubsButtonKeepsTheRename(t *testing.T) {
+	s := &mockSubsHandler{}
+	router := &Router{subs: s}
+
+	router.RouteCallback(&tgbotapi.CallbackQuery{
+		Data:    "subs:r:0a1b2c3d",
+		Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}},
+	})
+
+	if s.cleared != 0 {
+		t.Errorf("ClearState called %d times, want 0", s.cleared)
+	}
+	if !s.callbackCalled {
+		t.Error("expected subs.HandleCallback to be called")
+	}
+}
+
 func TestRouter_TextWithoutARenameGoesToTheWizard(t *testing.T) {
 	s := &mockSubsHandler{}
 	w, e, c := &mockWizardHandler{}, &mockExcludeHandler{}, &mockClientsHandler{}
