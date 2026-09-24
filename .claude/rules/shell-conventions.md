@@ -497,11 +497,13 @@ the call ignores it.
 0 for an action whose `false` was followed by a successful command. Read
 `ACTION_RC` after the call instead.
 
-### Nothing that can pass 128 KiB goes to jq as an argument
+### Nothing that can reach 128 KiB goes to jq as an argument
 
-**Problem**: `execve` takes no single argument longer than 128 KiB
-(`MAX_ARG_STRLEN`, 32 pages). A byte more and the exec fails with `E2BIG`: jq
-never starts, bash prints `jq: Argument list too long`, and the status is 126.
+**Problem**: `execve` takes no single argument of 128 KiB or more
+(`MAX_ARG_STRLEN`, 32 pages, counts the terminating NUL): 131,071 bytes pass,
+and at 131,072 the exec fails with `E2BIG`. jq never starts, bash prints
+`<path to jq>: Argument list too long` (`/usr/bin/jq: …` here), and the status
+is 126.
 
 ```bash
 s=$(head -c 131072 /dev/zero | tr '\0' a)

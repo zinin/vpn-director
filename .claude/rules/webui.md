@@ -108,12 +108,17 @@ after, as the bot does. The server and subscription routes are the exception.
 `/api/servers/active` regenerates `config.json`, rewrites `xray.servers` under
 the lock and restarts Xray instead of applying. The subscription routes apply
 nothing: every change to a subscription file happens inside a config-lock
-update that recomputes `xray.servers` with it (a rename changes no address),
-through `service.AddSubscription`, `RefreshSubscription`,
-`RefreshAllSubscriptions`, `RenameSubscription` and `DeleteSubscription` — the
-functions the bot's `/import` and `/subs` call too — because a subscription
-file takes no lock of its own and `Deps.OpMutex` does not reach the bot or the
-subscription watch. A refresh publishes only while its subscription still
+update, and an add, a refresh and a delete recompute `xray.servers` in it (a
+rename and a recorded error change no address and recompute nothing), through
+`service.AddSubscription`, `RefreshSubscription`, `RefreshAllSubscriptions`,
+`RenameSubscription` and `DeleteSubscription` — the functions the bot's
+`/import` and `/subs` call too — because a subscription file takes no lock of
+its own and `Deps.OpMutex` does not reach the bot or the subscription watch.
+Every reader of the files — both daemons, the watch, `configure.sh` and
+`import_server_list.sh` — skips with a warning a file that is broken or whose
+id is not its name, and ignores a file not named `<id>.json`, a temp or backup
+file among them, so that no reader fails because of one. A refresh publishes
+only while its subscription still
 exists with the link it downloaded (`vpnconfig.ErrSubscriptionGone` otherwise,
 and nothing is written): it may have been deleted meanwhile, or deleted and its
 link added again under another id, and the list would bring it back. A refresh
