@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
 import api from '../api'
-import type { ActiveServer } from '../types'
+import type { ActiveServer, ServersResponse } from '../types'
 
 const status = ref('')
 const ip = ref('')
 const ipError = ref('')
 const activeServer = ref<ActiveServer | null>(null)
+const activeLabel = ref('')
 const serverError = ref('')
 // "Nothing is selected" and "we have not asked yet" look identical in
 // activeServer, and only the first of them is worth telling the user about.
@@ -16,6 +17,17 @@ const actionLoading = ref('')
 
 function errorText(e: any): string {
   return e?.response?.data?.error || e?.message || 'unknown error'
+}
+
+// "Beta / Germany-1": the running server under its subscription's name, or
+// its own name when no subscription holds it any more - deleted since, or a
+// record from before subscriptions.
+function serverLabel(data: ServersResponse): string {
+  const a = data.active
+  if (!a) return ''
+  const name = a.name || a.address
+  const group = (data.subscriptions ?? []).find((g) => g.id === a.subscription)
+  return group ? `${group.name} / ${name}` : `${name} — not in any subscription`
 }
 
 async function loadStatus() {
@@ -42,6 +54,7 @@ async function loadStatus() {
   }
   if (serversRes.status === 'fulfilled') {
     activeServer.value = serversRes.value.data.active ?? null
+    activeLabel.value = serverLabel(serversRes.value.data)
     serverLoaded.value = true
   } else {
     activeServer.value = null
@@ -94,7 +107,7 @@ onMounted(loadStatus)
         <div class="card-title">Xray Server</div>
         <div v-if="activeServer">
           <div style="font-size: 20px; margin-top: 8px;">
-            {{ activeServer.name || activeServer.address }}
+            {{ activeLabel }}
           </div>
           <div style="margin-top: 4px; color: #999; font-size: 0.875rem;">
             {{ activeServer.address }}:{{ activeServer.port }}

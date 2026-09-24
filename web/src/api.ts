@@ -3,16 +3,19 @@ import type {
   AllLogsResponse,
   ClientsResponse,
   ConfigResponse,
+  DeleteSubscriptionResponse,
   ExcludeIPsResponse,
   ExcludeSetsResponse,
-  ImportResponse,
   IPResponse,
   LogResponse,
   OkResponse,
   PlatformInfo,
+  RefreshResponse,
   Server,
   ServersResponse,
   StatusResponse,
+  SubscriptionResult,
+  SubscriptionsResponse,
   UpdateCheckResponse,
   UpdateStartResponse,
   UpdateStatusResponse,
@@ -68,21 +71,31 @@ export default {
   getPlatform: () =>
     api.get<PlatformInfo>('/api/platform'),
 
-  // Servers
+  // Servers and subscriptions
   getServers: () =>
     api.get<ServersResponse>('/api/servers'),
-  // The server as the page shows it at that index: the list can change before
-  // the click, and the router answers 409 when the index names another server.
-  selectServer: (index: number, server: Server) =>
+  // The server as the page shows it at that index of that subscription: the
+  // list can change before the click, and the router answers 409 when the
+  // index names another server or the subscription is gone.
+  selectServer: (subscription: string, index: number, server: Server) =>
     api.post<OkResponse>('/api/servers/active', {
+      subscription,
       index,
       name: server.name,
       address: server.address,
       port: server.port,
     }),
-  // Empty url reuses xray.subscription_url on the server.
-  importServers: (url: string) =>
-    api.post<ImportResponse>('/api/servers/import', { url }),
+  getSubscriptions: () =>
+    api.get<SubscriptionsResponse>('/api/subscriptions'),
+  addSubscription: (url: string, name: string) =>
+    api.post<SubscriptionResult>('/api/subscriptions', { url, name }),
+  // No id refreshes every subscription that has a link.
+  refreshSubscription: (id?: string) =>
+    api.post<RefreshResponse>('/api/subscriptions/refresh', null, { params: id ? { id } : {} }),
+  renameSubscription: (id: string, name: string) =>
+    api.post<OkResponse>('/api/subscriptions/rename', { name }, { params: { id } }),
+  deleteSubscription: (id: string) =>
+    api.delete<DeleteSubscriptionResponse>('/api/subscriptions', { params: { id } }),
 
   // Clients
   getClients: () =>
