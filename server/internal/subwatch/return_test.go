@@ -838,3 +838,48 @@ func TestTick_APreferredServerFromBeforeSubscriptionsIsNothingToReturnTo(t *test
 		t.Fatalf("log %q; nothing to return to is nothing to say", logs.String())
 	}
 }
+
+// The user deletes the preferred server's subscription while the return probes
+// the first of its addresses, which does not answer. The switch to the second
+// address is refused, and Xray goes back to the server that ran before - the
+// way back is not held to the subscription, though Madrid's went too - rather
+// than staying on the address its probe just found dead.
+func TestTick_AReturnWhoseSubscriptionGoesMidAttemptRollsBack(t *testing.T) {
+	servers := returnServers()
+	servers[0].IPs = []string{osloIP, osloIP2}
+	r := newReturnRig(servers)
+	subs := []vpnconfig.Subscription{{ID: "aaaaaaaa", Name: "Alpha", URL: "https://a.example/s/token", Servers: servers}}
+	r.f.cfg.Xray.ActiveServer.Subscription = "aaaaaaaa"
+	r.f.cfg.Xray.PreferredServer.Subscription = "aaaaaaaa"
+	deleted := false
+	r.w.LoadSubscriptions = func() ([]vpnconfig.Subscription, error) {
+		if deleted {
+			return nil, nil
+		}
+		return cloneSubs(subs), nil
+	}
+	r.up[osloIP] = true
+	r.up[osloIP2] = true
+	r.live[madridIP] = true
+	r.onProbe = func() {
+		if r.running == osloIP {
+			deleted = true // the user deletes Alpha while the return probes Oslo
+		}
+	}
+
+	r.tick()
+
+	want := []string{"Oslo@" + osloIP, "restart", "Madrid@" + madridIP, "restart"}
+	if !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v: no second switch to Oslo, and the way back", r.events, want)
+	}
+	if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Madrid" {
+		t.Fatalf("active %+v, want Madrid back", a)
+	}
+	if len(r.f.notes) != 0 {
+		t.Fatalf("notes %v; nothing returned", r.f.notes)
+	}
+	if r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnRetry %v, want %v: the attempt failed", r.w.returnRetry, ReturnRetry)
+	}
+}

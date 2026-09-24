@@ -94,8 +94,10 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // process remembers it - and holds the next attempt back. That way back is
 // known before the first switch, and an attempt without one is put off. Every
 // write carries the walk's guard: a stop or a selection made meanwhile refuses
-// it, a switch to the preferred server is refused too once its subscription
-// is deleted, and the attempt ends there.
+// it, and the attempt ends there. A switch to the preferred server is refused
+// too once its subscription is deleted; nobody else wrote, so the attempt
+// fails as a dead one does, and goes back to the server that ran before if it
+// has left it.
 func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, servers, candidates []vpnconfig.Server) {
 	before := cfg.Xray.ActiveServer
 	links := make(map[string]string, len(subs))
@@ -117,9 +119,13 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 	}
 	slog.Info("Returning to the preferred server", "server", candidates[0].Name, "from", before.Name)
 	for _, c := range candidates {
-		live, ended := sw.to(ctx, c, true)
+		live, ended, gone := sw.to(ctx, c, true)
 		if ended {
 			return
+		}
+		if gone {
+			slog.Info("Return to the preferred server abandoned; its subscription was deleted", "server", c.Name)
+			break
 		}
 		if live {
 			// A stop or a selection can land while the probe waits; the walk
@@ -139,7 +145,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		return
 	}
 	for _, c := range back {
-		live, ended := sw.to(ctx, c, false)
+		live, ended, _ := sw.to(ctx, c, false)
 		if ended {
 			return
 		}
@@ -166,28 +172,32 @@ type switcher struct {
 }
 
 // to writes c as the running server, restarts Xray and probes it. With holds,
-// c's subscription must still exist with the link the attempt read: a switch
-// to a server of a subscription deleted meanwhile ends the attempt. The way
-// back to the server that ran before is not held to that - it is the server
-// that ran. live is a probe that passed; ended is a write the guard refused, a
-// restart a stop skipped, or a context or stop that ended the attempt, after
-// which nothing more may be written.
-func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended bool) {
+// c's subscription must still exist with the link the attempt read: gone is a
+// switch the guard refused because that subscription was deleted meanwhile.
+// Nothing was written for it, and nobody else wrote either, so the way back
+// stays open - and is not held to that check itself: it is the server that
+// ran. live is a probe that passed; ended is a write the guard refused for a
+// stop or a newer selection, a restart a stop skipped, or a context or stop
+// that ended the attempt, after which nothing more may be written.
+func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended, gone bool) {
 	w := s.w
 	if ctx.Err() != nil || w.stopped() {
-		return false, true
+		return false, true, false
 	}
 	sub, link := "", ""
 	if holds {
 		sub, link = c.Subscription, s.links[c.Subscription]
 	}
 	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq))
-	if endsWalk(err) || errors.Is(err, vpnconfig.ErrSubscriptionGone) {
-		return false, true
+	if endsWalk(err) {
+		return false, true, false
+	}
+	if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
+		return false, false, true
 	}
 	if !generated {
 		slog.Warn("Generating Xray config for server failed", "server", c.Name, "error", err)
-		return false, false
+		return false, false, false
 	}
 	s.wrote = true
 	if err == nil {
@@ -195,26 +205,26 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 	}
 	s.seq = seq
 	if ctx.Err() != nil {
-		return false, true
+		return false, true, false
 	}
 	if err := w.restartXray(); err != nil {
 		if errors.Is(err, errStopped) {
-			return false, true
+			return false, true, false
 		}
 		slog.Warn("Xray restart failed", "server", c.Name, "error", err)
-		return false, false
+		return false, false, false
 	}
 	w.AfterRestart(SettleAfterRestart)
 	if err := w.Probe(ctx, s.socks); err != nil {
 		// A probe a cancelled context or a stop cut short says nothing about
 		// the server.
 		if ctx.Err() != nil || w.stopped() {
-			return false, true
+			return false, true, false
 		}
 		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, "error", err)
-		return false, false
+		return false, false, false
 	}
-	return true, false
+	return true, false, false
 }
 
 // rollbackOrder is where a failed return goes back to: the server that ran
