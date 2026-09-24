@@ -14,16 +14,17 @@ import (
 )
 
 type mockVPNDirector struct {
-	statusOutput string
-	statusErr    error
-	restartErr   error
-	stopErr      error
+	statusOutput  string
+	statusErr     error
+	restartErr    error
+	stopErr       error
+	restartCalled bool
 }
 
 func (m *mockVPNDirector) Status() (string, error) { return m.statusOutput, m.statusErr }
 func (m *mockVPNDirector) Apply() error            { return nil }
 func (m *mockVPNDirector) Restart() error          { return m.restartErr }
-func (m *mockVPNDirector) RestartXray() error      { return nil }
+func (m *mockVPNDirector) RestartXray() error      { m.restartCalled = true; return nil }
 func (m *mockVPNDirector) Stop() error             { return m.stopErr }
 func (m *mockVPNDirector) Update() error           { return nil }
 func (m *mockVPNDirector) Platform() (vpnconfig.PlatformInfo, error) {
