@@ -1,6 +1,7 @@
 package wizard
 
 import (
+	"strings"
 	"testing"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -11,9 +12,9 @@ func TestHandler_Start(t *testing.T) {
 	t.Run("starts wizard and renders first step", func(t *testing.T) {
 		sender := &trackingSender{}
 		configStore := &trackingConfigStore{
-			servers: []vpnconfig.Server{
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 				{Name: "Server1", IPs: []string{"1.2.3.4"}},
-			},
+			}}},
 			vpnConfig: &vpnconfig.VPNDirectorConfig{},
 		}
 		vpnDirector := &mockVPNDirector{}
@@ -22,9 +23,9 @@ func TestHandler_Start(t *testing.T) {
 		handler := NewHandler(sender, configStore, vpnDirector, xrayGen)
 		handler.Start(123)
 
-		// Verify at least one message was sent (server selection step)
-		if len(sender.messages) == 0 {
-			t.Error("expected at least one message to be sent")
+		// Verify the server selection step was sent, not "No servers found"
+		if len(sender.messages) == 0 || !strings.Contains(sender.messages[0], "Step 1/4") {
+			t.Errorf("messages %q, want step 1", sender.messages)
 		}
 
 		// Verify state was created
@@ -158,10 +159,10 @@ func TestHandler_HandleCallback_RoutesToStep(t *testing.T) {
 	t.Run("routes callback to current step handler", func(t *testing.T) {
 		sender := &trackingSender{}
 		configStore := &trackingConfigStore{
-			servers: []vpnconfig.Server{
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 				{Name: "Server1", IPs: []string{"1.2.3.4"}},
 				{Name: "Server2", IPs: []string{"5.6.7.8"}},
-			},
+			}}},
 			vpnConfig: &vpnconfig.VPNDirectorConfig{},
 		}
 		vpnDirector := &mockVPNDirector{}
@@ -182,7 +183,7 @@ func TestHandler_HandleCallback_RoutesToStep(t *testing.T) {
 		// Select server (this should route to ServerStep)
 		cb := &tgbotapi.CallbackQuery{
 			ID:      "cb1",
-			Data:    "server:0",
+			Data:    "server:0a1b2c3d:0",
 			Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}, MessageID: 100},
 		}
 		handler.HandleCallback(cb)

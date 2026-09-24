@@ -60,9 +60,9 @@ func (s *State) PickServer(idx int, srv vpnconfig.Server) {
 	s.Picked = vpnconfig.NewActiveServer(srv)
 }
 
-// PickedIndex is where servers has the server step 1 picked, by name, address
-// and port, or -1 when servers no longer has it. A state with no pick recorded
-// has only its index to go by.
+// PickedIndex is where servers has the server step 1 picked, by subscription,
+// name, address and port, or -1 when servers no longer has it. A state with no
+// pick recorded has only its index to go by.
 func (s *State) PickedIndex(servers []vpnconfig.Server) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -95,7 +95,8 @@ func (s *State) PickedName() string {
 }
 
 func (s *State) picks(srv vpnconfig.Server) bool {
-	return srv.Name == s.Picked.Name && srv.Address == s.Picked.Address && srv.Port == s.Picked.Port
+	return srv.Subscription == s.Picked.Subscription && srv.Name == s.Picked.Name &&
+		srv.Address == s.Picked.Address && srv.Port == s.Picked.Port
 }
 
 func (s *State) SetExclusion(key string, value bool) {

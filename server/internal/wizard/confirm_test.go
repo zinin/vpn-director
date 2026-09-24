@@ -413,24 +413,44 @@ func TestConfirmStep_ExclusionsSorted(t *testing.T) {
 // Step 4 is where the user checks what is about to be applied, and it must name
 // the server step 1 picked, wherever a refresh has moved it since.
 func TestConfirmStep_Render_NamesThePickedServerAfterTheListMoved(t *testing.T) {
-	store := &mockConfigStore{servers: wizardServers("Oslo", "Paris")}
+	store := &mockConfigStore{subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo", "Paris")}}}
 	state := pickedServer(t, store, 1)
-	store.servers = wizardServers("Berlin", "Oslo", "Paris")
+	store.subs = []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Berlin", "Oslo", "Paris")}}
 	sender := &mockSender{}
 
 	NewConfirmStep(&StepDeps{Sender: sender, Config: store}).Render(123, state)
 
-	if !strings.Contains(sender.lastText, "Xray server: Paris") {
+	if !strings.Contains(sender.lastText, "Xray server: Main / Paris") {
 		t.Fatalf("confirmation %q, want the server picked in step 1", sender.lastText)
+	}
+}
+
+// Two subscriptions can name a server alike: step 4 names the one step 1
+// picked by its subscription, even after a refresh moved it next to the other.
+func TestConfirmStep_Render_NamesTheSubscriptionOfThePickedServer(t *testing.T) {
+	store := &mockConfigStore{subs: twoSubs()}
+	state := NewManager().Start(123)
+	NewServerStep(&StepDeps{Sender: &mockSender{}, Config: store}, nil).HandleCallback(&tgbotapi.CallbackQuery{
+		Data:    "server:1b2c3d4e:0",
+		Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}},
+	}, state)
+	store.subs = twoSubs()
+	store.subs[0].Servers = store.subs[0].Servers[1:] // Alpha drops Oslo: Beta's Germany-1 moves from 2 to 1
+	sender := &mockSender{}
+
+	NewConfirmStep(&StepDeps{Sender: sender, Config: store}).Render(123, state)
+
+	if !strings.Contains(sender.lastText, `Xray server: Beta / Germany\-1`) {
+		t.Fatalf("confirmation %q, want Beta's Germany-1, the one picked in step 1", sender.lastText)
 	}
 }
 
 // And one a refresh dropped is named as gone, so the user is not surprised when
 // the apply leaves the running server alone.
 func TestConfirmStep_Render_SaysThePickedServerIsGone(t *testing.T) {
-	store := &mockConfigStore{servers: wizardServers("Oslo", "Paris")}
+	store := &mockConfigStore{subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo", "Paris")}}}
 	state := pickedServer(t, store, 1)
-	store.servers = wizardServers("Oslo", "Berlin")
+	store.subs = []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo", "Berlin")}}
 	sender := &mockSender{}
 
 	NewConfirmStep(&StepDeps{Sender: sender, Config: store}).Render(123, state)

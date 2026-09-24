@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
+	"strings"
 	"testing"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -16,6 +18,7 @@ type mockSender struct {
 	lastChatID   int64
 	lastText     string
 	lastKeyboard *tgbotapi.InlineKeyboardMarkup
+	editedMsgID  int // the message the last EditMessage replaced
 	sendError    error
 }
 
@@ -54,6 +57,7 @@ func (m *mockSender) EditMessage(chatID int64, msgID int, text string, kb tgbota
 	m.lastChatID = chatID
 	m.lastText = text
 	m.lastKeyboard = &kb
+	m.editedMsgID = msgID
 	return m.sendError
 }
 
@@ -70,6 +74,9 @@ type mockConfigStore struct {
 }
 
 func (m *mockConfigStore) LoadServers() ([]vpnconfig.Server, error) {
+	if m.subs != nil {
+		return vpnconfig.AllServers(m.subs), m.err
+	}
 	return m.servers, m.err
 }
 
@@ -146,11 +153,11 @@ func TestServerStep_Render(t *testing.T) {
 	t.Run("renders server selection with keyboard", func(t *testing.T) {
 		sender := &mockSender{}
 		configStore := &mockConfigStore{
-			servers: []vpnconfig.Server{
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 				{Name: "Server1"},
 				{Name: "Server2"},
 				{Name: "Server3"},
-			},
+			}}},
 		}
 
 		deps := &StepDeps{
@@ -203,7 +210,7 @@ func TestServerStep_Render(t *testing.T) {
 	t.Run("sends error and clears wizard on no servers", func(t *testing.T) {
 		sender := &mockSender{}
 		configStore := &mockConfigStore{
-			servers: []vpnconfig.Server{},
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{}}},
 		}
 
 		var clearedChatID int64
@@ -272,10 +279,10 @@ func TestServerStep_HandleCallback(t *testing.T) {
 	t.Run("selects server and advances to exclusions step", func(t *testing.T) {
 		sender := &mockSender{}
 		configStore := &mockConfigStore{
-			servers: []vpnconfig.Server{
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 				{Name: "Server1"},
 				{Name: "Server2"},
-			},
+			}}},
 		}
 
 		deps := &StepDeps{
@@ -297,7 +304,7 @@ func TestServerStep_HandleCallback(t *testing.T) {
 		}
 
 		cb := &tgbotapi.CallbackQuery{
-			Data: "server:1",
+			Data: "server:0a1b2c3d:1",
 			Message: &tgbotapi.Message{
 				Chat: &tgbotapi.Chat{ID: 123},
 			},
@@ -331,12 +338,12 @@ func TestServerStep_HandleCallback(t *testing.T) {
 		}
 	})
 
-	t.Run("ignores invalid server index", func(t *testing.T) {
+	t.Run("an index past the list starts step 1 again", func(t *testing.T) {
 		sender := &mockSender{}
 		configStore := &mockConfigStore{
-			servers: []vpnconfig.Server{
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 				{Name: "Server1"},
-			},
+			}}},
 		}
 
 		deps := &StepDeps{
@@ -356,9 +363,10 @@ func TestServerStep_HandleCallback(t *testing.T) {
 		}
 
 		cb := &tgbotapi.CallbackQuery{
-			Data: "server:5", // Invalid index
+			Data: "server:0a1b2c3d:5", // Invalid index
 			Message: &tgbotapi.Message{
-				Chat: &tgbotapi.Chat{ID: 123},
+				MessageID: 7,
+				Chat:      &tgbotapi.Chat{ID: 123},
 			},
 		}
 
@@ -373,14 +381,22 @@ func TestServerStep_HandleCallback(t *testing.T) {
 		if nextCalled {
 			t.Error("next callback should not be called for invalid index")
 		}
+
+		// The tapped keyboard is replaced by step 1 as the list is now
+		if !strings.Contains(sender.lastText, "The server list has changed") || sender.editedMsgID != 7 {
+			t.Fatalf("text %q, edited message %d; want the server list has changed, in message 7", sender.lastText, sender.editedMsgID)
+		}
+		if got := buttonData(sender.lastKeyboard); !reflect.DeepEqual(got, []string{"server:0a1b2c3d:0", "cancel"}) {
+			t.Errorf("buttons %v, want step 1 again", got)
+		}
 	})
 
-	t.Run("ignores negative server index", func(t *testing.T) {
+	t.Run("a negative index starts step 1 again", func(t *testing.T) {
 		sender := &mockSender{}
 		configStore := &mockConfigStore{
-			servers: []vpnconfig.Server{
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 				{Name: "Server1"},
-			},
+			}}},
 		}
 
 		deps := &StepDeps{
@@ -400,9 +416,10 @@ func TestServerStep_HandleCallback(t *testing.T) {
 		}
 
 		cb := &tgbotapi.CallbackQuery{
-			Data: "server:-1",
+			Data: "server:0a1b2c3d:-1",
 			Message: &tgbotapi.Message{
-				Chat: &tgbotapi.Chat{ID: 123},
+				MessageID: 7,
+				Chat:      &tgbotapi.Chat{ID: 123},
 			},
 		}
 
@@ -411,14 +428,21 @@ func TestServerStep_HandleCallback(t *testing.T) {
 		if nextCalled {
 			t.Error("next callback should not be called for negative index")
 		}
+
+		if !strings.Contains(sender.lastText, "The server list has changed") || sender.editedMsgID != 7 {
+			t.Fatalf("text %q, edited message %d; want the server list has changed, in message 7", sender.lastText, sender.editedMsgID)
+		}
+		if got := buttonData(sender.lastKeyboard); !reflect.DeepEqual(got, []string{"server:0a1b2c3d:0", "cancel"}) {
+			t.Errorf("buttons %v, want step 1 again", got)
+		}
 	})
 
 	t.Run("ignores non-server callbacks", func(t *testing.T) {
 		sender := &mockSender{}
 		configStore := &mockConfigStore{
-			servers: []vpnconfig.Server{
+			subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: []vpnconfig.Server{
 				{Name: "Server1"},
-			},
+			}}},
 		}
 
 		deps := &StepDeps{
@@ -490,7 +514,7 @@ func TestServerStep_GridLayoutWithManyServers(t *testing.T) {
 		for i := range servers {
 			servers[i] = vpnconfig.Server{Name: "Server"}
 		}
-		configStore := &mockConfigStore{servers: servers}
+		configStore := &mockConfigStore{subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: servers}}}
 
 		deps := &StepDeps{
 			Sender: sender,
@@ -521,4 +545,153 @@ func TestServerStep_GridLayoutWithManyServers(t *testing.T) {
 			t.Errorf("expected 2 columns, got %d", len(sender.lastKeyboard.InlineKeyboard[0]))
 		}
 	})
+}
+
+// twoSubs is two subscriptions that both name a server Germany-1.
+func twoSubs() []vpnconfig.Subscription {
+	return []vpnconfig.Subscription{
+		{ID: "0a1b2c3d", Name: "Alpha", Servers: []vpnconfig.Server{
+			{Name: "Oslo", Address: "a.example.com", Port: 443},
+			{Name: "Germany-1", Address: "de.example.com", Port: 443},
+		}},
+		{ID: "1b2c3d4e", Name: "Beta", Servers: []vpnconfig.Server{{Name: "Germany-1", Address: "de.example.com", Port: 443}}},
+	}
+}
+
+func buttonData(kb *tgbotapi.InlineKeyboardMarkup) []string {
+	var out []string
+	for _, row := range kb.InlineKeyboard {
+		for _, b := range row {
+			out = append(out, *b.CallbackData)
+		}
+	}
+	return out
+}
+
+func TestServerStep_SeveralSubscriptionsOpenOnTheSubscriptions(t *testing.T) {
+	sender := &mockSender{}
+	step := NewServerStep(&StepDeps{Sender: sender, Config: &mockConfigStore{subs: twoSubs()}}, nil)
+
+	step.Render(123, NewManager().Start(123))
+
+	if got := buttonData(sender.lastKeyboard); !reflect.DeepEqual(got, []string{"server:sub:0a1b2c3d:0", "server:sub:1b2c3d4e:0", "cancel"}) {
+		t.Fatalf("buttons %v", got)
+	}
+}
+
+func TestServerStep_OneSubscriptionOpensOnItsServers(t *testing.T) {
+	sender := &mockSender{}
+	step := NewServerStep(&StepDeps{Sender: sender, Config: &mockConfigStore{subs: twoSubs()[:1]}}, nil)
+
+	step.Render(123, NewManager().Start(123))
+
+	if got := buttonData(sender.lastKeyboard); !reflect.DeepEqual(got, []string{"server:0a1b2c3d:0", "server:0a1b2c3d:1", "cancel"}) {
+		t.Fatalf("buttons %v", got)
+	}
+}
+
+// Both subscriptions list Germany-1 at one address: the pick records the one tapped.
+func TestServerStep_PicksTheServerOfTheSubscriptionTapped(t *testing.T) {
+	var next *State
+	step := NewServerStep(&StepDeps{Sender: &mockSender{}, Config: &mockConfigStore{subs: twoSubs()}}, func(_ int64, s *State) { next = s })
+	state := NewManager().Start(123)
+
+	step.HandleCallback(&tgbotapi.CallbackQuery{Data: "server:1b2c3d4e:0", Message: &tgbotapi.Message{MessageID: 7, Chat: &tgbotapi.Chat{ID: 123}}}, state)
+
+	if next == nil || state.Picked == nil || state.Picked.Subscription != "1b2c3d4e" || state.GetStep() != StepExclusions {
+		t.Fatalf("picked %+v, step %v", state.Picked, state.GetStep())
+	}
+	if i := state.PickedIndex(vpnconfig.AllServers(twoSubs())); i != 2 {
+		t.Fatalf("picked index %d, want 2 (Beta's Germany-1 in the flattened list)", i)
+	}
+}
+
+// A button of a keyboard sent before subscriptions names a list that is gone.
+func TestServerStep_AnOldButtonStartsStepOneAgain(t *testing.T) {
+	sender := &mockSender{}
+	step := NewServerStep(&StepDeps{Sender: sender, Config: &mockConfigStore{subs: twoSubs()}}, nil)
+	state := NewManager().Start(123)
+
+	step.HandleCallback(&tgbotapi.CallbackQuery{Data: "server:1", Message: &tgbotapi.Message{MessageID: 7, Chat: &tgbotapi.Chat{ID: 123}}}, state)
+
+	if state.Picked != nil || !strings.Contains(sender.lastText, "The server list has changed") {
+		t.Fatalf("picked %+v, text %q", state.Picked, sender.lastText)
+	}
+	if got := buttonData(sender.lastKeyboard); len(got) != 3 || got[0] != "server:sub:0a1b2c3d:0" {
+		t.Fatalf("buttons %v", got)
+	}
+}
+
+func TestServerStep_ThirtyServersAPage(t *testing.T) {
+	var many []vpnconfig.Server
+	for i := 0; i < 62; i++ {
+		many = append(many, vpnconfig.Server{Name: fmt.Sprintf("S%d", i+1), Address: "a.example.com", Port: i + 1})
+	}
+
+	_, kb := serverPage(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Main", Servers: many}, 1, true)
+
+	got := buttonData(&kb)
+	if len(got) != 34 || got[0] != "server:0a1b2c3d:30" || got[30] != "server:sub:0a1b2c3d:0" || got[31] != "server:sub:0a1b2c3d:2" || got[32] != "server:subs" || got[33] != "cancel" {
+		t.Fatalf("buttons %v", got)
+	}
+}
+
+// Step 1's navigation edits the tapped message and picks nothing: a
+// subscription's servers, « Back to the subscriptions, the next page, and a
+// subscription that is gone.
+func TestServerStep_NavigatesTheSubscriptionsAndTheirPages(t *testing.T) {
+	var many []vpnconfig.Server
+	for i := 0; i < 62; i++ {
+		many = append(many, vpnconfig.Server{Name: fmt.Sprintf("S%d", i+1), Address: "a.example.com", Port: i + 1})
+	}
+	var page2 []string
+	for i := 30; i < 60; i++ {
+		page2 = append(page2, fmt.Sprintf("server:0a1b2c3d:%d", i))
+	}
+	page2 = append(page2, "server:sub:0a1b2c3d:0", "server:sub:0a1b2c3d:2", "cancel")
+	subscriptions := []string{"server:sub:0a1b2c3d:0", "server:sub:1b2c3d4e:0", "cancel"}
+	tests := []struct {
+		name    string
+		subs    []vpnconfig.Subscription
+		data    string
+		text    string
+		buttons []string
+	}{
+		{"a subscription opens on its servers, with « Back", twoSubs(), "server:sub:1b2c3d4e:0", "of Beta", []string{"server:1b2c3d4e:0", "server:subs", "cancel"}},
+		{"« Back returns to the subscriptions", twoSubs(), "server:subs", "Select a subscription", subscriptions},
+		{"▶ turns the page, and one subscription has no « Back", []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: many}}, "server:sub:0a1b2c3d:1", "page 2/3", page2},
+		{"a subscription that is gone starts step 1 again", twoSubs(), "server:sub:ffffffff:0", "The server list has changed", subscriptions},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sender := &mockSender{}
+			state := NewManager().Start(123)
+			step := NewServerStep(&StepDeps{Sender: sender, Config: &mockConfigStore{subs: tt.subs}}, nil)
+
+			step.HandleCallback(&tgbotapi.CallbackQuery{Data: tt.data, Message: &tgbotapi.Message{MessageID: 7, Chat: &tgbotapi.Chat{ID: 123}}}, state)
+
+			if sender.editedMsgID != 7 || !strings.Contains(sender.lastText, tt.text) {
+				t.Fatalf("edited message %d, text %q; want message 7 edited to %q", sender.editedMsgID, sender.lastText, tt.text)
+			}
+			if got := buttonData(sender.lastKeyboard); !reflect.DeepEqual(got, tt.buttons) {
+				t.Fatalf("buttons %v, want %v", got, tt.buttons)
+			}
+			if state.Picked != nil || state.GetStep() != StepSelectServer {
+				t.Fatalf("picked %+v, step %v; navigation picks nothing", state.Picked, state.GetStep())
+			}
+		})
+	}
+}
+
+// The pick records where the flattened list LoadServers answers has it, the
+// place steps 4 and the apply look first.
+func TestServerStep_PickRecordsItsPlaceInTheFlattenedList(t *testing.T) {
+	state := NewManager().Start(123)
+	step := NewServerStep(&StepDeps{Sender: &mockSender{}, Config: &mockConfigStore{subs: twoSubs()}}, nil)
+
+	step.HandleCallback(&tgbotapi.CallbackQuery{Data: "server:1b2c3d4e:0", Message: &tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}}}, state)
+
+	if got := state.GetServerIndex(); got != 2 {
+		t.Fatalf("server index %d, want 2: Alpha's two servers come first", got)
+	}
 }
