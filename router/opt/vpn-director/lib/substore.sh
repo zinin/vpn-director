@@ -34,9 +34,12 @@ substore_valid_id() {
 # then by id, as the daemons order them. A file named anything but
 # <8 hex digits>.json is no subscription - a temp file of an atomic write
 # among them. One that does not parse, whose id is not its name, or with a
-# field of the wrong type - what the daemons' json.Unmarshal refuses - is
-# skipped with a warning. A null field is an absent one, and an absent name or
-# servers reads as "" or [], as the daemons read them.
+# field of the wrong type is skipped with a warning, as the daemons skip what
+# json.Unmarshal refuses: the fields of the file and of its servers have the
+# types vpnconfig.Subscription and vpnconfig.Server give them, a null being an
+# absent field, and a server's outbound, which Go keeps raw, may be anything.
+# An absent name or servers reads as "" or [], and a server's absent name or
+# address as "", as the daemons read them.
 substore_list() {
     local dir=$1 file name id sub
     local -a found=()
@@ -46,12 +49,21 @@ substore_list() {
             name=${file##*/}
             id=${name%.json}
             substore_valid_id "$id" || continue
-            if ! sub=$(jq -cse --arg id "$id" '
-                    select(length == 1) | .[0]
-                    | select(type == "object" and .id == $id
-                        and all(.name, .url, .added, .refreshed, .error; . == null or type == "string")
-                        and (.servers == null or (.servers | type == "array" and all(type == "object"))))
-                    | .name //= "" | .servers //= []' "$file" 2>/dev/null) || [[ -z $sub ]]; then
+            sub=$(jq -cs --arg id "$id" '
+                def text: . == null or type == "string";
+                def texts: . == null or (type == "array" and all(text));
+                def server: type == "object"
+                    and all(.address, .name, .uuid, .security, .network, .flow, .sni,
+                            .fingerprint, .public_key, .short_id; text)
+                    and (.port == null or (.port | type == "number"))
+                    and all(.ips, .alpn; texts);
+                select(length == 1) | .[0]
+                | select(type == "object" and .id == $id
+                    and all(.name, .url, .added, .refreshed, .error; text)
+                    and (.servers == null or (.servers | type == "array" and all(server))))
+                | .name //= "" | .servers //= []
+                | .servers[] |= (.name //= "" | .address //= "")' "$file" 2>/dev/null) || sub=""
+            if [[ -z $sub ]]; then
                 printf 'Skipping subscription file %s: it does not parse, its id is not its name, or a field has the wrong type\n' "$name" >&2
                 continue
             fi

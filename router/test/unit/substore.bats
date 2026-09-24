@@ -80,6 +80,34 @@ setup() {
     refute_output --partial "1b2c3d4e.json"
 }
 
+# Every field of every server has the type Go gives it too (vpnconfig.Server),
+# but the outbound, which Go keeps raw; one server of the wrong shape skips
+# the file. A server without a name or an address lists with "" for both, as
+# Go reads it.
+@test "substore_list: a server edited by hand" {
+    local dir="$BATS_TEST_TMPDIR/subscriptions" id
+    mkdir -p "$dir"
+    printf '%s' '{"id":"0a1b2c3d","added":"2026-09-24T18:00:00Z","servers":[{"port":443,"ips":[null,"192.0.2.1"],"outbound":"raw"}]}' > "$dir/0a1b2c3d.json"
+    printf '%s' '{"id":"1b2c3d4e","added":"2026-09-24T18:01:00Z","servers":[{"name":"Oslo","address":null,"port":null,"ips":null,"alpn":null,"uuid":null}]}' > "$dir/1b2c3d4e.json"
+    printf '%s' '{"id":"2c3d4e5f","servers":[{"name":5}]}' > "$dir/2c3d4e5f.json"
+    printf '%s' '{"id":"3d4e5f6a","servers":[{"port":"443"}]}' > "$dir/3d4e5f6a.json"
+    printf '%s' '{"id":"4e5f6a7b","servers":[{"ips":"192.0.2.1"}]}' > "$dir/4e5f6a7b.json"
+    printf '%s' '{"id":"5f6a7b8c","servers":[{"ips":[5]}]}' > "$dir/5f6a7b8c.json"
+    printf '%s' '{"id":"6a7b8c9d","servers":[{"alpn":["h2",1]}]}' > "$dir/6a7b8c9d.json"
+    printf '%s' '{"id":"7b8c9d0e","servers":[{"name":"Riga"},{"public_key":{}}]}' > "$dir/7b8c9d0e.json"
+
+    run bash -c "source '$LIB_DIR/substore.sh'; substore_list '$dir' 2>'$BATS_TEST_TMPDIR/err' | jq -c '[.[] | [.id, (.servers[] | [.name, .address, .port, .ips])]]'"
+
+    assert_success
+    assert_output '[["0a1b2c3d",["","",443,[null,"192.0.2.1"]]],["1b2c3d4e",["Oslo","",null,null]]]'
+    run cat "$BATS_TEST_TMPDIR/err"
+    for id in 2c3d4e5f 3d4e5f6a 4e5f6a7b 5f6a7b8c 6a7b8c9d 7b8c9d0e; do
+        assert_output --partial "Skipping subscription file $id.json"
+    done
+    refute_output --partial "0a1b2c3d.json"
+    refute_output --partial "1b2c3d4e.json"
+}
+
 @test "substore_valid_id: 8 lowercase hex digits" {
     substore_valid_id 0a1b2c3d
     run ! substore_valid_id 0A1B2C3D
