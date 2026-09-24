@@ -80,6 +80,9 @@ func lazyTunnel(ctx context.Context, cfgSvc service.ConfigStore, vpnSvc service.
 		return c
 	}
 	lookup = func(host string) ([]net.IP, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		p, c := find()
 		if c == nil {
 			return nil, errNoTunnel
@@ -119,7 +122,8 @@ func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel f
 		slog.Debug("Subscription hostnames did not resolve over the WAN, trying the tunnel", "error", rerr)
 	} else {
 		err = service.NewDownloadError(err)
-		if tunnel() == nil {
+		// An ended context leaves the tunnel nothing to try, and finding the tunnel runs vpn-director.sh platform.
+		if ctx.Err() != nil || tunnel() == nil {
 			return nil, err
 		}
 		slog.Debug("Subscription fetch over WAN failed, trying the tunnel", "error", err)

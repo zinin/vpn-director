@@ -516,7 +516,10 @@ menu_delete() {
         return 0
     fi
     substore_lock "$VPD_CONFIG" || abort "Config is locked by the Web UI or the bot; nothing was deleted"
-    substore_delete "$SUB_DIR" "$id"
+    if ! substore_delete "$SUB_DIR" "$id"; then
+        substore_unlock
+        abort "Failed to delete $name; nothing was deleted"
+    fi
     if ! substore_sync_config "$VPD_CONFIG" "$(substore_list "$SUB_DIR")" \
         "if (.xray.preferred_server.subscription // \"\") == \"$id\" then del(.xray.preferred_server) else . end"; then
         substore_unlock

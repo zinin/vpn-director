@@ -480,6 +480,28 @@ release_config_lock() {
     assert_output '[false,"A",[]]'
 }
 
+# A subscription file that cannot be removed ends the Delete with a message,
+# as every other store call that fails does, and nothing is deleted.
+@test "import_server_list.sh: Delete says so when the subscription file cannot be removed" {
+    load_import_into
+    write_config
+    write_list_file
+    run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+    local real_rm
+    real_rm=$(command -v rm)
+
+    # rm fails on a subscription file and removes anything else.
+    mkdir -p "$BATS_TEST_TMPDIR/norm"
+    printf '#!/bin/sh\nfor arg in "$@"; do\n    case $arg in */subscriptions/*.json) exit 1 ;; esac\ndone\nexec "%s" "$@"\n' \
+        "$real_rm" > "$BATS_TEST_TMPDIR/norm/rm"
+    chmod +x "$BATS_TEST_TMPDIR/norm/rm"
+    PATH="$BATS_TEST_TMPDIR/norm:$PATH" run_import d 1 y q
+
+    assert_output --partial "Failed to delete Alpha; nothing was deleted"
+    run bash -c "jq -r '.name' '$(subs_dir)'/*.json"
+    assert_output "Alpha"
+}
+
 # A link pasted where the menu wants a choice or a number, and a link of
 # another scheme - a single share link - where it wants a subscription: none
 # is echoed. A link carries a token or a key, and a share link of another

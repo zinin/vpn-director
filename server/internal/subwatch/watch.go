@@ -835,10 +835,11 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 		return
 	}
 	if !walk {
-		// Every download failed - the WAN, most likely - and a walk would cost
-		// an Xray restart per server for nothing. An all-dead walk may have
-		// backed the waves off to 10/20/30m; a failed download retries every
-		// ImportRetry.
+		// Some subscription failed and none was published - every download
+		// failing, the WAN most likely, is the usual case - and a walk would
+		// cost an Xray restart per server for nothing. An all-dead walk may
+		// have backed the waves off to 10/20/30m; a failed download retries
+		// every ImportRetry.
 		w.importRetry = 0
 		w.notifyRefreshFailed(cfg, failed)
 		return

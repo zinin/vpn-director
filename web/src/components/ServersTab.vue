@@ -88,7 +88,9 @@ function addSubscription() {
   return run('add', async () => {
     summaries.value = []
     const resp = await api.addSubscription(addUrl.value.trim(), addName.value.trim())
-    summaries.value = [resp.data.summary]
+    summaries.value = resp.data.existed
+      ? [resp.data.summary, 'The link was saved already; its list was refreshed.']
+      : [resp.data.summary]
     addUrl.value = ''
     addName.value = ''
     await load()

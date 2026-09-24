@@ -11,7 +11,7 @@
 # here calls log(); warnings go to stderr. Entware's jq is built without
 # oniguruma, so nothing here uses a regex builtin. A subscription list reaches
 # jq on stdin, never as an argument: with its outbounds it outgrows the
-# 128 KiB one argument may hold well inside SUBSTORE_MAX.
+# 131,071 bytes one argument may hold well inside SUBSTORE_MAX.
 ###############################################################################
 
 # The most subscriptions a router keeps, and the longest name in characters.

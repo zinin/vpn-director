@@ -202,9 +202,9 @@ setup() {
     assert_output '["192.0.2.1"]'
 }
 
-# A list with its outbounds passes the 128 KiB a single argument may hold well
-# inside the limit of ten subscriptions: every function that takes the list
-# has to hand it to jq on stdin.
+# A list with its outbounds passes the 131,071 bytes a single argument may
+# hold well inside the limit of ten subscriptions: every function that takes
+# the list has to hand it to jq on stdin.
 @test "the functions that take the list read a list past the argument limit" {
     local big config="$BATS_TEST_TMPDIR/vpn-director.json" ips
     big=$(jq -cn '[range(10) as $i | {id: "0000000\($i)", name: "Sub\($i)",

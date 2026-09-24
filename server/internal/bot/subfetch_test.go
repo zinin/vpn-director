@@ -514,6 +514,35 @@ func TestFetchServers_TheWANAloneLooksForNoTunnel(t *testing.T) {
 	}
 }
 
+// A /stop, a bot shutdown or the fetch deadline ends the context, and the WAN
+// download fails with it. Finding the tunnel runs vpn-director.sh platform,
+// which the context does not bound, and the wave waits for every fetch: a
+// fetch whose context has ended looks for no tunnel.
+func TestFetchServers_AnEndedContextLooksForNoTunnel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	wan := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		return nil, req.Context().Err()
+	})}
+	asked := 0
+	tunnel := func() *http.Client {
+		asked++
+		return nil
+	}
+
+	servers, err := fetchServers(ctx, "https://cdn.example/s/token", wan, tunnel, nil, nil)
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want the context's", err)
+	}
+	if servers != nil {
+		t.Fatalf("servers %+v", servers)
+	}
+	if asked != 0 {
+		t.Fatalf("the tunnel was looked for %d times after the context ended", asked)
+	}
+}
+
 // countingPlatform counts the vpn-director.sh platform runs.
 type countingPlatform struct {
 	service.VPNDirector
@@ -544,5 +573,25 @@ func TestLazyTunnel_FindsTheTunnelOnceAndOnlyWhenAskedFor(t *testing.T) {
 
 	if plat.runs != 1 {
 		t.Fatalf("%d platform runs, want 1", plat.runs)
+	}
+}
+
+// A host the WAN resolver does not answer is asked of the tunnel's. Once the
+// context has ended the lookup answers the context's error and finds no
+// tunnel: that would run vpn-director.sh platform, which the context does not
+// bound.
+func TestLazyTunnel_AnEndedContextLooksForNoTunnel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	plat := &countingPlatform{}
+	_, lookup := lazyTunnel(ctx, configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat)
+
+	ips, err := lookup("example.com")
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("lookup answered %v, err %v, want the context's", ips, err)
+	}
+	if plat.runs != 0 {
+		t.Fatalf("%d platform runs after the context ended", plat.runs)
 	}
 }
