@@ -244,10 +244,34 @@ func TestRecordSubscriptionError_KeepsTheList(t *testing.T) {
 	}
 }
 
+// Every wave of an outage fails the same way. The error is recorded once:
+// neither the file nor the config is written for it again. Another error is.
+func TestRecordSubscriptionError_TheSameErrorAgainWritesNothing(t *testing.T) {
+	m := &memStore{
+		subs:      []Subscription{{ID: "0a1b2c3d", URL: "https://sub.example.com/s/t", Refreshed: t0, Error: "download failed: HTTP 403", Servers: oslo()}},
+		saveErr:   errors.New("the file was written"),
+		configErr: errors.New("the config was written"),
+	}
+
+	if err := RecordSubscriptionError(m.update, m.files(), "0a1b2c3d", "https://sub.example.com/s/t", t0, "download failed: HTTP 403"); err != nil {
+		t.Fatal(err)
+	}
+
+	m.saveErr, m.configErr = nil, nil
+	if err := RecordSubscriptionError(m.update, m.files(), "0a1b2c3d", "https://sub.example.com/s/t", t0, "download failed: HTTP 502"); err != nil {
+		t.Fatal(err)
+	}
+	if m.subs[0].Error != "download failed: HTTP 502" {
+		t.Fatalf("error %q, want the new one recorded", m.subs[0].Error)
+	}
+}
+
 // Two refreshes can overlap: the Web UI's that succeeded and the watch's that
-// began before it and failed. The older one does not mark the newer list failed.
+// began before it and failed. The older one does not mark the newer list
+// failed, and writes neither the file nor the config.
 func TestRecordSubscriptionError_ANewerRefreshIsNotMarkedFailed(t *testing.T) {
-	m := &memStore{subs: []Subscription{{ID: "0a1b2c3d", URL: "https://sub.example.com/s/t", Refreshed: t0.Add(time.Minute)}}}
+	m := &memStore{subs: []Subscription{{ID: "0a1b2c3d", URL: "https://sub.example.com/s/t", Refreshed: t0.Add(time.Minute)}},
+		configErr: errors.New("the config was written")}
 
 	if err := RecordSubscriptionError(m.update, m.files(), "0a1b2c3d", "https://sub.example.com/s/t", t0, "download failed: timeout"); err != nil {
 		t.Fatal(err)

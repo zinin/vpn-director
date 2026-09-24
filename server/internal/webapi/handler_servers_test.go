@@ -419,6 +419,45 @@ func TestHandleSelectServer_TheSameNameInAnotherSubscription(t *testing.T) {
 	}
 }
 
+// publishingConfig publishes a list while the select waits for the config
+// lock: a refresh in another tab, or a wave of the bot's watch, got it first.
+type publishingConfig struct {
+	*mockConfig
+	publish func(*mockConfig)
+}
+
+func (p *publishingConfig) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	if publish := p.publish; publish != nil {
+		p.publish = nil
+		publish(p.mockConfig)
+	}
+	return p.mockConfig.UpdateVPNConfig(fn)
+}
+
+// xray.servers is the union as it stands under the lock. One read before the
+// wait would write back the older union, and the addresses of the list
+// published meanwhile would leave TPROXY_BYPASS.
+func TestHandleSelectServer_KeepsAListPublishedWhileItWaitedForTheLock(t *testing.T) {
+	deps, mc := subsDeps(t, alphaBeta()...)
+	deps.Config = &publishingConfig{mockConfig: mc, publish: func(m *mockConfig) {
+		m.subsMu.Lock()
+		defer m.subsMu.Unlock()
+		m.subs = append(m.subs, vpnconfig.Subscription{ID: "2c3d4e5f", Name: "Gamma", Servers: []vpnconfig.Server{
+			{Name: "Riga", Address: "riga.example.com", Port: 443, UUID: "uuid-4", IPs: []string{"203.0.113.30"}},
+		}})
+	}}
+
+	code, resp := call(t, handleSelectServer(deps), "POST", "/api/servers/active",
+		`{"subscription":"1b2c3d4e","index":0,"name":"Germany-1","address":"198.51.100.20","port":8443}`)
+
+	if code != http.StatusOK {
+		t.Fatalf("%d %v", code, resp)
+	}
+	if want := []string{"192.0.2.10", "192.0.2.11", "198.51.100.20", "203.0.113.30"}; !reflect.DeepEqual(mc.cfg.Xray.Servers, want) {
+		t.Fatalf("xray.servers %v, want %v", mc.cfg.Xray.Servers, want)
+	}
+}
+
 // A subscription deleted, or an index that names another server in its list,
 // is a list that changed since the page was drawn.
 func TestHandleSelectServer_AChangedListIsAConflict(t *testing.T) {

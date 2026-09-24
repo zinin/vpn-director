@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/zinin/vpn-director/server/internal/ssrf"
@@ -55,7 +56,6 @@ func (m *memConfigStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) e
 	return nil
 }
 func (m *memConfigStore) DataDir() (string, error) { return "/tmp/test-data", nil }
-func (m *memConfigStore) DataDirOrDefault() string { return "/tmp/test-data" }
 func (m *memConfigStore) ScriptsDir() string       { return "/tmp/test-scripts" }
 func (m *memConfigStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
 	m.mu.Lock()
@@ -285,11 +285,11 @@ func TestRefreshSubscription_AResolutionCutShortRecordsWhyAndKeepsTheList(t *tes
 
 // A *url.Error's text is the whole URL, and the subscription token sits in its path.
 func TestDownloadError_NamesNoLink(t *testing.T) {
-	err := downloadError(&url.Error{Op: "Get", URL: "https://sub.example.com/s/secret-token", Err: errors.New("i/o timeout")})
+	err := NewDownloadError(&url.Error{Op: "Get", URL: "https://sub.example.com/s/secret-token", Err: errors.New("i/o timeout")})
 	if strings.Contains(err.Error(), "secret-token") || err.Error() != "download failed: i/o timeout" {
 		t.Fatalf("%q", err)
 	}
-	blocked := downloadError(&url.Error{Op: "Get", URL: "https://x/s/t", Err: fmt.Errorf("dial: %w: 10.0.0.1", ssrf.ErrBlockedAddress)})
+	blocked := NewDownloadError(&url.Error{Op: "Get", URL: "https://x/s/t", Err: fmt.Errorf("dial: %w: 10.0.0.1", ssrf.ErrBlockedAddress)})
 	if strings.Contains(blocked.Error(), "10.0.0.1") {
 		t.Fatalf("the blocked address reached the text: %q", blocked)
 	}
@@ -318,6 +318,27 @@ func TestSubscriptionResult_ALineSaysTheListWasSaved(t *testing.T) {
 
 	if got, want := res.Line(), "Alpha: list saved, but xray.servers sync failed: disk full"; got != want {
 		t.Fatalf("line %q, want %q", got, want)
+	}
+}
+
+// A refresh downloads the link its file holds, and a file edited by hand can
+// hold any scheme: the daemons download https only, and refuse the rest before
+// a byte goes out.
+func TestRefreshSubscription_ALinkThatIsNotHTTPSIsNotDownloaded(t *testing.T) {
+	store := newMemConfigStore(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha", URL: "http://93.184.216.34/s/token"})
+	var requests atomic.Int32
+	client := subscriptionHost(t, func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(osloBody))
+	})
+
+	res := RefreshSubscription(context.Background(), store, client, "0a1b2c3d")
+
+	if !errors.Is(res.Err, ErrSubscriptionURL) || requests.Load() != 0 {
+		t.Fatalf("err %v, requests %d", res.Err, requests.Load())
+	}
+	if strings.Contains(res.Line(), "token") || len(store.subs[0].Servers) != 0 {
+		t.Fatalf("line %q, servers %d", res.Line(), len(store.subs[0].Servers))
 	}
 }
 

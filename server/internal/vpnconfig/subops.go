@@ -174,13 +174,19 @@ func RefreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawUR
 	}
 }
 
+// errNothingToWrite ends an update that has nothing to write, so that the
+// config is not saved either.
+var errNothingToWrite = errors.New("nothing to write")
+
 // RecordSubscriptionError notes msg, why a refresh of subscription id from
-// rawURL failed; the list stays. It writes nothing when the subscription is
-// gone or has another link (ErrSubscriptionGone), and nothing when its
-// Refreshed is no longer since, the time the caller read before it began: a
-// refresh that succeeded meanwhile is not marked failed by an older one.
+// rawURL failed; the list stays. It writes nothing, the config included, when
+// the subscription is gone or has another link (ErrSubscriptionGone), when its
+// Refreshed is no longer since, the time the caller read before it began - a
+// refresh that succeeded meanwhile is not marked failed by an older one - and
+// when msg is recorded already: every wave of the watch fails alike while an
+// outage lasts.
 func RecordSubscriptionError(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, since time.Time, msg string) error {
-	return update(func(*VPNDirectorConfig) error {
+	err := update(func(*VPNDirectorConfig) error {
 		subs, err := files.Load()
 		if err != nil {
 			return err
@@ -189,8 +195,8 @@ func RecordSubscriptionError(update ConfigUpdate, files SubscriptionFiles, id, r
 		if i < 0 || subs[i].URL != rawURL {
 			return ErrSubscriptionGone
 		}
-		if !subs[i].Refreshed.Equal(since) {
-			return nil
+		if !subs[i].Refreshed.Equal(since) || subs[i].Error == msg {
+			return errNothingToWrite
 		}
 		sub := subs[i]
 		sub.Error = msg
@@ -199,6 +205,10 @@ func RecordSubscriptionError(update ConfigUpdate, files SubscriptionFiles, id, r
 		}
 		return nil
 	})
+	if errors.Is(err, errNothingToWrite) {
+		return nil
+	}
+	return err
 }
 
 // RenameSubscription gives subscription id the name name, under update's lock.

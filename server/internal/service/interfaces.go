@@ -55,7 +55,6 @@ type ConfigStore interface {
 	// UpdateVPNConfig, so no code path can skip the lock.
 	UpdateVPNConfig(fn func(cfg *vpnconfig.VPNDirectorConfig) error) error
 	DataDir() (string, error)
-	DataDirOrDefault() string
 	ScriptsDir() string
 }
 

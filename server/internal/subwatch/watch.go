@@ -865,9 +865,11 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 // under that subscription's guard: it still exists with the link downloaded
 // (vpnconfig.RefreshSubscription). A download that fails leaves the list and
 // records why, unless a refresh from elsewhere succeeded meanwhile. failed
-// names the subscriptions that did not refresh; walk is false when none did
-// while some had a link. A stop or an ended context returns at once, writing
-// nothing more: the caller looks for both before it reads either result.
+// names the subscriptions whose download or publication failed; walk is false
+// when some failed and none was published. A list dropped because its
+// subscription was deleted while it downloaded is neither. A stop or an ended
+// context returns at once, writing nothing more: the caller looks for both
+// before it reads either result.
 func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subscription) (failed []string, walk bool) {
 	type download struct {
 		servers []vpnconfig.Server

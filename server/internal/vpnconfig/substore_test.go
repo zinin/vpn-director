@@ -1,9 +1,11 @@
 package vpnconfig
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -92,6 +94,65 @@ func TestLoadSubscriptions_SkipsWhatIsNoSubscription(t *testing.T) {
 	}
 	if len(subs) != 1 || subs[0].ID != "0a1b2c3d" {
 		t.Fatalf("got %+v, want 0a1b2c3d alone", subs)
+	}
+}
+
+// captureLog sends slog to a buffer for the rest of the test.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+// A file that cannot be read - a <id>.json that is a symlink to a directory
+// reads as EISDIR - is skipped as one that does not parse is: the readers of
+// the others do not fail with it.
+func TestLoadSubscriptions_AFileThatCannotBeReadIsSkipped(t *testing.T) {
+	dir := t.TempDir()
+	writeSubFile(t, dir, "0a1b2c3d.json", `{"id":"0a1b2c3d","name":"Alpha","added":"2026-09-24T18:00:00Z","refreshed":"2026-09-24T18:00:00Z","servers":[]}`)
+	if err := os.Symlink(t.TempDir(), filepath.Join(dir, "1b2c3d4e.json")); err != nil {
+		t.Fatal(err)
+	}
+	logs := captureLog(t)
+
+	subs, err := LoadSubscriptions(dir)
+
+	if err != nil || len(subs) != 1 || subs[0].ID != "0a1b2c3d" {
+		t.Fatalf("got %+v, %v; want 0a1b2c3d alone", subs, err)
+	}
+	if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), "file=1b2c3d4e.json") {
+		t.Fatalf("no warning names the file: %s", logs)
+	}
+}
+
+// The watch reads every file each 30 s tick. A file broken by hand is warned
+// about once in each state it is found in, not on every read, and again once
+// it has changed.
+func TestLoadSubscriptions_WarnsOnceForEachStateOfABrokenFile(t *testing.T) {
+	dir := t.TempDir()
+	writeSubFile(t, dir, "1b2c3d4e.json", `{"id":"1b2c3d4e",`)
+	logs := captureLog(t)
+
+	for i := 0; i < 3; i++ {
+		if _, err := LoadSubscriptions(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := strings.Count(logs.String(), "level=WARN"); n != 1 {
+		t.Fatalf("%d warnings for three reads of one broken file, want 1:\n%s", n, logs)
+	}
+
+	writeSubFile(t, dir, "1b2c3d4e.json", `{"id":"ffffffff","name":"Beta"}`)
+	for i := 0; i < 2; i++ {
+		if _, err := LoadSubscriptions(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := strings.Count(logs.String(), "level=WARN"); n != 2 {
+		t.Fatalf("%d warnings in all after an edit, want 2:\n%s", n, logs)
 	}
 }
 

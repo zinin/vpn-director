@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -74,9 +75,10 @@ func ValidSubscriptionID(id string) bool {
 
 // LoadSubscriptions reads every <id>.json in dir, ordered by Added, then by id.
 // A missing directory holds no subscription. A file named otherwise - the temp
-// file of an atomic write among them - is no subscription; a file that does not
-// parse, or whose id is not its name, is skipped with a warning rather than
-// failing every reader. Each server carries the id of its file.
+// file of an atomic write among them - is no subscription; a file that cannot
+// be read, does not parse, or whose id is not its name is skipped with a
+// warning rather than failing every reader. Each server carries the id of its
+// file.
 func LoadSubscriptions(dir string) ([]Subscription, error) {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -91,20 +93,22 @@ func LoadSubscriptions(dir string) ([]Subscription, error) {
 		if !ok || !ValidSubscriptionID(id) || e.IsDir() {
 			continue
 		}
-		data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		path := filepath.Join(dir, e.Name())
+		data, err := os.ReadFile(path)
 		if errors.Is(err, fs.ErrNotExist) {
 			continue // deleted since the listing
 		}
 		if err != nil {
-			return nil, err
+			warnSkipped(path, "Skipping a subscription file that cannot be read", "file", e.Name(), "error", err)
+			continue
 		}
 		var sub Subscription
 		if err := json.Unmarshal(data, &sub); err != nil {
-			slog.Warn("Skipping a subscription file that does not parse", "file", e.Name(), "error", err)
+			warnSkipped(path, "Skipping a subscription file that does not parse", "file", e.Name(), "error", err)
 			continue
 		}
 		if sub.ID != id {
-			slog.Warn("Skipping a subscription file whose id is not its name", "file", e.Name(), "id", sub.ID)
+			warnSkipped(path, "Skipping a subscription file whose id is not its name", "file", e.Name(), "id", sub.ID)
 			continue
 		}
 		for i := range sub.Servers {
@@ -119,6 +123,33 @@ func LoadSubscriptions(dir string) ([]Subscription, error) {
 		return subs[i].ID < subs[j].ID
 	})
 	return subs, nil
+}
+
+// skipped is, for each subscription file a reader skipped, the state - its
+// modification time and size - it was last warned about. The watch reads every
+// file each 30 s tick, and a file broken by hand would fill the log with the
+// same warning.
+var skipped = struct {
+	sync.Mutex
+	warned map[string]fileState
+}{warned: map[string]fileState{}}
+
+type fileState struct{ mod, size int64 }
+
+// warnSkipped logs msg for the file at path, once for each state it is found in.
+func warnSkipped(path, msg string, args ...any) {
+	var st fileState
+	if info, err := os.Stat(path); err == nil {
+		st = fileState{info.ModTime().UnixNano(), info.Size()}
+	}
+	skipped.Lock()
+	prev, seen := skipped.warned[path]
+	skipped.warned[path] = st
+	skipped.Unlock()
+	if seen && prev == st {
+		return
+	}
+	slog.Warn(msg, args...)
 }
 
 // SaveSubscription writes sub to dir/<id>.json, mode 0600 - the file holds the

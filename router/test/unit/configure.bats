@@ -456,6 +456,25 @@ two_subscriptions='[
     assert_output --partial "2) Beta | Premium (1 servers)"
 }
 
+# With errexit off, as bats "run" leaves it, only read's own status ends the
+# prompt when the answers run out: an input that ends must end the wizard, not
+# ask again for ever. timeout turns a prompt that loops into a failure.
+@test "step_select_xray_server: an input that ends ends the wizard at either prompt" {
+    local subs
+    for subs in "$two_subscriptions" \
+        '[{"id":"0a1b2c3d","name":"Main","servers":[{"name":"Oslo","address":"1.2.3.4","port":443,"ips":["1.2.3.4"]}]}]'; do
+        run timeout 10 bash -c '
+            VPD_DIR="$SCRIPTS_DIR"
+            . "$VPD_DIR/configure.sh" --source-only
+            set +e
+            SUBS_JSON=$1
+            step_select_xray_server <<< "9" > /dev/null 2>&1
+        ' _ "$subs"
+
+        assert_failure 1
+    done
+}
+
 @test "step_select_xray_server: one subscription goes straight to its servers" {
     load_wizard
 

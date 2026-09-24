@@ -131,7 +131,13 @@ func handleSelectServer(deps *Deps) http.HandlerFunc {
 		// xray restart would pick it up against the old vpn-director.json.
 		var ports service.InboundPorts
 		err = deps.Config.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
-			cfg.Xray.Servers = vpnconfig.SubscriptionIPs(subs)
+			// The union as it stands under the lock: a refresh, or a wave of
+			// the bot's watch, may have published while this waited for it.
+			all, err := deps.Config.LoadSubscriptions()
+			if err != nil {
+				return err
+			}
+			cfg.Xray.Servers = vpnconfig.SubscriptionIPs(all)
 			// Read here, where the config is already in hand: the generated
 			// inbound has to listen where the TPROXY rules send traffic.
 			ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)

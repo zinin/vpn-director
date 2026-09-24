@@ -75,6 +75,9 @@ async function run(what: string, fn: () => Promise<void>) {
     await fn()
   } catch (e: any) {
     alert('Error: ' + errorText(e))
+    // A failure can still have changed the list: "saved, but" and "deleted,
+    // but" answers, or a 404 for a subscription deleted meanwhile.
+    await load()
   } finally {
     busy.value = ''
   }
@@ -211,7 +214,7 @@ onMounted(load)
         </tr>
       </tbody>
     </table>
-    <p v-else-if="!loading" style="color: #999; font-size: 0.875rem;">
+    <p v-else-if="!loading && !error" style="color: #999; font-size: 0.875rem;">
       No subscriptions yet. Add one below.
     </p>
 
@@ -279,7 +282,7 @@ onMounted(load)
         </tbody>
       </table>
     </details>
-    <p v-if="groups.length === 0 && !loading" style="color: #999; font-size: 0.875rem;">
+    <p v-if="groups.length === 0 && !loading && !error" style="color: #999; font-size: 0.875rem;">
       No servers found. Add a subscription to get started.
     </p>
   </div>

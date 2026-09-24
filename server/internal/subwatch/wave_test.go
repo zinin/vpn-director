@@ -208,6 +208,30 @@ func TestWave_AnOlderFailureDoesNotMarkANewerRefresh(t *testing.T) {
 	}
 }
 
+// During an outage every wave fails alike, each ImportRetry. The error is
+// recorded once: the file is not written again for each wave.
+func TestWave_AnOutageRecordsItsErrorOnce(t *testing.T) {
+	alpha := subOf("aaaaaaaa", "Alpha", "https://a.example/s/token", "A1")
+	f := waveFake(alpha)
+	var events []string
+	w := walkRig(f, "", &events)
+	w.Fetch = fetchFrom([]vpnconfig.Subscription{alpha}, alpha.URL)
+	save := w.SaveSubscription
+	saves := 0
+	w.SaveSubscription = func(s vpnconfig.Subscription) error {
+		saves++
+		return save(s)
+	}
+
+	w.Tick(context.Background())
+	f.now = f.now.Add(ImportRetry)
+	w.Tick(context.Background())
+
+	if saves != 1 || f.subs[0].Error != "HTTP 403" {
+		t.Fatalf("%d writes of Alpha in two failed waves, error %q; want one write", saves, f.subs[0].Error)
+	}
+}
+
 // A download that decodes to no server keeps the list it would have replaced.
 func TestWave_ADownloadWithoutAServerKeepsTheList(t *testing.T) {
 	alpha := subOf("aaaaaaaa", "Alpha", "https://a.example/s/token", "A1")

@@ -196,7 +196,7 @@ step_select_xray_server() {
         printf "\n"
         while true; do
             printf "Select subscription [1-%d]: " "$count"
-            read -r choice
+            read -r choice || exit 1
             if [[ $choice -ge 1 ]] 2>/dev/null && [[ $choice -le $count ]] 2>/dev/null; then
                 break
             fi
@@ -246,7 +246,7 @@ step_select_xray_server() {
 
     while true; do
         printf "Select server [1-%d]: " "$total"
-        read -r choice
+        read -r choice || exit 1
 
         if [[ $choice -ge 1 ]] 2>/dev/null && [[ $choice -le $total ]] 2>/dev/null; then
             break

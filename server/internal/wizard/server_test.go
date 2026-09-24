@@ -104,10 +104,6 @@ func (m *mockConfigStore) DataDir() (string, error) {
 	return "/opt/vpn-director/data", m.err
 }
 
-func (m *mockConfigStore) DataDirOrDefault() string {
-	return "/opt/vpn-director/data"
-}
-
 func (m *mockConfigStore) ScriptsDir() string {
 	return "/opt/vpn-director"
 }

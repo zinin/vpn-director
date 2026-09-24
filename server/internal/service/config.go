@@ -85,16 +85,6 @@ func (s *ConfigService) DataDir() (string, error) {
 	return s.defaultDataDir, nil
 }
 
-// DataDirOrDefault returns data directory, falling back to default on error
-// Used by /import when vpn-director.json may not exist
-func (s *ConfigService) DataDirOrDefault() string {
-	dataDir, err := s.DataDir()
-	if err != nil || dataDir == "" {
-		return s.defaultDataDir
-	}
-	return dataDir
-}
-
 // LoadVPNConfig loads the VPN Director configuration
 func (s *ConfigService) LoadVPNConfig() (*vpnconfig.VPNDirectorConfig, error) {
 	return vpnconfig.LoadVPNDirectorConfig(s.ConfigPath())

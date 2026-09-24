@@ -146,7 +146,6 @@ func (m *mockConfig) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error
 }
 
 func (m *mockConfig) DataDir() (string, error) { return "/tmp/test-data", m.err }
-func (m *mockConfig) DataDirOrDefault() string { return "/tmp/test-data" }
 func (m *mockConfig) ScriptsDir() string       { return "/tmp/test-scripts" }
 
 // mockXray implements service.XrayGenerator for testing.

@@ -39,7 +39,6 @@ func (s *stubStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error)
 	return s.saveErr
 }
 func (s *stubStore) DataDir() (string, error) { return "", nil }
-func (s *stubStore) DataDirOrDefault() string { return "" }
 func (s *stubStore) ScriptsDir() string       { return "" }
 
 // stubXray notes whether the store was inside its locked section when the

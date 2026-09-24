@@ -98,10 +98,6 @@ func (m *trackingConfigStore) DataDir() (string, error) {
 	return "/opt/vpn-director/data", m.loadErr
 }
 
-func (m *trackingConfigStore) DataDirOrDefault() string {
-	return "/opt/vpn-director/data"
-}
-
 func (m *trackingConfigStore) ScriptsDir() string {
 	return "/opt/vpn-director"
 }
@@ -1150,6 +1146,47 @@ func TestApplier_Apply_GeneratesThePickedServerAfterTheListMoved(t *testing.T) {
 
 	if !xrayGen.generateCalled || xrayGen.generatedServer.Name != "Paris" {
 		t.Fatalf("generated %q (called %v), want Paris, the server picked in step 1", xrayGen.generatedServer.Name, xrayGen.generateCalled)
+	}
+}
+
+// publishingStore publishes a list while the apply waits for the config lock:
+// a refresh, or a wave of the subscription watch, got it first.
+type publishingStore struct {
+	*trackingConfigStore
+	publish func(*trackingConfigStore)
+}
+
+func (p *publishingStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	if publish := p.publish; publish != nil {
+		p.publish = nil
+		publish(p.trackingConfigStore)
+	}
+	return p.trackingConfigStore.UpdateVPNConfig(fn)
+}
+
+// The apply reads the lists, asks the platform, and only then waits for the
+// config lock. xray.servers is the union as it stands under the lock: the
+// addresses of a list published meanwhile stay in TPROXY_BYPASS.
+func TestApplier_Apply_KeepsAListPublishedWhileItWaitedForTheLock(t *testing.T) {
+	store := &trackingConfigStore{
+		subs: []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Main", Servers: wizardServers("Oslo")}},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{
+			Tunnels: map[string]vpnconfig.TunnelConfig{},
+		}},
+	}
+	state := pickedServer(t, store, 0)
+	published := &publishingStore{trackingConfigStore: store, publish: func(s *trackingConfigStore) {
+		s.subs = append(s.subs, vpnconfig.Subscription{ID: "1b2c3d4e", Name: "Beta", Servers: []vpnconfig.Server{
+			{Name: "Riga", Address: "riga.example", Port: 443, IPs: []string{"198.51.100.20"}},
+		}})
+	}}
+
+	if err := NewApplier(&trackingManager{}, &trackingSender{}, published, &mockVPNDirector{}, &mockXrayGenerator{}).Apply(123, state); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := strings.Join(store.savedConfig.Xray.Servers, ","); got != "198.51.100.20,203.0.113.10" {
+		t.Fatalf("xray.servers %s, want 198.51.100.20,203.0.113.10", got)
 	}
 }
 

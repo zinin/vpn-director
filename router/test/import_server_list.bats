@@ -482,19 +482,24 @@ release_config_lock() {
 
 # A link pasted where the menu wants a choice or a number, and a link of
 # another scheme - a single share link - where it wants a subscription: none
-# is echoed, the host at most. A link carries a token or a key.
+# is echoed. A link carries a token or a key, and a share link of another
+# scheme not even its host: a vmess link's "host" is its whole base64 payload,
+# the server's id in it.
 @test "import_server_list.sh: never echoes an answer that holds a link" {
     load_import_into
     write_config
     write_list_file
     run_import "$BATS_TEST_TMPDIR/servers.txt" "Alpha"
+    # {"add":"203.0.113.5","port":"443","id":"secret-uuid","ps":"X"}
+    local payload=eyJhZGQiOiIyMDMuMC4xMTMuNSIsInBvcnQiOiI0NDMiLCJpZCI6InNlY3JldC11dWlkIiwicHMiOiJYIn0=
 
     run_import "https://cdn.example/s/secret-token" d "https://cdn.example/s/secret-token" \
-        a "vless://secret-token@203.0.113.5:443?type=tcp#X" q
+        a "vless://secret-token@203.0.113.5:443?type=tcp#X" a "vmess://$payload" q
 
     assert_success
     refute_output --partial "secret-token"
-    assert_output --partial "Unsupported link to 203.0.113.5"
+    refute_output --partial "$payload"
+    assert_output --partial "Unsupported link: only http and https links are downloaded"
 }
 
 # The Web UI, the bot and configure.sh write under one lock, and so does the

@@ -43,7 +43,6 @@ func (m *subsStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error)
 	return fn(m.cfg)
 }
 func (m *subsStore) DataDir() (string, error) { return "/data", nil }
-func (m *subsStore) DataDirOrDefault() string { return "/data" }
 func (m *subsStore) ScriptsDir() string       { return "/scripts" }
 func (m *subsStore) LoadSubscriptions() ([]vpnconfig.Subscription, error) {
 	m.mu.Lock()

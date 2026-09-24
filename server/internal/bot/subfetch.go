@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/service"
@@ -61,15 +62,31 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 	// subscription can hold a watch tick for minutes on this router, and a stop
 	// has to be able to end it.
 	wanLookup := subscription.LookupIPv4(ctx)
-	p, tunnel := subscriptionTunnel(cfgSvc, vpnSvc)
-	var tunnelLookup func(host string) ([]net.IP, error)
-	if tunnel != nil {
-		path := p
-		tunnelLookup = func(host string) ([]net.IP, error) {
-			return lookupIPv4OnPath(ctx, path, host)
-		}
-	}
+	tunnel, tunnelLookup := lazyTunnel(ctx, cfgSvc, vpnSvc)
 	return fetchServers(ctx, rawURL, wan, tunnel, wanLookup, tunnelLookup)
+}
+
+// errNoTunnel is a lookup over a tunnel that is not there.
+var errNoTunnel = errors.New("no tunnel to look the host up over")
+
+// lazyTunnel is the tunnel one fetch falls back to, found when the fetch first
+// asks for it, and once: finding it runs vpn-director.sh platform, and a wave
+// of the watch fetches every subscription at once, mostly over a WAN that
+// serves them all. client answers nil, and lookup an error, without a tunnel.
+func lazyTunnel(ctx context.Context, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) (client func() *http.Client, lookup func(host string) ([]net.IP, error)) {
+	find := sync.OnceValues(func() (Path, *http.Client) { return subscriptionTunnel(cfgSvc, vpnSvc) })
+	client = func() *http.Client {
+		_, c := find()
+		return c
+	}
+	lookup = func(host string) ([]net.IP, error) {
+		p, c := find()
+		if c == nil {
+			return nil, errNoTunnel
+		}
+		return lookupIPv4OnPath(ctx, p, host)
+	}
+	return client, lookup
 }
 
 // fetchServers GETs via wan, then tunnel. A body the tunnel fetched resolves
@@ -79,8 +96,11 @@ func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.Config
 // the tunnel's resolver knew were dropped from it. A context that ends during
 // the resolution fails every lookup after it at once, and what resolved before
 // that is not the subscription: the context's error comes back instead of a
-// list cut short.
-func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
+// list cut short. A download that failed reads as the daemons' own
+// (service.DownloadError): the watch records it in the subscription's error,
+// which the Web UI and /subs show. tunnel is asked for the tunnel's client only
+// once the WAN falls short, and answers nil when there is none.
+func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel func() *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
 	body, err := getSubscription(ctx, wan, rawURL)
 	if err == nil {
 		servers, rerr := serversFromSubscriptionLookup(body, eitherLookup(ctx, wanLookup, tunnelLookup))
@@ -93,23 +113,20 @@ func fetchServers(ctx context.Context, rawURL string, wan, tunnel *http.Client, 
 		// A body none of whose hostnames answered, on the WAN resolver or the
 		// tunnel's, is the resolvers' failure rather than the subscription's:
 		// the tunnel's own download gets the last try.
-		if tunnel == nil || !errors.Is(rerr, errNoResolved) {
+		if !errors.Is(rerr, errNoResolved) || tunnel() == nil {
 			return nil, rerr
 		}
 		slog.Debug("Subscription hostnames did not resolve over the WAN, trying the tunnel", "error", rerr)
 	} else {
-		if tunnel == nil {
+		err = service.NewDownloadError(err)
+		if tunnel() == nil {
 			return nil, err
-		}
-		var ue *url.Error
-		if errors.As(err, &ue) {
-			err = ue.Err
 		}
 		slog.Debug("Subscription fetch over WAN failed, trying the tunnel", "error", err)
 	}
-	body, err = getSubscription(ctx, tunnel, rawURL)
+	body, err = getSubscription(ctx, tunnel(), rawURL)
 	if err != nil {
-		return nil, err
+		return nil, service.NewDownloadError(err)
 	}
 	servers, err := serversFromSubscriptionLookup(body, tunnelLookup)
 	if cerr := ctx.Err(); cerr != nil {

@@ -162,7 +162,7 @@ fetch_subscription() {
     # download (service.MaxSubscriptionBody). A larger one is refused, never
     # cut short: cut, a base64 list decodes to a shorter one.
     local -r max_bytes=1048576
-    local content rc=0 host
+    local content rc=0
     case $(link_scheme "$SUB_INPUT") in
         http|https)
             log "Downloading from URL..."
@@ -183,10 +183,10 @@ fetch_subscription() {
             if [[ ! -f "$SUB_INPUT" ]]; then
                 if [[ $SUB_INPUT == *://* ]]; then
                     # A link of another scheme - a share link pasted in place
-                    # of its subscription, say - shows its host alone: the
-                    # rest of it can be a token or a key.
-                    host=$(link_host "$SUB_INPUT")
-                    abort "Unsupported link${host:+ to $host}: only http and https links are downloaded"
+                    # of its subscription, say - shows nothing of itself: even
+                    # its "host" can be a key, as a vmess link's base64
+                    # payload is.
+                    abort "Unsupported link: only http and https links are downloaded"
                 fi
                 abort "File not found: $SUB_INPUT"
             fi

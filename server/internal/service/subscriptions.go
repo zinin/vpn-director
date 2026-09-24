@@ -42,9 +42,11 @@ func (e *DownloadError) Error() string {
 
 func (e *DownloadError) Unwrap() error { return e.Err }
 
-// downloadError wraps a failed download. A *url.Error gives up its URL first:
-// its text is the whole link, token included.
-func downloadError(err error) error {
+// NewDownloadError wraps a failed download. A *url.Error gives up its URL
+// first: its text is the whole link, token included. The watch's own download
+// wraps its failures here too, so the error a subscription records reads alike
+// whoever refreshed it.
+func NewDownloadError(err error) error {
 	var ue *url.Error
 	if errors.As(err, &ue) {
 		err = ue.Err
@@ -84,13 +86,18 @@ func ValidateSubscriptionURL(raw string) error {
 // /import download here; the watch has its own path (the WAN, then the
 // tunnel).
 func DownloadSubscription(ctx context.Context, client *http.Client, rawURL string) (subscription.Import, error) {
+	// A refresh downloads the link read back from its file, which a hand edit
+	// can have given any scheme.
+	if u, err := url.Parse(rawURL); err != nil || u.Scheme != "https" {
+		return subscription.Import{}, fmt.Errorf("%w: use an https:// link", ErrSubscriptionURL)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return subscription.Import{}, fmt.Errorf("%w: use an https:// link", ErrSubscriptionURL)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return subscription.Import{}, downloadError(err)
+		return subscription.Import{}, NewDownloadError(err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -99,7 +106,7 @@ func DownloadSubscription(ctx context.Context, client *http.Client, rawURL strin
 	// One byte past the cap tells a list that is too long from one that fits exactly.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxSubscriptionBody+1))
 	if err != nil {
-		return subscription.Import{}, downloadError(err)
+		return subscription.Import{}, NewDownloadError(err)
 	}
 	if len(body) > MaxSubscriptionBody {
 		return subscription.Import{}, &DownloadError{Err: errors.New("subscription exceeds 1 MiB")}
