@@ -113,14 +113,14 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		b.httpClient = NewPathClient(pm)
 		go pm.Start(ctx)
 		sw := &subwatch.Watch{
-			LoadVPN:      configSvc.LoadVPNConfig,
-			LoadPlatform: vpnSvc.Platform,
-			UpdateVPN:    configSvc.UpdateVPNConfig,
-			Apply:        vpnSvc.ApplyUnlessStopped,
-			RestartXray:  vpnSvc.RestartXrayProcessUnlessStopped,
-			SaveServers:  configSvc.SaveServers,
-			LoadServers:  configSvc.LoadServers,
-			Reachable:    reachTCP4(nil),
+			LoadVPN:           configSvc.LoadVPNConfig,
+			LoadPlatform:      vpnSvc.Platform,
+			UpdateVPN:         configSvc.UpdateVPNConfig,
+			Apply:             vpnSvc.ApplyUnlessStopped,
+			RestartXray:       vpnSvc.RestartXrayProcessUnlessStopped,
+			LoadSubscriptions: configSvc.LoadSubscriptions,
+			SaveSubscription:  configSvc.SaveSubscription,
+			Reachable:         reachTCP4(nil),
 			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 				cfg, err := configSvc.LoadVPNConfig()
 				if err != nil {

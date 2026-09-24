@@ -50,7 +50,7 @@ func controlUp(ip string) bool {
 // up names them.
 func reachWatch(f *fake, servers []vpnconfig.Server, up map[string]bool) *Watch {
 	w := f.watch()
-	w.LoadServers = func() ([]vpnconfig.Server, error) { return servers, nil }
+	w.LoadSubscriptions = subsOf(servers)
 	w.Reachable = func(_ context.Context, ip string, _ int) bool {
 		if ok, named := up[ip]; named {
 			return ok
@@ -164,17 +164,13 @@ func TestTick_NoReachAnswerKeepsThreeMinutes(t *testing.T) {
 		setup func(w *Watch)
 	}{
 		{"server not in servers.json", func(w *Watch) {
-			w.LoadServers = func() ([]vpnconfig.Server, error) {
-				return []vpnconfig.Server{{Name: "Paris", Address: "paris.example", Port: 443, IPs: []string{"203.0.113.30"}}}, nil
-			}
+			w.LoadSubscriptions = subsOf([]vpnconfig.Server{{Name: "Paris", Address: "paris.example", Port: 443, IPs: []string{"203.0.113.30"}}})
 		}},
 		{"hostname nothing resolved", func(w *Watch) {
-			w.LoadServers = func() ([]vpnconfig.Server, error) {
-				return []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}}, nil
-			}
+			w.LoadSubscriptions = subsOf([]vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443}})
 		}},
-		{"servers.json unreadable", func(w *Watch) {
-			w.LoadServers = func() ([]vpnconfig.Server, error) { return nil, errors.New("no such file") }
+		{"subscriptions unreadable", func(w *Watch) {
+			w.LoadSubscriptions = func() ([]vpnconfig.Subscription, error) { return nil, errors.New("no such file") }
 		}},
 		{"no TCP check", func(w *Watch) { w.Reachable = nil }},
 	} {

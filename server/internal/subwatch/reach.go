@@ -113,17 +113,17 @@ var reachControls = []vpnconfig.Server{
 }
 
 // activeServerDown reports whether the server active_server names accepts no
-// TCP connection on any address its servers.json entry lists while the WAN
+// TCP connection on any address its subscription lists for it while the WAN
 // reaches a control address. Every look without an answer is false: no record,
-// no entry, no IPv4 address to dial, no control accepting either, a look a
-// stop cut short, a server no TCP dial can see (tcpChecked), or a watch
-// without LoadServers or Reachable. The controls are dialed only once the
-// server's addresses have all failed.
+// no subscription lists it, no IPv4 address to dial, no control accepting
+// either, a look a stop cut short, a server no TCP dial can see (tcpChecked),
+// or a watch without LoadSubscriptions or Reachable. The controls are dialed
+// only once the server's addresses have all failed.
 func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
-	if w.LoadServers == nil || w.Reachable == nil || cfg == nil || cfg.Xray.ActiveServer == nil {
+	if w.LoadSubscriptions == nil || w.Reachable == nil || cfg == nil || cfg.Xray.ActiveServer == nil {
 		return false
 	}
-	servers, err := w.LoadServers()
+	servers, err := w.loadServers()
 	if err != nil {
 		return false
 	}
