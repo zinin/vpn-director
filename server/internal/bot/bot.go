@@ -26,21 +26,24 @@ import (
 
 // Bot is the main Telegram bot struct with DI
 type Bot struct {
-	api           *tgbotapi.BotAPI
-	auth          *Auth
-	router        *Router
-	mu            sync.Mutex
-	sender        telegram.MessageSender
-	pendingNotify []string
-	devMode       bool
-	executor      service.ShellExecutor
-	updater       updater.Updater
-	chatStore     *chatstore.Store
-	pathManager   *PathManager
-	subWatch      *subwatch.Watch
-	httpClient    *http.Client
-	endpoint      string
-	wire          func(*tgbotapi.BotAPI)
+	api    *tgbotapi.BotAPI
+	auth   *Auth
+	router *Router
+	mu     sync.Mutex
+	sender telegram.MessageSender
+	// outbox holds the watch's notifications until a path to Telegram carries
+	// them; pathLive says whether the path manager has one (nil: always).
+	outbox      outbox
+	pathLive    func() bool
+	devMode     bool
+	executor    service.ShellExecutor
+	updater     updater.Updater
+	chatStore   *chatstore.Store
+	pathManager *PathManager
+	subWatch    *subwatch.Watch
+	httpClient  *http.Client
+	endpoint    string
+	wire        func(*tgbotapi.BotAPI)
 	// apiBase is empty in production and set only by tests, where one local
 	// server answers both the path probe and the Telegram API, as one host
 	// does in production.
@@ -110,6 +113,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		})
 		pm.SelectOnce(ctx)
 		b.pathManager = pm
+		b.pathLive = func() bool { return pm.Current().kind != kindNone }
 		b.httpClient = NewPathClient(pm)
 		go pm.Start(ctx)
 		sw := &subwatch.Watch{
@@ -210,51 +214,40 @@ func (b *Bot) Connect(cfg *config.Config) error {
 	return nil
 }
 
+// setSender publishes the sender and delivers what the watch said before
+// Telegram was connected.
 func (b *Bot) setSender(s telegram.MessageSender) {
-	for {
-		b.mu.Lock()
-		pending := b.pendingNotify
-		b.pendingNotify = nil
-		store := b.chatStore
-		auth := b.auth
-		if len(pending) == 0 {
-			b.sender = s
-			b.mu.Unlock()
-			return
-		}
-		b.mu.Unlock()
-		for _, msg := range pending {
-			sendActiveChats(s, store, auth, msg)
-		}
-	}
+	b.mu.Lock()
+	b.sender = s
+	b.mu.Unlock()
+	b.flushNotifications()
 }
 
 // notifyActiveChats sends msg to every active chat whose user is still in
 // allowed_users, once per ChatID: one person who renamed their handle is two
-// chatstore records with one ChatID. Before Telegram is connected the
-// messages are queued so a failover during getMe retries is not lost.
+// chatstore records with one ChatID. The message goes through the outbox: it
+// waits there while Telegram is not connected yet or no path reaches it, and
+// behind any older message of the same chat.
 func (b *Bot) notifyActiveChats(msg string) {
 	b.mu.Lock()
-	sender := b.sender
 	store := b.chatStore
 	auth := b.auth
-	if sender == nil {
-		b.pendingNotify = append(b.pendingNotify, msg)
-		b.mu.Unlock()
-		return
-	}
 	b.mu.Unlock()
-	sendActiveChats(sender, store, auth, msg)
+	b.outbox.add(activeChats(store, auth), msg)
+	b.flushNotifications()
 }
 
-func sendActiveChats(sender telegram.MessageSender, store *chatstore.Store, auth *Auth, msg string) {
-	if store == nil || sender == nil {
-		return
+// activeChats is every active chat whose user is still in allowed_users, each
+// ChatID once.
+func activeChats(store *chatstore.Store, auth *Auth) []int64 {
+	if store == nil {
+		return nil
 	}
 	users, err := store.GetActiveUsers()
 	if err != nil {
-		return
+		return nil
 	}
+	var chats []int64
 	seen := make(map[int64]struct{}, len(users))
 	for _, u := range users {
 		if auth == nil || !auth.IsAuthorized(u.Username) {
@@ -264,8 +257,9 @@ func sendActiveChats(sender telegram.MessageSender, store *chatstore.Store, auth
 			continue
 		}
 		seen[u.ChatID] = struct{}{}
-		sender.SendPlain(u.ChatID, msg)
+		chats = append(chats, u.ChatID)
 	}
+	return chats
 }
 
 // RegisterCommands registers bot commands with Telegram
@@ -305,6 +299,7 @@ func (b *Bot) Run(ctx context.Context) {
 	if b.subWatch != nil {
 		go b.subWatch.Start(ctx)
 	}
+	go b.retryNotifications(ctx, outboxRetryEvery)
 	// b.chatStore is a typed nil in dev mode; assigning it straight into the
 	// interface would hand CheckAndSendNotify a non-nil interface over a nil
 	// pointer and panic on the first call.
