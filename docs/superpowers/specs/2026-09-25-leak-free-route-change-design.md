@@ -122,8 +122,9 @@ address.
   form's (xray, the platform's tunnels, and the routes in use when the platform
   cannot be asked), plus the row's own route when they lack it.
 - Picking a tunnel whose `connected` is false asks first: "Wireguard1 is down:
-  its traffic goes out through the WAN until it is up. Move anyway?" Cancel puts
-  the select back. The Add form asks the same before it adds to such a tunnel.
+  until it is up, this client's traffic goes out through the WAN. Move anyway?"
+  Cancel puts the select back. The Add form asks the same ("… Add anyway?")
+  before it adds to such a tunnel.
 - While the request runs, the row's controls are disabled. The list reloads when
   it ends, after an error too (`reportError`).
 - Rows are keyed by `ip|route`: during a staged failover one address sits in two
@@ -138,7 +139,10 @@ address.
   route carries ✓, and « Back returns to the list.
 - A route button (`clients:to:<route>:<ip>`) moves the client; the prefix, a
   route id and an address stay well within Telegram's 64 bytes. A tunnel that
-  is down asks first, with a second button that confirms.
+  is down asks first, with a second button that confirms
+  (`clients:toyes:<route>:<ip>`) and one that cancels (`clients:rm_no`). An
+  address no route can take (an IPv6 entry an older build saved) gets no 🔀
+  button.
 - The move runs `MoveClient` and `Apply`, and the message shows the list again.
   A button whose client is gone, or whose route is no longer offered, redraws
   the list, as the other `/clients` buttons do.
