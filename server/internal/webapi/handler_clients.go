@@ -1,6 +1,7 @@
 package webapi
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -53,33 +54,8 @@ func handleAddClient(deps *Deps) http.HandlerFunc {
 			jsonError(w, http.StatusBadRequest, "route is required")
 			return
 		}
-		// A route is xray, a tunnel already in the config, or a tunnel this
-		// router has, asked of the platform now: the list is the firmware's
-		// (Merlin wgcN/ovpncN, Keenetic OpenVPN0, Wireguard1, ...) and a tunnel
-		// can appear or go at any time. A configured tunnel is accepted without
-		// the platform, as the bot and the wizard accept it: ClientsTab offers
-		// exactly those when the platform cannot be asked, and a 503 here made
-		// that fallback unusable. An empty list is not an answer either: on
-		// Keenetic `vpn-director.sh platform` prints "tunnels": [] and exits 0
-		// while RCI does not reply (spec 13).
-		if req.Route != "xray" {
-			cfg, err := deps.Config.LoadVPNConfig()
-			if err != nil {
-				jsonError(w, http.StatusInternalServerError, "failed to load configuration")
-				return
-			}
-			if _, configured := cfg.TunnelDirector.Tunnels[req.Route]; !configured {
-				extendWriteDeadline(w, statusDeadline)
-				info, err := deps.VPN.Platform()
-				if err != nil || len(info.Tunnels) == 0 {
-					jsonError(w, http.StatusServiceUnavailable, "platform info unavailable")
-					return
-				}
-				if !info.HasTunnel(req.Route) {
-					jsonError(w, http.StatusBadRequest, "invalid route: must be xray or a tunnel this router has")
-					return
-				}
-			}
+		if !checkClientRoute(w, deps, req.Route) {
+			return
 		}
 
 		unlock, ok := lockLongOp(w, r, deps, applyDeadline)
@@ -117,6 +93,104 @@ func handleAddClient(deps *Deps) http.HandlerFunc {
 			cfg.TunnelDirector.Tunnels[req.Route] = tunnel
 			return nil
 		}))
+	}
+}
+
+// checkClientRoute answers whether route may take a client, for an add and a
+// move alike: xray, a tunnel already in the config, or a tunnel this router
+// has, asked of the platform now - the list is the firmware's (Merlin
+// wgcN/ovpncN, Keenetic OpenVPN0, Wireguard1, ...) and a tunnel can appear or
+// go at any time. A configured tunnel is accepted without the platform, as the
+// bot and the wizard accept it: ClientsTab offers exactly those when the
+// platform cannot be asked, and a 503 here made that fallback unusable. An
+// empty list is not an answer either: on Keenetic `vpn-director.sh platform`
+// prints "tunnels": [] and exits 0 while RCI does not reply (spec 13). It
+// writes the error response itself and returns false when the handler must
+// stop.
+func checkClientRoute(w http.ResponseWriter, deps *Deps, route string) bool {
+	if route == "xray" {
+		return true
+	}
+	cfg, err := deps.Config.LoadVPNConfig()
+	if err != nil {
+		jsonError(w, http.StatusInternalServerError, "failed to load configuration")
+		return false
+	}
+	if _, configured := cfg.TunnelDirector.Tunnels[route]; configured {
+		return true
+	}
+	extendWriteDeadline(w, statusDeadline)
+	info, err := deps.VPN.Platform()
+	if err != nil || len(info.Tunnels) == 0 {
+		jsonError(w, http.StatusServiceUnavailable, "platform info unavailable")
+		return false
+	}
+	if !info.HasTunnel(route) {
+		jsonError(w, http.StatusBadRequest, "invalid route: must be xray or a tunnel this router has")
+		return false
+	}
+	return true
+}
+
+// moveClientRequest is the expected JSON body for POST /api/clients/route.
+type moveClientRequest struct {
+	IP    string `json:"ip"`
+	Route string `json:"route"`
+}
+
+// errClientUnchanged ends a move whose route already holds the address alone:
+// the update writes nothing, and there is nothing to apply.
+var errClientUnchanged = errors.New("client already on that route")
+
+// handleMoveClient returns a handler that moves a client to another route in
+// one config change and one apply (vpnconfig.MoveClient). The apply moves it
+// make-before-break: the client stays on its old route until the new one
+// carries it, so none of its packets leaves through the WAN meanwhile - a
+// delete and an add left it there for as long as the user took between them.
+func handleMoveClient(deps *Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req moveClientRequest
+		if err := decodeJSON(r, &req); err != nil {
+			jsonError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if req.IP == "" {
+			jsonError(w, http.StatusBadRequest, "ip is required")
+			return
+		}
+		ip, err := vpnconfig.NormalizeClientAddr(req.IP)
+		if err != nil {
+			jsonError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if req.Route == "" {
+			jsonError(w, http.StatusBadRequest, "route is required")
+			return
+		}
+		if !checkClientRoute(w, deps, req.Route) {
+			return
+		}
+
+		unlock, ok := lockLongOp(w, r, deps, applyDeadline)
+		if !ok {
+			return
+		}
+		defer unlock()
+
+		err = updateAndApply(deps, func(cfg *vpnconfig.VPNDirectorConfig) error {
+			switch vpnconfig.MoveClient(cfg, ip, req.Route) {
+			case vpnconfig.ClientNotFound:
+				return &httpError{status: http.StatusNotFound, msg: "client not found"}
+			case vpnconfig.ClientAlreadyThere:
+				return errClientUnchanged
+			}
+			return nil
+		})
+		if errors.Is(err, errClientUnchanged) {
+			jsonOK(w, map[string]bool{"ok": true})
+			return
+		}
+		writeSaveApplyResult(w, err)
 	}
 }
 

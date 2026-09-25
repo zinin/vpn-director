@@ -198,6 +198,7 @@ func TestLongOpHandlers_ExtendWriteDeadline(t *testing.T) {
 		{"pause client", "POST", "/api/clients/pause?ip=192.168.50.10", "", handlePauseClient, applyDeadline},
 		{"resume client", "POST", "/api/clients/resume?ip=192.168.50.10", "", handleResumeClient, applyDeadline},
 		{"delete client", "DELETE", "/api/clients?ip=192.168.50.10", "", handleDeleteClient, applyDeadline},
+		{"move client", "POST", "/api/clients/route", `{"ip":"192.168.50.10","route":"xray"}`, handleMoveClient, applyDeadline},
 		{"update exclude sets", "POST", "/api/excludes/sets", `{"sets":["ru"]}`, handleUpdateExcludeSets, applyDeadline},
 		{"add exclude ip", "POST", "/api/excludes/ips", `{"ip":"1.2.3.4"}`, handleAddExcludeIP, applyDeadline},
 		{"delete exclude ip", "DELETE", "/api/excludes/ips?ip=1.2.3.4", "", handleDeleteExcludeIP, applyDeadline},
