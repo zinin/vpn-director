@@ -89,7 +89,10 @@ func (s *VPNDirectorService) Apply() error { return s.runChecked(ApplyTimeout, "
 // Restart restarts VPN Director
 func (s *VPNDirectorService) Restart() error { return s.runChecked(ApplyTimeout, "restart", "restart") }
 
-// RestartXray restarts only Xray
+// RestartXray restarts the Xray process and applies the TPROXY rules again in
+// place: nothing is stopped, so the Xray clients wait for the process instead
+// of leaving through the WAN. A server switch calls it; the switch may also
+// have recomputed xray.servers, which the apply swaps into TPROXY_BYPASS.
 func (s *VPNDirectorService) RestartXray() error {
 	return s.runChecked(ApplyTimeout, "restart xray", "restart", "xray")
 }
@@ -103,9 +106,8 @@ func (s *VPNDirectorService) ApplyUnlessStopped() error {
 
 // RestartXrayProcessUnlessStopped restarts the Xray process for the same
 // caller, skipped the same way, and leaves the TPROXY rules alone. The walk
-// writes one config.json per server it tries; the stop and apply of "restart
-// xray" would take the TPROXY jump away and put it back each time, and the
-// Xray clients leave through the WAN in between.
+// writes one config.json per server it tries and changes nothing else; "restart
+// xray" would apply the TPROXY rules again after each one for nothing.
 func (s *VPNDirectorService) RestartXrayProcessUnlessStopped() error {
 	return s.runChecked(ApplyTimeout, "restart xray-process", "--unless-stopped", "restart", "xray-process")
 }

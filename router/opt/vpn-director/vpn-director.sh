@@ -25,7 +25,7 @@ fi
 #   vpn-director status [tunnel|xray|ipset]  - Show status
 #   vpn-director apply [tunnel|xray]         - Apply configuration
 #   vpn-director stop [tunnel|xray]          - Stop components
-#   vpn-director restart [tunnel|xray]       - Restart components
+#   vpn-director restart [tunnel|xray]       - Rebuild in place, nothing stopped (all and xray restart Xray)
 #   vpn-director restart xray-process        - Restart the Xray process only (TPROXY rules kept)
 #   vpn-director update                      - Update ipsets and reapply all
 #   vpn-director platform                    - Print platform facts as JSON (for the daemons)
@@ -114,9 +114,9 @@ Usage:
 
 Commands:
   status [tunnel|xray|ipset]  Show status (all or specific component)
-  apply [tunnel|xray]         Apply configuration
+  apply [tunnel|xray]         Apply configuration (moving a client between them takes a full apply)
   stop [tunnel|xray]          Stop components
-  restart [tunnel|xray]       Restart (stop + apply)
+  restart [tunnel|xray]       Rebuild in place, nothing stopped (all and xray restart the Xray process)
   restart xray-process        Restart the Xray process only, TPROXY rules kept
   update                      Download fresh ipsets and reapply all
   platform                    Print platform facts as JSON
@@ -359,39 +359,40 @@ cmd_stop() {
 }
 
 cmd_restart() {
-    # Lock first for the same reason: cmd_stop and cmd_apply below would find
-    # the modules already loaded and reuse the config read before the wait.
+    # Lock first for the same reason: cmd_apply below would find the modules
+    # already loaded and reuse the config read before the wait.
     _load_common
     acquire_lock "vpn-director"
     _load_modules
     if _skip_when_stopped restart; then
         return 0
     fi
-    # A full restart leaves the marker in its own stop half; the apply half must
-    # not take that for a stop someone else made.
+    # Checked once, above, under the lock this restart holds throughout.
     UNLESS_STOPPED=0
+    # Nothing is stopped first. An apply replaces its chains and sets whole, with
+    # no moment without them (swap_fw_chain, ipset swap); a stop took the routing
+    # away until the apply put it back, and every client left through the WAN in
+    # between. TUN_DIR_FORCE_REBUILD rebuilds Tunnel Director even when its state
+    # reads up to date: what a restart is asked for.
     case "$COMPONENT" in
         ""|all)
             tproxy_restart_process
-            cmd_stop
-            cmd_apply
+            TUN_DIR_FORCE_REBUILD=1 cmd_apply
             ;;
         tunnel)
-            COMPONENT=tunnel cmd_stop
-            COMPONENT=tunnel cmd_apply
+            TUN_DIR_FORCE_REBUILD=1 COMPONENT=tunnel cmd_apply
             ;;
         xray|tproxy)
+            # A server switch (the Web UI, /xray, the wizard): the rules stay in
+            # place while the process restarts, so its clients wait for it
+            # instead of leaving through the WAN, and the apply swaps in
+            # TPROXY_BYPASS, whose xray.servers the switch may have recomputed.
             tproxy_restart_process
-            COMPONENT=xray cmd_stop
             COMPONENT=xray cmd_apply
             ;;
         xray-process)
             # config.json changed and nothing else: the Telegram bot's
-            # subscription watch writes one per server it tries. The stop and
-            # apply of "xray" take the TPROXY jump away and put it back, and in
-            # between the Xray clients leave through the WAN - once per server.
-            # With the rules in place, a client meets a restarting Xray and
-            # waits instead.
+            # subscription watch writes one per server it tries.
             tproxy_restart_process
             ;;
         *)

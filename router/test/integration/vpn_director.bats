@@ -268,14 +268,14 @@ run_stubbed_cli() {
     [ ! -e "$BATS_TEST_TMPDIR/calls" ]
 }
 
-# A full restart leaves the marker in its own stop half. Its apply half must not
-# take that for a stop someone else made.
+# A restart stops nothing, so it leaves no marker of its own: the apply it runs
+# removes the one a stop left, as an apply does.
 @test "vpn-director: restart --unless-stopped re-applies a running router" {
     export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
     run_stubbed_cli --unless-stopped restart
     assert_success
     grep -qx tproxy_apply "$BATS_TEST_TMPDIR/calls"
-    grep -qx tunnel_apply "$BATS_TEST_TMPDIR/calls"
+    grep -qx "tunnel_apply forced" "$BATS_TEST_TMPDIR/calls"
     [ ! -e "$VPD_STOPPED_FILE" ]
 }
 
@@ -615,4 +615,30 @@ run_stubbed_cli() {
     run "$SCRIPTS_DIR/vpn-director.sh" --help
     assert_output --partial "platform"
     assert_output --partial "cron install|remove"
+}
+
+# A restart stops nothing: every apply swaps its chains and sets in whole, where
+# a stop took the routing away until the apply put it back.
+@test "vpn-director: restart rebuilds in place and stops nothing" {
+    run_stubbed_cli restart
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_restart_process\ntproxy_apply\ntunnel_apply forced\ntproxy_prune'
+}
+
+# A server switch (the Web UI, /xray, the wizard) runs "restart xray". The TPROXY
+# rules stay in place while the process restarts: its clients wait for it
+# instead of leaving through the WAN.
+@test "vpn-director: restart xray restarts the process and re-applies Xray without a stop" {
+    run_stubbed_cli restart xray
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_restart_process\ntproxy_apply\ntproxy_prune'
+}
+
+@test "vpn-director: restart tunnel rebuilds Tunnel Director in place" {
+    run_stubbed_cli restart tunnel
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output 'tunnel_apply forced'
 }
