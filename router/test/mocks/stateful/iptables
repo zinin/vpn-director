@@ -1,0 +1,159 @@
+#!/bin/bash
+# An iptables that remembers: every chain of a table is a file under
+# $BATS_IPT_DIR/<table>/<chain> holding one "-A <chain> <spec>" line per rule,
+# the way "iptables -S" prints them. use_stateful_iptables (test_helper.bash)
+# puts it ahead of the stateless mocks/iptables for one test. Every call is
+# logged to /tmp/bats_iptables_calls.log, as the stateless mock logs it.
+#
+# It does one thing iptables does not: a flush of a chain that a rule still
+# jumps to - a live chain, whose packets meet no rule until it is filled again -
+# is appended to $BATS_IPT_DIR/live_flushes as "<table> <chain>". An apply must
+# never write there. A whole-table "-F" (Merlin's firewall start) is not
+# recorded.
+
+echo "iptables $*" >> /tmp/bats_iptables_calls.log
+
+dir="${BATS_IPT_DIR:?use_stateful_iptables sets BATS_IPT_DIR}"
+table=filter
+if [[ ${1:-} == -t ]]; then
+    table="$2"
+    shift 2
+fi
+tdir="$dir/$table"
+mkdir -p "$tdir"
+
+cmd="${1:-}"
+chain="${2:-}"
+file="$tdir/$chain"
+
+die() {
+    echo "iptables: $1" >&2
+    exit "${2:-1}"
+}
+
+is_builtin() {
+    case "$1" in
+        PREROUTING|INPUT|FORWARD|OUTPUT|POSTROUTING) return 0 ;;
+    esac
+    return 1
+}
+
+exists() {
+    is_builtin "$1" || [[ -f $tdir/$1 ]]
+}
+
+# jumped_to <chain> - does a rule of the table jump to <chain>?
+jumped_to() {
+    local f
+    for f in "$tdir"/*; do
+        [[ -f $f ]] || continue
+        grep -qE -- "-j $1( |\$)" "$f" && return 0
+    done
+    return 1
+}
+
+# target_known <rule args...> - is the -j target one iptables has, or a chain?
+target_known() {
+    local prev="" arg
+    for arg in "$@"; do
+        if [[ $prev == -j ]]; then
+            case "$arg" in
+                RETURN|ACCEPT|DROP|REJECT|MARK|CONNMARK|TPROXY|PPE|LOG) ;;
+                *) exists "$arg" || return 1 ;;
+            esac
+        fi
+        prev="$arg"
+    done
+    return 0
+}
+
+case "$cmd" in
+    -S)
+        if [[ -z $chain ]]; then
+            for c in PREROUTING INPUT FORWARD OUTPUT POSTROUTING; do
+                printf -- '-P %s ACCEPT\n' "$c"
+            done
+            for f in "$tdir"/*; do
+                [[ -f $f ]] || continue
+                is_builtin "${f##*/}" || printf -- '-N %s\n' "${f##*/}"
+            done
+            cat "$tdir"/* 2>/dev/null || true
+            exit 0
+        fi
+        exists "$chain" || die "No chain/target/match by that name."
+        if is_builtin "$chain"; then
+            printf -- '-P %s ACCEPT\n' "$chain"
+        else
+            printf -- '-N %s\n' "$chain"
+        fi
+        cat "$file" 2>/dev/null || true
+        ;;
+    -N)
+        exists "$chain" && die "Chain already exists."
+        : > "$file"
+        ;;
+    -F)
+        if [[ -z $chain ]]; then
+            for f in "$tdir"/*; do
+                [[ -f $f ]] && : > "$f"
+            done
+            exit 0
+        fi
+        exists "$chain" || die "No chain/target/match by that name."
+        if jumped_to "$chain"; then
+            printf '%s %s\n' "$table" "$chain" >> "$dir/live_flushes"
+        fi
+        : > "$file"
+        ;;
+    -X)
+        [[ -f $file ]] || die "No chain/target/match by that name."
+        jumped_to "$chain" && die "Too many links."
+        [[ -s $file ]] && die "Directory not empty."
+        rm -f "$file"
+        ;;
+    -E)
+        new="${3:-}"
+        [[ -f $file ]] || die "No chain/target/match by that name."
+        exists "$new" && die "File exists."
+        sed "s/^-A $chain /-A $new /" "$file" > "$tdir/$new"
+        rm -f "$file"
+        for f in "$tdir"/*; do
+            [[ -f $f ]] || continue
+            sed -i -E "s/-j $chain( |\$)/-j $new\\1/" "$f"
+        done
+        ;;
+    -A|-I|-D|-C)
+        exists "$chain" || die "No chain/target/match by that name."
+        shift 2
+        pos=1
+        if [[ $cmd == -I && ${1:-} =~ ^[0-9]+$ ]]; then
+            pos="$1"
+            shift
+        fi
+        line="-A $chain $*"
+        case "$cmd" in
+            -A)
+                target_known "$@" || die "Couldn't load target." 2
+                printf '%s\n' "$line" >> "$file"
+                ;;
+            -I)
+                target_known "$@" || die "Couldn't load target." 2
+                touch "$file"
+                n=$(wc -l < "$file")
+                (( pos >= 1 && pos <= n + 1 )) || die "Index of insertion too big."
+                awk -v p="$pos" -v l="$line" 'NR == p { print l } { print } END { if (p == NR + 1) print l }' \
+                    "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+                ;;
+            -D)
+                grep -qxF -- "$line" "$file" 2>/dev/null ||
+                    die "Bad rule (does a matching rule exist in that chain?)."
+                awk -v l="$line" '!done && $0 == l { done = 1; next } { print }' \
+                    "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+                ;;
+            -C)
+                grep -qxF -- "$line" "$file" 2>/dev/null || exit 1
+                ;;
+        esac
+        ;;
+esac
+exit 0

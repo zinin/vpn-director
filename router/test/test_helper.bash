@@ -84,6 +84,18 @@ load_firewall() {
     source "$LIB_DIR/firewall.sh"
 }
 
+# use_stateful_iptables - for the rest of the test, an iptables that remembers
+# its chains and rules under $BATS_IPT_DIR (mocks/stateful/iptables): a listing
+# shows what the code under test wrote, "-C" finds it, "-X" refuses a chain a
+# rule still jumps to. A flush of such a chain - a live one - is appended to
+# $BATS_IPT_DIR/live_flushes. Call it after the load_* helper.
+use_stateful_iptables() {
+    export BATS_IPT_DIR="$BATS_TEST_TMPDIR/iptables"
+    mkdir -p "$BATS_IPT_DIR"
+    export PATH="$TEST_ROOT/mocks/stateful:$PATH"
+    hash -r
+}
+
 # Helper to source config.sh
 load_config() {
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"
