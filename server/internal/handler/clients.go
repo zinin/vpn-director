@@ -1,7 +1,9 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -65,6 +67,11 @@ func (h *ClientsHandler) buildClientList(cfg *vpnconfig.VPNDirectorConfig) (stri
 			} else {
 				kb.Button(fmt.Sprintf("\u23f8 %s", c.IP), fmt.Sprintf("clients:pause:%s", c.IP))
 			}
+			// A move needs an address a route can take; an entry an older build
+			// saved in another form can only be paused or removed.
+			if _, err := vpnconfig.NormalizeClientAddr(c.IP); err == nil {
+				kb.Button(fmt.Sprintf("\U0001f500 %s", c.IP), fmt.Sprintf("clients:move:%s", c.IP))
+			}
 			kb.Button(fmt.Sprintf("\U0001f5d1 %s", c.IP), fmt.Sprintf("clients:remove:%s", c.IP))
 			kb.Row()
 		}
@@ -107,6 +114,12 @@ func (h *ClientsHandler) HandleCallback(cb *tgbotapi.CallbackQuery) {
 		h.handleAddStart(chatID)
 	case action == "close":
 		h.handleClose(chatID, msgID)
+	case strings.HasPrefix(action, "move:"):
+		h.handleMoveStart(chatID, msgID, strings.TrimPrefix(action, "move:"))
+	case strings.HasPrefix(action, "to:"):
+		h.handleMoveTo(chatID, msgID, strings.TrimPrefix(action, "to:"), false)
+	case strings.HasPrefix(action, "toyes:"):
+		h.handleMoveTo(chatID, msgID, strings.TrimPrefix(action, "toyes:"), true)
 	case strings.HasPrefix(action, "route:"):
 		route := strings.TrimPrefix(action, "route:")
 		h.handleAddRoute(chatID, msgID, route)
@@ -329,24 +342,24 @@ func (h *ClientsHandler) HandleTextInput(msg *tgbotapi.Message) {
 	h.showRouteSelection(chatID, normalized, cfg)
 }
 
-// showRouteSelection offers xray, every tunnel the platform lists, and the
-// tunnels already in the config the platform does not list (so an existing
-// route stays reachable), marked "(unknown)" the way the Web UI marks them.
-// When the platform cannot be asked the config's tunnels are all there is, and
-// the user is told: the tunnel is not unknown there, the platform is, so those
-// keep their bare names.
-func (h *ClientsHandler) showRouteSelection(chatID int64, ip string, cfg *vpnconfig.VPNDirectorConfig) {
-	kb := telegram.NewKeyboard()
+// routeChoice is one route the keyboards offer a client.
+type routeChoice struct {
+	id    string
+	label string
+}
 
-	kb.Button("xray", "clients:route:xray").Row()
-
+// routeChoices lists xray, every tunnel the platform lists (with its
+// description, and "(down)" when it is not connected), and the tunnels already
+// in the config the platform does not list, so an existing route stays
+// reachable - marked "(unknown)" the way the Web UI marks them when the
+// platform answered, bare when it could not be asked: the tunnel is not
+// unknown then, the platform is. answered is false in that last case.
+func (h *ClientsHandler) routeChoices(cfg *vpnconfig.VPNDirectorConfig) (choices []routeChoice, answered bool) {
+	choices = append(choices, routeChoice{id: "xray", label: "xray"})
 	listed := map[string]bool{}
-	platformAnswered := true
 	info, err := h.deps.VPN.Platform()
-	if err != nil {
-		platformAnswered = false
-		h.deps.Sender.SendPlain(chatID, "platform info unavailable; offering the configured tunnels only")
-	} else {
+	answered = err == nil
+	if answered {
 		for _, t := range info.Tunnels {
 			label := t.ID
 			if t.Description != "" {
@@ -355,26 +368,38 @@ func (h *ClientsHandler) showRouteSelection(chatID int64, ip string, cfg *vpncon
 			if !t.Connected {
 				label += " (down)"
 			}
-			kb.Button(label, fmt.Sprintf("clients:route:%s", t.ID)).Row()
+			choices = append(choices, routeChoice{id: t.ID, label: label})
 			listed[t.ID] = true
 		}
 	}
 
-	tunnelNames := make([]string, 0, len(cfg.TunnelDirector.Tunnels))
+	names := make([]string, 0, len(cfg.TunnelDirector.Tunnels))
 	for name := range cfg.TunnelDirector.Tunnels {
 		if !listed[name] {
-			tunnelNames = append(tunnelNames, name)
+			names = append(names, name)
 		}
 	}
-	sort.Strings(tunnelNames)
-	for _, name := range tunnelNames {
+	sort.Strings(names)
+	for _, name := range names {
 		label := name
-		if platformAnswered {
+		if answered {
 			label += " (unknown)"
 		}
-		kb.Button(label, fmt.Sprintf("clients:route:%s", name)).Row()
+		choices = append(choices, routeChoice{id: name, label: label})
 	}
+	return choices, answered
+}
 
+// showRouteSelection offers the routes a new client can go on.
+func (h *ClientsHandler) showRouteSelection(chatID int64, ip string, cfg *vpnconfig.VPNDirectorConfig) {
+	choices, answered := h.routeChoices(cfg)
+	if !answered {
+		h.deps.Sender.SendPlain(chatID, "platform info unavailable; offering the configured tunnels only")
+	}
+	kb := telegram.NewKeyboard()
+	for _, c := range choices {
+		kb.Button(c.label, fmt.Sprintf("clients:route:%s", c.id)).Row()
+	}
 	kb.Button("Cancel", "clients:route:cancel").Row()
 
 	text := telegram.EscapeMarkdownV2(fmt.Sprintf("Select route for %s:", ip))
@@ -471,4 +496,131 @@ func (h *ClientsHandler) handleAddRoute(chatID int64, msgID int, route string) {
 
 	text, kb := h.buildClientList(cfg)
 	h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+}
+
+// errNothingToMove ends a move whose client is gone or already on that route
+// alone: the update writes nothing, and there is nothing to apply.
+var errNothingToMove = errors.New("nothing to move")
+
+// handleMoveStart replaces the list with the routes a client can move to, its
+// current one marked ✓ (two during a staged failover).
+func (h *ClientsHandler) handleMoveStart(chatID int64, msgID int, ip string) {
+	cfg, err := h.deps.Config.LoadVPNConfig()
+	if err != nil {
+		h.deps.Sender.SendPlain(chatID, fmt.Sprintf("Config load error: %v", err))
+		return
+	}
+	current := vpnconfig.ClientRoutes(cfg, ip)
+	if len(current) == 0 {
+		// Removed since the list was sent.
+		text, kb := h.buildClientList(cfg)
+		h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+		return
+	}
+
+	choices, answered := h.routeChoices(cfg)
+	if !answered {
+		h.deps.Sender.SendPlain(chatID, "platform info unavailable; offering the configured tunnels only")
+	}
+	kb := telegram.NewKeyboard()
+	for _, c := range choices {
+		label := c.label
+		if slices.Contains(current, c.id) {
+			label = "✓ " + label
+		}
+		kb.Button(label, fmt.Sprintf("clients:to:%s:%s", c.id, ip)).Row()
+	}
+	kb.Button("« Back", "clients:rm_no").Row()
+
+	text := telegram.EscapeMarkdownV2(fmt.Sprintf("Move %s (now on %s) to:", ip, strings.Join(current, ", ")))
+	h.deps.Sender.EditMessage(chatID, msgID, text, kb.Build())
+}
+
+// handleMoveTo moves a client to a route in one config change and one apply;
+// the apply keeps it on its old route until the new one carries it. data is
+// "<route>:<ip>". A tunnel the platform reports down asks first, unless
+// confirmed: until it is up, the client's traffic goes out through the WAN.
+func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, confirmed bool) {
+	route, ip, ok := strings.Cut(data, ":")
+	if !ok || route == "" || ip == "" {
+		return
+	}
+
+	cfg, err := h.deps.Config.LoadVPNConfig()
+	if err != nil {
+		h.deps.Sender.SendPlain(chatID, fmt.Sprintf("Config load error: %v", err))
+		return
+	}
+	if len(vpnconfig.ClientRoutes(cfg, ip)) == 0 {
+		// Removed since the keyboard was sent.
+		text, kb := h.buildClientList(cfg)
+		h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+		return
+	}
+
+	if route != "xray" {
+		_, configured := cfg.TunnelDirector.Tunnels[route]
+		info, perr := h.deps.VPN.Platform()
+		if !configured {
+			// Not configured yet: fine when the router has the tunnel (the
+			// keyboard listed it from the platform), stale otherwise.
+			if perr != nil {
+				h.deps.Sender.SendPlain(chatID, "platform info unavailable, try again")
+				text, kb := h.buildClientList(cfg)
+				h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+				return
+			}
+			if !info.HasTunnel(route) {
+				h.deps.Sender.SendPlain(chatID, fmt.Sprintf("route %s is no longer available", route))
+				text, kb := h.buildClientList(cfg)
+				h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+				return
+			}
+		}
+		if !confirmed && perr == nil && tunnelDown(info, route) {
+			text := telegram.EscapeMarkdownV2(fmt.Sprintf(
+				"%s is down: until it is up, %s's traffic goes out through the WAN. Move anyway?", route, ip))
+			kb := telegram.NewKeyboard()
+			kb.Button("Move anyway", fmt.Sprintf("clients:toyes:%s:%s", route, ip))
+			kb.Button("Cancel", "clients:rm_no")
+			kb.Row()
+			h.deps.Sender.EditMessage(chatID, msgID, text, kb.Build())
+			return
+		}
+	}
+
+	err = h.deps.Config.UpdateVPNConfig(func(c *vpnconfig.VPNDirectorConfig) error {
+		if vpnconfig.MoveClient(c, ip, route) != vpnconfig.ClientMoved {
+			return errNothingToMove
+		}
+		cfg = c // render the list from what was actually saved
+		return nil
+	})
+	if errors.Is(err, errNothingToMove) {
+		h.handleRefreshList(chatID, msgID)
+		return
+	}
+	if err != nil {
+		h.deps.Sender.SendPlain(chatID, configUpdateError(err))
+		return
+	}
+
+	if err := h.deps.VPN.Apply(); err != nil {
+		h.deps.Sender.SendPlain(chatID, fmt.Sprintf("Apply error: %v", err))
+		return
+	}
+
+	text, kb := h.buildClientList(cfg)
+	h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+}
+
+// tunnelDown reports whether the platform lists route as a tunnel that is not
+// connected.
+func tunnelDown(info vpnconfig.PlatformInfo, route string) bool {
+	for _, t := range info.Tunnels {
+		if t.ID == route {
+			return !t.Connected
+		}
+	}
+	return false
 }
