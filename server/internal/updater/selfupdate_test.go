@@ -173,8 +173,20 @@ func newStep2Fixture(t *testing.T, onRequest func(path, lockFile string)) *step2
 		switch {
 		case r.URL.Path == "/repos/zinin/vpn-director/releases/tags/v1.2.4":
 			fmt.Fprintf(w, `{"tag_name": "v1.2.4", "assets": [
-				{"name": "telegram-bot-arm64", "browser_download_url": "%[1]s/assets/telegram-bot-arm64"},
-				{"name": "webui-arm64", "browser_download_url": "%[1]s/assets/webui-arm64"}]}`, server.URL)
+				{"url": "%[1]s/repos/zinin/vpn-director/releases/assets/301", "id": 301, "name": "telegram-bot-arm64",
+				 "browser_download_url": "%[1]s/zinin/vpn-director/releases/download/v1.2.4/telegram-bot-arm64"},
+				{"url": "%[1]s/repos/zinin/vpn-director/releases/assets/302", "id": 302, "name": "webui-arm64",
+				 "browser_download_url": "%[1]s/zinin/vpn-director/releases/download/v1.2.4/webui-arm64"}]}`, server.URL)
+		case strings.HasPrefix(r.URL.Path, "/repos/zinin/vpn-director/releases/assets/"):
+			// The API sends the file from the CDN, /assets/ here, to a request
+			// that asks for it, and describes the asset to any other.
+			id := strings.TrimPrefix(r.URL.Path, "/repos/zinin/vpn-director/releases/assets/")
+			if r.Header.Get("Accept") != "application/octet-stream" {
+				w.Header().Set("Content-Type", "application/json; charset=utf-8")
+				fmt.Fprintf(w, `{"id": %s, "name": %q}`, id, fakeAssets[id])
+				return
+			}
+			http.Redirect(w, r, "/assets/"+fakeAssets[id], http.StatusFound)
 		case strings.HasSuffix(r.URL.Path, "/"+manifestPath):
 			w.Write([]byte(testManifest))
 		case strings.HasPrefix(r.URL.Path, "/assets/"):

@@ -54,7 +54,9 @@ type Release struct {
 
 // Asset represents a downloadable file in a release.
 type Asset struct {
-	Name        string
+	Name string
+	// DownloadURL is the asset's address on the GitHub API; downloadAsset
+	// asks it for the file.
 	DownloadURL string
 }
 

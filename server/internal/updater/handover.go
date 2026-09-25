@@ -137,7 +137,7 @@ func (s *Service) downloadInstaller(ctx context.Context, release *Release, insta
 		return fmt.Errorf("asset %s: %w", name, err)
 	}
 	part := installer + ".part"
-	if err := s.downloadFile(ctx, url, part); err != nil {
+	if err := s.downloadAsset(ctx, url, part); err != nil {
 		os.Remove(part)
 		return fmt.Errorf("%s: %w", name, err)
 	}
