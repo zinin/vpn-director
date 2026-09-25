@@ -17,11 +17,12 @@ interface RouteOption {
   label: string
 }
 
-// xray first, then every tunnel the router has. These options also feed the Add
-// form's select, and POST /api/clients rejects a route the platform does not
-// list, so a listed client's unlisted route is added only when the platform
-// itself could not be asked - the fallback the form's own message describes.
-// The client rows print their route as text, so nothing is hidden either way.
+// xray first, then every tunnel the router has. These options feed the Add
+// form's select and every row's Route select, and POST /api/clients and
+// /api/clients/route reject a route the platform does not list, so a listed
+// client's unlisted route is offered only when the platform itself could not
+// be asked - the fallback the form's own message describes. A row always
+// offers its own route as well (rowRouteOptions), so nothing is hidden.
 // Rebuilt whenever the platform or the clients are reloaded.
 const routeOptions = ref<RouteOption[]>([{ value: 'xray', label: 'xray' }])
 const platformTunnels = ref<PlatformTunnel[]>([])
@@ -44,6 +45,27 @@ function buildRouteOptions() {
   if (!opts.some((o) => o.value === newRoute.value)) {
     newRoute.value = 'xray'
   }
+}
+
+// A row's options are the shared ones plus the row's own route, so its select
+// never shows blank for a tunnel the platform no longer lists.
+function rowRouteOptions(client: ClientInfo): RouteOption[] {
+  if (routeOptions.value.some((o) => o.value === client.route)) {
+    return routeOptions.value
+  }
+  return [...routeOptions.value, { value: client.route, label: client.route }]
+}
+
+// A tunnel the platform reports down has no route in its table, and a client
+// put on it goes out through the WAN until it comes up.
+function isDown(route: string): boolean {
+  return platformTunnels.value.some((t) => t.id === route && !t.connected)
+}
+
+function confirmDown(route: string, verb: string): boolean {
+  return confirm(
+    `${route} is down: until it is up, this client's traffic goes out through the WAN. ${verb} anyway?`,
+  )
 }
 
 async function loadPlatform() {
@@ -86,6 +108,7 @@ async function loadClients() {
 
 async function addClient() {
   if (!newIp.value.trim()) return
+  if (isDown(newRoute.value) && !confirmDown(newRoute.value, 'Add')) return
   addLoading.value = true
   try {
     await api.addClient(newIp.value.trim(), newRoute.value)
@@ -96,6 +119,52 @@ async function addClient() {
     await reportError(e)
   } finally {
     addLoading.value = false
+  }
+}
+
+// The row whose move is running, keyed ip|route like the rows, and the route
+// picked in it. Vue sets a select's value on every render, so the render that
+// disables the controls for the move would put that select back on the old
+// route for as long as the apply takes; the row shows the picked route instead
+// until the request ends.
+const pendingMove = ref<{ row: string; route: string } | null>(null)
+
+// ip|route: the key of a client's row, in the table and in pendingMove.
+function rowKey(client: ClientInfo): string {
+  return client.ip + '|' + client.route
+}
+
+// The route a row's select shows: the one picked in it while its move runs,
+// the route the client is on otherwise.
+function shownRoute(client: ClientInfo): string {
+  const m = pendingMove.value
+  return m !== null && m.row === rowKey(client) ? m.route : client.route
+}
+
+// One request moves the client: the router writes the new route and applies
+// once, and the apply keeps the client on its old route until the new one
+// carries it. A select whose move did not happen goes back to the route the
+// client is on.
+async function moveClient(client: ClientInfo, event: Event) {
+  const select = event.target as HTMLSelectElement
+  const route = select.value
+  if (route === client.route) return
+  if (isDown(route) && !confirmDown(route, 'Move')) {
+    select.value = client.route
+    return
+  }
+  pendingMove.value = { row: rowKey(client), route }
+  actionLoading.value = 'move:' + client.ip
+  try {
+    await api.moveClient(client.ip, route)
+    await loadClients()
+  } catch (e: any) {
+    pendingMove.value = null
+    select.value = client.route
+    await reportError(e)
+  } finally {
+    pendingMove.value = null
+    actionLoading.value = ''
   }
 }
 
@@ -189,9 +258,21 @@ onMounted(async () => {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="client in clients" :key="client.ip">
+        <!-- ip|route: during a staged failover one address sits on two routes. -->
+        <tr v-for="client in clients" :key="rowKey(client)">
           <td>{{ client.ip }}</td>
-          <td>{{ client.route }}</td>
+          <td>
+            <select
+              :value="shownRoute(client)"
+              :disabled="!!actionLoading"
+              style="min-width: 160px;"
+              @change="moveClient(client, $event)"
+            >
+              <option v-for="r in rowRouteOptions(client)" :key="r.value" :value="r.value">
+                {{ r.label }}
+              </option>
+            </select>
+          </td>
           <td>
             <span v-if="!client.paused" class="badge badge-green">Active</span>
             <span v-else class="badge badge-grey">Paused</span>
