@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -20,6 +21,8 @@ const (
 	repoRawPath     = "/%s/%s/refs/tags/%s/%s"
 	downloadTimeout = 2 * time.Minute
 	maxFileSize     = 50 * 1024 * 1024 // 50MB
+	// assetMediaType is what a release asset is asked for at its API address.
+	assetMediaType = "application/octet-stream"
 )
 
 // DownloadRelease downloads the release manifest, then every file it lists
@@ -179,7 +182,7 @@ func (s *Service) downloadBinaries(ctx context.Context, release *Release) error 
 		if err := requireHTTPS(url); err != nil {
 			return fmt.Errorf("asset %s: %w", assetName, err)
 		}
-		if err := s.downloadFile(ctx, url, target); err != nil {
+		if err := s.downloadAsset(ctx, url, target); err != nil {
 			if errors.Is(err, errClaimLost) {
 				return err
 			}
@@ -216,6 +219,19 @@ func requireHTTPS(rawURL string) error {
 }
 
 func (s *Service) downloadFile(ctx context.Context, url, target string) error {
+	return s.download(ctx, url, target, false)
+}
+
+// downloadAsset downloads a release asset from its address on the API. The API
+// sends the file only to a request that asks for assetMediaType, and the
+// asset's description in JSON to any other - also to one whose header got lost
+// on the way. A description is refused: the update script would install it as
+// a daemon that never starts.
+func (s *Service) downloadAsset(ctx context.Context, url, target string) error {
+	return s.download(ctx, url, target, true)
+}
+
+func (s *Service) download(ctx context.Context, url, target string, asset bool) error {
 	// Per-request timeout
 	ctx, cancel := context.WithTimeout(ctx, downloadTimeout)
 	defer cancel()
@@ -230,6 +246,9 @@ func (s *Service) downloadFile(ctx context.Context, url, target string) error {
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("User-Agent", "vpn-director-telegram-bot")
+	if asset {
+		req.Header.Set("Accept", assetMediaType)
+	}
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
@@ -239,6 +258,11 @@ func (s *Service) downloadFile(ctx context.Context, url, target string) error {
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	if asset {
+		if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == "application/json" {
+			return errors.New("GitHub sent the asset's description instead of the file")
+		}
 	}
 
 	// Stage beside the target and publish with a rename: between the caller's

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -41,6 +42,52 @@ func TestDownloadFile_Success(t *testing.T) {
 	if string(data) != content {
 		t.Errorf("File content = %q, want %q", string(data), content)
 	}
+}
+
+// The API answers an asset's address with the asset's description in JSON
+// unless the request asks for the file. A description that comes back all the
+// same - whatever lost the header on the way - is no daemon binary: the update
+// script would install it, and the daemon would not start again.
+func TestAssetDownload_RefusesTheAssetsDescription(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Write([]byte(`{"url": "https://api.github.com/repos/zinin/vpn-director/releases/assets/301", "id": 301,
+			"name": "telegram-bot-arm64", "label": "", "content_type": "application/octet-stream",
+			"state": "uploaded", "size": 8650936, "download_count": 0,
+			"browser_download_url": "https://github.com/zinin/vpn-director/releases/download/v1.2.4/telegram-bot-arm64"}`))
+	}))
+	defer server.Close()
+	release := &Release{TagName: "v1.2.4"}
+	for i, d := range Daemons {
+		release.Assets = append(release.Assets, Asset{
+			Name:        d.Name + "-arm64",
+			DownloadURL: server.URL + "/repos/zinin/vpn-director/releases/assets/" + strconv.Itoa(301+i),
+		})
+	}
+
+	t.Run("the installer of step 1", func(t *testing.T) {
+		dir := t.TempDir()
+		s := &Service{httpClient: server.Client(), updateDir: dir, archSuffix: "arm64", daemon: DaemonBot}
+		installer := filepath.Join(dir, "installer")
+		if err := s.downloadInstaller(context.Background(), release, installer); err == nil {
+			t.Fatal("downloadInstaller() took the asset's description for the installer")
+		}
+		if _, err := os.Stat(installer); !os.IsNotExist(err) {
+			t.Errorf("an installer is left behind (%v)", err)
+		}
+	})
+	t.Run("the binaries of step 2", func(t *testing.T) {
+		dir := t.TempDir()
+		s := &Service{httpClient: server.Client(), updateDir: dir, archSuffix: "arm64"}
+		if err := s.downloadBinaries(context.Background(), release); err == nil {
+			t.Fatal("downloadBinaries() took the asset's description for a binary")
+		}
+		for _, d := range Daemons {
+			if _, err := os.Stat(filepath.Join(dir, "files", d.Name)); !os.IsNotExist(err) {
+				t.Errorf("files/%s is there (%v)", d.Name, err)
+			}
+		}
+	})
 }
 
 func TestDownloadFile_CreatesParentDirs(t *testing.T) {

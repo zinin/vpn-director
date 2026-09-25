@@ -31,8 +31,12 @@ type githubRelease struct {
 
 // githubAsset represents a release asset in the GitHub API response.
 type githubAsset struct {
-	Name               string `json:"name"`
-	BrowserDownloadURL string `json:"browser_download_url"`
+	Name string `json:"name"`
+	// URL is the asset's own address on the API, which sends the file, by a
+	// redirect to GitHub's CDN, to a request that asks for it. Not
+	// browser_download_url: that one is on github.com, and a network can drop
+	// github.com while the API, which an update needs anyway, answers.
+	URL string `json:"url"`
 }
 
 // GetLatestRelease fetches the latest release info from GitHub API.
@@ -88,7 +92,7 @@ func (s *Service) fetchRelease(ctx context.Context, endpoint string) (*Release, 
 	for i, a := range ghRelease.Assets {
 		release.Assets[i] = Asset{
 			Name:        a.Name,
-			DownloadURL: a.BrowserDownloadURL,
+			DownloadURL: a.URL,
 		}
 	}
 

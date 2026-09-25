@@ -249,13 +249,15 @@ daemon table. Points that belong to the Web UI half:
 
 ## Trust model of self-update
 
-Release metadata comes from `api.github.com`, binaries from the URLs that
-response supplies and the shell scripts from `raw.githubusercontent.com` at the
-release tag; all of it is written to the router and run as root. The **entire**
+Release metadata comes from `api.github.com`, binaries from the asset addresses
+that response supplies (on the API, which redirects to GitHub's CDN) and the
+shell scripts from `raw.githubusercontent.com` at the release tag; all of it is
+written to the router and run as root. The **entire**
 integrity guarantee is TLS to github.com plus GitHub account security — there
 is no signature, no checksum and no pinning. That is the same model
 `install.sh`'s `curl … | bash` establishes, and it is stated rather than
-assumed. What the code does enforce: an asset URL must be `https`, every string
+assumed. What the code does enforce: an asset URL must be `https`, an asset
+answered with JSON (its description, not the file) is refused, every string
 reaching the generated script passes a strict allow-list, downloads are capped
 at 50 MB, and `files/` is wiped before every attempt so a partial download
 cannot be executed later. Since the self-update handover the new release's
