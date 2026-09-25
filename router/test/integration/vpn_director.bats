@@ -147,8 +147,13 @@ setup() {
 
 # run_stubbed_cli <arguments...> runs the command the CLI parses from its
 # arguments with the lock, the boot wait and the ipsets stubbed. Each module call
-# that would change routing appends its name to $BATS_TEST_TMPDIR/calls instead.
+# that would change routing appends its name to $BATS_TEST_TMPDIR/calls instead;
+# tunnel_apply appends " forced" under TUN_DIR_FORCE_REBUILD and returns
+# $TUNNEL_APPLY_RC.
 run_stubbed_cli() {
+    # cmd_apply and cmd_update remove the stopped marker: never the one of the
+    # machine running the suite.
+    export VPD_STOPPED_FILE="${VPD_STOPPED_FILE:-$BATS_TEST_TMPDIR/stopped}"
     run bash -c '
         script=$1 calls=$2
         shift 2
@@ -161,7 +166,11 @@ run_stubbed_cli() {
         tproxy_stop() { echo tproxy_stop >> "$calls"; }
         tunnel_stop() { echo tunnel_stop >> "$calls"; }
         tproxy_apply() { echo tproxy_apply >> "$calls"; }
-        tunnel_apply() { echo tunnel_apply >> "$calls"; }
+        tunnel_apply() {
+            echo "tunnel_apply${TUN_DIR_FORCE_REBUILD:+ forced}" >> "$calls"
+            return "${TUNNEL_APPLY_RC:-0}"
+        }
+        tproxy_prune() { echo tproxy_prune >> "$calls"; }
         "cmd_$COMMAND"
     ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" "$@"
 }
@@ -268,6 +277,44 @@ run_stubbed_cli() {
     grep -qx tproxy_apply "$BATS_TEST_TMPDIR/calls"
     grep -qx tunnel_apply "$BATS_TEST_TMPDIR/calls"
     [ ! -e "$VPD_STOPPED_FILE" ]
+}
+
+# Make before break: a client moving from Xray to a tunnel stays proxied until
+# Tunnel Director carries it, so the prune that lets it go runs last.
+@test "vpn-director: a full apply adds for Xray, applies Tunnel Director, then prunes" {
+    run_stubbed_cli apply
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_apply\ntunnel_apply\ntproxy_prune'
+}
+
+@test "vpn-director: update applies in the same order" {
+    run_stubbed_cli update
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_apply\ntunnel_apply\ntproxy_prune'
+}
+
+@test "vpn-director: apply xray adds and prunes, apply tunnel applies Tunnel Director alone" {
+    run_stubbed_cli apply xray
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_apply\ntproxy_prune'
+    rm -f "$BATS_TEST_TMPDIR/calls"
+    run_stubbed_cli apply tunnel
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output 'tunnel_apply'
+}
+
+# tunnel_apply hard-fails under errexit. The run ends there, before the prune:
+# the clients that left Xray stay proxied rather than leave through the WAN.
+@test "vpn-director: a Tunnel Director failure ends the apply before the prune" {
+    export TUNNEL_APPLY_RC=1
+    run_stubbed_cli apply
+    assert_failure
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_apply\ntunnel_apply'
 }
 
 # ============================================================================

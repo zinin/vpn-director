@@ -278,17 +278,26 @@ cmd_apply() {
                 _ensure_ipsets $required_ipsets
             fi
 
-            # Xray first. tproxy_apply soft-fails (a WARN and rc 0) while tunnel_apply
-            # hard-fails under errexit, so this order lets a Tunnel Director failure -
-            # a malformed tunnels object, say - end the run without stripping Xray
-            # clients of their TPROXY rules. The PREROUTING positions: XRAY_TPROXY always
-            # inserts at 1; TUN_DIR at the platform's base position, never ahead of the
-            # XRAY_TPROXY jumps already in place - tunnel_apply counts them - so the
-            # order is [XRAY_TPROXY, TUN_DIR] on both platforms. Neither call is wrapped
-            # in `||` or `if !`: that would run its whole body with errexit off and let
-            # an unguarded failure inside pass as success.
+            # Make before break, whichever way a client moves. tproxy_apply adds every
+            # client xray.clients names to XRAY_CLIENTS and removes none; tunnel_apply puts
+            # Tunnel Director's rules in place; only then does tproxy_prune let go of the
+            # clients that left Xray. XRAY_TPROXY runs ahead of TUN_DIR, so a client moving
+            # from Xray to a tunnel stays proxied until TUN_DIR marks it, and one moving the
+            # other way is proxied before TUN_DIR lets it go. Applied Xray-then-Tunnel
+            # Director in one step, a client moving to a tunnel was on neither for the length
+            # of tunnel_apply and left through the WAN.
+            #
+            # tproxy_apply soft-fails (a WARN and rc 0) while tunnel_apply hard-fails under
+            # errexit: a Tunnel Director failure - a malformed tunnels object, say - ends the
+            # run before the prune, and the clients that left Xray stay proxied rather than
+            # leak. The PREROUTING positions: XRAY_TPROXY always goes in at 1; TUN_DIR at the
+            # platform's base position, never ahead of the XRAY_TPROXY jumps - tunnel_apply
+            # counts them - so the order is [XRAY_TPROXY, TUN_DIR] on both platforms. No call
+            # is wrapped in `||` or `if !`: that would run its whole body with errexit off
+            # and let an unguarded failure inside pass as success.
             tproxy_apply
             tunnel_apply
+            tproxy_prune
             ;;
         tunnel)
             required_ipsets=$(tunnel_get_required_ipsets)
@@ -304,7 +313,10 @@ cmd_apply() {
                 # shellcheck disable=SC2086
                 _ensure_ipsets $required_ipsets
             fi
+            # A component apply does not wait for Tunnel Director: a client moving
+            # between the two needs a full apply.
             tproxy_apply
+            tproxy_prune
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2
@@ -410,9 +422,10 @@ cmd_update() {
         _ensure_ipsets $required_ipsets
     fi
 
-    # Xray first, for the reason spelled out in cmd_apply.
+    # Make before break, for the reason spelled out in cmd_apply.
     tproxy_apply
     tunnel_apply
+    tproxy_prune
 
     log "Update complete"
 }
