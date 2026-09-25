@@ -77,6 +77,31 @@ them, so the order is `[XRAY_TPROXY, TUN_DIR]` on both platforms.
 
 **Implication**: If a client IP is in both `xray.clients` and a TD rule, traffic goes through Xray only. TD rule is ignored for that client.
 
+## The apply: make before break
+
+A full apply (`apply`, `update`, `restart`) moves every client make-before-break:
+
+1. `tproxy_apply` adds every client `xray.clients` names to `XRAY_CLIENTS` and removes none.
+2. `tunnel_apply` puts Tunnel Director's rules in place.
+3. `tproxy_prune` swaps in the exact `XRAY_CLIENTS`.
+
+Xray wins over TUN_DIR (above). A client moving from Xray to a tunnel stays proxied until step 3
+lets it go, when TUN_DIR already marks it; a client moving the other way is proxied from step 1,
+before TUN_DIR lets it go in step 2. A Tunnel Director failure ends the run before step 3: the
+clients that left Xray stay proxied rather than leak.
+
+No step flushes a chain or a set a packet is crossing. `XRAY_TPROXY` and a rebuilt `TUN_DIR` are
+built as `<chain>_NEW` and swapped in by `swap_fw_chain` (`lib/firewall.sh`): the new jump goes in
+ahead of the old one, the old jump and chain go, the new chain takes the name. `TPROXY_BYPASS`
+and, in the prune, `XRAY_CLIENTS` are built as `<set>_NEW` and swapped in (`ipset swap`). A Tunnel
+Director rebuild keeps every tunnel's slot and installs the routing of a new slot before the swap
+and releases a dropped one after it (`tunnel-director.md`). `restart` and `restart xray` stop
+nothing; while the Xray process restarts, TPROXY drops what no socket takes.
+
+Left open: the firmware flushing our chains (Merlin's `iptables -t mangle -F` on a firewall start,
+an NDM rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply, and a tunnel
+that is down sends its clients to `main`.
+
 ## Fwmark Bit Layout
 
 ```
@@ -208,7 +233,8 @@ make every interface displace the one before it, and each rewrite is a window wi
 it would otherwise land among them. On Merlin without firmware iface-mark rules the base
 position is 1, the slot XRAY_TPROXY holds, and a rebuild used to put TUN_DIR ahead of it; the
 next apply then found the Xray jump off its position and purged and re-inserted it — a window
-with no TPROXY jump on every apply.
+with no TPROXY jump on every apply. A rebuild inserts its jumps to `TUN_DIR_NEW` at those
+positions, ahead of the old jumps, which go after (`swap_fw_chain`).
 
 Typically (one LAN interface):
 - Position 1: XRAY_TPROXY
@@ -326,7 +352,7 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | File | Purpose |
 |------|---------|
 | `/tmp/tunnel_director/tun_dir_rules.sha256` | Hash of applied TD rules |
-| `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`) |
+| `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`); a tunnel keeps its idx while it has clients; during a rebuild, the union of both layouts |
 
 ## Key Code Locations
 

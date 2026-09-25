@@ -58,6 +58,7 @@ sources `common.sh` can call `platform_*`. Firmware-specific facts belong in
 | `purge_fw_rules [-6] [-q] [--count] "<table> <chain>" "<pattern>"` | Remove matching rules |
 | `ensure_fw_rule [-6] [-q] [--count] <table> <chain> [-I [pos]\|-D] <rule>` | Idempotent rule add/delete |
 | `sync_fw_rule [-6] [-q] [--count] <table> <chain> "<pattern>" "<desired>" [pos]` | Replace matching rules with one |
+| `swap_fw_chain <table> <chain> <build_fn> <pos_fn> <jump_match>...` | Rebuild a chain PREROUTING jumps to as `<chain>_NEW` and swap it in; 0 done, 1 done with a rule missing, 2 live chain untouched, 3 cutover unfinished |
 | `block_wan_for_host <host>` | Block host from WAN (IPv4/IPv6); WAN interface from `platform_wan_if` |
 | `allow_wan_for_host <host>` | Unblock host from WAN |
 | `chg <cmd>` | Returns true if command output is non-zero integer |
@@ -226,11 +227,12 @@ applied: it put the PREROUTING jumps back into it and wrote `failover_ready`,
 and every Tunnel Director client left through the WAN until the configuration
 changed.
 
-**Solution**: refill the chain on every apply (`_tproxy_setup_iptables` flushes
-and rebuilds `XRAY_TPROXY`), or look for the rules themselves before calling it
-applied - `_tunnel_marks_present` asks `iptables -C` for every client's MARK
-rule and rebuilds when one is gone. KeeneticOS deletes our chains on every NDM
-rebuild, so there the missing chain is what sends the apply through a rebuild.
+**Solution**: rebuild the chain on every apply (`_tproxy_setup_iptables` builds
+`XRAY_TPROXY_NEW` and swaps it in), or look for the rules themselves before
+calling it applied - `_tunnel_marks_present` asks `iptables -C` for every
+client's MARK rule and rebuilds when one is gone. KeeneticOS deletes our chains
+on every NDM rebuild, so there the missing chain is what sends the apply
+through a rebuild.
 
 Either way the apply after the last firewall start has to run. The firmware
 starts `firewall-start` and `wan-event` without waiting for them
@@ -238,6 +240,35 @@ starts `firewall-start` and `wan-event` without waiting for them
 `apply` exits at once while another instance holds the lock - so the chains of
 a flush that landed during a running apply stayed empty until the next event.
 Both hooks pass `--wait`, as the KeeneticOS hooks do.
+
+### An apply never flushes a live chain or set
+
+**Problem**: `create_fw_chain -f` on a chain the PREROUTING jumps lead to,
+`ipset flush` on a set a rule matches, and `tunnel_stop` ahead of a rebuild each
+opened a window in which packets crossed an empty chain or set. `XRAY_TPROXY`
+returned every Xray client to the WAN for the length of its refill, on every
+apply; a Tunnel Director rebuild sent every tunnel client there for seconds.
+
+**Solution**: build beside the live object and swap it in. `swap_fw_chain`
+(`lib/firewall.sh`) creates `<chain>_NEW` with a bare `iptables -N`, fills it
+through a callback, inserts its jumps ahead of the old ones, deletes the old
+jumps and chain and renames the new chain; `ipset swap` replaces a set's
+contents in one step. Order does the rest: add before remove (`tproxy_apply`
+only adds clients, `tproxy_prune` removes them after `tunnel_apply`). Only
+`tproxy_stop` and `tunnel_stop` tear down.
+
+When an interrupted swap left a `<chain>_NEW` behind, `swap_fw_chain` first
+finishes that swap if a jump leads to it and deletes the chain if none does.
+Whether one does is read from a single PREROUTING listing whose status is
+checked: a failed listing would read as no jump, and the delete starts with a
+flush, so `swap_fw_chain` returns 2 there and changes nothing. `iptables -N`
+refuses a chain that is there, and `swap_fw_chain` then returns 2 as well: a
+live `<chain>_NEW` the existence check missed is never flushed either —
+`create_fw_chain -f` would have emptied it for the whole build.
+
+The stateful iptables mock (`use_stateful_iptables`) records every flush of a
+chain a rule still jumps to in `$BATS_IPT_DIR/live_flushes`; a test of an apply
+asserts that file stays empty.
 
 ### A dual-family DNS lookup on the router often never answers
 

@@ -105,6 +105,7 @@ prefixes every path `platform_detect` looks at. Seams for Keenetic unit tests:
 | `load_ipset_module` | Source lib/ipset.sh module (uses `--source-only` flag) |
 | `load_tunnel_module` | Source lib/tunnel.sh module (uses `--source-only` flag) |
 | `load_tproxy_module` | Source lib/tproxy.sh module (uses `--source-only` flag) |
+| `use_stateful_iptables` | For the rest of the test, `mocks/stateful/iptables` ahead of the stateless mock: chains and rules kept under `$BATS_IPT_DIR`, a flush of a live chain appended to `$BATS_IPT_DIR/live_flushes`; call it after the `load_*` helper |
 
 **Note:** Modules support `--source-only` flag for test sourcing without executing main logic.
 
@@ -137,6 +138,7 @@ Mocks are shell scripts in `router/test/mocks/` that simulate router commands:
 
 - **nvram**: Returns predefined values for router settings
 - **iptables/ip6tables**: Tracks rule operations
+- **stateful/iptables**: Remembers chains and rules per table under `$BATS_IPT_DIR` (`-S`, `-N`, `-F`, `-X`, `-E`, `-A`, `-I`, `-D`, `-C`); records a flush of a chain a rule still jumps to (a whole-table `-F` is not recorded). Turned on per test by `use_stateful_iptables`
 - **ipset**: Simulates ipset management
 - **nslookup**: Returns mock DNS responses
 - **logger**: Silent (no syslog in tests)

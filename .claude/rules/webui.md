@@ -58,6 +58,7 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | DELETE | `/api/subscriptions` | `?id=`; `active_removed` says the running server came from it |
 | GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config |
 | POST | `/api/clients/pause`, `/api/clients/resume` | Pause and resume a client |
+| POST | `/api/clients/route` | Move a client: `{ip, route}`, the route checked as for an add; one config update (`vpnconfig.MoveClient`) and one apply; 404 when no route holds the address, 200 with no write and no apply when the route already holds it alone |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |
 | GET/POST/DELETE | `/api/excludes/ips` | Excluded IPs and CIDRs |
 | GET | `/api/logs` | One source (`?source=`) or every source at once |
@@ -104,7 +105,10 @@ from the daemons and from `import_server_list.sh` alike.
 
 Client and exclusion mutations go through `updateAndApply`: the change is
 written under the config lock and `vpn-director.sh apply` runs immediately
-after, as the bot does. The server and subscription routes are the exception.
+after, as the bot does. A move is one such change: its apply takes the
+client off its old route only once the new one carries it
+(`packet-flow.md`), where a delete and an add left it on the WAN in between.
+The server and subscription routes are the exception.
 `/api/servers/active` regenerates `config.json`, rewrites `xray.servers` under
 the lock and restarts Xray instead of applying. The subscription routes apply
 nothing: every change to a subscription file happens inside a config-lock

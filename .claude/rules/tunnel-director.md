@@ -47,7 +47,7 @@ Routes LAN client traffic through VPN tunnels. All traffic goes through the tunn
 
 - All traffic from `clients` routes through the tunnel
 - Traffic to destinations in `exclude` ipsets bypasses VPN (goes direct)
-- Order of tunnels in JSON determines fwmark assignment
+- Order of tunnels in JSON decides which rule a client meets first; a tunnel's fwmark comes from its slot, which it keeps while it has clients (see "Stable slots and the rebuild in place")
 
 ## Chain Architecture
 
@@ -82,6 +82,32 @@ inside `TUN_DIR` with the identical match immediately before `MARK`.
 
 Default: bits 16-23 (8 bits = 255 tunnels max)
 
+## Stable slots and the rebuild in place
+
+A tunnel's slot `idx` gives its mark (`(idx + 1) << mark_shift`), its ip rule preference
+(`pref_base + idx`) and, on Keenetic, its table (`2000 + idx`). `_tunnel_collect_applied` reads the
+previous layout from `TUN_DIR_TABLES`: a tunnel in it keeps its idx, and a tunnel new to the layout
+takes the lowest idx that neither the previous nor the new layout holds, so an apply never reuses a
+slot it frees. The chain keeps the JSON order (the failover clients first), so the first match still
+wins between overlapping CIDRs. The slots used to follow the JSON order, and a tunnel that gained
+its first client or lost its last shifted the mark, preference and table of every tunnel after it.
+
+A rebuild no longer starts with `tunnel_stop`:
+
+1. Routing first, for every tunnel of the new layout. A new slot's table is released, its route
+   ensured and its ip rule replaced; a kept slot's route and rule are only ensured
+   (`_tunnel_rule_ensure` leaves a correct rule alone), and its table is never released.
+2. `TUN_DIR_NEW` is built (`_tunnel_build_chain`) and swapped in by `swap_fw_chain`.
+3. Every slot the new layout dropped loses its ip rule (only when it is ours) and its table
+   (`_tunnel_slot_release`) — after the swap, when no packet carries its mark.
+4. The hash and `failover_ready` are recorded. `TUN_DIR_TABLES` holds the union of both layouts
+   from step 1 to step 3, and the new layout after.
+
+The hash is removed when a rebuild starts and written back only by one that completes: a rebuild
+that dies part-way leaves the next apply a rebuild, which finishes the interrupted swap (step 0 of
+`swap_fw_chain`) and releases the slots left on record. A rebuild whose swap did not take over every
+interface (`swap_fw_chain` returned 2 or 3) records no hash and releases nothing.
+
 ## State Tracking
 
 | File | Purpose |
@@ -94,16 +120,13 @@ through `platform_tunnel_table_release`, then removes both files.
 
 The two can be out of step in one direction: an apply that skipped a tunnel the platform does not
 list writes `TUN_DIR_TABLES` but deliberately no hash, so the next apply retries instead of
-reporting itself up-to-date. The cleanup that precedes a rebuild therefore keys off **either**
-file — keying it off the hash alone left those tables allocated while the next apply handed their
-indices to other tunnels, and on Keenetic table `2000+idx` then still held the previous tunnel's
-route.
+reporting itself up-to-date. A rebuild reads its previous layout from `TUN_DIR_TABLES` whatever the
+hash says, so the tunnels on record keep their slots and the ones gone from the layout are released.
 
 A failover tunnel whose route or ip rule cannot be installed still writes the hash (when every
-configured tunnel was applied) and returns 0 with a WARN, so S99 start, hooks and Web UI Apply
-do not fail while the fallback interface is still coming up. Deleting the hash forced the next
-apply through `tunnel_stop`. The watch does not Commit Xray membership until
-`/tmp/tunnel_director/failover_ready` names that tunnel (route and ip rule installed);
+configured tunnel was applied) and returns 0 with a WARN, so S99 start, hooks and Web UI Apply do
+not fail while the fallback interface is still coming up. The watch does not Commit Xray membership
+until `/tmp/tunnel_director/failover_ready` names that tunnel (route and ip rule installed);
 `TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path always re-installs
 recorded routes **and ip rules** (`_tunnel_rule_ensure`, one per row of `TUN_DIR_TABLES`), then
 re-checks the failover tunnel's row and its rule (`pref TUN_DIR_PREF_BASE+idx`) and rewrites or
@@ -125,16 +148,16 @@ A client entry that is no IPv4 address or CIDR (`is_ipv4_net`: `192.168.1.1000`,
 leading zero, IPv6) or lies outside RFC1918 is skipped with a WARN, and the rest applies: `is_lan_ip`
 looks at the prefix only, and the failover copies `xray.clients` into a tunnel. A chain rule the
 kernel refuses costs that client only — `_tunnel_emit_client` checks every rule itself and runs
-under `||`, because under errexit one refused MARK used to end the apply after `tunnel_stop` had
-purged the jumps and the ip rules of every tunnel. Such a rebuild is not recorded as up-to-date, so
-the next apply rebuilds and retries it: the up-to-date branch looks for the MARK rules only, not
-for an exclusion or offload rule.
+under `||`, because under errexit one refused MARK used to end the apply half-way. Such a rebuild
+is not recorded as up-to-date, so the next apply rebuilds and retries it: the up-to-date branch
+looks for the MARK rules only, not for an exclusion or offload rule.
 
-The PREROUTING jumps are different: a rebuild whose jump did not go in keeps its hash, and the
-up-to-date branch puts a missing jump back (`_tunnel_jumps_ensure`), leaving one that is there where
-it is. `failover_ready` needs the jumps, and every failover client still on the failover tunnel
-marked — one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it
-would leave through the WAN.
+The PREROUTING jumps: a rebuild whose new jumps did not all go in records no hash, and the next
+apply finishes the swap. A jump that goes missing after a recorded rebuild is put back by the
+up-to-date branch (`_tunnel_jumps_ensure`), which leaves one that is there where it is.
+`failover_ready` needs the jumps, and every failover client still on the failover tunnel marked —
+one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it would leave
+through the WAN.
 
 A chain can also lose rules a recorded rebuild put in. Merlin's firewall start runs
 `iptables -t mangle -F`, which empties `TUN_DIR` without deleting it (the pitfall in
@@ -147,17 +170,19 @@ rebuilds when one is gone. The failover clients are clients of their tunnel unde
 are among them. A client the rebuild skips (no IPv4 address, outside RFC1918) is skipped there
 too: looking for its rule would rebuild the chain on every apply.
 
-The rebuild loop also releases each tunnel's table right before it ensures the route
-(`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that dies after
-ensuring a route but before writing `TUN_DIR_TABLES` leaves that route with no record at all, and
-the next apply, handing the index to a tunnel whose route cannot be installed, would otherwise
-send its clients through the previous owner's tunnel.
+A rebuild releases the table of a new slot right before it ensures the route
+(`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that died after
+ensuring a route but before recording its slot — an earlier version recorded the slots last — left
+that route with no record at all, and the next apply, handing the index to a tunnel whose route
+cannot be installed, would otherwise send its clients through the previous owner's tunnel. A kept
+slot's table is never released: it is carrying traffic.
 
 **Rebuild triggers**:
 - Config hash changed
 - Chain does not exist
 - `TUN_DIR_TABLES` is missing
 - A client's MARK rule is missing from the chain (`_tunnel_marks_present`)
+- `TUN_DIR_FORCE_REBUILD=1` (`restart`, `restart tunnel`)
 
 ## Key Functions
 
@@ -166,7 +191,7 @@ send its clients through the previous owner's tunnel.
 | Function | Purpose |
 |----------|---------|
 | `tunnel_status()` | Show chain, ip rules, configured tunnels |
-| `tunnel_apply()` | Apply rules from config (idempotent) |
+| `tunnel_apply()` | Apply rules from config (idempotent; a rebuild happens in place) |
 | `tunnel_stop()` | Remove chain, ip rules and the tunnel tables this module owns |
 | `tunnel_get_required_ipsets()` | Return list of exclude ipsets needed |
 
@@ -178,6 +203,9 @@ send its clients through the previous owner's tunnel.
 | `_tunnel_table_allowed(id)` | Check the tunnel id is one `platform_tunnels` lists |
 | `_tunnel_ensure_routes()` | Re-install the routes of the applied tunnels (used when nothing needs rebuilding) |
 | `_tunnel_marks_present()` | Does `TUN_DIR` still hold every client's MARK rule; one that is gone makes the apply a rebuild |
+| `_tunnel_collect_applied(prev)` | The slot of every tunnel of the new layout: kept from `prev`, or the lowest idx neither layout holds |
+| `_tunnel_build_chain(chain)` | `swap_fw_chain`'s build_fn: every client's rules, the failover clients first |
+| `_tunnel_slot_release(idx, tunnel)` | Drop the ip rule (ours only) and the table of a slot the layout dropped |
 
 **Module state variables**:
 - `_tunnel_valid_tables` - space-separated tunnel ids from `platform_tunnels`
@@ -188,7 +216,7 @@ send its clients through the previous owner's tunnel.
 
 From `lib/common.sh`: `log`, `tmp_file`, `compute_hash`, `is_lan_ip`
 
-From `lib/firewall.sh`: `create_fw_chain`, `delete_fw_chain`, `ensure_fw_rule`, `sync_fw_rule`, `purge_fw_rules`, `fw_chain_exists`
+From `lib/firewall.sh`: `swap_fw_chain`, `delete_fw_chain`, `ensure_fw_rule`, `sync_fw_rule`, `purge_fw_rules`, `find_fw_rules`, `fw_chain_exists`
 
 From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`, `TUN_DIR_TABLES`
 
