@@ -253,7 +253,14 @@ Routes traffic from specified LAN clients through OpenVPN/WireGuard tunnels base
 
 Pick another route for a client in the Web UI (the Route column) or in the bot (`/clients`, 🔀). It is one change and one apply, and the apply moves the client make-before-break: the client stays on its old route until the new one carries it, so none of its traffic leaves through the WAN in between. Every apply works that way — chains and sets are built beside the live ones and swapped in — and so does a server switch, which restarts Xray with its rules in place.
 
-What remains: the firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again, and a tunnel that is down sends its clients through the WAN (on Merlin, the VPN client's killswitch, when enabled, prevents that). The Web UI and the bot ask before they move a client to a tunnel that is down.
+What remains:
+
+- The firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again.
+- A tunnel that is down sends its clients through the WAN (on Merlin, the VPN client's killswitch, when enabled, prevents that). The Web UI and the bot ask before they move a client to a tunnel that is down.
+- A move changes the route of new connections. An open connection may break (reconnect it) or, on KeeneticOS, keep its old route until its conntrack entry expires. A UDP flow moved from Xray to a tunnel can stall until its conntrack entry expires.
+- Only a full `apply`, `restart` or `update` moves a client; the Web UI and the bot always run a full apply. `apply xray`, `restart xray`, `apply tunnel` and `restart tunnel` apply one module: after moving a client by hand in `vpn-director.json`, run a full `vpn-director.sh apply`, since until then the client can go out through the WAN.
+- `/opt/etc/init.d/S99vpn-director restart` stops the service and starts it again, and the clients go out through the WAN in between; `vpn-director.sh restart` rebuilds in place.
+- IPv6 is routed by neither module: where the LAN has IPv6, a client's IPv6 traffic bypasses Xray and Tunnel Director.
 
 ### Country IPSets
 

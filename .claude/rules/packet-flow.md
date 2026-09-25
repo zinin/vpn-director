@@ -98,9 +98,22 @@ Director rebuild keeps every tunnel's slot and installs the routing of a new slo
 and releases a dropped one after it (`tunnel-director.md`). `restart` and `restart xray` stop
 nothing; while the Xray process restarts, TPROXY drops what no socket takes.
 
-Left open: the firmware flushing our chains (Merlin's `iptables -t mangle -F` on a firewall start,
-an NDM rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply, and a tunnel
-that is down sends its clients to `main`.
+Left open:
+
+- The firmware flushing our chains (Merlin's `iptables -t mangle -F` on a firewall start, an NDM
+  rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply.
+- A tunnel that is down sends its clients to `main`.
+- A move changes the route of new connections only. An open connection breaks, or, on KeeneticOS,
+  one the fast path already holds keeps its old path until its conntrack entry expires ("The
+  firmware fast path" below); a UDP flow moved from Xray to a tunnel can stall until its entry
+  expires. Nothing flushes conntrack: KeeneticOS has no conntrack-tools.
+- A component command cannot move a client. `apply xray` and `restart xray` prune with no Tunnel
+  Director step, so a client moved from Xray to a tunnel leaves through the WAN until the next full
+  apply; `apply tunnel` and `restart tunnel` add nothing to `XRAY_CLIENTS`, so one moved from a
+  tunnel to Xray does the same. The daemons move clients with full applies only.
+- `S99vpn-director restart` is `stop`, then `start` (`vpn-director.sh stop`, then `apply`), with no
+  routing in between: not the in-place `restart`.
+- IPv6 is routed by neither module.
 
 ## Fwmark Bit Layout
 
