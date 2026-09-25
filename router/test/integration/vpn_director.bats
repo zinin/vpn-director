@@ -183,6 +183,14 @@ run_stubbed_cli() {
     [ ! -e "$VPD_STOPPED_FILE" ]
 }
 
+@test "vpn-director: restart removes the stopped marker" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    run_stubbed_cli restart
+    assert_success
+    [ ! -e "$VPD_STOPPED_FILE" ]
+}
+
 # The subscription watch applies with --unless-stopped. A stop that took the lock
 # ahead of it - or finished while the watch was still probing - must survive: the
 # check runs under the lock, where the marker that stop left is visible.
@@ -249,9 +257,8 @@ run_stubbed_cli() {
 }
 
 # The subscription watch writes config.json for each server it tries and needs
-# only the process to pick it up. "restart xray" takes the TPROXY rules down
-# and puts them back, and in between the Xray clients leave through the WAN -
-# once for every server tried.
+# only the process to pick it up. "restart xray" would apply the TPROXY rules
+# again after each one for nothing.
 @test "vpn-director: restart xray-process restarts the Xray process and nothing else" {
     run_stubbed_cli restart xray-process
     assert_success

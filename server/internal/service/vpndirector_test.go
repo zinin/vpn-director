@@ -104,9 +104,8 @@ func TestVPNDirectorService_ApplyUnlessStopped(t *testing.T) {
 }
 
 // The walk writes one config.json per server it tries, and only the Xray process
-// has to read it. The stop and apply of "restart xray" take the TPROXY jump away
-// and put it back, and in between the Xray clients leave through the WAN - once
-// per server tried.
+// has to read it. "restart xray" would apply the TPROXY rules again after each
+// one for nothing.
 func TestVPNDirectorService_RestartXrayProcessUnlessStopped(t *testing.T) {
 	mock := &mockExecutor{result: &shell.Result{Output: "ok", ExitCode: 0}}
 	svc := NewVPNDirectorService("/opt/vpn-director", mock)

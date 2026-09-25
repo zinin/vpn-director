@@ -480,7 +480,7 @@ marks_in_place() {
 # PREROUTING jumps and every ip rule, so unrelated Tunnel Director clients lost
 # routing until the fallback interface was up. The watch retries apply every
 # 30s while pendingApply is set; hooks and Web UI Apply do the same.
-@test "tunnel_apply: a failed failover route still records the hash so the next apply does not tear down" {
+@test "tunnel_apply: a failed failover route still records the hash so the next apply does not rebuild" {
     load_common
     source "$LIB_DIR/firewall.sh"
     local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-route-hash.json"

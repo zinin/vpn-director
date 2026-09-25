@@ -468,7 +468,7 @@ acquire_lock() {
 
     # Already ours: `exec 200>` would close the descriptor, dropping the lock,
     # and take it again - a window another waiter can step into. cmd_restart
-    # holds the lock and calls cmd_stop and cmd_apply, which both ask for it.
+    # holds the lock and calls cmd_apply, which asks for it again.
     if [[ ${_VPD_LOCK_FILE:-} == "$file" ]]; then
         return 0
     fi
