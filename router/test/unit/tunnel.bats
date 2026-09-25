@@ -1629,6 +1629,50 @@ ip_rule_show_cut_short() {
     [ ! -e "$TUN_DIR_FAILOVER_READY" ]
 }
 
+# A rebuild the platform refuses changes nothing, and must not leave an earlier
+# apply's failover_ready either: the watch takes the marker without an apply of
+# its own. After Merlin's firewall start emptied mangle, a busy xtables lock
+# fails the PREROUTING listing Merlin reads the position from; the failover
+# clients, off Xray, would have no MARK rule and no jump, and leave through the
+# WAN.
+@test "tunnel_apply: a rebuild refused for want of a PREROUTING position leaves no failover_ready" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    [ -f "$TUN_DIR_HASH" ]
+
+    iptables -t mangle -F
+    platform_prerouting_base_pos() { return 1; }
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "Cannot determine the PREROUTING insert position"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+    [ ! -e "$TUN_DIR_HASH" ]
+}
+
+@test "tunnel_apply: a rebuild refused for want of a LAN interface leaves no failover_ready" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    [ -f "$TUN_DIR_HASH" ]
+
+    iptables -t mangle -F
+    platform_lan_ifaces() { return 1; }
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "Cannot determine the LAN interfaces"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+    [ ! -e "$TUN_DIR_HASH" ]
+}
+
 # With stable slots the mark field can be full while the tunnels would fit it:
 # the slot this apply frees still carries marks until the swap, so it is not
 # handed out before the next apply. That apply has to come - the hash is not

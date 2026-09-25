@@ -808,6 +808,16 @@ tunnel_apply() {
         return 0
     fi
 
+    # Written back only by a rebuild that completes, and removed first, so that
+    # no exit short of that leaves either behind: not a rebuild refused just
+    # below, not one that dies part-way. Without the hash the next apply is a
+    # rebuild as well, and it finishes the swap a dead one left and releases the
+    # slots it left on record. The failover marker goes with the hash, as it
+    # went with the tunnel_stop a rebuild used to start with: the watch trusts
+    # the marker over the apply's exit status, so a rebuild that is refused or
+    # dies part-way must not leave a stale "ready" behind.
+    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY"
+
     # The PREROUTING jumps below are what make the chain matter, so ask for the
     # LAN interfaces before touching any firewall state. A platform that cannot
     # name them would otherwise leave a fully populated chain with nothing
@@ -838,13 +848,6 @@ tunnel_apply() {
         # missing TUN_DIR_TABLES, a MARK rule gone - and that is no change.
         log "Applied rules are incomplete; rebuilding..."
     fi
-    # Written back only by a rebuild that completes. One that dies part-way
-    # leaves the next apply a rebuild as well, and that one finishes the swap
-    # the dead one left and releases the slots it left on record. The failover
-    # marker goes with the hash, as it went with the tunnel_stop that used to
-    # stand here: the watch trusts the marker over the apply's exit status, so a
-    # rebuild that dies part-way must not leave a stale "ready" behind.
-    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY"
     changes=1
 
     # A platform whose firmware accelerates established forwarded flows past
