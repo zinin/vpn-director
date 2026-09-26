@@ -129,6 +129,62 @@ func TestMoveClient_PausedSlash32DuringAFailover(t *testing.T) {
 	}
 }
 
+// A move repoints the moved address's pause, nobody else's. 192.168.50.20 sits
+// on xray and, as 192.168.50.20/32, on wgc1, both paused - what the pause
+// handlers write. Repointed onto its first stored spelling, the /32 entry went,
+// and the shell, which subtracts by exact string, resumed the client on wgc1.
+func TestMoveClient_LeavesAnotherClientsPausesAlone(t *testing.T) {
+	cfg := movable()
+	cfg.Xray.Clients = append(cfg.Xray.Clients, "192.168.50.20")
+	cfg.TunnelDirector.Tunnels["wgc1"] = TunnelConfig{
+		Clients: []string{"192.168.50.30", "192.168.50.20/32"}, Exclude: []string{"ru"},
+	}
+	cfg.PausedClients = []string{"192.168.50.20", "192.168.50.20/32"}
+
+	if got := MoveClient(cfg, "192.168.50.10", "wgc1"); got != ClientMoved {
+		t.Fatalf("MoveClient = %v, want ClientMoved", got)
+	}
+	if !reflect.DeepEqual(cfg.PausedClients, []string{"192.168.50.20", "192.168.50.20/32"}) {
+		t.Errorf("paused_clients = %v; another client's pause changed", cfg.PausedClients)
+	}
+}
+
+// A stale entry - 192.168.50.20 paused by an older build for a client stored as
+// 192.168.50.20/32 - pauses nothing, and the UI shows the client active. An
+// unrelated move must not turn it into a pause that sends the client direct.
+func TestMoveClient_LeavesAStalePauseStale(t *testing.T) {
+	cfg := movable()
+	cfg.TunnelDirector.Tunnels["wgc1"] = TunnelConfig{
+		Clients: []string{"192.168.50.30", "192.168.50.20/32"}, Exclude: []string{"ru"},
+	}
+	cfg.PausedClients = []string{"192.168.50.20"}
+
+	if got := MoveClient(cfg, "192.168.50.10", "wgc1"); got != ClientMoved {
+		t.Fatalf("MoveClient = %v, want ClientMoved", got)
+	}
+	if !reflect.DeepEqual(cfg.PausedClients, []string{"192.168.50.20"}) {
+		t.Errorf("paused_clients = %v", cfg.PausedClients)
+	}
+	for _, c := range CollectClients(cfg) {
+		if c.IP == "192.168.50.20/32" && c.Paused {
+			t.Error("192.168.50.20/32 is paused now: an unrelated move paused it")
+		}
+	}
+}
+
+// The moved address itself: a stale entry of it goes, and it moves as it was -
+// active here, since no stored spelling of it was paused.
+func TestMoveClient_DropsTheMovedAddressesStalePause(t *testing.T) {
+	cfg := movable()
+	cfg.Xray.Clients = []string{"192.168.50.10/32"}
+	cfg.PausedClients = []string{"192.168.50.10", "192.168.50.99"}
+
+	MoveClient(cfg, "192.168.50.10", "wgc1")
+	if !reflect.DeepEqual(cfg.PausedClients, []string{"192.168.50.99"}) {
+		t.Errorf("paused_clients = %v", cfg.PausedClients)
+	}
+}
+
 func TestMoveClient_AlreadyThereChangesNothing(t *testing.T) {
 	cfg := movable()
 	if got := MoveClient(cfg, "192.168.50.10", "xray"); got != ClientAlreadyThere {

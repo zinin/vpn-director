@@ -40,11 +40,15 @@ func ClientRoutes(cfg *VPNDirectorConfig, addr string) []string {
 // inherits xray.exclude_sets, as an added client's does: an empty exclude
 // would carry the client's local-country traffic through the tunnel too.
 // paused_clients follows the new spelling, since the shell subtracts it by
-// exact string: a paused client moves paused. The address leaves the failover
-// record, so a restore cannot undo the user's choice; one moved to Xray while
-// Xray is down joins the failover afresh, as an added one does. A tunnel whose
-// last client leaves stays in the config with an empty list, as after a
-// delete. Only the routes that hold the address are rewritten.
+// exact string: a paused client moves paused, an active one active. Only the
+// moved address's entries change - every other one stays as written: a
+// whole-config repoint moved another client's pause onto one spelling of it,
+// and turned a stale entry into a pause that sent a client direct. The address
+// leaves the failover record, so a restore cannot undo the user's choice; one
+// moved to Xray while Xray is down joins the failover afresh, as an added one
+// does. A tunnel whose last client leaves stays in the config with an empty
+// list, as after a delete. Only the routes that hold the address are
+// rewritten.
 func MoveClient(cfg *VPNDirectorConfig, addr, route string) MoveResult {
 	on := ClientRoutes(cfg, addr)
 	switch {
@@ -52,6 +56,16 @@ func MoveClient(cfg *VPNDirectorConfig, addr, route string) MoveResult {
 		return ClientNotFound
 	case len(on) == 1 && on[0] == route:
 		return ClientAlreadyThere
+	}
+
+	key := addrKey(addr)
+	// Paused as the shell and CollectClients read it: some stored spelling of
+	// the address is in paused_clients exactly.
+	wasPaused := false
+	for _, c := range CollectClients(cfg) {
+		if addrKey(c.IP) == key && c.Paused {
+			wasPaused = true
+		}
 	}
 
 	for _, r := range on {
@@ -64,7 +78,6 @@ func MoveClient(cfg *VPNDirectorConfig, addr, route string) MoveResult {
 		cfg.TunnelDirector.Tunnels[r] = t
 	}
 
-	key := addrKey(addr)
 	if route == "xray" {
 		cfg.Xray.Clients = append(cfg.Xray.Clients, key)
 	} else {
@@ -78,7 +91,13 @@ func MoveClient(cfg *VPNDirectorConfig, addr, route string) MoveResult {
 		t.Clients = append(t.Clients, key)
 		cfg.TunnelDirector.Tunnels[route] = t
 	}
-	cfg.PausedClients = RepointPausedClients(cfg.PausedClients, CollectClients(cfg))
+	if len(cfg.PausedClients) > 0 {
+		paused := withoutAddr(cfg.PausedClients, addr)
+		if wasPaused {
+			paused = append(paused, key)
+		}
+		cfg.PausedClients = paused
+	}
 	DetachFailoverClient(cfg, addr)
 	return ClientMoved
 }
