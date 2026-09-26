@@ -266,6 +266,12 @@ refuses a chain that is there, and `swap_fw_chain` then returns 2 as well: a
 live `<chain>_NEW` the existence check missed is never flushed either —
 `create_fw_chain -f` would have emptied it for the whole build.
 
+A rename that keeps failing holds every later swap at that first step:
+`swap_fw_chain` returns 3 before it builds, so `<chain>_NEW` keeps the rules of
+the apply that made it, and a later configuration change does not reach the
+chain until the rename goes through. Each apply logs the failed rename as an
+ERROR, and `status` lists the `_NEW` chain.
+
 The stateful iptables mock (`use_stateful_iptables`) records every flush of a
 chain a rule still jumps to in `$BATS_IPT_DIR/live_flushes`; a test of an apply
 asserts that file stays empty.
