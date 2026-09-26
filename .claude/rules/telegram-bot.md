@@ -152,11 +152,18 @@ Each client gets ⏸/▶, 🔀 (`clients:move:<ip>`) and 🗑; an address no rou
 an older build saved) gets no 🔀. 🔀 replaces the list with the routes (`routeChoices`, which the
 Add flow's keyboard uses too): xray, the platform's tunnels with their description ("(down)" on one
 that is not connected), the config's tunnels the platform does not list ("(unknown)" when the
-platform answered); ✓ on the current route; « Back (`clients:rm_no`). A route button
-(`clients:to:<route>:<ip>`) runs `vpnconfig.MoveClient` under the config lock and one `Apply`, and
-the message shows the list again. A tunnel that is down asks first — "Move anyway"
-(`clients:toyes:<route>:<ip>`) or Cancel. A button whose client is gone, or whose route the router
-no longer has, redraws the list.
+platform answered; never `main`, Tunnel Director's own route, which no platform lists); ✓ on the
+current route; « Back (`clients:rm_no`). A route button (`clients:to:<route>:<ip>`) runs
+`vpnconfig.MoveClient` under the config lock and one `Apply`, and the message shows the list again.
+A tap on the route the client is on alone moves nothing and asks nothing: the list comes back. A
+tunnel that is down asks first — "Move anyway" (`clients:toyes:<route>:<ip>`) or Cancel — and so
+does an "(unknown)" one, which Tunnel Director skips until the platform lists it: "`<route>` is not
+on the router's tunnel list: until it is, Tunnel Director does not route `<ip>` through it. Move
+anyway?". A Tunnel Director route (any but xray) is refused, in a move and in the Add flow alike,
+for an address Tunnel Director cannot carry - anything but a private IPv4 address or network
+(`vpnconfig.TDCarries`): the bot says so ("Tunnel Director routes private IPv4 addresses only;
+`<ip>` can go on xray") and redraws the list, as the API answers 400. A button whose client is
+gone, or whose route the router no longer has, redraws the list.
 
 ## Server switch (`/xray`)
 

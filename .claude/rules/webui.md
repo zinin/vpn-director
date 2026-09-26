@@ -56,9 +56,9 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | POST | `/api/subscriptions/refresh` | `?id=` refreshes one subscription (404 when it is gone, 400 for a static list), no id every one with a link, in parallel; `results`, one per subscription, each with its `summary` and the counts or its `error` |
 | POST | `/api/subscriptions/rename` | `?id=` and `{name}`; 400 for a name the rules refuse or another subscription has |
 | DELETE | `/api/subscriptions` | `?id=`; `active_removed` says the running server came from it |
-| GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config |
+| GET/POST/DELETE | `/api/clients` | LAN clients; a POST route must be xray, a tunnel already in the config, or a tunnel `/api/platform` lists; 503 when the platform cannot answer for a route outside the config; 400 for a Tunnel Director route (any but xray) and an address Tunnel Director cannot carry - anything but a private IPv4 address or network (`vpnconfig.TDCarries`) - which can go on xray |
 | POST | `/api/clients/pause`, `/api/clients/resume` | Pause and resume a client |
-| POST | `/api/clients/route` | Move a client: `{ip, route}`, the route checked as for an add; one config update (`vpnconfig.MoveClient`) and one apply; 404 when no route holds the address, 200 with no write and no apply when the route already holds it alone |
+| POST | `/api/clients/route` | Move a client: `{ip, route}`, the route checked as for an add (the 400 for an address Tunnel Director cannot carry included); one config update (`vpnconfig.MoveClient`) and one apply; 404 when no route holds the address, 200 with no write and no apply when the route already holds it alone |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |
 | GET/POST/DELETE | `/api/excludes/ips` | Excluded IPs and CIDRs |
 | GET | `/api/logs` | One source (`?source=`) or every source at once |

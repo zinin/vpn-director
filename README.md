@@ -99,7 +99,7 @@ After installation, configs are located at:
 /opt/vpn-director/vpn-director.sh status              # Show all status
 /opt/vpn-director/vpn-director.sh apply               # Apply configuration
 /opt/vpn-director/vpn-director.sh stop                # Stop all components
-/opt/vpn-director/vpn-director.sh restart             # Rebuild all in place (nothing stopped)
+/opt/vpn-director/vpn-director.sh restart             # Restart Xray, rebuild all in place without a stop
 /opt/vpn-director/vpn-director.sh update              # Update ipsets + reapply
 
 # Component-specific
@@ -258,7 +258,7 @@ What remains:
 - The firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again.
 - A tunnel that is down sends its clients through the WAN (on Merlin, the VPN client's killswitch, when enabled, prevents that). The Web UI and the bot ask before they move a client to a tunnel that is down.
 - A move changes the route of new connections. An open connection may break (reconnect it) or, on KeeneticOS, keep its old route until its conntrack entry expires. A UDP flow moved from Xray to a tunnel can stall until its conntrack entry expires.
-- Only a full `apply`, `restart` or `update` moves a client; the Web UI and the bot always run a full apply. `apply xray`, `restart xray`, `apply tunnel` and `restart tunnel` apply one module: after moving a client by hand in `vpn-director.json`, run a full `vpn-director.sh apply`, since until then the client can go out through the WAN.
+- Only a full `apply`, `restart` or `update` moves a client between Xray and a tunnel. The Web UI and the bot move clients with a full apply (a server switch, which changes no client's route, runs `restart xray`). After moving a client by hand in `vpn-director.json`, run a full `vpn-director.sh apply`: `apply xray` and `restart xray` keep a client moved from Xray to a tunnel proxied until then, but `apply tunnel` and `restart tunnel`, which move a client between tunnels in place, add nothing to Xray, so a client moved from a tunnel to Xray goes out through the WAN until the full apply.
 - `/opt/etc/init.d/S99vpn-director restart` stops the service and starts it again, and the clients go out through the WAN in between; `vpn-director.sh restart` rebuilds in place.
 - IPv6 is routed by neither module: where the LAN has IPv6, a client's IPv6 traffic bypasses Xray and Tunnel Director.
 

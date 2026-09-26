@@ -81,14 +81,24 @@ them, so the order is `[XRAY_TPROXY, TUN_DIR]` on both platforms.
 
 A full apply (`apply`, `update`, `restart`) moves every client make-before-break:
 
-1. `tproxy_apply` adds every client `xray.clients` names to `XRAY_CLIENTS` and removes none.
-2. `tunnel_apply` puts Tunnel Director's rules in place.
-3. `tproxy_prune` swaps in the exact `XRAY_CLIENTS`.
+1. `tproxy_apply` adds every effective Xray client to `XRAY_CLIENTS` - `xray.clients` less
+   `paused_clients`, an entry that is no IPv4 address or CIDR skipped - and removes none.
+2. `tunnel_apply` puts Tunnel Director's rules in place and reports the clients the live `TUN_DIR`
+   does not carry when it returns (`TUNNEL_UNCARRIED`).
+3. `tproxy_prune` swaps in the effective Xray clients, plus every reported client `XRAY_CLIENTS`
+   still holds.
 
 Xray wins over TUN_DIR (above). A client moving from Xray to a tunnel stays proxied until step 3
 lets it go, when TUN_DIR already marks it; a client moving the other way is proxied from step 1,
-before TUN_DIR lets it go in step 2. A Tunnel Director failure ends the run before step 3: the
-clients that left Xray stay proxied rather than leak.
+before TUN_DIR lets it go in step 2. A Tunnel Director failure that stops the apply (a tunnels value
+that is no object, no LAN interface, no PREROUTING position) ends the run before step 3. One that
+costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
+tunnel the platform does not list, a slot whose route or ip rule is not in place, a client outside
+RFC1918 - and step 2 reports the clients it cost. Step 3 keeps each of them that `XRAY_CLIENTS`
+still holds: a client that came from Xray stays proxied rather than leak, until an apply in which
+Tunnel Director carries it. A client that left Xray for direct - paused, deleted - is let go, and
+one that was not proxied is not made so (`tunnel-director.md`, "What tunnel_apply reports as not
+carried").
 
 No step flushes a chain or a set a packet is crossing. `XRAY_TPROXY` and a rebuilt `TUN_DIR` are
 built as `<chain>_NEW` and swapped in by `swap_fw_chain` (`lib/firewall.sh`): the new jump goes in
@@ -102,15 +112,20 @@ Left open:
 
 - The firmware flushing our chains (Merlin's `iptables -t mangle -F` on a firewall start, an NDM
   rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply.
-- A tunnel that is down sends its clients to `main`.
+- A tunnel that is down sends its clients to `main`. One that comes from Xray while the tunnel's
+  route cannot be installed stays proxied instead (step 3).
 - A move changes the route of new connections only. An open connection breaks, or, on KeeneticOS,
   one the fast path already holds keeps its old path until its conntrack entry expires ("The
   firmware fast path" below); a UDP flow moved from Xray to a tunnel can stall until its entry
   expires. Nothing flushes conntrack: KeeneticOS has no conntrack-tools.
-- A component command cannot move a client. `apply xray` and `restart xray` prune with no Tunnel
-  Director step, so a client moved from Xray to a tunnel leaves through the WAN until the next full
-  apply; `apply tunnel` and `restart tunnel` add nothing to `XRAY_CLIENTS`, so one moved from a
-  tunnel to Xray does the same. The daemons move clients with full applies only.
+- A component command does not move a client between Xray and a tunnel. `apply xray` and
+  `restart xray` run no Tunnel Director, so their prune keeps every client the config puts on a
+  tunnel that `XRAY_CLIENTS` still holds: a client moved from Xray to a tunnel by hand stays
+  proxied until a full apply moves it, and only a client that left Xray for direct is let go.
+  `apply tunnel` and `restart tunnel` move a client between tunnels in place, but add nothing to
+  `XRAY_CLIENTS`: one moved from a tunnel to Xray leaves through the WAN until the next full apply.
+  The daemons move clients with full applies; a server switch, which changes no client's route,
+  runs `restart xray`.
 - `S99vpn-director restart` is `stop`, then `start` (`vpn-director.sh stop`, then `apply`), with no
   routing in between: not the in-place `restart`.
 - IPv6 is routed by neither module.

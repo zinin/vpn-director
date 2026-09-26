@@ -104,9 +104,42 @@ A rebuild no longer starts with `tunnel_stop`:
    from step 1 to step 3, and the new layout after.
 
 The hash is removed when a rebuild starts and written back only by one that completes: a rebuild
-that dies part-way leaves the next apply a rebuild, which finishes the interrupted swap (step 0 of
-`swap_fw_chain`) and releases the slots left on record. A rebuild whose swap did not take over every
-interface (`swap_fw_chain` returned 2 or 3) records no hash and releases nothing.
+that dies part-way leaves the next apply a rebuild, which finishes the interrupted swap
+(`swap_fw_chain` does that before anything else; see "An apply never flushes a live chain or set"
+in `shell-conventions.md`) and releases the slots left on record. A rebuild whose swap did not take
+over every interface (`swap_fw_chain` returned 2 or 3) records no hash and releases nothing.
+
+Both writes of `TUN_DIR_TABLES` go into `tun_dir_tables.new` beside it, which a rename then puts in
+its place (`_tunnel_tables_write`). Written in place, the record was emptied before the new lines
+went in: an apply killed in that instant, or a full `/tmp` failing the write, left it empty or
+partial after the hash was already gone, and the next rebuild handed out slots the live chain still
+marked with as free ones.
+
+## What tunnel_apply reports as not carried
+
+`tunnel_apply` returns 0 on a failure that costs some clients - a refused rule, a swap that did not
+take over every interface, a tunnel the platform does not list - so its status cannot tell a full
+apply whether the clients that left Xray are carried now. It lists in `TUNNEL_UNCARRIED`, an array
+reset at its start, the clients the live `TUN_DIR` may not mark or route when it returns: each
+spelled as its tunnel's client list spells it (paused clients are not in those lists), each once.
+`tunnel_uncarried` prints them.
+
+| Path | Reported |
+|------|----------|
+| Rebuild | The clients of a tunnel `_tunnel_collect_applied` gave no slot: one the platform does not list, one the mark field has no room for |
+| Rebuild | The clients of a slot whose route or ip rule is not in place after the routing step, new or kept: its mark reaches `main` |
+| Rebuild | A client `_tunnel_emit_client` skipped as outside RFC1918, or whose MARK rule was refused - or whose offload opt-out was: the fast path then takes its flows past mangle after their first packets |
+| Rebuild | Every client, when `swap_fw_chain` did not take over every interface (rc 2 or 3): an interface still on the old chain marks none of the clients new to it |
+| Up to date | The clients of a slot whose route or rule did not go back in (`_tunnel_ensure_routes`), every client when a PREROUTING jump did not, and every client outside RFC1918: the rebuild that skipped it recorded the hash, and no path marks it |
+| No tunnels (`{}`) | Nothing: no client is on a tunnel |
+
+The failover clients are clients of their tunnel and are reported with it. `vpn-director.sh` hands
+the list to `tproxy_prune`, which keeps each client `XRAY_CLIENTS` still holds: a client moving from
+Xray to a tunnel stays proxied until an apply in which Tunnel Director carries it, instead of
+leaving through the WAN. A client that left Xray for direct is not in the list, and a client that
+was not proxied - one moving between two tunnels - is not added to Xray (`packet-flow.md`, "The
+apply: make before break"). `apply xray` and `restart xray` run no `tunnel_apply`: they hand the
+prune every client the config puts on a tunnel (`tunnel_clients`).
 
 ## State Tracking
 
@@ -191,7 +224,9 @@ slot's table is never released: it is carrying traffic.
 | Function | Purpose |
 |----------|---------|
 | `tunnel_status()` | Show chain, ip rules, configured tunnels |
-| `tunnel_apply()` | Apply rules from config (idempotent; a rebuild happens in place) |
+| `tunnel_apply()` | Apply rules from config (idempotent; a rebuild happens in place); reports the clients it does not carry in `TUNNEL_UNCARRIED` |
+| `tunnel_uncarried()` | Print `TUNNEL_UNCARRIED`, one client per line |
+| `tunnel_clients()` | Print every client the config puts on a tunnel, `main` included, paused ones left out |
 | `tunnel_stop()` | Remove chain, ip rules and the tunnel tables this module owns |
 | `tunnel_get_required_ipsets()` | Return list of exclude ipsets needed |
 
@@ -206,6 +241,10 @@ slot's table is never released: it is carrying traffic.
 | `_tunnel_collect_applied(prev)` | The slot of every tunnel of the new layout: kept from `prev`, or the lowest idx neither layout holds |
 | `_tunnel_build_chain(chain)` | `swap_fw_chain`'s build_fn: every client's rules, the failover clients first |
 | `_tunnel_slot_release(idx, tunnel)` | Drop the ip rule (ours only) and the table of a slot the layout dropped |
+| `_tunnel_tables_write(file...)` | Replace `TUN_DIR_TABLES` with the lines of the files, each once, through a file beside it and a rename |
+| `_tunnel_clients_of(tunnel)` | The clients of one tunnel, one per line; none for an entry that is no object or clients that are no array |
+| `_tunnel_not_carried(clients...)` | Add clients to `TUNNEL_UNCARRIED`, each once |
+| `_tunnel_not_carried_non_rfc1918()` | Add every configured client outside RFC1918 (the up-to-date path) |
 
 **Module state variables**:
 - `_tunnel_valid_tables` - space-separated tunnel ids from `platform_tunnels`

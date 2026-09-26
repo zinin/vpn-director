@@ -99,7 +99,7 @@ curl -fsSL \
 /opt/vpn-director/vpn-director.sh status              # Показать статус
 /opt/vpn-director/vpn-director.sh apply               # Применить конфигурацию
 /opt/vpn-director/vpn-director.sh stop                # Остановить все компоненты
-/opt/vpn-director/vpn-director.sh restart             # Пересобрать всё на месте, без остановки
+/opt/vpn-director/vpn-director.sh restart             # Перезапустить Xray и пересобрать всё на месте, без остановки
 /opt/vpn-director/vpn-director.sh update              # Обновить ipsets + применить
 
 # Отдельные компоненты
@@ -258,7 +258,7 @@ HTTPS веб-интерфейс для управления VPN Director из б
 - Собственные пересборки firewall прошивки (перезапуск firewall на Merlin, пересборка NDM на KeeneticOS) очищают цепочки, пока хук не применит их заново.
 - Упавший туннель отправляет своих клиентов в WAN (на Merlin этого не будет, если у VPN-клиента прошивки включён killswitch). Web UI и бот спрашивают подтверждение, прежде чем перенести клиента на упавший туннель.
 - Перенос меняет маршрут новых соединений. Открытое соединение может оборваться (переподключитесь), а на KeeneticOS — идти старым путём, пока не истечёт его запись в conntrack. UDP-поток, перенесённый из Xray в туннель, может зависнуть, пока не истечёт его запись в conntrack.
-- Клиента переносит только полный `apply`, `restart` или `update`; Web UI и бот всегда выполняют полный apply. `apply xray`, `restart xray`, `apply tunnel` и `restart tunnel` применяют один модуль: перенеся клиента вручную в `vpn-director.json`, выполните полный `vpn-director.sh apply` — до него клиент может уходить в WAN.
+- Между Xray и туннелем клиента переносит только полный `apply`, `restart` или `update`. Web UI и бот переносят клиентов полным apply (смена сервера маршрутов клиентов не меняет и выполняет `restart xray`). Перенеся клиента вручную в `vpn-director.json`, выполните полный `vpn-director.sh apply`: до него `apply xray` и `restart xray` по-прежнему пропускают через Xray клиента, перенесённого в туннель, а `apply tunnel` и `restart tunnel` переносят клиента между туннелями на месте, но в Xray никого не добавляют, поэтому клиент, перенесённый из туннеля в Xray, до полного apply уходит в WAN.
 - `/opt/etc/init.d/S99vpn-director restart` останавливает сервис и запускает его снова, и в промежутке клиенты уходят в WAN, а `vpn-director.sh restart` пересобирает всё на месте.
 - IPv6 не маршрутизирует ни один из модулей: если в LAN есть IPv6, IPv6-трафик клиента идёт в обход Xray и Tunnel Director.
 

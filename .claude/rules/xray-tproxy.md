@@ -39,9 +39,15 @@ watch trying one server after another.
   by `swap_fw_chain`. Flushing the live chain and refilling it one rule per call left every Xray
   client unproxied — out through the WAN — for the length of the refill, on every apply.
 - `TPROXY_BYPASS` is built as `TPROXY_BYPASS_NEW` and swapped in (`ipset swap`).
-- `XRAY_CLIENTS` is only added to. `tproxy_prune`, which a full apply runs after `tunnel_apply`,
-  swaps in the exact set: a client moving to a tunnel stays proxied until Tunnel Director carries
-  it (`packet-flow.md`, "The apply: make before break").
+- `XRAY_CLIENTS` is only added to, by the soft-fails as well: with xt_TPROXY missing or an
+  exclusion set not ready, a live set still takes every effective client
+  (`_tproxy_add_to_live_clients`). `tproxy_prune`, the last step of an apply, swaps in the
+  effective clients - `xray.clients` less `paused_clients`, an entry that is no IPv4 address or
+  CIDR skipped - plus every client the caller names that the live set holds: after `tunnel_apply`
+  (a full apply) the clients it reported as not carried, for `apply xray` and `restart xray` every
+  client the config puts on a tunnel. A client moving to a tunnel stays proxied that way until an
+  apply in which Tunnel Director carries it (`packet-flow.md`, "The apply: make before break"); one
+  that left Xray for direct is let go. A WARN names the clients kept.
 - A name from `advanced.xray.chain` leaves room for `_NEW` (24 characters at most), and so does
   one from `advanced.xray.clients_ipset` or `bypass_ipset` (27).
 
@@ -209,9 +215,13 @@ mark or our table, because other firmware versions may still park policies at 20
 
 ## Fail-Safe
 
-Script exits without changes if:
+`tproxy_apply` sets up no rule, no route and no bypass set if:
 - Required exclusion ipsets not found
 - xt_TPROXY module unavailable
+
+It still adds every effective client to an `XRAY_CLIENTS` that exists: the rules of an earlier apply
+may still intercept with it, and a client moving from a tunnel to Xray has to be in it before
+`tunnel_apply` takes its mark away.
 
 > An unknown country code in `xray.exclude_sets` is **not** one of those
 > reasons: `_tproxy_exclude_sets` drops it with a WARN before the check, so a
@@ -232,7 +242,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 |----------|---------|
 | `tproxy_status()` | Show XRAY_TPROXY chain, routing, xray process |
 | `tproxy_apply()` | The make half of an apply: routing, sets, chain swapped in; clients added, never removed; soft-fail if unavailable |
-| `tproxy_prune()` | The break half: `XRAY_CLIENTS` swapped to exactly `xray.clients`; always returns 0 |
+| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; always returns 0 and leaves the ready marker alone |
 | `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) |
 | `tproxy_restart_process()` | Restart Xray process via Entware init script |
 | `tproxy_get_required_ipsets()` | Return list of valid exclude ipsets (unknown codes dropped with a WARN) |
@@ -249,6 +259,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | `_tproxy_setup_routing()` | Create route table + ip rule |
 | `_tproxy_teardown_routing()` | Remove route table + ip rule |
 | `_tproxy_setup_clients_ipset()` | Create the client ipset and add every effective client (never removes) |
+| `_tproxy_add_to_live_clients()` | The same for the soft-fails, only when the client ipset already exists |
 | `_tproxy_shadow_set(name)` | An empty `<name>_NEW` to fill and swap in |
 | `_tproxy_swap_set(name)` | `ipset swap` of `<name>_NEW` into `<name>`, then destroy the shadow |
 | `_tproxy_setup_bypass_ipset()` | Build `TPROXY_BYPASS_NEW` from the three sources and swap it in |
@@ -258,7 +269,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | `_tproxy_setup_iptables()` | Platform rules, then `XRAY_TPROXY` swapped in with its jumps |
 | `_tproxy_teardown_iptables()` | Remove chain and ipsets |
 
-**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue.
+**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client.
 
 **Ready marker**: `tproxy_apply()` writes `/tmp/xray_tproxy/ready` (`XRAY_TPROXY_READY`) only when
 every rule went in, the platform's own included, and removes it on any soft-fail. The Telegram
