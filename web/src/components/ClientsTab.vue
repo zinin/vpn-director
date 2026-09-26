@@ -63,6 +63,13 @@ function isDown(route: string): boolean {
   return platformTunnels.value.some((t) => t.id === route && !t.connected)
 }
 
+// Only a tunnel can be down. xray is none, and neither is main, which the
+// platform never lists (vpn-director.sh platform leaves it out): no question
+// follows a pick of either, so the platform is not asked for one.
+function canBeDown(route: string): boolean {
+  return route !== 'xray' && route !== 'main'
+}
+
 // A legacy entry that is no IPv4 address (an IPv6 one an older build saved):
 // no route can take it, and the router refuses to move it.
 function isMovable(client: ClientInfo): boolean {
@@ -87,10 +94,11 @@ async function loadPlatform() {
   buildRouteOptions()
 }
 
-// The platform as it is now, for the question asked before a move or an add:
-// a tab left open for hours holds a tunnel state that may be long gone, and
-// that question is the one warning before a client goes on a tunnel that is
-// down. A reload that fails leaves the state already loaded.
+// The platform as it is now, for the question asked before a move to a tunnel
+// or an add on one (canBeDown): a tab left open for hours holds a tunnel state
+// that may be long gone, and that question is the one warning before a client
+// goes on a tunnel that is down. A reload that fails leaves the state already
+// loaded.
 async function refreshPlatform() {
   try {
     const resp = await api.getPlatform()
@@ -142,8 +150,10 @@ async function addClient() {
   if (!ip) return
   addLoading.value = true
   try {
-    await refreshPlatform()
-    if (isDown(route) && !confirmDown(route, 'Add')) return
+    if (canBeDown(route)) {
+      await refreshPlatform()
+      if (isDown(route) && !confirmDown(route, 'Add')) return
+    }
     await api.addClient(ip, route)
     newIp.value = ''
     newRoute.value = 'xray'
@@ -177,9 +187,9 @@ function shownRoute(client: ClientInfo): string {
 // One request moves the client: the router writes the new route and applies
 // once, and the apply keeps the client on its old route until the new one
 // carries it. The row shows the picked route, its controls disabled, from the
-// pick on: the platform is asked afresh before the question about a tunnel that
-// is down, and a render in that wait would put the select back. A select whose
-// move did not happen goes back to the route the client is on.
+// pick on: for a tunnel the platform is asked afresh before the question about
+// one that is down, and a render in that wait would put the select back. A
+// select whose move did not happen goes back to the route the client is on.
 async function moveClient(client: ClientInfo, event: Event) {
   const select = event.target as HTMLSelectElement
   const route = select.value
@@ -187,10 +197,12 @@ async function moveClient(client: ClientInfo, event: Event) {
   pendingMove.value = { row: rowKey(client), route }
   actionLoading.value = 'move:' + client.ip
   try {
-    await refreshPlatform()
-    if (isDown(route) && !confirmDown(route, 'Move')) {
-      select.value = client.route
-      return
+    if (canBeDown(route)) {
+      await refreshPlatform()
+      if (isDown(route) && !confirmDown(route, 'Move')) {
+        select.value = client.route
+        return
+      }
     }
     await api.moveClient(client.ip, route)
     await loadClients()
