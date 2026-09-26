@@ -256,7 +256,7 @@ Pick another route for a client in the Web UI (the Route column) or in the bot (
 What remains:
 
 - The firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again.
-- A tunnel that is down sends its clients through the WAN (on Merlin, the VPN client's killswitch, when enabled, prevents that). The Web UI and the bot ask before they move a client to a tunnel that is down.
+- A tunnel that is down sends its clients through the WAN (on Merlin, the VPN client's killswitch, when enabled, prevents that). The Web UI and the bot ask before they move a client to a tunnel that is down or that the router does not list.
 - A move changes the route of new connections. An open connection may break (reconnect it) or, on KeeneticOS, keep its old route until its conntrack entry expires. A UDP flow moved from Xray to a tunnel can stall until its conntrack entry expires.
 - Only a full `apply`, `restart` or `update` moves a client between Xray and a tunnel. The Web UI and the bot move clients with a full apply (a server switch, which changes no client's route, runs `restart xray`). After moving a client by hand in `vpn-director.json`, run a full `vpn-director.sh apply`: `apply xray` and `restart xray` keep a client moved from Xray to a tunnel proxied until then, but `apply tunnel` and `restart tunnel`, which move a client between tunnels in place, add nothing to Xray, so a client moved from a tunnel to Xray goes out through the WAN until the full apply.
 - `/opt/etc/init.d/S99vpn-director restart` stops the service and starts it again, and the clients go out through the WAN in between; `vpn-director.sh restart` rebuilds in place.

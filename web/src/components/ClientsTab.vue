@@ -82,6 +82,20 @@ function confirmDown(route: string, verb: string): boolean {
   )
 }
 
+// A tunnel the platform does not list - a typo, a connection deleted on the
+// router - is one Tunnel Director skips until it is listed, and a client put
+// on it goes out through the WAN meanwhile. Asked only when the platform
+// answered: a failed read has no list to go by.
+function isUnlisted(route: string): boolean {
+  return platformError.value === '' && !platformTunnels.value.some((t) => t.id === route)
+}
+
+function confirmUnlisted(route: string, verb: string): boolean {
+  return confirm(
+    `${route} is not on the router's tunnel list: until it is, Tunnel Director does not route this client through it. ${verb} anyway?`,
+  )
+}
+
 async function loadPlatform() {
   try {
     const resp = await api.getPlatform()
@@ -97,8 +111,8 @@ async function loadPlatform() {
 // The platform as it is now, for the question asked before a move to a tunnel
 // or an add on one (canBeDown): a tab left open for hours holds a tunnel state
 // that may be long gone, and that question is the one warning before a client
-// goes on a tunnel that is down. A reload that fails leaves the state already
-// loaded.
+// goes on a tunnel that is down or not listed. A reload that fails leaves the
+// state already loaded.
 async function refreshPlatform() {
   try {
     const resp = await api.getPlatform()
@@ -153,6 +167,7 @@ async function addClient() {
     if (canBeDown(route)) {
       await refreshPlatform()
       if (isDown(route) && !confirmDown(route, 'Add')) return
+      if (isUnlisted(route) && !confirmUnlisted(route, 'Add')) return
     }
     await api.addClient(ip, route)
     newIp.value = ''
@@ -188,8 +203,9 @@ function shownRoute(client: ClientInfo): string {
 // once, and the apply keeps the client on its old route until the new one
 // carries it. The row shows the picked route, its controls disabled, from the
 // pick on: for a tunnel the platform is asked afresh before the question about
-// one that is down, and a render in that wait would put the select back. A
-// select whose move did not happen goes back to the route the client is on.
+// one that is down or not listed, and a render in that wait would put the
+// select back. A select whose move did not happen goes back to the route the
+// client is on.
 async function moveClient(client: ClientInfo, event: Event) {
   const select = event.target as HTMLSelectElement
   const route = select.value
@@ -200,6 +216,10 @@ async function moveClient(client: ClientInfo, event: Event) {
     if (canBeDown(route)) {
       await refreshPlatform()
       if (isDown(route) && !confirmDown(route, 'Move')) {
+        select.value = client.route
+        return
+      }
+      if (isUnlisted(route) && !confirmUnlisted(route, 'Move')) {
         select.value = client.route
         return
       }
