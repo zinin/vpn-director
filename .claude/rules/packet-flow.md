@@ -84,7 +84,8 @@ A full apply (`apply`, `update`, `restart`) moves every client make-before-break
 1. `tproxy_apply` adds every effective Xray client to `XRAY_CLIENTS` - `xray.clients` less
    `paused_clients`, an entry that is no IPv4 address or CIDR skipped - and removes none.
 2. `tunnel_apply` puts Tunnel Director's rules in place and reports the clients the live `TUN_DIR`
-   does not carry when it returns (`TUNNEL_UNCARRIED`).
+   does not carry when it returns (`TUNNEL_UNCARRIED`) - never a client of `main`, which goes direct
+   unmarked as well.
 3. `tproxy_prune` swaps in the effective Xray clients, plus every reported client `XRAY_CLIENTS`
    still holds.
 
@@ -120,8 +121,9 @@ Left open:
   expires. Nothing flushes conntrack: KeeneticOS has no conntrack-tools.
 - A component command does not move a client between Xray and a tunnel. `apply xray` and
   `restart xray` run no Tunnel Director, so their prune keeps every client the config puts on a
-  tunnel that `XRAY_CLIENTS` still holds: a client moved from Xray to a tunnel by hand stays
-  proxied until a full apply moves it, and only a client that left Xray for direct is let go.
+  tunnel - `main`'s left out - that `XRAY_CLIENTS` still holds: a client moved from Xray to a tunnel
+  by hand stays proxied until a full apply moves it, and only a client that left Xray for direct is
+  let go.
   `apply tunnel` and `restart tunnel` move a client between tunnels in place, but add nothing to
   `XRAY_CLIENTS`: one moved from a tunnel to Xray leaves through the WAN until the next full apply.
   The daemons move clients with full applies; a server switch, which changes no client's route,

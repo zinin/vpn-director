@@ -24,7 +24,8 @@
 #   tunnel_apply()               - apply rules from config (idempotent; a rebuild happens in place);
 #                                  reports the clients the live TUN_DIR does not carry (TUNNEL_UNCARRIED)
 #   tunnel_uncarried()           - print what the last tunnel_apply reported, one client per line
-#   tunnel_clients()             - print every client the config puts on a tunnel, one per line
+#   tunnel_clients()             - print every client the config puts on a tunnel, one per line;
+#                                  main is no tunnel, and its clients are left out
 #   tunnel_stop()                - remove chain, ip rules and tunnel tables
 #   tunnel_get_required_ipsets() - return list of ipsets needed for rules
 #
@@ -33,7 +34,8 @@
 #   _tunnel_gateway()            - the configured gateway of a tunnel, or nothing
 #   _tunnel_clients_of()         - the clients of one tunnel, one per line
 #   _tunnel_not_carried()        - add clients to TUNNEL_UNCARRIED, each once
-#   _tunnel_not_carried_non_rfc1918() - add every configured client outside RFC1918
+#   _tunnel_not_carried_on()     - the same for clients of one tunnel; nothing for main
+#   _tunnel_not_carried_non_rfc1918() - add every client of a tunnel outside RFC1918
 #   _tunnel_ensure_routes()      - re-install the routes and ip rules of every applied tunnel
 #   _tunnel_jumps_ensure()       - put back a missing PREROUTING jump without a rebuild
 #   _tunnel_marks_present()      - is every client's MARK rule still in TUN_DIR
@@ -89,8 +91,10 @@ _tunnel_initialized=0
 # holds: a client on its way from Xray to a tunnel stays proxied until an apply in which Tunnel
 # Director carries it, rather than leave through the WAN. tunnel_apply returns 0 on a refused rule,
 # a swap that did not finish, a tunnel the platform does not list, so its status alone could not
-# say that. The functions that add to it run inside tunnel_apply, some inside swap_fw_chain; the
-# array is global, so no local of theirs can shadow it.
+# say that. A client of main is never here: main is no tunnel, and a client of it that TUN_DIR does
+# not mark still goes direct, which is what main means (_tunnel_not_carried_on). The functions that
+# add to it run inside tunnel_apply, some inside swap_fw_chain; the array is global, so no local of
+# theirs can shadow it.
 TUNNEL_UNCARRIED=()
 
 ###################################################################################################
@@ -204,13 +208,30 @@ _tunnel_not_carried() {
 }
 
 # -------------------------------------------------------------------------------------------------
-# _tunnel_not_carried_non_rfc1918 - add every configured client outside RFC1918
+# _tunnel_not_carried_on <tunnel> <clients>... - _tunnel_not_carried, for clients of <tunnel>
+# -------------------------------------------------------------------------------------------------
+# Nothing for main, which is no tunnel. Its slot sends a mark to the main table, which an unmarked
+# packet reaches as well: a client of main that TUN_DIR does not mark, or whose rule is not in
+# place, still goes direct - what main means - or, where main carves it out of a later tunnel's
+# network, into that tunnel; neither is a leak. Reported, it would stay proxied instead: a client
+# moved from Xray to main is let go, as one that left Xray for direct is. tunnel_clients leaves
+# main out for the same reason. Runs under "||" as well (_tunnel_emit_client,
+# _tunnel_ensure_routes): nothing here can fail.
+# -------------------------------------------------------------------------------------------------
+_tunnel_not_carried_on() {
+    [[ ${1:-} != main ]] || return 0
+    shift
+    _tunnel_not_carried "$@"
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tunnel_not_carried_non_rfc1918 - add every client of a tunnel outside RFC1918
 # -------------------------------------------------------------------------------------------------
 # A rebuild skips such a client (_tunnel_emit_client returns 2) and still records the hash - the
 # skip is a state of the configuration - so every later apply takes the up-to-date path, which puts
 # no rule of it in place either. Reported there too, the client stays proxied on every apply, not
 # only on the one that moved it. An entry that is no IPv4 address at all is no client TPROXY can
-# take either, and is left out.
+# take either, and is left out; so is a client of main (tunnel_clients), which goes direct.
 # -------------------------------------------------------------------------------------------------
 _tunnel_not_carried_non_rfc1918() {
     local client
@@ -249,7 +270,7 @@ _tunnel_ensure_routes() {
         # the result; a rule that cannot be installed has logged its own error.
         _tunnel_rule_ensure "$idx" "$tunnel" || carried=0
         if [[ $carried -eq 0 ]]; then
-            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
+            _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
         fi
     done < "$TUN_DIR_TABLES"
     return "$rc"
@@ -419,7 +440,7 @@ _tunnel_collect_applied() {
             log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
             warnings=1
             skipped_unknown=1
-            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
+            _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
             continue
         fi
         tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
@@ -455,7 +476,7 @@ _tunnel_collect_applied() {
             log -l WARN "Too many tunnels (max $_tunnel_mark_field_max); skipping '$tunnel'"
             warnings=1
             incomplete=1
-            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
+            _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
             continue
         fi
         used+="$idx "
@@ -479,7 +500,8 @@ _tunnel_collect_applied() {
 # carried (TUNNEL_UNCARRIED); nor is one whose offload opt-out did not go in:
 # the firmware's fast path then takes its flows past mangle after their first
 # packets, and those leave through the WAN unmarked (packet-flow.md, "The
-# firmware fast path").
+# firmware fast path"). A client of main is never reported: unmarked, it still
+# goes direct, which is what main means (_tunnel_not_carried_on).
 _tunnel_emit_client() {
     local chain="$1" client="$2" tunnel="$3" mark_hex="$4" excludes="$5"
     local client_ip="${client%%/*}"
@@ -493,7 +515,7 @@ _tunnel_emit_client() {
     if ! is_lan_ip "$client_ip"; then
         log -l WARN "Client '$client' is not RFC1918; skipping"
         warnings=1
-        _tunnel_not_carried "$client"
+        _tunnel_not_carried_on "$tunnel" "$client"
         return 2
     fi
 
@@ -519,7 +541,7 @@ _tunnel_emit_client() {
             -j "$offload_target"; then
             warnings=1
             incomplete=1
-            _tunnel_not_carried "$client"
+            _tunnel_not_carried_on "$tunnel" "$client"
         fi
     fi
 
@@ -529,7 +551,7 @@ _tunnel_emit_client() {
         log -l ERROR "Client '$client' is not marked for tunnel '$tunnel'; its traffic falls through to main"
         warnings=1
         incomplete=1
-        _tunnel_not_carried "$client"
+        _tunnel_not_carried_on "$tunnel" "$client"
         return 3
     fi
 
@@ -780,16 +802,19 @@ tunnel_uncarried() {
 # -------------------------------------------------------------------------------------------------
 # tunnel_clients - print every client the config puts on a tunnel, one per line
 # -------------------------------------------------------------------------------------------------
-# The clients of every key of tunnel_director.tunnels, main included, less paused_clients
-# (config.sh subtracts them): the ones a rebuild would mark, spelled as they are configured. A
+# The clients of every key of tunnel_director.tunnels but main, less paused_clients (config.sh
+# subtracts them), spelled as they are configured: the ones a rebuild would mark for a tunnel. A
 # command that does not run tunnel_apply knows none of them to be carried - vpn-director.sh hands
-# them to tproxy_prune for "apply xray" and "restart xray". A tunnel whose entry is no object, or
-# whose clients are no array, contributes none.
+# them to tproxy_prune for "apply xray" and "restart xray" - and tunnel_apply reports them all
+# when the swap or a jump did not take over every interface. main is no tunnel: a client of it that
+# TUN_DIR does not mark still goes direct, which is what main means (_tunnel_not_carried_on), so
+# none of its clients is here. A tunnel whose entry is no object, or whose clients are no array,
+# contributes none.
 # -------------------------------------------------------------------------------------------------
 tunnel_clients() {
     [[ -n ${TUN_DIR_TUNNELS_JSON:-} ]] || return 0
     printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r '
-        if type == "object" then .[] else empty end
+        if type == "object" then del(.main) | .[] else empty end
         | if type == "object" then .clients else null end
         | if type == "array" then .[] | select(type == "string") else empty end' 2>/dev/null || true
 }
@@ -865,8 +890,9 @@ tunnel_stop() {
 # did not carry, and every client when the swap did not take over every interface; on the
 # up-to-date path, the clients of a slot whose route or rule did not go back in, every client when
 # a jump did not, and the clients outside RFC1918, which no path marks. The failover clients count
-# as clients of their tunnel. A full apply keeps those of them Xray still has in XRAY_CLIENTS
-# (tproxy_prune).
+# as clients of their tunnel. A client of main is never reported: main is no tunnel, and a client
+# of it that TUN_DIR does not mark still goes direct (_tunnel_not_carried_on). A full apply keeps
+# those of them Xray still has in XRAY_CLIENTS (tproxy_prune).
 # -------------------------------------------------------------------------------------------------
 tunnel_apply() {
     # Before anything else: a run never hands on what an earlier one reported.
@@ -1071,7 +1097,7 @@ tunnel_apply() {
         fi
         # Marked or not, a client of this slot reaches main, not the tunnel.
         if [[ $route_ok -eq 0 || $rule_ok -eq 0 ]]; then
-            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
+            _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
         fi
     done < "$slots_tmp"
 

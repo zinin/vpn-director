@@ -143,7 +143,7 @@ Mocks are shell scripts in `router/test/mocks/` that simulate router commands:
 - **iptables/ip6tables**: Tracks rule operations
 - **stateful/iptables**: Remembers chains and rules per table under `$BATS_IPT_DIR` (`-S`, `-N`, `-F`, `-X`, `-E`, `-A`, `-I`, `-D`, `-C`); records a flush of a chain a rule still jumps to (a whole-table `-F` is not recorded). Turned on per test by `use_stateful_iptables`
 - **ipset**: Simulates ipset management
-- **stateful-ipset/ipset**: Remembers `XRAY_CLIENTS`, `TPROXY_BYPASS` and their `_NEW` shadows under `$BATS_IPSET_DIR` (`list`, `create`, `add`, `del`, `test`, `flush`, `destroy`, `swap`); a member is compared as written, a `/32` as the bare address; unlike the kernel, `test` does not find a host inside a network the set holds. Everything else goes to the stateless mock. Turned on per test by `use_stateful_ipset`; the processes a test starts inherit it
+- **stateful-ipset/ipset**: Remembers `XRAY_CLIENTS`, `TPROXY_BYPASS` and their `_NEW` shadows under `$BATS_IPSET_DIR` (`list`, `create`, `add`, `del`, `test`, `flush`, `destroy`, `swap`). Members compare as in the kernel's `hash:net` sets: `x` and `x/32` are one element, kept as `x`; `add` and `del` take an element as written, so a host inside a network the set holds is added as an element of its own; `test` of a host (no prefix, or `/32`) finds it through any element that holds it, the address itself or a network around it, and `test` of a network finds only the identical element. Everything else goes to the stateless mock. Turned on per test by `use_stateful_ipset`; the processes a test starts inherit it
 - **nslookup**: Returns mock DNS responses
 - **logger**: Silent (no syslog in tests)
 - **ip**: Returns mock interface info

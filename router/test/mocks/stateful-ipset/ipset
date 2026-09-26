@@ -8,8 +8,11 @@
 # mock, which knows the country sets. Calls on the remembered sets are logged to
 # /tmp/bats_ipset_calls.log, as the stateless mock logs the rest.
 #
-# A member is compared as written, a /32 read as the bare address: "test" does not
-# find a host inside a network the set holds, which the kernel does.
+# Members compare as they do in the kernel's hash:net sets. x and x/32 are one
+# element, kept as x. "add" and "del" take an element as written - a host inside
+# a network the set holds is added as an element of its own. "test" of a host (no
+# prefix, or /32) finds it through any element that holds it, the address itself
+# or a network around it; "test" of a network finds only the identical element.
 
 stateless="$(dirname "$0")/../ipset"
 dir="${BATS_IPSET_DIR:?use_stateful_ipset sets BATS_IPSET_DIR}"
@@ -25,6 +28,29 @@ remembered() {
 die() {
     echo "ipset v7.1: $1" >&2
     exit 1
+}
+
+# ipv4 <address> - the dotted IPv4 address as one number; rc 1 for anything else
+ipv4() {
+    local re='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
+    [[ $1 =~ $re ]] || return 1
+    printf '%s\n' $(( (10#${BASH_REMATCH[1]} << 24) + (10#${BASH_REMATCH[2]} << 16) +
+        (10#${BASH_REMATCH[3]} << 8) + 10#${BASH_REMATCH[4]} ))
+}
+
+# holds <host> - is the host an element of $file, or inside a network that is?
+holds() {
+    local host element net bits mask
+    host=$(ipv4 "$1") || die "Syntax error: cannot parse $1: resolving to IPv4 address failed"
+    while IFS= read -r element; do
+        net=$(ipv4 "${element%/*}") || continue
+        bits=32
+        [[ $element != */* ]] || bits=${element#*/}
+        [[ $bits =~ ^([0-9]|[12][0-9]|3[0-2])$ ]] || continue
+        mask=$(( (0xffffffff << (32 - bits)) & 0xffffffff ))
+        (( (net & mask) == (host & mask) )) && return 0
+    done < "$file"
+    return 1
 }
 
 exist=0
@@ -101,7 +127,13 @@ case "$cmd" in
         ;;
     test)
         [[ -f $file ]] || die "The set with the given name does not exist"
-        if grep -qxF -- "$member" "$file"; then
+        found=1
+        if [[ $member == */* ]]; then
+            grep -qxF -- "$member" "$file" && found=0
+        elif holds "$member"; then
+            found=0
+        fi
+        if [[ $found -eq 0 ]]; then
             echo "Warning: $member is in set $name." >&2
             exit 0
         fi

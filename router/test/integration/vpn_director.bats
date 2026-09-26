@@ -349,9 +349,11 @@ run_stubbed_cli() {
     assert_output $'tproxy_restart_process\ntproxy_apply\ntunnel_apply forced\ntproxy_prune 192.168.1.100 10.0.0.0/24'
 }
 
-# The clients of every tunnel key, main included, less paused_clients: the ones
-# tunnel_apply would carry. config.sh subtracts the paused ones.
-@test "vpn-director: apply xray keeps every effective Tunnel Director client, main included" {
+# The clients of every tunnel, less paused_clients: the ones tunnel_apply would
+# carry. config.sh subtracts the paused ones. main is no tunnel - a client of it
+# that Tunnel Director does not mark still goes direct - and its clients are
+# left out.
+@test "vpn-director: apply xray keeps every effective Tunnel Director client but main's" {
     local cfg="$BATS_TEST_TMPDIR/vpn-director.json"
     jq '.tunnel_director.tunnels.wgc1.clients += ["192.168.50.9"]
         | .tunnel_director.tunnels.main = {"clients": ["192.168.50.20"]}
@@ -360,7 +362,7 @@ run_stubbed_cli() {
     run_stubbed_cli apply xray
     assert_success
     run cat "$BATS_TEST_TMPDIR/calls"
-    assert_output $'tproxy_apply\ntproxy_prune 192.168.50.0/24 192.168.50.20'
+    assert_output $'tproxy_apply\ntproxy_prune 192.168.50.0/24'
 }
 
 # ============================================================================
@@ -763,4 +765,29 @@ applied_then_moved_by_hand() {
     assert_success
     run ipset test XRAY_CLIENTS 192.168.1.101
     assert_failure
+}
+
+# main is no tunnel: a client of it that Tunnel Director does not mark still goes
+# direct, which is what main means. One moved by hand from Xray to main left Xray
+# for direct, and apply xray lets it go at once rather than keep it proxied until
+# a full apply.
+@test "vpn-director: apply xray lets go of a client moved from Xray to main" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    jq '.xray.clients = ["192.168.1.100", "192.168.1.101"]' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    ipset test XRAY_CLIENTS 192.168.1.100 2>/dev/null
+    jq '.xray.clients = ["192.168.1.101"] | .tunnel_director.tunnels.main = {"clients": ["192.168.1.100"]}' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply xray
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+    run ipset test XRAY_CLIENTS 192.168.1.101
+    assert_success
 }

@@ -2001,3 +2001,106 @@ move_100_to_wgc1() {
     run ipset test XRAY_CLIENTS 192.168.1.101
     assert_failure
 }
+
+# ============================================================================
+# main is no tunnel: its clients are never reported, nor kept on Xray
+# ============================================================================
+
+# main's slot sends a mark to the main table, which an unmarked packet reaches as
+# well: a client of main that Tunnel Director does not mark or route still goes
+# direct, which is what main means. Kept on Xray, it would be proxied instead.
+
+@test "tunnel_clients: prints the clients of every tunnel, main's left out" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.0/28"]},"main":{"clients":["192.168.1.6"]},"ovpnc1":{"clients":["10.0.0.7"]}}'
+    run tunnel_clients
+    assert_success
+    assert_output $'192.168.1.5\n192.168.1.0/28\n10.0.0.7'
+}
+
+@test "tunnel_apply: a swap that did not finish reports no client of main" {
+    load_tunnel_module_with '{"main":{"clients":["192.168.1.6"]},"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    iptables() {
+        [[ $* == *"-I PREROUTING "*"-j TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+    tunnel_apply
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.5"
+}
+
+@test "tunnel_apply: a client of main whose offload opt-out or MARK is refused is not reported" {
+    load_tunnel_module_with '{"main":{"clients":["192.168.1.6","192.168.1.7"]},"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.6 "*"-j PPE" ]] && return 4
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.7 "*"-j MARK"* ]] && return 4
+        command iptables "$@"
+    }
+    tunnel_apply
+    grep -q "Client '192.168.1.7' is not marked for tunnel 'main'" "$LOG_FILE"
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+}
+
+# main takes slot 0, pref 16384, in JSON order.
+@test "tunnel_apply: a client of main is not reported while its slot's ip rule is refused" {
+    load_tunnel_module_with '{"main":{"clients":["192.168.1.6"]},"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    ip() {
+        [[ $* == "rule add pref 16384 "* ]] && return 2
+        command ip "$@"
+    }
+    tunnel_apply
+    grep -q "Failed to add ip rule: pref=16384" "$LOG_FILE"
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+}
+
+# A one-bit mark field holds one slot: wgc1 takes it, main and wgc2 get none.
+@test "tunnel_apply: a client of main that gets no slot is not reported" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["192.168.1.6"]},"wgc2":{"clients":["192.168.1.7"]}}'
+    export TUN_DIR_MARK_MASK=0x00010000
+    use_stateful_iptables
+    tunnel_apply
+    grep -q "Too many tunnels (max 1); skipping 'main'" "$LOG_FILE"
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.7"
+}
+
+# The rebuild skips an address outside RFC1918 on main as on any tunnel, and it
+# goes direct: main's route. It left Xray for direct, and the prune lets it go.
+@test "full apply: an address outside RFC1918 moved from Xray to main is let go" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["100.64.0.8"]}}'
+
+    full_apply > "$BATS_TEST_TMPDIR/out" 2>&1
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+    run cat "$BATS_TEST_TMPDIR/out"
+    assert_output --partial "Client '100.64.0.8' is not RFC1918; skipping"
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_failure
+}
+
+# The same move reaching a full apply through the up-to-date path: Tunnel Director
+# alone ("apply tunnel") recorded the layout first, and Xray still has the
+# address. That path reports the configured clients outside RFC1918 of a tunnel:
+# main is none.
+@test "full apply: an address outside RFC1918 moved from Xray to main is let go by an up-to-date apply" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["100.64.0.8"]}}'
+    tunnel_apply > /dev/null 2>&1
+    ipset test XRAY_CLIENTS 100.64.0.8 2>/dev/null
+
+    full_apply > "$BATS_TEST_TMPDIR/out" 2>&1
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+    run cat "$BATS_TEST_TMPDIR/out"
+    assert_output --partial "Rules are applied and up-to-date"
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_failure
+}

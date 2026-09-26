@@ -45,9 +45,13 @@ watch trying one server after another.
   effective clients - `xray.clients` less `paused_clients`, an entry that is no IPv4 address or
   CIDR skipped - plus every client the caller names that the live set holds: after `tunnel_apply`
   (a full apply) the clients it reported as not carried, for `apply xray` and `restart xray` every
-  client the config puts on a tunnel. A client moving to a tunnel stays proxied that way until an
-  apply in which Tunnel Director carries it (`packet-flow.md`, "The apply: make before break"); one
-  that left Xray for direct is let go. A WARN names the clients kept.
+  client the config puts on a tunnel, `main`'s left out (`tunnel-director.md`, "What tunnel_apply
+  reports as not carried"). A client moving to a tunnel stays proxied that way until an apply in
+  which Tunnel Director carries it (`packet-flow.md`, "The apply: make before break"); one that left
+  Xray for direct - moved to `main` as well - is let go. A named client the new set already matches
+  gets no element of its own: `ipset test` finds a host through any network the set holds, so a host
+  inside an effective network is in through that network, and `x/32` of an effective `x` is `x`. A
+  WARN names the clients kept.
 - A name from `advanced.xray.chain` leaves room for `_NEW` (24 characters at most), and so does
   one from `advanced.xray.clients_ipset` or `bypass_ipset` (27).
 
@@ -242,7 +246,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 |----------|---------|
 | `tproxy_status()` | Show XRAY_TPROXY chain, routing, xray process |
 | `tproxy_apply()` | The make half of an apply: routing, sets, chain swapped in; clients added, never removed; soft-fail if unavailable |
-| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; always returns 0 and leaves the ready marker alone |
+| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; always returns 0 and leaves the ready marker alone |
 | `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) |
 | `tproxy_restart_process()` | Restart Xray process via Entware init script |
 | `tproxy_get_required_ipsets()` | Return list of valid exclude ipsets (unknown codes dropped with a WARN) |

@@ -122,7 +122,12 @@ take over every interface, a tunnel the platform does not list - so its status c
 apply whether the clients that left Xray are carried now. It lists in `TUNNEL_UNCARRIED`, an array
 reset at its start, the clients the live `TUN_DIR` may not mark or route when it returns: each
 spelled as its tunnel's client list spells it (paused clients are not in those lists), each once.
-`tunnel_uncarried` prints them.
+`tunnel_uncarried` prints them. A client of `main` is never among them, on any path below: `main`
+is no tunnel. Its slot sends a mark to the main table, which an unmarked packet reaches as well, so
+a client of `main` that `TUN_DIR` does not mark, or whose ip rule is not in place, still goes
+direct - what `main` means - or, where `main` carves it out of a later tunnel's network, into that
+tunnel; neither is a leak. Reported, it would stay proxied instead: a client moved from Xray to
+`main` is let go, as one that left Xray for direct is (`_tunnel_not_carried_on`, `tunnel_clients`).
 
 | Path | Reported |
 |------|----------|
@@ -139,7 +144,7 @@ Xray to a tunnel stays proxied until an apply in which Tunnel Director carries i
 leaving through the WAN. A client that left Xray for direct is not in the list, and a client that
 was not proxied - one moving between two tunnels - is not added to Xray (`packet-flow.md`, "The
 apply: make before break"). `apply xray` and `restart xray` run no `tunnel_apply`: they hand the
-prune every client the config puts on a tunnel (`tunnel_clients`).
+prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clients`).
 
 ## State Tracking
 
@@ -226,7 +231,7 @@ slot's table is never released: it is carrying traffic.
 | `tunnel_status()` | Show chain, ip rules, configured tunnels |
 | `tunnel_apply()` | Apply rules from config (idempotent; a rebuild happens in place); reports the clients it does not carry in `TUNNEL_UNCARRIED` |
 | `tunnel_uncarried()` | Print `TUNNEL_UNCARRIED`, one client per line |
-| `tunnel_clients()` | Print every client the config puts on a tunnel, `main` included, paused ones left out |
+| `tunnel_clients()` | Print every client the config puts on a tunnel; `main`'s and the paused ones left out |
 | `tunnel_stop()` | Remove chain, ip rules and the tunnel tables this module owns |
 | `tunnel_get_required_ipsets()` | Return list of exclude ipsets needed |
 
@@ -244,7 +249,8 @@ slot's table is never released: it is carrying traffic.
 | `_tunnel_tables_write(file...)` | Replace `TUN_DIR_TABLES` with the lines of the files, each once, through a file beside it and a rename |
 | `_tunnel_clients_of(tunnel)` | The clients of one tunnel, one per line; none for an entry that is no object or clients that are no array |
 | `_tunnel_not_carried(clients...)` | Add clients to `TUNNEL_UNCARRIED`, each once |
-| `_tunnel_not_carried_non_rfc1918()` | Add every configured client outside RFC1918 (the up-to-date path) |
+| `_tunnel_not_carried_on(tunnel, clients...)` | The same for clients of one tunnel; nothing for `main` |
+| `_tunnel_not_carried_non_rfc1918()` | Add every client of a tunnel outside RFC1918 (the up-to-date path) |
 
 **Module state variables**:
 - `_tunnel_valid_tables` - space-separated tunnel ids from `platform_tunnels`

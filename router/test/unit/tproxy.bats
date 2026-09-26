@@ -1008,6 +1008,68 @@ live_xray_clients() {
     assert_failure
 }
 
+# load_tproxy_module_with_clients <json array> - load_tproxy_module on a copy of
+# the fixture whose xray.clients is <json array>: config.sh marks XRAY_CLIENTS
+# readonly, so a test cannot set it afterwards.
+load_tproxy_module_with_clients() {
+    load_common
+    jq --argjson c "$1" '.xray.clients = $c' "$TEST_ROOT/fixtures/vpn-director.json" \
+        > "$BATS_TEST_TMPDIR/vpn-director.json"
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/tproxy.sh" --source-only
+}
+
+# The overlap packet-flow.md documents ("Example 3"): the network on Xray, a host
+# of it on a tunnel. The kernel's "ipset test" finds the host through the
+# network, and "apply xray", which names every tunnel client, added it as an
+# element of its own - with a WARN - on every run, though Tunnel Director never
+# takes it while the network is on Xray.
+@test "tproxy_prune: a named host inside an effective network is not kept on its own" {
+    load_tproxy_module_with_clients '["192.168.50.0/24"]'
+    live_xray_clients 192.168.50.0/24
+    run tproxy_prune 192.168.50.10
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset list XRAY_CLIENTS
+    assert_output $'Name: XRAY_CLIENTS\nType: hash:net\nNumber of entries: 1\nMembers:\n192.168.50.0/24'
+}
+
+@test "tproxy_prune: a named x/32 of an effective x is not kept on its own" {
+    load_tproxy_module_with_clients '["192.168.1.7"]'
+    live_xray_clients 192.168.1.7
+    run tproxy_prune 192.168.1.7/32
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset list XRAY_CLIENTS
+    assert_output $'Name: XRAY_CLIENTS\nType: hash:net\nNumber of entries: 1\nMembers:\n192.168.1.7'
+}
+
+@test "tproxy_prune: an address named twice, in either spelling, is kept once" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.1.7
+    run tproxy_prune 192.168.1.7 192.168.1.7/32
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.7 - they stay proxied"
+}
+
+# The network has left Xray while the live set still holds it: the host was
+# proxied through it and Tunnel Director has not taken it, so it is kept, as an
+# element of its own, and the rest of the network is let go.
+@test "tproxy_prune: a named host is kept on its own once its network has left Xray" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.50.0/24
+    run tproxy_prune 192.168.50.10
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.50.10 - they stay proxied"
+    run ipset list XRAY_CLIENTS
+    assert_output $'Name: XRAY_CLIENTS\nType: hash:net\nNumber of entries: 2\nMembers:\n192.168.1.100\n192.168.50.10'
+    run ipset test XRAY_CLIENTS 192.168.50.11
+    assert_failure
+}
+
 # M1: both soft-fails returned before any client was added. A client moving
 # from a tunnel to Xray then entered XRAY_CLIENTS only at the prune - after the
 # TUN_DIR swap had already taken its mark.

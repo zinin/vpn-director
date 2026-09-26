@@ -181,7 +181,9 @@ _ensure_ipsets() {
 # TUN_DIR may not carry (<clients>, one per line), so that each one XRAY_CLIENTS still holds stays in
 # it. After tunnel_apply those are the ones it reported (tunnel_uncarried); an apply of Xray alone
 # runs no Tunnel Director and names every client the config puts on a tunnel (tunnel_clients).
-# Either way only a client that left Xray for direct - paused, deleted - is let go.
+# Neither names a client of main: main is no tunnel, and a client of it that Tunnel Director does
+# not mark still goes direct, which is what main means. Either way only a client that left Xray for
+# direct - paused, deleted, moved to main - is let go.
 ###################################################################################################
 _prune_keeping() {
     local -a keep=()
@@ -337,7 +339,8 @@ cmd_apply() {
             # No Tunnel Director here, so nothing marks a client moved from Xray to a
             # tunnel: the prune keeps every client the config puts on a tunnel while
             # Xray has it, and such a client stays proxied until a full apply moves it.
-            # Only a client that left Xray for direct is let go.
+            # Only a client that left Xray for direct is let go, one moved to main among
+            # them: main is no tunnel, and a client of it that no rule marks goes direct.
             tproxy_apply
             _prune_keeping "$(tunnel_clients)"
             ;;

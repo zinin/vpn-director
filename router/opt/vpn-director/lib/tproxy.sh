@@ -862,10 +862,13 @@ tproxy_apply() {
 # holds the effective clients - xray.clients less paused_clients, each an IPv4 address or CIDR - and
 # every <addr> the live set holds. The caller names there the clients the live TUN_DIR may not
 # carry: a full apply the ones tunnel_apply reported (TUNNEL_UNCARRIED), "apply xray" and "restart
-# xray" every client the config puts on a tunnel, since they run no Tunnel Director. A client on its
-# way from Xray to a tunnel stays proxied that way until an apply in which Tunnel Director carries
-# it; one that left Xray for direct - paused, deleted - is let go. An <addr> the live set does not
-# hold was not proxied, and is not made so: one WARN names the addresses kept.
+# xray" every client the config puts on a tunnel (tunnel_clients; main is none), since they run no
+# Tunnel Director. A client on its way from Xray to a tunnel stays proxied that way until an apply
+# in which Tunnel Director carries it; one that left Xray for direct - paused, deleted, moved to
+# main - is let go. An <addr> the live set does not hold was not proxied, and is not made so. One
+# the new set already matches gets no element of its own: the kernel's test finds a host through
+# any network that holds it, so a host inside an effective network is in, and so is x/32 of an
+# effective x. One WARN names the addresses kept.
 #
 # A client the new set does not take would lose its interception with the swap, so the prune stops
 # there instead: the clients that left stay proxied until the next apply, which is no leak. Always
@@ -900,8 +903,10 @@ tproxy_prune() {
     fi
     for ip in "$@"; do
         [[ -n $ip ]] || continue
-        # An effective client is in already, and an address named twice is kept once.
-        [[ " ${XRAY_CLIENTS:-} $kept " != *" $ip "* ]] || continue
+        # Matched by the new set already, as the kernel tests it - an effective client, x/32 of one,
+        # a host inside an effective network, an address named before. An element of its own would
+        # add nothing but a WARN, on every run.
+        ipset test "$shadow" "$ip" >/dev/null 2>&1 && continue
         # Not proxied now: the prune does not make it so.
         ipset test "$XRAY_CLIENTS_IPSET" "$ip" >/dev/null 2>&1 || continue
         if ! ipset add -exist "$shadow" "$ip" 2>/dev/null; then
