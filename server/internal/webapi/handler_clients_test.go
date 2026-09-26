@@ -1289,3 +1289,55 @@ func TestHandleMoveClient_DetachesTheAddressFromTheFailover(t *testing.T) {
 		t.Errorf("xray.clients = %v", mc.savedCfg.Xray.Clients)
 	}
 }
+
+// Tunnel Director marks private IPv4 addresses and networks only (tunnel.sh
+// skips the rest, vpnconfig.TDCarries). A client outside them on a tunnel
+// route is on no route at all: it left Xray for the WAN. It can go on xray.
+func TestHandleAddClient_TunnelRouteRefusesAnAddressTunnelDirectorCannotCarry(t *testing.T) {
+	for _, route := range []string{"wgc1", "main"} {
+		mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+		deps := newTestDeps(t)
+		deps.Config = mc
+		vpn := &mockVPN{platform: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "wgc1", Connected: true}}}}
+		deps.VPN = vpn
+
+		rec := httptest.NewRecorder()
+		handleAddClient(deps).ServeHTTP(rec, httptest.NewRequest("POST", "/api/clients",
+			strings.NewReader(`{"ip":"100.64.0.8","route":"`+route+`"}`)))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Tunnel Director routes private IPv4") {
+			t.Fatalf("%s: status = %d: %s", route, rec.Code, rec.Body.String())
+		}
+		if mc.savedCfg != nil || vpn.applyCalls != 0 {
+			t.Errorf("%s: saved %v, applies %d: nothing may happen", route, mc.savedCfg, vpn.applyCalls)
+		}
+	}
+
+	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	rec := httptest.NewRecorder()
+	handleAddClient(deps).ServeHTTP(rec, httptest.NewRequest("POST", "/api/clients",
+		strings.NewReader(`{"ip":"100.64.0.8","route":"xray"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("xray: status = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleMoveClient_TunnelRouteRefusesAnAddressTunnelDirectorCannotCarry(t *testing.T) {
+	cfg := movableClients()
+	cfg.Xray.Clients = append(cfg.Xray.Clients, "100.64.0.8")
+	mc := &mockConfig{cfg: cfg}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	vpn := &mockVPN{platform: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "wgc1", Connected: true}}}}
+	deps.VPN = vpn
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"100.64.0.8","route":"wgc1"}`))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Tunnel Director routes private IPv4") {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if mc.savedCfg != nil || vpn.applyCalls != 0 {
+		t.Errorf("saved %v, applies %d: nothing may happen", mc.savedCfg, vpn.applyCalls)
+	}
+}

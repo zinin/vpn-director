@@ -54,7 +54,7 @@ func handleAddClient(deps *Deps) http.HandlerFunc {
 			jsonError(w, http.StatusBadRequest, "route is required")
 			return
 		}
-		if !checkClientRoute(w, deps, req.Route) {
+		if !checkClientRoute(w, deps, ip, req.Route) {
 			return
 		}
 
@@ -96,20 +96,27 @@ func handleAddClient(deps *Deps) http.HandlerFunc {
 	}
 }
 
-// checkClientRoute answers whether route may take a client, for an add and a
-// move alike: xray, a tunnel already in the config, or a tunnel this router
-// has, asked of the platform now - the list is the firmware's (Merlin
-// wgcN/ovpncN, Keenetic OpenVPN0, Wireguard1, ...) and a tunnel can appear or
-// go at any time. A configured tunnel is accepted without the platform, as the
-// bot and the wizard accept it: ClientsTab offers exactly those when the
-// platform cannot be asked, and a 503 here made that fallback unusable. An
-// empty list is not an answer either: on Keenetic `vpn-director.sh platform`
-// prints "tunnels": [] and exits 0 while RCI does not reply (spec 13). It
-// writes the error response itself and returns false when the handler must
-// stop.
-func checkClientRoute(w http.ResponseWriter, deps *Deps, route string) bool {
+// checkClientRoute answers whether route may take the client ip (normalized),
+// for an add and a move alike: xray, a tunnel already in the config, or a
+// tunnel this router has, asked of the platform now - the list is the
+// firmware's (Merlin wgcN/ovpncN, Keenetic OpenVPN0, Wireguard1, ...) and a
+// tunnel can appear or go at any time. A configured tunnel is accepted without
+// the platform, as the bot and the wizard accept it: ClientsTab offers exactly
+// those when the platform cannot be asked, and a 503 here made that fallback
+// unusable. An empty list is not an answer either: on Keenetic `vpn-director.sh
+// platform` prints "tunnels": [] and exits 0 while RCI does not reply (spec 13).
+// A Tunnel Director route - any but xray - takes only an address Tunnel
+// Director marks (vpnconfig.TDCarries): tunnel.sh skips the rest, so such a
+// client would be on no route at all. It writes the error response itself and
+// returns false when the handler must stop.
+func checkClientRoute(w http.ResponseWriter, deps *Deps, ip, route string) bool {
 	if route == "xray" {
 		return true
+	}
+	if !vpnconfig.TDCarries(ip) {
+		jsonError(w, http.StatusBadRequest,
+			"invalid route: Tunnel Director routes private IPv4 addresses and networks only (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16); this client can go on xray")
+		return false
 	}
 	cfg, err := deps.Config.LoadVPNConfig()
 	if err != nil {
@@ -167,7 +174,7 @@ func handleMoveClient(deps *Deps) http.HandlerFunc {
 			jsonError(w, http.StatusBadRequest, "route is required")
 			return
 		}
-		if !checkClientRoute(w, deps, req.Route) {
+		if !checkClientRoute(w, deps, ip, req.Route) {
 			return
 		}
 

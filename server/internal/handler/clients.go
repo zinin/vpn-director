@@ -351,9 +351,10 @@ type routeChoice struct {
 // routeChoices lists xray, every tunnel the platform lists (with its
 // description, and "(down)" when it is not connected), and the tunnels already
 // in the config the platform does not list, so an existing route stays
-// reachable - marked "(unknown)" the way the Web UI marks them when the
-// platform answered, bare when it could not be asked: the tunnel is not
-// unknown then, the platform is. answered is false in that last case.
+// reachable - marked "(unknown)" when the platform answered, bare when it could
+// not be asked: the tunnel is not unknown then, the platform is. answered is
+// false in that last case. main is never "(unknown)": it is Tunnel Director's
+// own route, which the platform does not list among its tunnels.
 func (h *ClientsHandler) routeChoices(cfg *vpnconfig.VPNDirectorConfig) (choices []routeChoice, answered bool) {
 	choices = append(choices, routeChoice{id: "xray", label: "xray"})
 	listed := map[string]bool{}
@@ -382,12 +383,29 @@ func (h *ClientsHandler) routeChoices(cfg *vpnconfig.VPNDirectorConfig) (choices
 	sort.Strings(names)
 	for _, name := range names {
 		label := name
-		if answered {
+		if answered && name != "main" {
 			label += " (unknown)"
 		}
 		choices = append(choices, routeChoice{id: name, label: label})
 	}
 	return choices, answered
+}
+
+// tdRefusal is what the bot says when a Tunnel Director route - any but xray -
+// is picked for an address Tunnel Director cannot carry (tdCarries).
+func tdRefusal(ip string) string {
+	return fmt.Sprintf("Tunnel Director routes private IPv4 addresses only; %s can go on xray", ip)
+}
+
+// tdCarries reports whether Tunnel Director marks ip in the spelling it goes
+// on a route in (vpnconfig.TDCarries): a private IPv4 address or network.
+// tunnel.sh skips any other client, so on a tunnel route it would be on no
+// route at all - out through the WAN - where on xray TPROXY takes it.
+func tdCarries(ip string) bool {
+	if n, err := vpnconfig.NormalizeClientAddr(ip); err == nil {
+		ip = n
+	}
+	return vpnconfig.TDCarries(ip)
 }
 
 // showRouteSelection offers the routes a new client can go on.
@@ -435,6 +453,12 @@ func (h *ClientsHandler) handleAddRoute(chatID int64, msgID int, route string) {
 	}
 
 	if route != "xray" {
+		if !tdCarries(ip) {
+			h.deps.Sender.SendPlain(chatID, tdRefusal(ip))
+			text, kb := h.buildClientList(cfg)
+			h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+			return
+		}
 		if _, ok := cfg.TunnelDirector.Tunnels[route]; !ok {
 			// Not configured yet: fine when the router has the tunnel (the
 			// keyboard listed it from the platform), stale otherwise. Either way
@@ -538,8 +562,10 @@ func (h *ClientsHandler) handleMoveStart(chatID int64, msgID int, ip string) {
 
 // handleMoveTo moves a client to a route in one config change and one apply;
 // the apply keeps it on its old route until the new one carries it. data is
-// "<route>:<ip>". A tunnel the platform reports down asks first, unless
-// confirmed: until it is up, the client's traffic goes out through the WAN.
+// "<route>:<ip>". A client already on that route alone is left as it is,
+// before anything is asked. A Tunnel Director route refuses an address Tunnel
+// Director cannot carry. A tunnel the platform reports down, or a configured
+// one it does not list, asks first, unless confirmed (moveQuestion).
 func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, confirmed bool) {
 	route, ip, ok := strings.Cut(data, ":")
 	if !ok || route == "" || ip == "" {
@@ -551,14 +577,21 @@ func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, conf
 		h.deps.Sender.SendPlain(chatID, fmt.Sprintf("Config load error: %v", err))
 		return
 	}
-	if len(vpnconfig.ClientRoutes(cfg, ip)) == 0 {
-		// Removed since the keyboard was sent.
+	if on := vpnconfig.ClientRoutes(cfg, ip); len(on) == 0 || (len(on) == 1 && on[0] == route) {
+		// Removed since the keyboard was sent, or tapped on the ✓ route:
+		// nothing to move, and nothing to ask.
 		text, kb := h.buildClientList(cfg)
 		h.deps.Sender.EditMessage(chatID, msgID, text, kb)
 		return
 	}
 
 	if route != "xray" {
+		if !tdCarries(ip) {
+			h.deps.Sender.SendPlain(chatID, tdRefusal(ip))
+			text, kb := h.buildClientList(cfg)
+			h.deps.Sender.EditMessage(chatID, msgID, text, kb)
+			return
+		}
 		_, configured := cfg.TunnelDirector.Tunnels[route]
 		info, perr := h.deps.VPN.Platform()
 		if !configured {
@@ -577,14 +610,12 @@ func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, conf
 				return
 			}
 		}
-		if !confirmed && perr == nil && tunnelDown(info, route) {
-			text := telegram.EscapeMarkdownV2(fmt.Sprintf(
-				"%s is down: until it is up, %s's traffic goes out through the WAN. Move anyway?", route, ip))
+		if question := moveQuestion(info, route, ip); !confirmed && perr == nil && question != "" {
 			kb := telegram.NewKeyboard()
 			kb.Button("Move anyway", fmt.Sprintf("clients:toyes:%s:%s", route, ip))
 			kb.Button("Cancel", "clients:rm_no")
 			kb.Row()
-			h.deps.Sender.EditMessage(chatID, msgID, text, kb.Build())
+			h.deps.Sender.EditMessage(chatID, msgID, telegram.EscapeMarkdownV2(question), kb.Build())
 			return
 		}
 	}
@@ -614,13 +645,24 @@ func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, conf
 	h.deps.Sender.EditMessage(chatID, msgID, text, kb)
 }
 
-// tunnelDown reports whether the platform lists route as a tunnel that is not
-// connected.
-func tunnelDown(info vpnconfig.PlatformInfo, route string) bool {
+// moveQuestion is what a move of ip to the tunnel route asks before it goes
+// ahead, given what the platform answered, or "" when it asks nothing. A tunnel
+// listed as down has no route in its table: the client's traffic goes out
+// through the WAN until it is up. A configured tunnel the platform does not
+// list - "(unknown)": a typo, a connection deleted in the router, RCI silent -
+// is one Tunnel Director skips until it is listed. main is Tunnel Director's
+// own route, which no platform lists.
+func moveQuestion(info vpnconfig.PlatformInfo, route, ip string) string {
+	if route == "main" {
+		return ""
+	}
 	for _, t := range info.Tunnels {
 		if t.ID == route {
-			return !t.Connected
+			if t.Connected {
+				return ""
+			}
+			return fmt.Sprintf("%s is down: until it is up, %s's traffic goes out through the WAN. Move anyway?", route, ip)
 		}
 	}
-	return false
+	return fmt.Sprintf("%s is not on the router's tunnel list: until it is, Tunnel Director does not route %s through it. Move anyway?", route, ip)
 }
