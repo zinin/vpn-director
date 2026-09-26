@@ -738,14 +738,25 @@ tunnel_status() {
     printf '%s\n' "=== Tunnel Director Status ==="
     printf '\n'
 
-    # Show chain rules
+    # Show chain rules. A swap that stopped half-way leaves TUN_DIR_NEW behind; one that stopped
+    # at the rename leaves it carrying the traffic until the next apply, with TUN_DIR gone.
+    local shadow="${TUN_DIR_CHAIN}_NEW" shadow_found=0
+    fw_chain_exists mangle "$shadow" && shadow_found=1
     printf '%s\n' "--- Chain: $TUN_DIR_CHAIN ---"
     if fw_chain_exists mangle "$TUN_DIR_CHAIN"; then
         iptables -t mangle -S "$TUN_DIR_CHAIN" 2>/dev/null | tail -n +2
+    elif [[ $shadow_found -eq 1 ]]; then
+        printf '%s\n' "Chain not found"
     else
         printf '%s\n' "Chain not found (not applied)"
     fi
     printf '\n'
+
+    if [[ $shadow_found -eq 1 ]]; then
+        printf '%s\n' "--- Chain: $shadow (left by an interrupted swap; the next apply finishes or removes it) ---"
+        iptables -t mangle -S "$shadow" 2>/dev/null | tail -n +2
+        printf '\n'
+    fi
 
     # Show IP rules
     printf '%s\n' "--- IP Rules (fwmark-based) ---"
@@ -1046,7 +1057,10 @@ tunnel_apply() {
     # 1. Routing, before any packet carries a new mark. TUN_DIR_TABLES holds
     # both layouts until the release below: an apply that dies in between
     # leaves every slot in use on record, and the next one releases the extras.
-    _tunnel_tables_write "$prev_tmp" "$slots_tmp"
+    _tunnel_tables_write "$prev_tmp" "$slots_tmp" || {
+        log -l ERROR "Tunnel Director: cannot write $TUN_DIR_TABLES; the next apply rebuilds"
+        return 1
+    }
 
     local tunnel_idx tunnel table pref mark_hex route_ok rule_ok
     while read -r tunnel_idx tunnel; do
@@ -1129,7 +1143,10 @@ tunnel_apply() {
             grep -qxF "$old_idx $old_tunnel" "$slots_tmp" && continue
             _tunnel_slot_release "$old_idx" "$old_tunnel"
         done < "$prev_tmp"
-        _tunnel_tables_write "$slots_tmp"
+        _tunnel_tables_write "$slots_tmp" || {
+            log -l ERROR "Tunnel Director: cannot write $TUN_DIR_TABLES; the next apply rebuilds"
+            return 1
+        }
     fi
 
     # 4. The hash is what makes the next apply take the up-to-date branch, so it

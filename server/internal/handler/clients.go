@@ -593,7 +593,11 @@ func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, conf
 			return
 		}
 		_, configured := cfg.TunnelDirector.Tunnels[route]
-		info, perr := h.deps.VPN.Platform()
+		var info vpnconfig.PlatformInfo
+		var perr error
+		if !configured || route != "main" {
+			info, perr = h.deps.VPN.Platform()
+		}
 		if !configured {
 			// Not configured yet: fine when the router has the tunnel (the
 			// keyboard listed it from the platform), stale otherwise.

@@ -365,6 +365,29 @@ live_chain() {
     [ ! -s "$BATS_IPT_DIR/live_flushes" ]
 }
 
+# A refused jump used to take a position all the same: the next interface's jump
+# went one lower - behind whatever held the position pos_fn names, or past the
+# end of a short PREROUTING.
+@test "swap_fw_chain: a refused jump leaves its position to the next interface" {
+    load_firewall
+    use_stateful_iptables
+    iptables -t mangle -A PREROUTING -p icmp -j ACCEPT
+    iptables -t mangle -A PREROUTING -p igmp -j ACCEPT
+    iptables() {
+        [[ $* == *"-I PREROUTING "*"-i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW" ]] && return 1
+        command iptables "$@"
+    }
+
+    run swap_fw_chain mangle TUN_DIR build_new pos_two \
+        "-i br0 -m mark --mark 0x0/0xff0000" "-i br1 -m mark --mark 0x0/0xff0000"
+    assert_failure 3
+    unset -f iptables
+
+    run iptables -t mangle -S PREROUTING
+    assert_output "$(printf '%s\n' '-P PREROUTING ACCEPT' '-A PREROUTING -p icmp -j ACCEPT' \
+        '-A PREROUTING -i br1 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW' '-A PREROUTING -p igmp -j ACCEPT')"
+}
+
 # A swap that stopped after its new jump went in left two chains, the new one
 # complete: the jumps go in only after the build.
 @test "swap_fw_chain: finishes a swap that stopped after its jump went in" {

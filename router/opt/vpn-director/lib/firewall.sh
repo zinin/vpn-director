@@ -861,7 +861,8 @@ sync_fw_rule() {
 #                   rule went in, 1 when the chain may go in although a rule did not, and 2 when
 #                   it must not go in at all
 #   <pos_fn>      : prints the PREROUTING position of the first jump, read from the listing as
-#                   it stands; jump N goes to that position + N - 1
+#                   it stands; each jump goes to that position plus the number of jumps already
+#                   on the new chain
 #   <jump_match>  : the match of one jump per LAN interface ("-i br0",
 #                   "-i br0 -m mark --mark 0x0/0xff0000")
 #
@@ -956,11 +957,11 @@ _fw_chain_cutover() {
         if iptables -t "$_sw_table" -C PREROUTING $_sw_match -j "$_sw_shadow" 2>/dev/null \
             || iptables -t "$_sw_table" -I PREROUTING "$((_sw_pos + _sw_i))" $_sw_match -j "$_sw_shadow" 2>/dev/null; then
             _sw_moved+=("$_sw_match")
+            _sw_i=$((_sw_i + 1))
         else
             log -l ERROR "Failed to insert the PREROUTING jump to $_sw_shadow ($_sw_match); that interface stays on $_sw_chain"
             _sw_rc=1
         fi
-        _sw_i=$((_sw_i + 1))
     done
 
     if [[ $_sw_rc -ne 0 ]]; then

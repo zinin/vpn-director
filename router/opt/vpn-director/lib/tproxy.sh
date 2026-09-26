@@ -11,7 +11,7 @@
 #   - common.sh (log, tmp_file, is_ipv4_net, rt_table_label) and, through it, the platform contract
 #     (platform_load_module, platform_vpn_endpoints, platform_tproxy_extra_rules,
 #      platform_lan_ifaces)
-#   - firewall.sh (delete_fw_chain, ensure_fw_rule, purge_fw_rules, swap_fw_chain)
+#   - firewall.sh (delete_fw_chain, ensure_fw_rule, purge_fw_rules, swap_fw_chain, fw_chain_exists)
 #   - config.sh (XRAY_* variables)
 #   - ipset.sh (_is_valid_country_code, _ipset_exists)
 #
@@ -745,6 +745,12 @@ tproxy_status() {
 
     printf '%s\n' "--- Iptables Chain ---"
     iptables -t mangle -S "$XRAY_CHAIN" 2>/dev/null || printf 'Chain %s not found\n' "$XRAY_CHAIN"
+    # A swap that stopped half-way leaves XRAY_TPROXY_NEW behind; one that stopped at the rename
+    # leaves it carrying the traffic until the next apply, with XRAY_TPROXY gone.
+    if fw_chain_exists mangle "${XRAY_CHAIN}_NEW"; then
+        printf '%s\n' "--- Chain: ${XRAY_CHAIN}_NEW (left by an interrupted swap; the next apply finishes or removes it) ---"
+        iptables -t mangle -S "${XRAY_CHAIN}_NEW" 2>/dev/null | tail -n +2
+    fi
     printf '\n'
 
     printf '%s\n' "--- PREROUTING Jump ---"

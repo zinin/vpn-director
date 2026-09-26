@@ -81,10 +81,11 @@ func (m *mockConfigClients) SaveSubscription(vpnconfig.Subscription) error      
 func (m *mockConfigClients) DeleteSubscription(string) error                      { return nil }
 
 type mockVPNClients struct {
-	applyErr    error
-	applyCalls  int
-	platform    vpnconfig.PlatformInfo
-	platformErr error
+	applyErr      error
+	applyCalls    int
+	platform      vpnconfig.PlatformInfo
+	platformErr   error
+	platformCalls int
 }
 
 func (m *mockVPNClients) Status() (string, error) { return "", nil }
@@ -94,6 +95,7 @@ func (m *mockVPNClients) RestartXray() error      { return nil }
 func (m *mockVPNClients) Stop() error             { return nil }
 func (m *mockVPNClients) Update() error           { return nil }
 func (m *mockVPNClients) Platform() (vpnconfig.PlatformInfo, error) {
+	m.platformCalls++
 	return m.platform, m.platformErr
 }
 
@@ -987,7 +989,8 @@ func TestClientsHandler_TappingTheCurrentRouteAsksNothing(t *testing.T) {
 }
 
 // main is Tunnel Director's own route, which no platform lists: never
-// "(unknown)", and a move to it asks nothing.
+// "(unknown)", and a move to it asks nothing - the platform included, once
+// the config has main.
 func TestClientsHandler_MainIsNeverUnknown(t *testing.T) {
 	cfg := moveCfg()
 	cfg.TunnelDirector.Tunnels["main"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.50.40"}}
@@ -1010,9 +1013,13 @@ func TestClientsHandler_MainIsNeverUnknown(t *testing.T) {
 		t.Fatalf("no main button: %+v", sender.editKeyboard.InlineKeyboard)
 	}
 
+	asked := vpn.platformCalls
 	h.HandleCallback(moveCallback("clients:to:main:192.168.50.10"))
 	if config.savedConfig == nil || vpn.applyCalls != 1 {
 		t.Fatalf("saved %v, applies %d: a move to main asks nothing", config.savedConfig, vpn.applyCalls)
+	}
+	if vpn.platformCalls != asked {
+		t.Errorf("platform calls %d: a move to a configured main asks the platform nothing", vpn.platformCalls-asked)
 	}
 }
 
