@@ -18,12 +18,13 @@ interface RouteOption {
 }
 
 // xray first, then every tunnel the router has. These options feed the Add
-// form's select and every row's Route select, and POST /api/clients and
-// /api/clients/route reject a route the platform does not list, so a listed
-// client's unlisted route is offered only when the platform itself could not
-// be asked - the fallback the form's own message describes. A row always
-// offers its own route as well (rowRouteOptions), so nothing is hidden.
-// Rebuilt whenever the platform or the clients are reloaded.
+// form's select and every row's Route select. POST /api/clients and
+// /api/clients/route take xray, a tunnel the config already has, or one the
+// platform lists (checkClientRoute); the routes in use are offered for all
+// rows only when the platform itself could not be asked - the fallback the
+// form's own message describes. A row always offers its own route as well
+// (rowRouteOptions), so nothing is hidden. Rebuilt whenever the platform or
+// the clients are reloaded.
 const routeOptions = ref<RouteOption[]>([{ value: 'xray', label: 'xray' }])
 const platformTunnels = ref<PlatformTunnel[]>([])
 const platformError = ref('')
@@ -62,6 +63,12 @@ function isDown(route: string): boolean {
   return platformTunnels.value.some((t) => t.id === route && !t.connected)
 }
 
+// A legacy entry that is no IPv4 address (an IPv6 one an older build saved):
+// no route can take it, and the router refuses to move it.
+function isMovable(client: ClientInfo): boolean {
+  return !client.ip.includes(':')
+}
+
 function confirmDown(route: string, verb: string): boolean {
   return confirm(
     `${route} is down: until it is up, this client's traffic goes out through the WAN. ${verb} anyway?`,
@@ -78,6 +85,26 @@ async function loadPlatform() {
     platformError.value = e.response?.data?.error || e.message
   }
   buildRouteOptions()
+}
+
+// The platform as it is now, for the question asked before a move or an add:
+// a tab left open for hours holds a tunnel state that may be long gone, and
+// that question is the one warning before a client goes on a tunnel that is
+// down. A reload that fails leaves the state already loaded.
+async function refreshPlatform() {
+  try {
+    const resp = await api.getPlatform()
+    platformTunnels.value = resp.data.tunnels ?? []
+    platformError.value = ''
+    buildRouteOptions()
+  } catch {
+    // The state loaded before is the best there is.
+  }
+}
+
+// ⟳ Refresh: the clients and the tunnels alike.
+async function refreshAll() {
+  await Promise.all([loadClients(), loadPlatform()])
 }
 
 // Shows the server error; when the change was saved but apply failed
@@ -106,12 +133,18 @@ async function loadClients() {
   }
 }
 
+// The address and the route are read before the platform is asked afresh: a
+// reload that no longer lists the picked tunnel puts the form back on xray, and
+// the add must not follow it there.
 async function addClient() {
-  if (!newIp.value.trim()) return
-  if (isDown(newRoute.value) && !confirmDown(newRoute.value, 'Add')) return
+  const ip = newIp.value.trim()
+  const route = newRoute.value
+  if (!ip) return
   addLoading.value = true
   try {
-    await api.addClient(newIp.value.trim(), newRoute.value)
+    await refreshPlatform()
+    if (isDown(route) && !confirmDown(route, 'Add')) return
+    await api.addClient(ip, route)
     newIp.value = ''
     newRoute.value = 'xray'
     await loadClients()
@@ -143,19 +176,22 @@ function shownRoute(client: ClientInfo): string {
 
 // One request moves the client: the router writes the new route and applies
 // once, and the apply keeps the client on its old route until the new one
-// carries it. A select whose move did not happen goes back to the route the
-// client is on.
+// carries it. The row shows the picked route, its controls disabled, from the
+// pick on: the platform is asked afresh before the question about a tunnel that
+// is down, and a render in that wait would put the select back. A select whose
+// move did not happen goes back to the route the client is on.
 async function moveClient(client: ClientInfo, event: Event) {
   const select = event.target as HTMLSelectElement
   const route = select.value
   if (route === client.route) return
-  if (isDown(route) && !confirmDown(route, 'Move')) {
-    select.value = client.route
-    return
-  }
   pendingMove.value = { row: rowKey(client), route }
   actionLoading.value = 'move:' + client.ip
   try {
+    await refreshPlatform()
+    if (isDown(route) && !confirmDown(route, 'Move')) {
+      select.value = client.route
+      return
+    }
     await api.moveClient(client.ip, route)
     await loadClients()
   } catch (e: any) {
@@ -241,70 +277,75 @@ onMounted(async () => {
     <div class="card-title">Clients</div>
 
     <div class="actions">
-      <button class="btn btn-blue" :disabled="loading" @click="loadClients">
+      <button class="btn btn-blue" :disabled="loading" @click="refreshAll">
         {{ loading ? '...' : '⟳ Refresh' }}
       </button>
     </div>
 
     <p v-if="error" class="error-msg">{{ error }}</p>
 
-    <table v-if="clients.length > 0">
-      <thead>
-        <tr>
-          <th>IP</th>
-          <th>Route</th>
-          <th>Status</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        <!-- ip|route: during a staged failover one address sits on two routes. -->
-        <tr v-for="client in clients" :key="rowKey(client)">
-          <td>{{ client.ip }}</td>
-          <td>
-            <select
-              :value="shownRoute(client)"
-              :disabled="!!actionLoading"
-              style="min-width: 160px;"
-              @change="moveClient(client, $event)"
-            >
-              <option v-for="r in rowRouteOptions(client)" :key="r.value" :value="r.value">
-                {{ r.label }}
-              </option>
-            </select>
-          </td>
-          <td>
-            <span v-if="!client.paused" class="badge badge-green">Active</span>
-            <span v-else class="badge badge-grey">Paused</span>
-          </td>
-          <td style="display: flex; gap: 0.35rem;">
-            <button
-              v-if="!client.paused"
-              class="btn btn-yellow"
-              :disabled="!!actionLoading"
-              @click="pauseClient(client.ip)"
-            >
-              {{ actionLoading === 'pause:' + client.ip ? '...' : 'Pause' }}
-            </button>
-            <button
-              v-else
-              class="btn btn-green"
-              :disabled="!!actionLoading"
-              @click="resumeClient(client.ip)"
-            >
-              {{ actionLoading === 'resume:' + client.ip ? '...' : 'Resume' }}
-            </button>
-            <button
-              class="btn btn-red"
-              :disabled="!!actionLoading"
-              @click="removeClient(client.ip)"
-            >
-              {{ actionLoading === 'remove:' + client.ip ? '...' : 'Remove' }}
-            </button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <!-- The table scrolls sideways inside the card: on a phone the page itself does not. -->
+    <div v-if="clients.length > 0" style="overflow-x: auto;">
+      <table>
+        <thead>
+          <tr>
+            <th>IP</th>
+            <th>Route</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <!-- ip|route: during a staged failover one address sits on two routes. -->
+          <tr v-for="client in clients" :key="rowKey(client)">
+            <td>{{ client.ip }}</td>
+            <td>
+              <select
+                v-if="isMovable(client)"
+                :value="shownRoute(client)"
+                :disabled="!!actionLoading"
+                style="min-width: 160px;"
+                @change="moveClient(client, $event)"
+              >
+                <option v-for="r in rowRouteOptions(client)" :key="r.value" :value="r.value">
+                  {{ r.label }}
+                </option>
+              </select>
+              <span v-else>{{ client.route }}</span>
+            </td>
+            <td>
+              <span v-if="!client.paused" class="badge badge-green">Active</span>
+              <span v-else class="badge badge-grey">Paused</span>
+            </td>
+            <td style="display: flex; gap: 0.35rem;">
+              <button
+                v-if="!client.paused"
+                class="btn btn-yellow"
+                :disabled="!!actionLoading"
+                @click="pauseClient(client.ip)"
+              >
+                {{ actionLoading === 'pause:' + client.ip ? '...' : 'Pause' }}
+              </button>
+              <button
+                v-else
+                class="btn btn-green"
+                :disabled="!!actionLoading"
+                @click="resumeClient(client.ip)"
+              >
+                {{ actionLoading === 'resume:' + client.ip ? '...' : 'Resume' }}
+              </button>
+              <button
+                class="btn btn-red"
+                :disabled="!!actionLoading"
+                @click="removeClient(client.ip)"
+              >
+                {{ actionLoading === 'remove:' + client.ip ? '...' : 'Remove' }}
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
     <p v-else-if="!loading" style="color: #999; font-size: 0.875rem;">
       No clients configured.
