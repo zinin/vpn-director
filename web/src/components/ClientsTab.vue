@@ -48,13 +48,21 @@ function buildRouteOptions() {
   }
 }
 
-// A row's options are the shared ones plus the row's own route, so its select
-// never shows blank for a tunnel the platform no longer lists.
+// A row's options are the shared ones plus the row's own route and, while its
+// move runs, the route picked in it, so its select never shows blank: not for a
+// tunnel the platform no longer lists, and not for a route in use picked while
+// the platform could not be asked, which the fresh read before the question
+// drops from the shared options.
 function rowRouteOptions(client: ClientInfo): RouteOption[] {
-  if (routeOptions.value.some((o) => o.value === client.route)) {
-    return routeOptions.value
+  const opts = [...routeOptions.value]
+  const m = pendingMove.value
+  const own = m !== null && m.row === rowKey(client) ? [client.route, m.route] : [client.route]
+  for (const r of own) {
+    if (!opts.some((o) => o.value === r)) {
+      opts.push({ value: r, label: r })
+    }
   }
-  return [...routeOptions.value, { value: client.route, label: client.route }]
+  return opts
 }
 
 // A tunnel the platform reports down has no route in its table, and a client
