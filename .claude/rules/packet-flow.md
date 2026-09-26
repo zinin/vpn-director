@@ -115,6 +115,10 @@ Left open:
   rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply.
 - A tunnel that is down sends its clients to `main`. One that comes from Xray while the tunnel's
   route cannot be installed stays proxied instead (step 3).
+- A client the kernel refuses to add to `XRAY_CLIENTS` (a WARN names it, and the ready marker is
+  withheld) is not proxied until an add succeeds - the prune of the same apply tries again. One
+  moving from a tunnel to Xray leaves through the WAN in between, once `tunnel_apply` has let it
+  go: the cost a refused MARK rule has for a Tunnel Director client that did not come from Xray.
 - A move changes the route of new connections only. An open connection breaks, or, on KeeneticOS,
   one the fast path already holds keeps its old path until its conntrack entry expires ("The
   firmware fast path" below); a UDP flow moved from Xray to a tunnel can stall until its entry
