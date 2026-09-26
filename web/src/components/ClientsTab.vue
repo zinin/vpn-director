@@ -70,10 +70,18 @@ function canBeDown(route: string): boolean {
   return route !== 'xray' && route !== 'main'
 }
 
-// A legacy entry that is no IPv4 address (an IPv6 one an older build saved):
-// no route can take it, and the router refuses to move it.
+// The forms the router moves (vpnconfig.NormalizeClientAddr, which the bot's
+// 🔀 button follows too): an IPv4 address, octets 0-255 without leading zeros,
+// optionally with a prefix length 0-32. A legacy entry in any other form - an
+// IPv6 one an older build saved, 192.168.1.1000 from a hand edit - gets no
+// Route select: no route can take it, and the router refuses to move it.
 function isMovable(client: ClientInfo): boolean {
-  return !client.ip.includes(':')
+  const [addr, prefix, ...rest] = client.ip.trim().split('/')
+  if (rest.length > 0) return false
+  const octets = addr.split('.')
+  if (octets.length !== 4) return false
+  if (!octets.every((o) => /^(0|[1-9]\d{0,2})$/.test(o) && Number(o) <= 255)) return false
+  return prefix === undefined || (/^\d+$/.test(prefix) && Number(prefix) <= 32)
 }
 
 function confirmDown(route: string, verb: string): boolean {
