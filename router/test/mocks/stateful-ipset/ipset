@@ -1,0 +1,126 @@
+#!/bin/bash
+# An ipset that remembers the sets tproxy.sh builds and swaps: XRAY_CLIENTS,
+# TPROXY_BYPASS and their _NEW shadows. Each is a file under $BATS_IPSET_DIR with
+# one member per line, and "list", "create", "add", "del", "test", "flush",
+# "destroy" and "swap" read and change those files the way the kernel changes the
+# sets. use_stateful_ipset (test_helper.bash) puts it ahead of the stateless
+# mocks/ipset for one test; every other set and every other command goes to that
+# mock, which knows the country sets. Calls on the remembered sets are logged to
+# /tmp/bats_ipset_calls.log, as the stateless mock logs the rest.
+#
+# A member is compared as written, a /32 read as the bare address: "test" does not
+# find a host inside a network the set holds, which the kernel does.
+
+stateless="$(dirname "$0")/../ipset"
+dir="${BATS_IPSET_DIR:?use_stateful_ipset sets BATS_IPSET_DIR}"
+mkdir -p "$dir"
+
+remembered() {
+    case "${1:-}" in
+        XRAY_CLIENTS|XRAY_CLIENTS_NEW|TPROXY_BYPASS|TPROXY_BYPASS_NEW) return 0 ;;
+    esac
+    return 1
+}
+
+die() {
+    echo "ipset v7.1: $1" >&2
+    exit 1
+}
+
+exist=0
+terse=0
+args=()
+for a in "$@"; do
+    case "$a" in
+        -exist|--exist) exist=1 ;;
+        -t|--terse)     terse=1 ;;
+        *)              args+=("$a") ;;
+    esac
+done
+
+cmd="${args[0]:-}"
+name="${args[1]:-}"
+other=""
+case "$cmd" in
+    list)
+        [[ $name == -n ]] && name="${args[2]:-}"
+        ;;
+    create|add|del|test|flush|destroy) ;;
+    swap)
+        other="${args[2]:-}"
+        ;;
+    *)
+        exec "$stateless" "$@"
+        ;;
+esac
+if ! remembered "$name" && ! remembered "$other"; then
+    exec "$stateless" "$@"
+fi
+
+echo "ipset $*" >> /tmp/bats_ipset_calls.log
+file="$dir/$name"
+member="${args[2]:-}"
+member="${member%/32}"
+
+case "$cmd" in
+    list)
+        [[ -f $file ]] || die "The set with the given name does not exist"
+        if [[ ${args[1]} == -n ]]; then
+            printf '%s\n' "$name"
+            exit 0
+        fi
+        printf 'Name: %s\nType: hash:net\nNumber of entries: %s\n' "$name" "$(grep -c . "$file")"
+        if [[ $terse -eq 0 ]]; then
+            printf 'Members:\n'
+            cat "$file"
+        fi
+        ;;
+    create)
+        if [[ -f $file ]]; then
+            [[ $exist -eq 1 ]] && exit 0
+            die "Set cannot be created: set with the same name already exists"
+        fi
+        : > "$file"
+        ;;
+    add)
+        [[ -f $file ]] || die "The set with the given name does not exist"
+        if grep -qxF -- "$member" "$file"; then
+            [[ $exist -eq 1 ]] && exit 0
+            die "Element cannot be added to the set: it's already added"
+        fi
+        printf '%s\n' "$member" >> "$file"
+        ;;
+    del)
+        [[ -f $file ]] || die "The set with the given name does not exist"
+        if ! grep -qxF -- "$member" "$file"; then
+            [[ $exist -eq 1 ]] && exit 0
+            die "Element cannot be deleted from the set: it's not added"
+        fi
+        grep -vxF -- "$member" "$file" > "$file.tmp" || true
+        mv -f "$file.tmp" "$file"
+        ;;
+    test)
+        [[ -f $file ]] || die "The set with the given name does not exist"
+        if grep -qxF -- "$member" "$file"; then
+            echo "Warning: $member is in set $name." >&2
+            exit 0
+        fi
+        echo "$member is NOT in set $name." >&2
+        exit 1
+        ;;
+    flush)
+        [[ -f $file ]] || die "The set with the given name does not exist"
+        : > "$file"
+        ;;
+    destroy)
+        [[ -f $file ]] || die "The set with the given name does not exist"
+        rm -f "$file"
+        ;;
+    swap)
+        [[ -f $file && -f $dir/$other ]] || die "The set with the given name does not exist"
+        mv -f "$file" "$dir/.swap"
+        mv -f "$dir/$other" "$file"
+        mv -f "$dir/.swap" "$dir/$other"
+        ;;
+esac
+exit 0

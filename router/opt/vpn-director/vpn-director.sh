@@ -114,7 +114,7 @@ Usage:
 
 Commands:
   status [tunnel|xray|ipset]  Show status (all or specific component)
-  apply [tunnel|xray]         Apply configuration (moving a client between them takes a full apply)
+  apply [tunnel|xray]         Apply configuration (only a full apply moves a client between Xray and a tunnel)
   stop [tunnel|xray]          Stop components
   restart [tunnel|xray]       Rebuild in place, nothing stopped (all and xray restart the Xray process)
   restart xray-process        Restart the Xray process only, TPROXY rules kept
@@ -174,6 +174,24 @@ _ensure_ipsets() {
         [[ -z $set ]] && continue
         ipset_ensure "$set" || return 1
     done
+}
+
+###################################################################################################
+# _prune_keeping <clients> - the break half of an apply: tproxy_prune, told which clients the live
+# TUN_DIR may not carry (<clients>, one per line), so that each one XRAY_CLIENTS still holds stays in
+# it. After tunnel_apply those are the ones it reported (tunnel_uncarried); an apply of Xray alone
+# runs no Tunnel Director and names every client the config puts on a tunnel (tunnel_clients).
+# Either way only a client that left Xray for direct - paused, deleted - is let go.
+###################################################################################################
+_prune_keeping() {
+    local -a keep=()
+    [[ -z ${1:-} ]] || mapfile -t keep <<< "$1"
+    # bash before 4.4 refuses "${keep[@]}" of an empty array under set -u.
+    if [[ ${#keep[@]} -gt 0 ]]; then
+        tproxy_prune "${keep[@]}"
+    else
+        tproxy_prune
+    fi
 }
 
 ###################################################################################################
@@ -279,7 +297,7 @@ cmd_apply() {
             fi
 
             # Make before break, whichever way a client moves. tproxy_apply adds every
-            # client xray.clients names to XRAY_CLIENTS and removes none; tunnel_apply puts
+            # effective Xray client to XRAY_CLIENTS and removes none; tunnel_apply puts
             # Tunnel Director's rules in place; only then does tproxy_prune let go of the
             # clients that left Xray. XRAY_TPROXY runs ahead of TUN_DIR, so a client moving
             # from Xray to a tunnel stays proxied until TUN_DIR marks it, and one moving the
@@ -287,17 +305,20 @@ cmd_apply() {
             # Director in one step, a client moving to a tunnel was on neither for the length
             # of tunnel_apply and left through the WAN.
             #
-            # tproxy_apply soft-fails (a WARN and rc 0) while tunnel_apply hard-fails under
-            # errexit: a Tunnel Director failure - a malformed tunnels object, say - ends the
-            # run before the prune, and the clients that left Xray stay proxied rather than
-            # leak. The PREROUTING positions: XRAY_TPROXY always goes in at 1; TUN_DIR at the
-            # platform's base position, never ahead of the XRAY_TPROXY jumps - tunnel_apply
-            # counts them - so the order is [XRAY_TPROXY, TUN_DIR] on both platforms. No call
-            # is wrapped in `||` or `if !`: that would run its whole body with errexit off
-            # and let an unguarded failure inside pass as success.
+            # tproxy_apply soft-fails (a WARN and rc 0). tunnel_apply hard-fails under
+            # errexit when it cannot apply at all - a malformed tunnels object, no LAN
+            # interface - and the run ends before the prune: the clients that left Xray stay
+            # proxied rather than leak. On a soft failure - a refused rule, a swap that did not
+            # take over every interface, a tunnel the platform does not list - it returns 0 and
+            # reports the clients the live TUN_DIR does not carry, and the prune keeps each of
+            # them that Xray still has. The PREROUTING positions: XRAY_TPROXY always goes in at
+            # 1; TUN_DIR at the platform's base position, never ahead of the XRAY_TPROXY jumps -
+            # tunnel_apply counts them - so the order is [XRAY_TPROXY, TUN_DIR] on both
+            # platforms. No call is wrapped in `||` or `if !`: that would run its whole body
+            # with errexit off and let an unguarded failure inside pass as success.
             tproxy_apply
             tunnel_apply
-            tproxy_prune
+            _prune_keeping "$(tunnel_uncarried)"
             ;;
         tunnel)
             required_ipsets=$(tunnel_get_required_ipsets)
@@ -313,10 +334,12 @@ cmd_apply() {
                 # shellcheck disable=SC2086
                 _ensure_ipsets $required_ipsets
             fi
-            # A component apply does not wait for Tunnel Director: a client moving
-            # between the two needs a full apply.
+            # No Tunnel Director here, so nothing marks a client moved from Xray to a
+            # tunnel: the prune keeps every client the config puts on a tunnel while
+            # Xray has it, and such a client stays proxied until a full apply moves it.
+            # Only a client that left Xray for direct is let go.
             tproxy_apply
-            tproxy_prune
+            _prune_keeping "$(tunnel_clients)"
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2
@@ -426,7 +449,7 @@ cmd_update() {
     # Make before break, for the reason spelled out in cmd_apply.
     tproxy_apply
     tunnel_apply
-    tproxy_prune
+    _prune_keeping "$(tunnel_uncarried)"
 
     log "Update complete"
 }

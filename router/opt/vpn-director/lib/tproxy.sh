@@ -19,7 +19,8 @@
 #   tproxy_status()              - show XRAY_TPROXY chain, routing, xray process
 #   tproxy_apply()               - the make half of an apply: routing, sets, chain swapped in;
 #                                  clients added, never removed; soft-fail if unavailable
-#   tproxy_prune()               - the break half: XRAY_CLIENTS becomes exactly xray.clients
+#   tproxy_prune [<addr>...]     - the break half: XRAY_CLIENTS becomes the effective clients, plus
+#                                  every <addr> it holds (the clients Tunnel Director does not carry)
 #   tproxy_stop()                - remove chain and routing
 #   tproxy_restart_process()     - restart Xray process via Entware init script
 #   tproxy_get_required_ipsets() - return list of valid exclude ipsets (unknown codes dropped with a WARN)
@@ -33,6 +34,7 @@
 #   _tproxy_setup_routing()         - setup routing table and ip rule
 #   _tproxy_teardown_routing()      - remove routing table and ip rule
 #   _tproxy_setup_clients_ipset()   - create the clients ipset and add every client (never removes)
+#   _tproxy_add_to_live_clients()   - the same for the soft-fails, only when the clients ipset exists
 #   _tproxy_shadow_set()            - an empty <set>_NEW to fill and swap in
 #   _tproxy_swap_set()              - put <set>_NEW in place of <set> in one step
 #   _tproxy_setup_bypass_ipset()    - build the bypass ipset beside the live one (3-source assembly)
@@ -352,6 +354,20 @@ _tproxy_setup_clients_ipset() {
 
     log "Added the Xray clients to $XRAY_CLIENTS_IPSET (${#clients_array[@]} entries)"
     return $rc
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tproxy_add_to_live_clients - add every effective client to XRAY_CLIENTS, if there is one
+# -------------------------------------------------------------------------------------------------
+# For the soft-fails of tproxy_apply, which return before the rules. The rules of an earlier apply
+# still intercept what the live set holds, and a client that joined Xray has to be in it before
+# tunnel_apply takes its tunnel mark away, as on every other apply: added only by the prune, it went
+# out through the WAN in between. Without a set there is no rule to intercept anything, and none is
+# made.
+# -------------------------------------------------------------------------------------------------
+_tproxy_add_to_live_clients() {
+    _ipset_exists "$XRAY_CLIENTS_IPSET" || return 0
+    _tproxy_setup_clients_ipset || true
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -788,10 +804,12 @@ tproxy_apply() {
 
     log "Starting Xray TPROXY routing..."
 
-    # Soft-fail: if xt_TPROXY module not available, return 0 without applying
+    # Soft-fail: if xt_TPROXY module not available, return 0 without applying.
+    # A live XRAY_CLIENTS still gets every client, as on every apply (below).
     if ! _tproxy_check_module; then
         log -l WARN "xt_TPROXY module not available; skipping TPROXY setup"
         rm -f "$XRAY_TPROXY_READY"
+        _tproxy_add_to_live_clients
         return 0
     fi
 
@@ -800,6 +818,7 @@ tproxy_apply() {
         log -l WARN "Required ipsets not ready; exiting without applying rules"
         log -l WARN "Run 'vpn-director.sh apply' first to build required ipsets"
         rm -f "$XRAY_TPROXY_READY"
+        _tproxy_add_to_live_clients
         return 0
     fi
 
@@ -836,18 +855,26 @@ tproxy_apply() {
 }
 
 # -------------------------------------------------------------------------------------------------
-# tproxy_prune - let go of the clients xray.clients no longer names
+# tproxy_prune [<addr>...] - let go of the clients that left Xray, except the ones nothing carries
 # -------------------------------------------------------------------------------------------------
-# The break half of a full apply (vpn-director.sh): tproxy_apply only adds to XRAY_CLIENTS, and a
-# client that left Xray stays intercepted until Tunnel Director has taken it. The exact set is
-# built as XRAY_CLIENTS_NEW and swapped in. A client the new set does not take would lose its
-# interception with the swap, so the prune stops there instead: the clients that left stay
-# proxied until the next apply, which is no leak. Always returns 0.
+# The break half of an apply (vpn-director.sh): tproxy_apply only adds to XRAY_CLIENTS, and a client
+# that left Xray stays intercepted until this runs. The set built as XRAY_CLIENTS_NEW and swapped in
+# holds the effective clients - xray.clients less paused_clients, each an IPv4 address or CIDR - and
+# every <addr> the live set holds. The caller names there the clients the live TUN_DIR may not
+# carry: a full apply the ones tunnel_apply reported (TUNNEL_UNCARRIED), "apply xray" and "restart
+# xray" every client the config puts on a tunnel, since they run no Tunnel Director. A client on its
+# way from Xray to a tunnel stays proxied that way until an apply in which Tunnel Director carries
+# it; one that left Xray for direct - paused, deleted - is let go. An <addr> the live set does not
+# hold was not proxied, and is not made so: one WARN names the addresses kept.
+#
+# A client the new set does not take would lose its interception with the swap, so the prune stops
+# there instead: the clients that left stay proxied until the next apply, which is no leak. Always
+# returns 0, and leaves the ready marker alone: every effective client is in the set either way.
 # -------------------------------------------------------------------------------------------------
 tproxy_prune() {
     _tproxy_init
 
-    local ip shadow="${XRAY_CLIENTS_IPSET}_NEW" count=0
+    local ip shadow="${XRAY_CLIENTS_IPSET}_NEW" count=0 kept=""
     local -a clients_array=()
 
     # tproxy_apply soft-failed before it made the set: there is nothing to prune.
@@ -871,11 +898,27 @@ tproxy_prune() {
             count=$((count + 1))
         done
     fi
+    for ip in "$@"; do
+        [[ -n $ip ]] || continue
+        # An effective client is in already, and an address named twice is kept once.
+        [[ " ${XRAY_CLIENTS:-} $kept " != *" $ip "* ]] || continue
+        # Not proxied now: the prune does not make it so.
+        ipset test "$XRAY_CLIENTS_IPSET" "$ip" >/dev/null 2>&1 || continue
+        if ! ipset add -exist "$shadow" "$ip" 2>/dev/null; then
+            log -l WARN "Cannot add $ip to $shadow; clients that left Xray stay proxied until the next apply"
+            ipset destroy "$shadow" 2>/dev/null || true
+            return 0
+        fi
+        kept+="$ip "
+    done
     if ! _tproxy_swap_set "$XRAY_CLIENTS_IPSET"; then
         log -l WARN "Cannot swap $shadow into $XRAY_CLIENTS_IPSET; clients that left Xray stay proxied until the next apply"
         return 0
     fi
-    log "Pruned $XRAY_CLIENTS_IPSET to the $count clients xray.clients names"
+    if [[ -n $kept ]]; then
+        log -l WARN "Kept in $XRAY_CLIENTS_IPSET: ${kept% } - they stay proxied until an apply in which Tunnel Director carries them"
+    fi
+    log "Pruned $XRAY_CLIENTS_IPSET to the $count effective Xray clients${kept:+ and the ones kept}"
     return 0
 }
 

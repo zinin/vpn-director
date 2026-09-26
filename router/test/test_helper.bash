@@ -96,6 +96,20 @@ use_stateful_iptables() {
     hash -r
 }
 
+# use_stateful_ipset - for the rest of the test, an ipset that remembers the
+# members of XRAY_CLIENTS, TPROXY_BYPASS and their _NEW shadows under
+# $BATS_IPSET_DIR (mocks/stateful-ipset/ipset): "swap" exchanges them, "test"
+# looks a member up, so a test reads what the sets hold after an apply. Every
+# other set - the country sets - stays with the stateless mock. The sets start
+# out missing, as on a router that has never applied. Call it after the load_*
+# helper.
+use_stateful_ipset() {
+    export BATS_IPSET_DIR="$BATS_TEST_TMPDIR/ipset"
+    mkdir -p "$BATS_IPSET_DIR"
+    export PATH="$TEST_ROOT/mocks/stateful-ipset:$PATH"
+    hash -r
+}
+
 # Helper to source config.sh
 load_config() {
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"

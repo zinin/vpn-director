@@ -934,3 +934,114 @@ duplicate_last_rule() {
     grep -qx 'ipset destroy XRAY_CLIENTS_NEW' /tmp/bats_ipset_calls.log
     grep -qx 'ipset destroy TPROXY_BYPASS_NEW' /tmp/bats_ipset_calls.log
 }
+
+# ============================================================================
+# The keep-list: a client Tunnel Director did not take stays proxied
+# ============================================================================
+
+# live_xray_clients <member>... - a live XRAY_CLIENTS holding <member>..., on the
+# stateful ipset. The fixture's xray.clients is 192.168.1.100.
+live_xray_clients() {
+    use_stateful_ipset
+    ipset create XRAY_CLIENTS hash:net
+    local m
+    for m in "$@"; do
+        ipset add XRAY_CLIENTS "$m"
+    done
+    : > /tmp/bats_ipset_calls.log
+}
+
+@test "tproxy_prune: keeps a named address the live set holds, and says so" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.1.7 192.168.1.8
+    run tproxy_prune 192.168.1.7
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.7 - they stay proxied"
+    run ipset test XRAY_CLIENTS 192.168.1.7
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    # Left Xray for direct: let go.
+    run ipset test XRAY_CLIENTS 192.168.1.8
+    assert_failure
+}
+
+# A client that was not proxied - one moving between two tunnels, say - is not
+# made one now.
+@test "tproxy_prune: a named address the live set does not hold is not added" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100
+    run tproxy_prune 192.168.1.9
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 192.168.1.9
+    assert_failure
+}
+
+@test "tproxy_prune: an Xray client named as well is not reported as kept" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100
+    run tproxy_prune 192.168.1.100
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+}
+
+# The swap would drop a client the new set lacks: a kept address the set refuses
+# ends the prune as an Xray client the set refuses does, and every client stays.
+@test "tproxy_prune: a kept address the new set refuses leaves the live set as it is" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.1.7 192.168.1.8
+    ipset() {
+        if [[ $1 == add && $* == *"XRAY_CLIENTS_NEW 192.168.1.7" ]]; then
+            return 1
+        fi
+        command ipset "$@"
+    }
+    run tproxy_prune 192.168.1.7
+    assert_success
+    assert_output --partial "stay proxied until the next apply"
+    run ipset test XRAY_CLIENTS 192.168.1.8
+    assert_success
+    run ipset list -n XRAY_CLIENTS_NEW
+    assert_failure
+}
+
+# M1: both soft-fails returned before any client was added. A client moving
+# from a tunnel to Xray then entered XRAY_CLIENTS only at the prune - after the
+# TUN_DIR swap had already taken its mark.
+@test "tproxy_apply: a soft-fail for missing ipsets still adds the clients to a live XRAY_CLIENTS" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.7
+    _tproxy_check_required_ipsets() { return 1; }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "Required ipsets not ready"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.7
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+@test "tproxy_apply: a soft-fail for a missing xt_TPROXY still adds the clients to a live XRAY_CLIENTS" {
+    load_tproxy_module
+    live_xray_clients
+    _tproxy_check_module() { return 1; }
+    run tproxy_apply
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+@test "tproxy_apply: a soft-fail makes no XRAY_CLIENTS where there was none" {
+    load_tproxy_module
+    use_stateful_ipset
+    _tproxy_check_required_ipsets() { return 1; }
+    run tproxy_apply
+    assert_success
+    run ipset list -n XRAY_CLIENTS
+    assert_failure
+}

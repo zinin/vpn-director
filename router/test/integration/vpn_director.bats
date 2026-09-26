@@ -148,8 +148,9 @@ setup() {
 # run_stubbed_cli <arguments...> runs the command the CLI parses from its
 # arguments with the lock, the boot wait and the ipsets stubbed. Each module call
 # that would change routing appends its name to $BATS_TEST_TMPDIR/calls instead;
-# tunnel_apply appends " forced" under TUN_DIR_FORCE_REBUILD and returns
-# $TUNNEL_APPLY_RC.
+# tunnel_apply appends " forced" under TUN_DIR_FORCE_REBUILD, reports the clients
+# in $TUNNEL_UNCARRIED_STUB as not carried and returns $TUNNEL_APPLY_RC;
+# tproxy_prune appends the addresses it is told to keep.
 run_stubbed_cli() {
     # cmd_apply and cmd_update remove the stopped marker: never the one of the
     # machine running the suite.
@@ -168,9 +169,10 @@ run_stubbed_cli() {
         tproxy_apply() { echo tproxy_apply >> "$calls"; }
         tunnel_apply() {
             echo "tunnel_apply${TUN_DIR_FORCE_REBUILD:+ forced}" >> "$calls"
+            read -ra TUNNEL_UNCARRIED <<< "${TUNNEL_UNCARRIED_STUB:-}"
             return "${TUNNEL_APPLY_RC:-0}"
         }
-        tproxy_prune() { echo tproxy_prune >> "$calls"; }
+        tproxy_prune() { echo "tproxy_prune${*:+ $*}" >> "$calls"; }
         "cmd_$COMMAND"
     ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" "$@"
 }
@@ -302,11 +304,13 @@ run_stubbed_cli() {
     assert_output $'tproxy_apply\ntunnel_apply\ntproxy_prune'
 }
 
+# apply xray runs no Tunnel Director, so the prune keeps every client the config
+# puts on a tunnel - the fixture's wgc1 holds 192.168.50.0/24 - while Xray has it.
 @test "vpn-director: apply xray adds and prunes, apply tunnel applies Tunnel Director alone" {
     run_stubbed_cli apply xray
     assert_success
     run cat "$BATS_TEST_TMPDIR/calls"
-    assert_output $'tproxy_apply\ntproxy_prune'
+    assert_output $'tproxy_apply\ntproxy_prune 192.168.50.0/24'
     rm -f "$BATS_TEST_TMPDIR/calls"
     run_stubbed_cli apply tunnel
     assert_success
@@ -322,6 +326,41 @@ run_stubbed_cli() {
     assert_failure
     run cat "$BATS_TEST_TMPDIR/calls"
     assert_output $'tproxy_apply\ntunnel_apply'
+}
+
+# C1: tunnel_apply soft-fails with 0 - a refused rule, a tunnel the platform
+# does not list - and reports the clients the live TUN_DIR does not carry. The
+# prune is told to keep each of them: every full apply, update and restart.
+@test "vpn-director: a full apply hands the prune what Tunnel Director did not carry" {
+    export TUNNEL_UNCARRIED_STUB='192.168.1.100 10.0.0.0/24'
+    run_stubbed_cli apply
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_apply\ntunnel_apply\ntproxy_prune 192.168.1.100 10.0.0.0/24'
+    rm -f "$BATS_TEST_TMPDIR/calls"
+    run_stubbed_cli update
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_apply\ntunnel_apply\ntproxy_prune 192.168.1.100 10.0.0.0/24'
+    rm -f "$BATS_TEST_TMPDIR/calls"
+    run_stubbed_cli restart
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_restart_process\ntproxy_apply\ntunnel_apply forced\ntproxy_prune 192.168.1.100 10.0.0.0/24'
+}
+
+# The clients of every tunnel key, main included, less paused_clients: the ones
+# tunnel_apply would carry. config.sh subtracts the paused ones.
+@test "vpn-director: apply xray keeps every effective Tunnel Director client, main included" {
+    local cfg="$BATS_TEST_TMPDIR/vpn-director.json"
+    jq '.tunnel_director.tunnels.wgc1.clients += ["192.168.50.9"]
+        | .tunnel_director.tunnels.main = {"clients": ["192.168.50.20"]}
+        | .paused_clients = ["192.168.50.9"]' "$TEST_ROOT/fixtures/vpn-director.json" > "$cfg"
+    export VPD_CONFIG_FILE="$cfg"
+    run_stubbed_cli apply xray
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output $'tproxy_apply\ntproxy_prune 192.168.50.0/24 192.168.50.20'
 }
 
 # ============================================================================
@@ -640,7 +679,7 @@ run_stubbed_cli() {
     run_stubbed_cli restart xray
     assert_success
     run cat "$BATS_TEST_TMPDIR/calls"
-    assert_output $'tproxy_restart_process\ntproxy_apply\ntproxy_prune'
+    assert_output $'tproxy_restart_process\ntproxy_apply\ntproxy_prune 192.168.50.0/24'
 }
 
 @test "vpn-director: restart tunnel rebuilds Tunnel Director in place" {
@@ -648,4 +687,80 @@ run_stubbed_cli() {
     assert_success
     run cat "$BATS_TEST_TMPDIR/calls"
     assert_output 'tunnel_apply forced'
+}
+
+# ============================================================================
+# A component command after a move made by hand (I2)
+# ============================================================================
+
+# run_cli <arguments...> runs the command the CLI parses from its arguments with
+# the real modules, on the stateful mocks the test turned on; only the lock, the
+# boot wait and the download of the country sets are stubbed.
+run_cli() {
+    export VPD_STOPPED_FILE="${VPD_STOPPED_FILE:-$BATS_TEST_TMPDIR/stopped}"
+    export XRAY_INIT_DIR="$BATS_TEST_TMPDIR/init.d"
+    mkdir -p "$XRAY_INIT_DIR"
+    run bash -c '
+        script=$1
+        shift
+        source "$script" --source-only "$@"
+        _load_modules
+        acquire_lock() { :; }
+        _ipset_boot_wait() { :; }
+        _ensure_ipsets() { :; }
+        "cmd_$COMMAND"
+    ' -- "$SCRIPTS_DIR/vpn-director.sh" "$@"
+}
+
+# applied_then_moved_by_hand - 192.168.1.100 and 192.168.1.101 on Xray, applied
+# in full; then, by hand in vpn-director.json, 192.168.1.100 moved to wgc1 and
+# 192.168.1.101 deleted.
+applied_then_moved_by_hand() {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    jq '.xray.clients = ["192.168.1.100", "192.168.1.101"]' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    ipset test XRAY_CLIENTS 192.168.1.100 2>/dev/null
+    ipset test XRAY_CLIENTS 192.168.1.101 2>/dev/null
+    jq '.xray.clients = [] | .tunnel_director.tunnels.wgc1.clients += ["192.168.1.100"]' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+}
+
+# apply xray runs no Tunnel Director, so nothing marks the moved client yet: its
+# prune let it go to the WAN until the next full apply. It now keeps every live
+# member the config puts on a tunnel and lets go only of the client that left
+# Xray for direct. The full apply that marks the moved client lets it go.
+@test "vpn-director: apply xray keeps a client moved to a tunnel proxied and lets a deleted one go" {
+    applied_then_moved_by_hand
+
+    run_cli apply xray
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.101
+    assert_failure
+
+    run_cli apply
+    assert_success
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.100 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+}
+
+# The server switch of the Web UI and /xray runs exactly this.
+@test "vpn-director: restart xray keeps a client moved to a tunnel proxied and lets a deleted one go" {
+    applied_then_moved_by_hand
+
+    run_cli restart xray
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.101
+    assert_failure
 }

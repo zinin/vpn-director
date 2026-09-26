@@ -1707,3 +1707,297 @@ ip_rule_show_cut_short() {
     run ip rule show
     assert_line $'16384:\tfrom all fwmark 0x10000/0x30000 lookup ovpnc2'
 }
+
+# ============================================================================
+# What tunnel_apply reports as not carried (TUNNEL_UNCARRIED)
+# ============================================================================
+
+@test "tunnel_apply: every run starts its report afresh, the no-tunnels branch included" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    TUNNEL_UNCARRIED=(192.168.1.99)
+    tunnel_apply
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+
+    TUNNEL_UNCARRIED=(192.168.1.99)
+    TUN_DIR_TUNNELS_JSON='{}'
+    tunnel_apply
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+}
+
+# KeeneticOS binds an established forwarded flow to a fast path that never
+# returns to mangle. Without the opt-out rule only a flow's first packets are
+# marked, and the rest leave through the WAN: the client is not carried.
+@test "tunnel_apply: reports a client whose fast-path opt-out did not go in" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    use_stateful_iptables
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.5 "*"-j PPE" ]] && return 4
+        command iptables "$@"
+    }
+    tunnel_apply
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.5"
+}
+
+# The up-to-date path re-ensures the routes, the ip rules and the jumps. A slot
+# whose route does not go in routes nowhere, and a jump that does not go back in
+# leaves an interface with no Tunnel Director at all.
+@test "tunnel_apply: the up-to-date path reports the clients of a slot whose route does not go in" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    tunnel_apply
+    [ -f "$TUN_DIR_HASH" ]
+    platform_tunnel_route_ensure() { [[ $1 != wgc2 ]]; }
+
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.6"
+}
+
+@test "tunnel_apply: the up-to-date path reports every client when a missing jump does not go back in" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    tunnel_apply
+    [ -f "$TUN_DIR_HASH" ]
+    iptables -t mangle -D PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR
+    iptables() {
+        [[ $* == *" -I PREROUTING "* ]] && return 4
+        command iptables "$@"
+    }
+
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.5 192.168.1.6"
+}
+
+# M2: TUN_DIR_TABLES was written in place, emptied before the new lines went in.
+# An apply killed in that instant - or a full /tmp failing the write - left an
+# empty or partial record after the hash was already gone, and the next rebuild
+# handed out live slots as free ones. What the file holds while a write runs is
+# what such a kill leaves.
+@test "tunnel_apply: TUN_DIR_TABLES holds a whole record while it is written" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n1 ovpnc2'
+
+    awk() {
+        if [[ ${1:-} == '!seen[$0]++' ]]; then
+            cat "$TUN_DIR_TABLES" >> "$BATS_TEST_TMPDIR/during_write"
+            printf -- '--\n' >> "$BATS_TEST_TMPDIR/during_write"
+        fi
+        command awk "$@"
+    }
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"ovpnc2":{"clients":[]},"wgc2":{"clients":["192.168.1.7"]}}'
+    run tunnel_apply
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/during_write"
+    assert_output $'0 wgc1\n1 ovpnc2\n--\n0 wgc1\n1 ovpnc2\n2 wgc2\n--'
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n2 wgc2'
+}
+
+# ============================================================================
+# The full apply keeps on Xray what Tunnel Director did not take (C1)
+# ============================================================================
+
+# full_apply - vpn-director.sh apply: Xray adds, Tunnel Director applies, and the
+# prune lets go of the clients that left Xray, except those Tunnel Director
+# reported it does not carry.
+full_apply() {
+    tproxy_apply
+    tunnel_apply
+    tproxy_prune ${TUNNEL_UNCARRIED[@]+"${TUNNEL_UNCARRIED[@]}"}
+}
+
+# load_full_apply - both modules on the stateful mocks: 192.168.1.100,
+# 192.168.1.101 and 100.64.0.8 on Xray, 192.168.1.5 on wgc1, applied once.
+load_full_apply() {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_TPROXY_PORT=12345 XRAY_ROUTE_TABLE=100 XRAY_RULE_PREF=200
+    export XRAY_FWMARK=0x100 XRAY_FWMARK_MASK=0x100 XRAY_CHAIN=XRAY_TPROXY
+    export XRAY_CLIENTS_IPSET=XRAY_CLIENTS XRAY_BYPASS_IPSET=TPROXY_BYPASS
+    export XRAY_SERVERS=1.2.3.4 XRAY_EXCLUDE_IPS= XRAY_EXCLUDE_SETS=
+    export XRAY_CLIENTS='192.168.1.100 192.168.1.101 100.64.0.8'
+    source "$LIB_DIR/tproxy.sh" --source-only
+    use_stateful_iptables
+    use_stateful_ipset
+    full_apply > /dev/null 2>&1
+    ipset test XRAY_CLIENTS 192.168.1.100 2>/dev/null
+}
+
+# move_100_to_wgc1 - the move under test, one change of the config:
+# 192.168.1.100 leaves Xray for wgc1.
+move_100_to_wgc1() {
+    XRAY_CLIENTS='192.168.1.101 100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.100"]}}'
+}
+
+@test "full apply: a client moved from Xray to a tunnel is let go once TUN_DIR marks it" {
+    load_full_apply
+    move_100_to_wgc1
+
+    run full_apply
+    assert_success
+    refute_output --partial "Kept in XRAY_CLIENTS"
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.100 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+    run ipset test XRAY_CLIENTS 192.168.1.101
+    assert_success
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+# (A) A busy xtables lock refuses "iptables -N TUN_DIR_NEW": swap_fw_chain leaves
+# the live chain, which never marked the client, and tunnel_apply returns 0. The
+# prune let the client go all the same, out through the WAN until the next
+# complete apply. That apply lets it go.
+@test "full apply: a client moved to a tunnel stays proxied when the rebuilt chain cannot be made" {
+    load_full_apply
+    move_100_to_wgc1
+    iptables() {
+        [[ $* == "-t mangle -N TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S TUN_DIR
+    refute_output --partial '192.168.1.100'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+
+    unset -f iptables
+    run full_apply
+    assert_success
+    refute_output --partial "Kept in XRAY_CLIENTS"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+}
+
+# (B) One refused rule, the moved client's MARK.
+@test "full apply: a client moved to a tunnel stays proxied when its MARK rule is refused" {
+    load_full_apply
+    move_100_to_wgc1
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.100 "*"-j MARK"* ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S TUN_DIR
+    refute_output --partial '-s 192.168.1.100 -m mark --mark 0x0/0xff0000 -j MARK'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+}
+
+# (C) The new PREROUTING jump is refused: br0 stays on the old chain. Every
+# client of the layout is reported, and only the one Xray still holds is kept:
+# 192.168.1.5 was never proxied and is not now.
+@test "full apply: a client moved to a tunnel stays proxied when the new PREROUTING jump is refused" {
+    load_full_apply
+    move_100_to_wgc1
+    iptables() {
+        [[ $* == *"-I PREROUTING "*"-j TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S PREROUTING
+    assert_line '-A PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.5
+    assert_failure
+}
+
+# (D) The fixture's rt_tables has no wgc9: the tunnel is skipped.
+@test "full apply: a client moved to a tunnel the platform does not list stays proxied" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.101 100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"wgc9":{"clients":["192.168.1.100"]}}'
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+}
+
+# (E) Tunnel Director skips an address outside RFC1918, and records the hash:
+# the skip is a state of the configuration. The next apply takes the up-to-date
+# path, which marks no such client either.
+@test "full apply: an address outside RFC1918 moved to a tunnel stays proxied, on the next apply too" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","100.64.0.8"]}}'
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 100.64.0.8 - they stay proxied"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_success
+
+    run full_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_success
+}
+
+# (F) The new slot's ip rule is refused: the client is marked, and the mark
+# goes nowhere but main. The rule goes back in on the up-to-date path, and the
+# prune after it lets the client go.
+@test "full apply: a client moved to a new tunnel stays proxied while the slot's ip rule is refused" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.101 100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.100"]}}'
+    ip() {
+        [[ $* == "rule add pref 16385 "* ]] && return 2
+        command ip "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.100 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+
+    unset -f ip
+    run full_apply
+    assert_success
+    assert_output --partial "re-installed the ip rule at pref 16385"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+}
+
+# A client that left Xray for direct - deleted, or paused, which config.sh
+# subtracts the same way - is let go by the same prune that keeps the one
+# Tunnel Director did not take.
+@test "full apply: a client deleted from Xray is let go while one Tunnel Director did not take stays" {
+    load_full_apply
+    XRAY_CLIENTS='100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.100"]}}'
+    iptables() {
+        [[ $* == "-t mangle -N TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.101
+    assert_failure
+}

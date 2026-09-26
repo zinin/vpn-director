@@ -21,17 +21,24 @@
 #
 # Public API:
 #   tunnel_status()              - show TUN_DIR chain, ip rules, configured tunnels
-#   tunnel_apply()               - apply rules from config (idempotent; a rebuild happens in place)
+#   tunnel_apply()               - apply rules from config (idempotent; a rebuild happens in place);
+#                                  reports the clients the live TUN_DIR does not carry (TUNNEL_UNCARRIED)
+#   tunnel_uncarried()           - print what the last tunnel_apply reported, one client per line
+#   tunnel_clients()             - print every client the config puts on a tunnel, one per line
 #   tunnel_stop()                - remove chain, ip rules and tunnel tables
 #   tunnel_get_required_ipsets() - return list of ipsets needed for rules
 #
 # Internal functions (for testing):
 #   _tunnel_table_allowed()      - check if a tunnel id is one the platform lists
 #   _tunnel_gateway()            - the configured gateway of a tunnel, or nothing
+#   _tunnel_clients_of()         - the clients of one tunnel, one per line
+#   _tunnel_not_carried()        - add clients to TUNNEL_UNCARRIED, each once
+#   _tunnel_not_carried_non_rfc1918() - add every configured client outside RFC1918
 #   _tunnel_ensure_routes()      - re-install the routes and ip rules of every applied tunnel
 #   _tunnel_jumps_ensure()       - put back a missing PREROUTING jump without a rebuild
 #   _tunnel_marks_present()      - is every client's MARK rule still in TUN_DIR
 #   _tunnel_collect_applied()    - the slot of every tunnel: kept from TUN_DIR_TABLES, or the lowest free
+#   _tunnel_tables_write()       - replace TUN_DIR_TABLES in one step
 #   _tunnel_build_chain()        - fill a fresh chain with every client's rules (swap_fw_chain's build_fn)
 #   _tunnel_slot_release()       - drop the ip rule and the table of a slot the new layout dropped
 #   _tunnel_init()               - initialize module state
@@ -75,6 +82,16 @@ _tunnel_mark_mask_hex=""
 
 # Initialization flag
 _tunnel_initialized=0
+
+# The clients the live TUN_DIR may not mark or route when tunnel_apply returns 0 - each spelled as
+# its tunnel's client list spells it - reset by every tunnel_apply. A full apply hands them to
+# tproxy_prune (vpn-director.sh, through tunnel_uncarried), which keeps each one XRAY_CLIENTS still
+# holds: a client on its way from Xray to a tunnel stays proxied until an apply in which Tunnel
+# Director carries it, rather than leave through the WAN. tunnel_apply returns 0 on a refused rule,
+# a swap that did not finish, a tunnel the platform does not list, so its status alone could not
+# say that. The functions that add to it run inside tunnel_apply, some inside swap_fw_chain; the
+# array is global, so no local of theirs can shadow it.
+TUNNEL_UNCARRIED=()
 
 ###################################################################################################
 # Internal helper functions (defined before --source-only for testability)
@@ -155,19 +172,74 @@ _tunnel_gateway() {
 }
 
 # -------------------------------------------------------------------------------------------------
+# _tunnel_clients_of <tunnel> - the clients of one tunnel, one per line
+# -------------------------------------------------------------------------------------------------
+# As the rebuild reads them: TUN_DIR_TUNNELS_JSON, paused_clients already subtracted (config.sh).
+# An entry that is no object, or whose clients are no array, has none - _tunnel_collect_applied
+# skips such a tunnel with a WARN of its own - so this is safe on a tunnel nothing has validated.
+# -------------------------------------------------------------------------------------------------
+_tunnel_clients_of() {
+    printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "${1:-}" '
+        .[$t] | if type == "object" then .clients else null end
+        | if type == "array" then .[] | select(type == "string") else empty end' 2>/dev/null || true
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tunnel_not_carried <clients>... - add clients to TUNNEL_UNCARRIED, each once
+# -------------------------------------------------------------------------------------------------
+# An argument may hold several clients, one per line (_tunnel_clients_of, tunnel_clients). Runs
+# under "||" as well (_tunnel_emit_client, _tunnel_ensure_routes): nothing here can fail.
+# -------------------------------------------------------------------------------------------------
+_tunnel_not_carried() {
+    local arg client have
+    for arg in "$@"; do
+        while IFS= read -r client; do
+            [[ -n $client ]] || continue
+            for have in ${TUNNEL_UNCARRIED[@]+"${TUNNEL_UNCARRIED[@]}"}; do
+                [[ $have != "$client" ]] || continue 2
+            done
+            TUNNEL_UNCARRIED+=("$client")
+        done <<< "$arg"
+    done
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tunnel_not_carried_non_rfc1918 - add every configured client outside RFC1918
+# -------------------------------------------------------------------------------------------------
+# A rebuild skips such a client (_tunnel_emit_client returns 2) and still records the hash - the
+# skip is a state of the configuration - so every later apply takes the up-to-date path, which puts
+# no rule of it in place either. Reported there too, the client stays proxied on every apply, not
+# only on the one that moved it. An entry that is no IPv4 address at all is no client TPROXY can
+# take either, and is left out.
+# -------------------------------------------------------------------------------------------------
+_tunnel_not_carried_non_rfc1918() {
+    local client
+    while IFS= read -r client; do
+        [[ -n $client ]] || continue
+        if is_ipv4_net "$client" && ! is_lan_ip "${client%%/*}"; then
+            _tunnel_not_carried "$client"
+        fi
+    done <<< "$(tunnel_clients)"
+}
+
+# -------------------------------------------------------------------------------------------------
 # _tunnel_ensure_routes - re-install the routes of every applied tunnel
 # -------------------------------------------------------------------------------------------------
 # Reads TUN_DIR_TABLES ("<idx> <id>" per line, written by tunnel_apply) and calls
 # platform_tunnel_route_ensure for each. A no-op on Merlin, where the firmware
 # keeps the tunnel tables; on Keenetic the route follows the interface state.
+# A tunnel whose route or ip rule is not in place routes its marks to main: its
+# clients are not carried (TUNNEL_UNCARRIED).
 # -------------------------------------------------------------------------------------------------
 _tunnel_ensure_routes() {
-    local idx tunnel rc=0
+    local idx tunnel rc=0 carried
     [[ -f $TUN_DIR_TABLES ]] || return 0
     while read -r idx tunnel; do
         [[ -n $tunnel ]] || continue
+        carried=1
         if ! platform_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
             log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
+            carried=0
             if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
                 rc=1
             fi
@@ -175,7 +247,10 @@ _tunnel_ensure_routes() {
         # The rule outlives an interface flap, but one that never went in at
         # rebuild time is retried nowhere else. The failover check below reads
         # the result; a rule that cannot be installed has logged its own error.
-        _tunnel_rule_ensure "$idx" "$tunnel" || true
+        _tunnel_rule_ensure "$idx" "$tunnel" || carried=0
+        if [[ $carried -eq 0 ]]; then
+            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
+        fi
     done < "$TUN_DIR_TABLES"
     return "$rc"
 }
@@ -330,7 +405,9 @@ _tunnel_failover_needed() {
 # that neither layout holds: a slot this apply frees still carries marks until the
 # swap, and its ip rule goes only after it. warnings, skipped_unknown and
 # incomplete are tunnel_apply's locals (bash dynamic scope). One pass, so the
-# failover MARK slots cannot drift from the rules.
+# failover MARK slots cannot drift from the rules. The clients of a tunnel that
+# gets no slot - one the platform does not list, one the mark field has no room
+# for - are not carried (TUNNEL_UNCARRIED).
 _tunnel_collect_applied() {
     local prev="${1:-/dev/null}"
     local tunnel tunnel_type clients_type clients idx used tunnels
@@ -342,6 +419,7 @@ _tunnel_collect_applied() {
             log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
             warnings=1
             skipped_unknown=1
+            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
             continue
         fi
         tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
@@ -377,6 +455,7 @@ _tunnel_collect_applied() {
             log -l WARN "Too many tunnels (max $_tunnel_mark_field_max); skipping '$tunnel'"
             warnings=1
             incomplete=1
+            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
             continue
         fi
         used+="$idx "
@@ -395,6 +474,12 @@ _tunnel_collect_applied() {
 # outside RFC1918, and 3 when its MARK rule did not go in. The callers run it
 # under "||", which turns errexit off here, so every rule is checked by hand:
 # under errexit one refused rule used to end the whole apply half-way.
+#
+# A client skipped as outside RFC1918, or whose MARK rule did not go in, is not
+# carried (TUNNEL_UNCARRIED); nor is one whose offload opt-out did not go in:
+# the firmware's fast path then takes its flows past mangle after their first
+# packets, and those leave through the WAN unmarked (packet-flow.md, "The
+# firmware fast path").
 _tunnel_emit_client() {
     local chain="$1" client="$2" tunnel="$3" mark_hex="$4" excludes="$5"
     local client_ip="${client%%/*}"
@@ -408,6 +493,7 @@ _tunnel_emit_client() {
     if ! is_lan_ip "$client_ip"; then
         log -l WARN "Client '$client' is not RFC1918; skipping"
         warnings=1
+        _tunnel_not_carried "$client"
         return 2
     fi
 
@@ -433,6 +519,7 @@ _tunnel_emit_client() {
             -j "$offload_target"; then
             warnings=1
             incomplete=1
+            _tunnel_not_carried "$client"
         fi
     fi
 
@@ -442,6 +529,7 @@ _tunnel_emit_client() {
         log -l ERROR "Client '$client' is not marked for tunnel '$tunnel'; its traffic falls through to main"
         warnings=1
         incomplete=1
+        _tunnel_not_carried "$client"
         return 3
     fi
 
@@ -599,6 +687,20 @@ _tunnel_slot_release() {
     log "Tunnel '$tunnel': released slot $idx"
 }
 
+# _tunnel_tables_write <file>... - make TUN_DIR_TABLES the lines of <file>...,
+# each once, in one step: they go into a file beside it, which a rename then
+# puts in its place. Written in place, the record was emptied before the new
+# lines went in, and an apply killed in that instant - or a full /tmp failing
+# the write - left it empty or partial after the hash was already gone: the next
+# rebuild handed out slots the live chain still marks with as free ones. Returns
+# 1, TUN_DIR_TABLES as it was, when the write fails.
+_tunnel_tables_write() {
+    local new="$TUN_DIR_TABLES.new"
+    mkdir -p "$(dirname "$TUN_DIR_TABLES")" &&
+        awk '!seen[$0]++' "$@" > "$new" &&
+        mv -f "$new" "$TUN_DIR_TABLES"
+}
+
 ###################################################################################################
 # Public API (defined before --source-only for testability)
 ###################################################################################################
@@ -664,6 +766,35 @@ tunnel_get_required_ipsets() {
 }
 
 # -------------------------------------------------------------------------------------------------
+# tunnel_uncarried - print the clients the last tunnel_apply did not carry, one per line
+# -------------------------------------------------------------------------------------------------
+# TUNNEL_UNCARRIED, for a caller that hands the list on (vpn-director.sh to tproxy_prune). Nothing
+# when every client is carried: the guard spares the caller bash before 4.4, which refuses to expand
+# an empty array under "set -u".
+# -------------------------------------------------------------------------------------------------
+tunnel_uncarried() {
+    [[ ${#TUNNEL_UNCARRIED[@]} -gt 0 ]] || return 0
+    printf '%s\n' "${TUNNEL_UNCARRIED[@]}"
+}
+
+# -------------------------------------------------------------------------------------------------
+# tunnel_clients - print every client the config puts on a tunnel, one per line
+# -------------------------------------------------------------------------------------------------
+# The clients of every key of tunnel_director.tunnels, main included, less paused_clients
+# (config.sh subtracts them): the ones a rebuild would mark, spelled as they are configured. A
+# command that does not run tunnel_apply knows none of them to be carried - vpn-director.sh hands
+# them to tproxy_prune for "apply xray" and "restart xray". A tunnel whose entry is no object, or
+# whose clients are no array, contributes none.
+# -------------------------------------------------------------------------------------------------
+tunnel_clients() {
+    [[ -n ${TUN_DIR_TUNNELS_JSON:-} ]] || return 0
+    printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r '
+        if type == "object" then .[] else empty end
+        | if type == "object" then .clients else null end
+        | if type == "array" then .[] | select(type == "string") else empty end' 2>/dev/null || true
+}
+
+# -------------------------------------------------------------------------------------------------
 # tunnel_stop - remove chain, ip rules and tunnel tables
 # -------------------------------------------------------------------------------------------------
 # Removes TUN_DIR chain, all associated ip rules and the tunnel tables this
@@ -724,8 +855,22 @@ tunnel_stop() {
 # changes the chain alone. The rebuild used to start with tunnel_stop: every Tunnel Director
 # client left through the WAN until the last rule was back, on every change of any client.
 # TUN_DIR_FORCE_REBUILD=1 rebuilds even when the state reads up to date ("restart").
+#
+# A failure that ends the apply - rc 1 before any rule is touched (a tunnels value that is no
+# object, no LAN interface, no PREROUTING position), or errexit - ends vpn-director.sh before its
+# prune. A refused rule, a swap that did not take over every interface, a tunnel the platform does
+# not list cost their clients and return 0, and TUNNEL_UNCARRIED names those clients: the ones the
+# live TUN_DIR may not mark or route when this returns. On a rebuild, the clients of a tunnel that
+# got no slot, of a slot whose route or ip rule is not in place, every client _tunnel_emit_client
+# did not carry, and every client when the swap did not take over every interface; on the
+# up-to-date path, the clients of a slot whose route or rule did not go back in, every client when
+# a jump did not, and the clients outside RFC1918, which no path marks. The failover clients count
+# as clients of their tunnel. A full apply keeps those of them Xray still has in XRAY_CLIENTS
+# (tproxy_prune).
 # -------------------------------------------------------------------------------------------------
 tunnel_apply() {
+    # Before anything else: a run never hands on what an earlier one reported.
+    TUNNEL_UNCARRIED=()
     _tunnel_init
 
     local changes=0
@@ -789,7 +934,10 @@ tunnel_apply() {
         if ! _tunnel_jumps_ensure; then
             log -l ERROR "Tunnel Director: a PREROUTING jump to $TUN_DIR_CHAIN is missing and did not go back in"
             jumps_rc=1
+            # An interface without its jump runs no Tunnel Director at all.
+            _tunnel_not_carried "$(tunnel_clients)"
         fi
+        _tunnel_not_carried_non_rfc1918
         if _tunnel_failover_needed; then
             if ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES" \
                 || [[ $route_rc -ne 0 ]] \
@@ -872,8 +1020,7 @@ tunnel_apply() {
     # 1. Routing, before any packet carries a new mark. TUN_DIR_TABLES holds
     # both layouts until the release below: an apply that dies in between
     # leaves every slot in use on record, and the next one releases the extras.
-    mkdir -p "$(dirname "$TUN_DIR_TABLES")"
-    awk '!seen[$0]++' "$prev_tmp" "$slots_tmp" > "$TUN_DIR_TABLES"
+    _tunnel_tables_write "$prev_tmp" "$slots_tmp"
 
     local tunnel_idx tunnel table pref mark_hex route_ok rule_ok
     while read -r tunnel_idx tunnel; do
@@ -922,6 +1069,10 @@ tunnel_apply() {
             [[ $route_ok -eq 1 ]] || fo_route_ok=0
             [[ $rule_ok -eq 1 ]] || fo_rule_ok=0
         fi
+        # Marked or not, a client of this slot reaches main, not the tunnel.
+        if [[ $route_ok -eq 0 || $rule_ok -eq 0 ]]; then
+            _tunnel_not_carried "$(_tunnel_clients_of "$tunnel")"
+        fi
     done < "$slots_tmp"
 
     # 2. The chain, built beside the live one and swapped in, one jump per LAN
@@ -938,6 +1089,9 @@ tunnel_apply() {
         log -l ERROR "Tunnel Director: the rebuilt chain did not take over every LAN interface; the next apply finishes it"
         warnings=1
         jumps_ok=0
+        # An interface still on the old chain marks none of the clients new to
+        # it, and which clients use that interface is not known here.
+        _tunnel_not_carried "$(tunnel_clients)"
     fi
 
     # 3. Release the slots the new layout dropped - only once the new chain
@@ -949,7 +1103,7 @@ tunnel_apply() {
             grep -qxF "$old_idx $old_tunnel" "$slots_tmp" && continue
             _tunnel_slot_release "$old_idx" "$old_tunnel"
         done < "$prev_tmp"
-        cp -f "$slots_tmp" "$TUN_DIR_TABLES"
+        _tunnel_tables_write "$slots_tmp"
     fi
 
     # 4. The hash is what makes the next apply take the up-to-date branch, so it
