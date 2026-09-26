@@ -115,6 +115,12 @@ Left open:
   rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply.
 - A tunnel that is down sends its clients to `main`. One that comes from Xray while the tunnel's
   route cannot be installed stays proxied instead (step 3).
+- Xray that cannot intercept at all - no `xt_TPROXY`, so `tproxy_apply` sets up no rule and
+  withholds the ready marker - carries no client: one moved from a tunnel to Xray leaves through
+  the WAN once `tunnel_apply` lets it go, as one moved to a tunnel that is down does, and nothing
+  asks first. It is the router's state, not a window of the apply: while `XRAY_TPROXY` holds
+  TPROXY targets the kernel keeps the module loaded, and an exclusion set that cannot be built
+  ends the run before `tproxy_apply` (`_ensure_ipsets`).
 - A client the kernel refuses to add to `XRAY_CLIENTS` (a WARN names it, and the ready marker is
   withheld) is not proxied until an add succeeds - the prune of the same apply tries again. One
   moving from a tunnel to Xray leaves through the WAN in between, once `tunnel_apply` has let it
