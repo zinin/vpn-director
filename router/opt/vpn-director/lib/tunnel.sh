@@ -492,9 +492,10 @@ _tunnel_collect_applied() {
 #
 # Returns 0 when the client is marked, 1 when it is skipped as no IPv4 address
 # or CIDR at all - nothing TPROXY can take either - 2 when it is skipped as
-# outside RFC1918, and 3 when its MARK rule did not go in. The callers run it
-# under "||", which turns errexit off here, so every rule is checked by hand:
-# under errexit one refused rule used to end the whole apply half-way.
+# outside RFC1918, 3 when its MARK rule did not go in, and 4 when its MARK rule
+# went in but its offload opt-out did not - marked, yet not carried. The callers
+# run it under "||", which turns errexit off here, so every rule is checked by
+# hand: under errexit one refused rule used to end the whole apply half-way.
 #
 # A client skipped as outside RFC1918, or whose MARK rule did not go in, is not
 # carried (TUNNEL_UNCARRIED); nor is one whose offload opt-out did not go in:
@@ -535,6 +536,7 @@ _tunnel_emit_client() {
         fi
     done <<< "$excludes"
 
+    local offload_ok=1
     if [[ -n $offload_target ]]; then
         if ! ensure_fw_rule -q mangle "$chain" \
             -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
@@ -542,6 +544,7 @@ _tunnel_emit_client() {
             warnings=1
             incomplete=1
             _tunnel_not_carried_on "$tunnel" "$client"
+            offload_ok=0
         fi
     fi
 
@@ -557,6 +560,7 @@ _tunnel_emit_client() {
 
     log "Added: client=$client tunnel=$tunnel mark=$mark_hex"
     changes=1
+    [[ $offload_ok -eq 1 ]] || return 4
 }
 
 # _tunnel_prerouting_pos - where the first TUN_DIR jump goes
@@ -645,9 +649,11 @@ _tunnel_build_chain() {
             [[ $fo_still -eq 1 ]] || continue
             fo_rc=0
             _tunnel_emit_client "$chain" "$fo_client" "$XRAY_FAILOVER_TUNNEL" "$fo_mark" "$fo_excludes" || fo_rc=$?
-            # 1 is no address at all, which TPROXY cannot take either. 2 and 3
-            # are clients TPROXY takes and TUN_DIR does not mark: dropped from
-            # Xray on failover_ready, they would leave through the WAN.
+            # 1 is no address at all, which TPROXY cannot take either. 2, 3
+            # and 4 are clients TPROXY takes and TUN_DIR does not carry:
+            # dropped from Xray on failover_ready, they would leave through the
+            # WAN, or with the keep-list sit on a dead Xray while the watch
+            # counts them carried.
             [[ $fo_rc -lt 2 ]] || fo_carried=0
         done
     fi

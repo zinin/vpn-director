@@ -1218,6 +1218,24 @@ load_tunnel_module_with() {
     [ ! -e "$TUN_DIR_FAILOVER_READY" ]
 }
 
+# Marked, yet not carried: the fast path takes the client's flows past mangle
+# after their first packets, and those leave through the WAN unmarked. On
+# failover_ready the watch would commit the failover and count the client carried.
+@test "tunnel_apply: no failover_ready when a failover client's offload opt-out did not go in" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.8 "*"-j PPE"* ]] && return 4
+        command iptables "$@"
+    }
+
+    tunnel_apply
+
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
 # sync_fw_rule used to report an insert the kernel refused as success, so the
 # marker went out for a chain nothing jumped to, and the watch dropped Xray
 # membership onto it.
