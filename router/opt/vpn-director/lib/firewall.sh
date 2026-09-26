@@ -55,6 +55,11 @@
 #       With --count, print the number of changes (deleted + inserted) to stdout.
 #       -6 uses ip6tables; -q suppresses informational logs (errors still logged).
 #
+#   swap_fw_chain <table> <chain> <build_fn> <pos_fn> <jump_match>...
+#       Rebuild a chain that PREROUTING jumps to as <chain>_NEW, move the jumps over and give
+#       it the chain's name: no moment without a whole chain. Returns 0 done, 1 done with a
+#       rule missing, 2 live chain untouched, 3 cutover unfinished (the next swap finishes it).
+#
 #   block_wan_for_host <hostname|ip>
 #       Resolve host to a LAN IPv4 and (if IPv6 is enabled) to all global IPv6.
 #       Add filter/FORWARD REJECT/DROP rules to block both outbound-to and inbound-from
@@ -841,6 +846,149 @@ sync_fw_rule() {
 
     [[ $print_count -eq 1 ]] && printf '%s\n' "$cnt"
     return "$rc"
+}
+
+###################################################################################################
+# swap_fw_chain - rebuild a chain PREROUTING jumps to, with no moment in which it is not whole
+# -------------------------------------------------------------------------------------------------
+# Usage:
+#   swap_fw_chain <table> <chain> <build_fn> <pos_fn> <jump_match>...
+#
+# Args:
+#   <table>       : iptables table (the jumps live in its PREROUTING)
+#   <chain>       : the chain to rebuild; 24 characters at most, to leave room for "_NEW"
+#   <build_fn>    : called as "<build_fn> <chain>_NEW" on an empty chain; returns 0 when every
+#                   rule went in, 1 when the chain may go in although a rule did not, and 2 when
+#                   it must not go in at all
+#   <pos_fn>      : prints the PREROUTING position of the first jump, read from the listing as
+#                   it stands; each jump goes to that position plus the number of jumps already
+#                   on the new chain
+#   <jump_match>  : the match of one jump per LAN interface ("-i br0",
+#                   "-i br0 -m mark --mark 0x0/0xff0000")
+#
+# Behavior:
+#   * Flushing the live chain and filling it again one rule per call left every packet that
+#     crossed it meanwhile unrouted - out through the WAN, on every apply. The rules go into
+#     <chain>_NEW instead, and only a finished chain takes the jumps over: a jump to <chain>_NEW
+#     goes in ahead of each old jump, the old jumps go, <chain> - nothing jumps to it any more -
+#     is emptied and deleted, and <chain>_NEW takes its name ("iptables -E"; the jumps follow the
+#     rename). A packet crosses a whole chain at every step. While both jumps stand the new chain
+#     comes first, and the old one can only take up what the new one returned.
+#   * A <chain>_NEW a jump leads to is what a swap left when it stopped half-way, and it is
+#     complete: the jumps go in only after the build. Its cutover is finished first. One that
+#     nothing jumps to is deleted - as read from a PREROUTING listing that worked: a failed one
+#     reads as no jump at all, and the delete starts with a flush. The build then gets a chain
+#     of its own from "iptables -N", which refuses one that is there, so a <chain>_NEW the
+#     existence check missed is never flushed either.
+#   * build_fn runs in the caller's dynamic scope, with errexit off (it runs under "||"), and
+#     checks its rules itself. The locals here carry a _sw_ prefix so that none of them can
+#     shadow a variable the callback sets.
+#   * Returns 0 when the new chain carries every interface; 1 when it does, but build_fn
+#     reported a rule missing; 2 when the live chain is untouched (build_fn returned 2, the name
+#     is too long, PREROUTING could not be listed, <chain>_NEW could not be made); 3 when the
+#     cutover did not finish - an interface whose new jump did not go in stays on the old
+#     chain, or the rename failed - and the next swap finishes it.
+###################################################################################################
+swap_fw_chain() {
+    local _sw_table="${1-}" _sw_chain="${2-}" _sw_build="${3-}" _sw_pos="${4-}"
+    local _sw_shadow _sw_rules _sw_build_rc=0
+
+    if [[ -z $_sw_table || -z $_sw_chain || -z $_sw_build || -z $_sw_pos || $# -lt 5 ]]; then
+        log -l ERROR "swap_fw_chain: usage: swap_fw_chain <table> <chain> <build_fn> <pos_fn> <jump_match>..."
+        return 2
+    fi
+    shift 4
+    _sw_shadow="${_sw_chain}_NEW"
+    # iptables takes chain names of up to 28 characters.
+    if (( ${#_sw_shadow} > 28 )); then
+        log -l ERROR "Chain name '$_sw_chain' leaves no room for the _NEW suffix (24 characters at most)"
+        return 2
+    fi
+
+    if fw_chain_exists "$_sw_table" "$_sw_shadow"; then
+        # A listing that failed would read as no jump, and delete_fw_chain flushes first.
+        if ! _sw_rules="$(iptables -t "$_sw_table" -S PREROUTING 2>/dev/null)"; then
+            log -l ERROR "Cannot list $_sw_table PREROUTING to see whether $_sw_shadow is live; nothing changed"
+            return 2
+        fi
+        if [[ $_sw_rules$'\n' == *" -j ${_sw_shadow}"$'\n'* ]]; then
+            log -l WARN "Finishing an interrupted swap of $_sw_chain"
+            _fw_chain_cutover "$_sw_table" "$_sw_chain" "$_sw_pos" "$@" || return 3
+        elif ! delete_fw_chain -q "$_sw_table" "$_sw_shadow"; then
+            return 2
+        fi
+    fi
+
+    # Not "create_fw_chain -f": -N refuses a chain that is there, so a <chain>_NEW the check
+    # above missed - a jump may lead to it - is never flushed.
+    if ! iptables -t "$_sw_table" -N "$_sw_shadow" 2>/dev/null; then
+        log -l ERROR "Failed to create chain $_sw_shadow in $_sw_table; the live chain stays as it is"
+        return 2
+    fi
+
+    "$_sw_build" "$_sw_shadow" || _sw_build_rc=$?
+    if [[ $_sw_build_rc -ge 2 ]]; then
+        delete_fw_chain -q "$_sw_table" "$_sw_shadow" || true
+        return 2
+    fi
+
+    _fw_chain_cutover "$_sw_table" "$_sw_chain" "$_sw_pos" "$@" || return 3
+    return "$_sw_build_rc"
+}
+
+# _fw_chain_cutover <table> <chain> <pos_fn> <jump_match>... - move the PREROUTING jumps from
+# <chain> to <chain>_NEW, then retire <chain> and give <chain>_NEW its name. Returns 1 when a
+# jump or the rename did not go in; <chain> then keeps every jump that did not move.
+_fw_chain_cutover() {
+    local _sw_table="$1" _sw_chain="$2" _sw_pos_fn="$3"
+    shift 3
+    local _sw_shadow="${_sw_chain}_NEW" _sw_pos _sw_match _sw_i=0 _sw_rc=0
+    local -a _sw_moved=()
+
+    _sw_pos="$("$_sw_pos_fn")" || _sw_pos=""
+    if [[ ! $_sw_pos =~ ^[1-9][0-9]*$ ]]; then
+        log -l ERROR "Cannot determine the PREROUTING position for $_sw_shadow; $_sw_chain stays in place"
+        return 1
+    fi
+
+    for _sw_match in "$@"; do
+        # The match is word-split on purpose: "-i br0 -m mark --mark 0x0/0xff0000".
+        # shellcheck disable=SC2086
+        if iptables -t "$_sw_table" -C PREROUTING $_sw_match -j "$_sw_shadow" 2>/dev/null \
+            || iptables -t "$_sw_table" -I PREROUTING "$((_sw_pos + _sw_i))" $_sw_match -j "$_sw_shadow" 2>/dev/null; then
+            _sw_moved+=("$_sw_match")
+            _sw_i=$((_sw_i + 1))
+        else
+            log -l ERROR "Failed to insert the PREROUTING jump to $_sw_shadow ($_sw_match); that interface stays on $_sw_chain"
+            _sw_rc=1
+        fi
+    done
+
+    if [[ $_sw_rc -ne 0 ]]; then
+        # Only the interfaces now on the new chain lose their old jump.
+        if [[ ${#_sw_moved[@]} -gt 0 ]]; then
+            for _sw_match in "${_sw_moved[@]}"; do
+                purge_fw_rules -q "$_sw_table PREROUTING" "^-A PREROUTING ${_sw_match} -j ${_sw_chain}\$"
+            done
+        fi
+        return 1
+    fi
+
+    # Every interface is on the new chain: every jump to the old one goes, a copy an older
+    # version left and an interface no longer listed included.
+    purge_fw_rules -q "$_sw_table PREROUTING" "-j ${_sw_chain}\$"
+    if [[ -n $(find_fw_rules "$_sw_table PREROUTING" "-j ${_sw_chain}\$") ]]; then
+        log -l ERROR "A PREROUTING jump to $_sw_chain did not go; the next apply finishes the swap"
+        return 1
+    fi
+    if fw_chain_exists "$_sw_table" "$_sw_chain"; then
+        delete_fw_chain -q "$_sw_table" "$_sw_chain" || return 1
+    fi
+    if ! iptables -t "$_sw_table" -E "$_sw_shadow" "$_sw_chain" 2>/dev/null; then
+        log -l ERROR "Failed to rename $_sw_shadow to $_sw_chain; it carries the traffic until the next apply renames it"
+        return 1
+    fi
+    return 0
 }
 
 ###################################################################################################

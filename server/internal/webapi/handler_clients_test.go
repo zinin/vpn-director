@@ -1066,3 +1066,278 @@ func TestHandleAddClient_DetachesTheAddressFromTheFailover(t *testing.T) {
 		t.Fatalf("wgc1 %v", mc.savedCfg.TunnelDirector.Tunnels["wgc1"].Clients)
 	}
 }
+
+// movableClients is 192.168.50.10 on Xray, which excludes ru, and
+// 192.168.50.30 on wgc1.
+func movableClients() *vpnconfig.VPNDirectorConfig {
+	return &vpnconfig.VPNDirectorConfig{
+		Xray: vpnconfig.XrayConfig{Clients: []string{"192.168.50.10"}, ExcludeSets: []string{"ru"}},
+		TunnelDirector: vpnconfig.TunnelDirectorConfig{
+			Tunnels: map[string]vpnconfig.TunnelConfig{
+				"wgc1": {Clients: []string{"192.168.50.30"}, Exclude: []string{"ru"}},
+			},
+		},
+	}
+}
+
+func moveRequest(body string) *http.Request {
+	return httptest.NewRequest("POST", "/api/clients/route", strings.NewReader(body))
+}
+
+func TestHandleMoveClient_XrayToTunnel(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	vpn := &mockVPN{}
+	deps.VPN = vpn
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"wgc1"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(mc.savedCfg.Xray.Clients) != 0 {
+		t.Errorf("xray.clients = %v, want the address gone", mc.savedCfg.Xray.Clients)
+	}
+	if got := mc.savedCfg.TunnelDirector.Tunnels["wgc1"].Clients; strings.Join(got, ",") != "192.168.50.30,192.168.50.10" {
+		t.Errorf("wgc1 = %v", got)
+	}
+	if vpn.applyCalls != 1 {
+		t.Errorf("expected one apply, got %d", vpn.applyCalls)
+	}
+}
+
+func TestHandleMoveClient_TunnelToXray(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.30","route":"xray"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Join(mc.savedCfg.Xray.Clients, ",") != "192.168.50.10,192.168.50.30" {
+		t.Errorf("xray.clients = %v", mc.savedCfg.Xray.Clients)
+	}
+	if got := mc.savedCfg.TunnelDirector.Tunnels["wgc1"].Clients; len(got) != 0 {
+		t.Errorf("wgc1 = %v", got)
+	}
+}
+
+// newTestDeps's platform lists wgc1 and ovpnc1; ovpnc1 is not in the config.
+func TestHandleMoveClient_NewTunnelInheritsTheXrayExclusions(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"ovpnc1"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	tun := mc.savedCfg.TunnelDirector.Tunnels["ovpnc1"]
+	if strings.Join(tun.Clients, ",") != "192.168.50.10" || strings.Join(tun.Exclude, ",") != "ru" {
+		t.Errorf("ovpnc1 = %+v", tun)
+	}
+}
+
+func TestHandleMoveClient_ToTheRouteItIsOnChangesNothing(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	vpn := &mockVPN{}
+	deps.VPN = vpn
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"xray"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if mc.savedCfg != nil {
+		t.Error("a move that changes nothing must write nothing")
+	}
+	if vpn.applyCalls != 0 {
+		t.Errorf("a move that changes nothing must not apply, got %d applies", vpn.applyCalls)
+	}
+}
+
+func TestHandleMoveClient_NotFound(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	vpn := &mockVPN{}
+	deps.VPN = vpn
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.99","route":"wgc1"}`))
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if mc.savedCfg != nil || vpn.applyCalls != 0 {
+		t.Errorf("saved %v, applies %d: nothing may happen", mc.savedCfg, vpn.applyCalls)
+	}
+}
+
+func TestHandleMoveClient_RejectsBadInput(t *testing.T) {
+	for _, body := range []string{
+		`not json`,
+		`{"route":"xray"}`,
+		`{"ip":"fd00::1","route":"xray"}`,
+		`{"ip":"192.168.50.10"}`,
+	} {
+		deps := newTestDeps(t)
+		deps.Config = &mockConfig{cfg: movableClients()}
+		rec := httptest.NewRecorder()
+		handleMoveClient(deps).ServeHTTP(rec, moveRequest(body))
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s: expected 400, got %d: %s", body, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+func TestHandleMoveClient_RouteMustBeATunnelThePlatformLists(t *testing.T) {
+	deps := newTestDeps(t)
+	deps.Config = &mockConfig{cfg: movableClients()}
+	deps.VPN = &mockVPN{platform: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "OpenVPN0"}}}}
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"wgc2"}`))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid route") {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleMoveClient_PlatformUnavailableIs503(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	deps.VPN = &mockVPN{platformErr: errors.New("down")}
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"OpenVPN0"}`))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "platform info unavailable") {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if mc.savedCfg != nil {
+		t.Error("nothing may be saved when the route could not be validated")
+	}
+}
+
+func TestHandleMoveClient_SavedButApplyFailed(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	deps.VPN = &mockVPN{err: errors.New("apply failed (exit 1):\n[ERROR] iptables missing")}
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"wgc1"}`))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", rec.Code, rec.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp["saved"] != true {
+		t.Errorf("expected saved: true, got %v", resp["saved"])
+	}
+}
+
+func TestHandleMoveClient_KeepsThePausedState(t *testing.T) {
+	cfg := movableClients()
+	cfg.Xray.Clients = []string{"192.168.50.10/32"}
+	cfg.PausedClients = []string{"192.168.50.10/32"}
+	mc := &mockConfig{cfg: cfg}
+	deps := newTestDeps(t)
+	deps.Config = mc
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"wgc1"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if strings.Join(mc.savedCfg.PausedClients, ",") != "192.168.50.10" {
+		t.Errorf("paused_clients = %v", mc.savedCfg.PausedClients)
+	}
+}
+
+// Moving an address during a failover is where the user wants it; left in the
+// failover record, the restore would take it back to Xray.
+func TestHandleMoveClient_DetachesTheAddressFromTheFailover(t *testing.T) {
+	mc := &mockConfig{cfg: failedOverClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.8","route":"xray"}`))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if fo := mc.savedCfg.Xray.Failover; fo == nil || len(fo.Clients) != 0 || len(fo.Added) != 0 {
+		t.Fatalf("failover %+v", fo)
+	}
+	if strings.Join(mc.savedCfg.Xray.Clients, ",") != "192.168.50.8" {
+		t.Errorf("xray.clients = %v", mc.savedCfg.Xray.Clients)
+	}
+}
+
+// Tunnel Director marks private IPv4 addresses and networks only (tunnel.sh
+// skips the rest, vpnconfig.TDCarries). A client outside them on a tunnel
+// route is on no route at all: it left Xray for the WAN. It can go on xray.
+func TestHandleAddClient_TunnelRouteRefusesAnAddressTunnelDirectorCannotCarry(t *testing.T) {
+	for _, route := range []string{"wgc1", "main"} {
+		mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+		deps := newTestDeps(t)
+		deps.Config = mc
+		vpn := &mockVPN{platform: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "wgc1", Connected: true}}}}
+		deps.VPN = vpn
+
+		rec := httptest.NewRecorder()
+		handleAddClient(deps).ServeHTTP(rec, httptest.NewRequest("POST", "/api/clients",
+			strings.NewReader(`{"ip":"100.64.0.8","route":"`+route+`"}`)))
+		if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Tunnel Director routes private IPv4") {
+			t.Fatalf("%s: status = %d: %s", route, rec.Code, rec.Body.String())
+		}
+		if mc.savedCfg != nil || vpn.applyCalls != 0 {
+			t.Errorf("%s: saved %v, applies %d: nothing may happen", route, mc.savedCfg, vpn.applyCalls)
+		}
+	}
+
+	mc := &mockConfig{cfg: &vpnconfig.VPNDirectorConfig{}}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	rec := httptest.NewRecorder()
+	handleAddClient(deps).ServeHTTP(rec, httptest.NewRequest("POST", "/api/clients",
+		strings.NewReader(`{"ip":"100.64.0.8","route":"xray"}`)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("xray: status = %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleMoveClient_TunnelRouteRefusesAnAddressTunnelDirectorCannotCarry(t *testing.T) {
+	cfg := movableClients()
+	cfg.Xray.Clients = append(cfg.Xray.Clients, "100.64.0.8")
+	mc := &mockConfig{cfg: cfg}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	vpn := &mockVPN{platform: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "wgc1", Connected: true}}}}
+	deps.VPN = vpn
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"100.64.0.8","route":"wgc1"}`))
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Tunnel Director routes private IPv4") {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if mc.savedCfg != nil || vpn.applyCalls != 0 {
+		t.Errorf("saved %v, applies %d: nothing may happen", mc.savedCfg, vpn.applyCalls)
+	}
+}

@@ -25,7 +25,7 @@ fi
 #   vpn-director status [tunnel|xray|ipset]  - Show status
 #   vpn-director apply [tunnel|xray]         - Apply configuration
 #   vpn-director stop [tunnel|xray]          - Stop components
-#   vpn-director restart [tunnel|xray]       - Restart components
+#   vpn-director restart [tunnel|xray]       - Rebuild in place, nothing stopped (all and xray restart Xray)
 #   vpn-director restart xray-process        - Restart the Xray process only (TPROXY rules kept)
 #   vpn-director update                      - Update ipsets and reapply all
 #   vpn-director platform                    - Print platform facts as JSON (for the daemons)
@@ -114,9 +114,9 @@ Usage:
 
 Commands:
   status [tunnel|xray|ipset]  Show status (all or specific component)
-  apply [tunnel|xray]         Apply configuration
+  apply [tunnel|xray]         Apply configuration (only a full apply moves a client between Xray and a tunnel)
   stop [tunnel|xray]          Stop components
-  restart [tunnel|xray]       Restart (stop + apply)
+  restart [tunnel|xray]       Rebuild in place, nothing stopped (all and xray restart the Xray process)
   restart xray-process        Restart the Xray process only, TPROXY rules kept
   update                      Download fresh ipsets and reapply all
   platform                    Print platform facts as JSON
@@ -174,6 +174,26 @@ _ensure_ipsets() {
         [[ -z $set ]] && continue
         ipset_ensure "$set" || return 1
     done
+}
+
+###################################################################################################
+# _prune_keeping <clients> - the break half of an apply: tproxy_prune, told which clients the live
+# TUN_DIR may not carry (<clients>, one per line), so that each one XRAY_CLIENTS still holds stays in
+# it. After tunnel_apply those are the ones it reported (tunnel_uncarried); an apply of Xray alone
+# runs no Tunnel Director and names every client the config puts on a tunnel (tunnel_clients).
+# Neither names a client of main: main is no tunnel, and a client of it that Tunnel Director does
+# not mark still goes direct, which is what main means. Either way only a client that left Xray for
+# direct - paused, deleted, moved to main - is let go.
+###################################################################################################
+_prune_keeping() {
+    local -a keep=()
+    [[ -z ${1:-} ]] || mapfile -t keep <<< "$1"
+    # bash before 4.4 refuses "${keep[@]}" of an empty array under set -u.
+    if [[ ${#keep[@]} -gt 0 ]]; then
+        tproxy_prune "${keep[@]}"
+    else
+        tproxy_prune
+    fi
 }
 
 ###################################################################################################
@@ -278,17 +298,29 @@ cmd_apply() {
                 _ensure_ipsets $required_ipsets
             fi
 
-            # Xray first. tproxy_apply soft-fails (a WARN and rc 0) while tunnel_apply
-            # hard-fails under errexit, so this order lets a Tunnel Director failure -
-            # a malformed tunnels object, say - end the run without stripping Xray
-            # clients of their TPROXY rules. The PREROUTING positions: XRAY_TPROXY always
-            # inserts at 1; TUN_DIR at the platform's base position, never ahead of the
-            # XRAY_TPROXY jumps already in place - tunnel_apply counts them - so the
-            # order is [XRAY_TPROXY, TUN_DIR] on both platforms. Neither call is wrapped
-            # in `||` or `if !`: that would run its whole body with errexit off and let
-            # an unguarded failure inside pass as success.
+            # Make before break, whichever way a client moves. tproxy_apply adds every
+            # effective Xray client to XRAY_CLIENTS and removes none; tunnel_apply puts
+            # Tunnel Director's rules in place; only then does tproxy_prune let go of the
+            # clients that left Xray. XRAY_TPROXY runs ahead of TUN_DIR, so a client moving
+            # from Xray to a tunnel stays proxied until TUN_DIR marks it, and one moving the
+            # other way is proxied before TUN_DIR lets it go. Applied Xray-then-Tunnel
+            # Director in one step, a client moving to a tunnel was on neither for the length
+            # of tunnel_apply and left through the WAN.
+            #
+            # tproxy_apply soft-fails (a WARN and rc 0). tunnel_apply hard-fails under
+            # errexit when it cannot apply at all - a malformed tunnels object, no LAN
+            # interface - and the run ends before the prune: the clients that left Xray stay
+            # proxied rather than leak. On a soft failure - a refused rule, a swap that did not
+            # take over every interface, a tunnel the platform does not list - it returns 0 and
+            # reports the clients the live TUN_DIR does not carry, and the prune keeps each of
+            # them that Xray still has. The PREROUTING positions: XRAY_TPROXY always goes in at
+            # 1; TUN_DIR at the platform's base position, never ahead of the XRAY_TPROXY jumps -
+            # tunnel_apply counts them - so the order is [XRAY_TPROXY, TUN_DIR] on both
+            # platforms. No call is wrapped in `||` or `if !`: that would run its whole body
+            # with errexit off and let an unguarded failure inside pass as success.
             tproxy_apply
             tunnel_apply
+            _prune_keeping "$(tunnel_uncarried)"
             ;;
         tunnel)
             required_ipsets=$(tunnel_get_required_ipsets)
@@ -304,7 +336,13 @@ cmd_apply() {
                 # shellcheck disable=SC2086
                 _ensure_ipsets $required_ipsets
             fi
+            # No Tunnel Director here, so nothing marks a client moved from Xray to a
+            # tunnel: the prune keeps every client the config puts on a tunnel while
+            # Xray has it, and such a client stays proxied until a full apply moves it.
+            # Only a client that left Xray for direct is let go, one moved to main among
+            # them: main is no tunnel, and a client of it that no rule marks goes direct.
             tproxy_apply
+            _prune_keeping "$(tunnel_clients)"
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2
@@ -347,39 +385,40 @@ cmd_stop() {
 }
 
 cmd_restart() {
-    # Lock first for the same reason: cmd_stop and cmd_apply below would find
-    # the modules already loaded and reuse the config read before the wait.
+    # Lock first for the same reason: cmd_apply below would find the modules
+    # already loaded and reuse the config read before the wait.
     _load_common
     acquire_lock "vpn-director"
     _load_modules
     if _skip_when_stopped restart; then
         return 0
     fi
-    # A full restart leaves the marker in its own stop half; the apply half must
-    # not take that for a stop someone else made.
+    # Checked once, above, under the lock this restart holds throughout.
     UNLESS_STOPPED=0
+    # Nothing is stopped first. An apply replaces its chains and sets whole, with
+    # no moment without them (swap_fw_chain, ipset swap); a stop took the routing
+    # away until the apply put it back, and every client left through the WAN in
+    # between. TUN_DIR_FORCE_REBUILD rebuilds Tunnel Director even when its state
+    # reads up to date: what a restart is asked for.
     case "$COMPONENT" in
         ""|all)
             tproxy_restart_process
-            cmd_stop
-            cmd_apply
+            TUN_DIR_FORCE_REBUILD=1 cmd_apply
             ;;
         tunnel)
-            COMPONENT=tunnel cmd_stop
-            COMPONENT=tunnel cmd_apply
+            TUN_DIR_FORCE_REBUILD=1 COMPONENT=tunnel cmd_apply
             ;;
         xray|tproxy)
+            # A server switch (the Web UI, /xray, the wizard): the rules stay in
+            # place while the process restarts, so its clients wait for it
+            # instead of leaving through the WAN, and the apply swaps in
+            # TPROXY_BYPASS, whose xray.servers the switch may have recomputed.
             tproxy_restart_process
-            COMPONENT=xray cmd_stop
             COMPONENT=xray cmd_apply
             ;;
         xray-process)
             # config.json changed and nothing else: the Telegram bot's
-            # subscription watch writes one per server it tries. The stop and
-            # apply of "xray" take the TPROXY jump away and put it back, and in
-            # between the Xray clients leave through the WAN - once per server.
-            # With the rules in place, a client meets a restarting Xray and
-            # waits instead.
+            # subscription watch writes one per server it tries.
             tproxy_restart_process
             ;;
         *)
@@ -410,9 +449,10 @@ cmd_update() {
         _ensure_ipsets $required_ipsets
     fi
 
-    # Xray first, for the reason spelled out in cmd_apply.
+    # Make before break, for the reason spelled out in cmd_apply.
     tproxy_apply
     tunnel_apply
+    _prune_keeping "$(tunnel_uncarried)"
 
     log "Update complete"
 }

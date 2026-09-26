@@ -99,13 +99,13 @@ After installation, configs are located at:
 /opt/vpn-director/vpn-director.sh status              # Show all status
 /opt/vpn-director/vpn-director.sh apply               # Apply configuration
 /opt/vpn-director/vpn-director.sh stop                # Stop all components
-/opt/vpn-director/vpn-director.sh restart             # Restart all
+/opt/vpn-director/vpn-director.sh restart             # Restart Xray, rebuild all in place without a stop
 /opt/vpn-director/vpn-director.sh update              # Update ipsets + reapply
 
 # Component-specific
 /opt/vpn-director/vpn-director.sh status tunnel       # Tunnel Director status only
 /opt/vpn-director/vpn-director.sh status ipset        # IPSet status only
-/opt/vpn-director/vpn-director.sh restart xray        # Restart Xray TPROXY only
+/opt/vpn-director/vpn-director.sh restart xray        # Restart Xray, TPROXY applied again in place
 
 # Options (can be used with any command)
 /opt/vpn-director/vpn-director.sh -v status           # Verbose output
@@ -137,7 +137,7 @@ A self-signed TLS certificate is generated automatically during installation. Yo
 |-----|-------------|
 | **Status** | VPN Director operational overview |
 | **Servers** | Subscriptions (add, refresh, rename, delete) and their Xray servers, switch active server |
-| **Clients** | LAN client routing assignment (pause/resume/delete) |
+| **Clients** | LAN client routing: add, change the route in place, pause/resume, delete |
 | **Exclusions** | Country and IP/CIDR exclusion lists |
 | **Logs** | Log viewer (bot, vpn, xray, webui) |
 | **Settings** | Version, self-update, configuration |
@@ -203,7 +203,7 @@ Remote management via Telegram with username-based authorization.
 | `/import <url> [name]` | Add a subscription, or refresh the one saved with that link; /import alone refreshes them all |
 | `/subs` | Subscriptions: refresh, rename, delete |
 | `/exclude` | Manage excluded IPs/CIDRs |
-| `/clients` | Manage VPN clients |
+| `/clients` | Manage VPN clients: move between routes, pause, remove |
 | `/configure` | Configuration wizard |
 | `/restart` | Restart VPN Director |
 | `/stop` | Stop VPN Director |
@@ -248,6 +248,19 @@ Routes traffic from specified LAN clients through OpenVPN/WireGuard tunnels base
   }
 }
 ```
+
+### Changing a client's route
+
+Pick another route for a client in the Web UI (the Route column) or in the bot (`/clients`, 🔀). It is one change and one apply, and the apply moves the client make-before-break: the client stays on its old route until the new one carries it, so none of its traffic leaves through the WAN in between. Every apply works that way — chains and sets are built beside the live ones and swapped in — and so does a server switch, which restarts Xray with its rules in place.
+
+What remains:
+
+- The firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again.
+- A tunnel that is down sends its clients through the WAN (on Merlin, the VPN client's killswitch, when enabled, prevents that). The Web UI and the bot ask before they move a client to a tunnel that is down or that the router does not list.
+- A move changes the route of new connections. An open connection may break (reconnect it) or, on KeeneticOS, keep its old route until its conntrack entry expires. A UDP flow moved from Xray to a tunnel can stall until its conntrack entry expires.
+- Only a full `apply`, `restart` or `update` moves a client between Xray and a tunnel. The Web UI and the bot move clients with a full apply (a server switch, which changes no client's route, runs `restart xray`). After moving a client by hand in `vpn-director.json`, run a full `vpn-director.sh apply`: `apply xray` and `restart xray` keep a client moved from Xray to a tunnel proxied until then, but `apply tunnel` and `restart tunnel`, which move a client between tunnels in place, add nothing to Xray, so a client moved from a tunnel to Xray goes out through the WAN until the full apply.
+- `/opt/etc/init.d/S99vpn-director restart` stops the service and starts it again, and the clients go out through the WAN in between; `vpn-director.sh restart` rebuilds in place.
+- IPv6 is routed by neither module: where the LAN has IPv6, a client's IPv6 traffic bypasses Xray and Tunnel Director.
 
 ### Country IPSets
 

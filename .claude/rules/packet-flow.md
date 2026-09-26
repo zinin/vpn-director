@@ -77,6 +77,71 @@ them, so the order is `[XRAY_TPROXY, TUN_DIR]` on both platforms.
 
 **Implication**: If a client IP is in both `xray.clients` and a TD rule, traffic goes through Xray only. TD rule is ignored for that client.
 
+## The apply: make before break
+
+A full apply (`apply`, `update`, `restart`) moves every client make-before-break:
+
+1. `tproxy_apply` adds every effective Xray client to `XRAY_CLIENTS` - `xray.clients` less
+   `paused_clients`, an entry that is no IPv4 address or CIDR skipped - and removes none.
+2. `tunnel_apply` puts Tunnel Director's rules in place and reports the clients the live `TUN_DIR`
+   does not carry when it returns (`TUNNEL_UNCARRIED`) - never a client of `main`, which goes direct
+   unmarked as well.
+3. `tproxy_prune` swaps in the effective Xray clients, plus every reported client `XRAY_CLIENTS`
+   still holds.
+
+Xray wins over TUN_DIR (above). A client moving from Xray to a tunnel stays proxied until step 3
+lets it go, when TUN_DIR already marks it; a client moving the other way is proxied from step 1,
+before TUN_DIR lets it go in step 2. A Tunnel Director failure that stops the apply (a tunnels value
+that is no object, no LAN interface, no PREROUTING position) ends the run before step 3. One that
+costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
+tunnel the platform does not list, a slot whose route or ip rule is not in place, a client outside
+RFC1918 - and step 2 reports the clients it cost. Step 3 keeps each of them that `XRAY_CLIENTS`
+still holds: a client that came from Xray stays proxied rather than leak, until an apply in which
+Tunnel Director carries it. A client that left Xray for direct - paused, deleted - is let go, and
+one that was not proxied is not made so (`tunnel-director.md`, "What tunnel_apply reports as not
+carried").
+
+No step flushes a chain or a set a packet is crossing. `XRAY_TPROXY` and a rebuilt `TUN_DIR` are
+built as `<chain>_NEW` and swapped in by `swap_fw_chain` (`lib/firewall.sh`): the new jump goes in
+ahead of the old one, the old jump and chain go, the new chain takes the name. `TPROXY_BYPASS`
+and, in the prune, `XRAY_CLIENTS` are built as `<set>_NEW` and swapped in (`ipset swap`). A Tunnel
+Director rebuild keeps every tunnel's slot and installs the routing of a new slot before the swap
+and releases a dropped one after it (`tunnel-director.md`). `restart` and `restart xray` stop
+nothing; while the Xray process restarts, TPROXY drops what no socket takes.
+
+Left open:
+
+- The firmware flushing our chains (Merlin's `iptables -t mangle -F` on a firewall start, an NDM
+  rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply.
+- A tunnel that is down sends its clients to `main`. One that comes from Xray while the tunnel's
+  route cannot be installed stays proxied instead (step 3).
+- Xray that cannot intercept at all - no `xt_TPROXY`, so `tproxy_apply` sets up no rule and
+  withholds the ready marker - carries no client: one moved from a tunnel to Xray leaves through
+  the WAN once `tunnel_apply` lets it go, as one moved to a tunnel that is down does, and nothing
+  asks first. It is the router's state, not a window of the apply: while `XRAY_TPROXY` holds
+  TPROXY targets the kernel keeps the module loaded, and an exclusion set that cannot be built
+  ends the run before `tproxy_apply` (`_ensure_ipsets`).
+- A client the kernel refuses to add to `XRAY_CLIENTS` (a WARN names it, and the ready marker is
+  withheld) is not proxied until an add succeeds - the prune of the same apply tries again. One
+  moving from a tunnel to Xray leaves through the WAN in between, once `tunnel_apply` has let it
+  go: the cost a refused MARK rule has for a Tunnel Director client that did not come from Xray.
+- A move changes the route of new connections only. An open connection breaks, or, on KeeneticOS,
+  one the fast path already holds keeps its old path until its conntrack entry expires ("The
+  firmware fast path" below); a UDP flow moved from Xray to a tunnel can stall until its entry
+  expires. Nothing flushes conntrack: KeeneticOS has no conntrack-tools.
+- A component command does not move a client between Xray and a tunnel. `apply xray` and
+  `restart xray` run no Tunnel Director, so their prune keeps every client the config puts on a
+  tunnel - `main`'s left out - that `XRAY_CLIENTS` still holds: a client moved from Xray to a tunnel
+  by hand stays proxied until a full apply moves it, and only a client that left Xray for direct is
+  let go.
+  `apply tunnel` and `restart tunnel` move a client between tunnels in place, but add nothing to
+  `XRAY_CLIENTS`: one moved from a tunnel to Xray leaves through the WAN until the next full apply.
+  The daemons move clients with full applies; a server switch, which changes no client's route,
+  runs `restart xray`.
+- `S99vpn-director restart` is `stop`, then `start` (`vpn-director.sh stop`, then `apply`), with no
+  routing in between: not the in-place `restart`.
+- IPv6 is routed by neither module.
+
 ## Fwmark Bit Layout
 
 ```
@@ -208,7 +273,8 @@ make every interface displace the one before it, and each rewrite is a window wi
 it would otherwise land among them. On Merlin without firmware iface-mark rules the base
 position is 1, the slot XRAY_TPROXY holds, and a rebuild used to put TUN_DIR ahead of it; the
 next apply then found the Xray jump off its position and purged and re-inserted it — a window
-with no TPROXY jump on every apply.
+with no TPROXY jump on every apply. A rebuild inserts its jumps to `TUN_DIR_NEW` at those
+positions, ahead of the old jumps, which go after (`swap_fw_chain`).
 
 Typically (one LAN interface):
 - Position 1: XRAY_TPROXY
@@ -326,7 +392,7 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | File | Purpose |
 |------|---------|
 | `/tmp/tunnel_director/tun_dir_rules.sha256` | Hash of applied TD rules |
-| `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`) |
+| `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`); a tunnel keeps its idx while it has clients; during a rebuild, the union of both layouts |
 
 ## Key Code Locations
 

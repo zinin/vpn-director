@@ -8,6 +8,7 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/service"
+	"github.com/zinin/vpn-director/server/internal/telegram"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -80,18 +81,21 @@ func (m *mockConfigClients) SaveSubscription(vpnconfig.Subscription) error      
 func (m *mockConfigClients) DeleteSubscription(string) error                      { return nil }
 
 type mockVPNClients struct {
-	applyErr    error
-	platform    vpnconfig.PlatformInfo
-	platformErr error
+	applyErr      error
+	applyCalls    int
+	platform      vpnconfig.PlatformInfo
+	platformErr   error
+	platformCalls int
 }
 
 func (m *mockVPNClients) Status() (string, error) { return "", nil }
-func (m *mockVPNClients) Apply() error            { return m.applyErr }
+func (m *mockVPNClients) Apply() error            { m.applyCalls++; return m.applyErr }
 func (m *mockVPNClients) Restart() error          { return nil }
 func (m *mockVPNClients) RestartXray() error      { return nil }
 func (m *mockVPNClients) Stop() error             { return nil }
 func (m *mockVPNClients) Update() error           { return nil }
 func (m *mockVPNClients) Platform() (vpnconfig.PlatformInfo, error) {
+	m.platformCalls++
 	return m.platform, m.platformErr
 }
 
@@ -125,7 +129,7 @@ func TestClientsHandler_HandleClients_WithClients(t *testing.T) {
 	if !strings.Contains(sender.lastText, "192\\.168\\.50\\.20") {
 		t.Errorf("expected message to contain escaped 192.168.50.20/32, got: %s", sender.lastText)
 	}
-	// 2 clients x 2 buttons + 1 Add row = 3 rows
+	// A row per client (pause or resume, move, remove) + the Add/Close row = 3 rows
 	if len(sender.lastKeyboard.InlineKeyboard) != 3 {
 		t.Errorf("expected 3 keyboard rows, got %d", len(sender.lastKeyboard.InlineKeyboard))
 	}
@@ -659,4 +663,367 @@ func TestClientsHandler_HandleAddRoute_DetachesTheAddressFromTheFailover(t *test
 	if fo := config.savedConfig.Xray.Failover; fo == nil || len(fo.Clients) != 0 || len(fo.Added) != 0 {
 		t.Fatalf("failover %+v; the restore would take the address off the tunnel it was just put on", fo)
 	}
+}
+
+// moveCfg is 192.168.50.10 on Xray, which excludes ru, and 192.168.50.30 on wgc1.
+func moveCfg() *vpnconfig.VPNDirectorConfig {
+	return &vpnconfig.VPNDirectorConfig{
+		Xray: vpnconfig.XrayConfig{Clients: []string{"192.168.50.10"}, ExcludeSets: []string{"ru"}},
+		TunnelDirector: vpnconfig.TunnelDirectorConfig{Tunnels: map[string]vpnconfig.TunnelConfig{
+			"wgc1": {Clients: []string{"192.168.50.30"}, Exclude: []string{"ru"}},
+		}},
+	}
+}
+
+// movePlatform lists OpenVPN0 up and Wireguard1 down.
+func movePlatform() vpnconfig.PlatformInfo {
+	return vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "OpenVPN0", Connected: true, Description: "office"},
+		{ID: "Wireguard1", Connected: false},
+	}}
+}
+
+func moveCallback(data string) *tgbotapi.CallbackQuery {
+	return &tgbotapi.CallbackQuery{
+		Data:    data,
+		Message: &tgbotapi.Message{MessageID: 42, Chat: &tgbotapi.Chat{ID: 100}},
+	}
+}
+
+func TestClientsHandler_ListOffersAMoveButtonPerClient(t *testing.T) {
+	sender := &mockSenderClients{}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: &mockConfigClients{vpnConfig: moveCfg()}})
+	h.HandleClients(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 100}})
+
+	row := sender.lastKeyboard.InlineKeyboard[0]
+	if len(row) != 3 || *row[1].CallbackData != "clients:move:192.168.50.10" || row[1].Text != "\U0001f500 192.168.50.10" {
+		t.Fatalf("row 0 = %+v, want pause, move, remove", row)
+	}
+}
+
+// An entry an older build saved as IPv6 goes on no route: it can be paused or
+// removed, not moved.
+func TestClientsHandler_NoMoveButtonForAnAddressNoRouteTakes(t *testing.T) {
+	cfg := &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{Clients: []string{"fd00::10"}}}
+	sender := &mockSenderClients{}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: &mockConfigClients{vpnConfig: cfg}})
+	h.HandleClients(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 100}})
+
+	if row := sender.lastKeyboard.InlineKeyboard[0]; len(row) != 2 {
+		t.Fatalf("row 0 = %+v, want pause and remove only", row)
+	}
+}
+
+func TestClientsHandler_MoveKeyboardMarksTheCurrentRoute(t *testing.T) {
+	sender := &mockSenderClients{}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: &mockConfigClients{vpnConfig: moveCfg()}, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:move:192.168.50.10"))
+
+	rows := sender.editKeyboard.InlineKeyboard
+	want := []struct{ text, data string }{
+		{"✓ xray", "clients:to:xray:192.168.50.10"},
+		{"OpenVPN0 office", "clients:to:OpenVPN0:192.168.50.10"},
+		{"Wireguard1 (down)", "clients:to:Wireguard1:192.168.50.10"},
+		{"wgc1 (unknown)", "clients:to:wgc1:192.168.50.10"},
+		{"« Back", "clients:rm_no"},
+	}
+	if len(rows) != len(want) {
+		t.Fatalf("rows = %+v", rows)
+	}
+	for i, w := range want {
+		if rows[i][0].Text != w.text || *rows[i][0].CallbackData != w.data {
+			t.Errorf("row %d = %q %q, want %q %q", i, rows[i][0].Text, *rows[i][0].CallbackData, w.text, w.data)
+		}
+	}
+	if sender.editMsgID != 42 {
+		t.Errorf("editMsgID = %d, want the list replaced", sender.editMsgID)
+	}
+}
+
+func TestClientsHandler_MoveToATunnel(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:OpenVPN0:192.168.50.10"))
+
+	if config.savedConfig == nil {
+		t.Fatal("expected config to be saved")
+	}
+	if len(config.savedConfig.Xray.Clients) != 0 {
+		t.Errorf("xray.clients = %v", config.savedConfig.Xray.Clients)
+	}
+	tun := config.savedConfig.TunnelDirector.Tunnels["OpenVPN0"]
+	if strings.Join(tun.Clients, ",") != "192.168.50.10" || strings.Join(tun.Exclude, ",") != "ru" {
+		t.Errorf("OpenVPN0 = %+v", tun)
+	}
+	if vpn.applyCalls != 1 {
+		t.Errorf("applies = %d, want 1", vpn.applyCalls)
+	}
+	if sender.editMsgID != 42 {
+		t.Errorf("the list was not redrawn: editMsgID = %d", sender.editMsgID)
+	}
+}
+
+func TestClientsHandler_MoveToADownTunnelAsksFirst(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:Wireguard1:192.168.50.10"))
+
+	if config.savedConfig != nil || vpn.applyCalls != 0 {
+		t.Fatal("a move to a tunnel that is down happens only once confirmed")
+	}
+	if !strings.Contains(sender.editText, "Wireguard1 is down") {
+		t.Errorf("edit text = %q", sender.editText)
+	}
+	row := sender.editKeyboard.InlineKeyboard[0]
+	if len(row) != 2 || *row[0].CallbackData != "clients:toyes:Wireguard1:192.168.50.10" || *row[1].CallbackData != "clients:rm_no" {
+		t.Errorf("confirmation row = %+v", row)
+	}
+}
+
+func TestClientsHandler_MoveConfirmedToADownTunnel(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:toyes:Wireguard1:192.168.50.10"))
+
+	if config.savedConfig == nil {
+		t.Fatal("expected config to be saved")
+	}
+	if got := config.savedConfig.TunnelDirector.Tunnels["Wireguard1"].Clients; strings.Join(got, ",") != "192.168.50.10" {
+		t.Errorf("Wireguard1 = %v", got)
+	}
+	if vpn.applyCalls != 1 {
+		t.Errorf("applies = %d, want 1", vpn.applyCalls)
+	}
+}
+
+func TestClientsHandler_MoveToTheRouteItIsOnChangesNothing(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:xray:192.168.50.10"))
+
+	if config.savedConfig != nil || vpn.applyCalls != 0 {
+		t.Errorf("saved %v, applies %d: nothing may happen", config.savedConfig, vpn.applyCalls)
+	}
+	if sender.editMsgID != 42 {
+		t.Errorf("the list was not redrawn: editMsgID = %d", sender.editMsgID)
+	}
+}
+
+func TestClientsHandler_MoveOfAClientThatIsGoneRedrawsTheList(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:OpenVPN0:192.168.50.99"))
+
+	if config.savedConfig != nil || vpn.applyCalls != 0 {
+		t.Errorf("saved %v, applies %d: nothing may happen", config.savedConfig, vpn.applyCalls)
+	}
+	if sender.editMsgID != 42 {
+		t.Errorf("the list was not redrawn: editMsgID = %d", sender.editMsgID)
+	}
+}
+
+func TestClientsHandler_MoveToARouteNoLongerAvailable(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:Wireguard9:192.168.50.10"))
+
+	if config.savedConfig != nil {
+		t.Error("a route the router does not have must not be saved")
+	}
+	if len(sender.plainTexts) == 0 || !strings.Contains(sender.plainTexts[len(sender.plainTexts)-1], "route Wireguard9 is no longer available") {
+		t.Errorf("plain texts = %v", sender.plainTexts)
+	}
+}
+
+// The buttons carry the stored spelling; the paused entry follows the address
+// to the spelling it is stored under now.
+func TestClientsHandler_MoveKeepsThePausedState(t *testing.T) {
+	cfg := moveCfg()
+	cfg.Xray.Clients = []string{"192.168.50.10/32"}
+	cfg.PausedClients = []string{"192.168.50.10/32"}
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: cfg}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:OpenVPN0:192.168.50.10/32"))
+
+	if config.savedConfig == nil {
+		t.Fatal("expected config to be saved")
+	}
+	if got := config.savedConfig.TunnelDirector.Tunnels["OpenVPN0"].Clients; strings.Join(got, ",") != "192.168.50.10" {
+		t.Errorf("OpenVPN0 = %v", got)
+	}
+	if strings.Join(config.savedConfig.PausedClients, ",") != "192.168.50.10" {
+		t.Errorf("paused_clients = %v", config.savedConfig.PausedClients)
+	}
+}
+
+// Tunnel Director marks private IPv4 addresses and networks only
+// (vpnconfig.TDCarries): on a tunnel route any other address is on no route at
+// all, out through the WAN. The API answers 400; the bot says why and redraws.
+func TestClientsHandler_MoveToATunnelRefusesAnAddressTunnelDirectorCannotCarry(t *testing.T) {
+	cfg := moveCfg()
+	cfg.Xray.Clients = append(cfg.Xray.Clients, "100.64.0.8")
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: cfg}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:toyes:OpenVPN0:100.64.0.8"))
+
+	if config.savedConfig != nil || vpn.applyCalls != 0 {
+		t.Fatalf("saved %v, applies %d: nothing may happen", config.savedConfig, vpn.applyCalls)
+	}
+	if len(sender.plainTexts) == 0 || !strings.Contains(sender.plainTexts[len(sender.plainTexts)-1], "Tunnel Director routes private IPv4 addresses only; 100.64.0.8 can go on xray") {
+		t.Errorf("plain texts = %v", sender.plainTexts)
+	}
+	if sender.editMsgID != 42 {
+		t.Errorf("the list was not redrawn: editMsgID = %d", sender.editMsgID)
+	}
+}
+
+func TestClientsHandler_HandleAddRoute_RefusesATunnelForAnAddressTunnelDirectorCannotCarry(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+	h.mu.Lock()
+	h.addState[100] = "100.64.0.8"
+	h.mu.Unlock()
+
+	h.HandleCallback(moveCallback("clients:route:wgc1"))
+
+	if config.savedConfig != nil || vpn.applyCalls != 0 {
+		t.Fatalf("saved %v, applies %d: nothing may happen", config.savedConfig, vpn.applyCalls)
+	}
+	if len(sender.plainTexts) == 0 || !strings.Contains(sender.plainTexts[len(sender.plainTexts)-1], "Tunnel Director routes private IPv4 addresses only; 100.64.0.8 can go on xray") {
+		t.Errorf("plain texts = %v", sender.plainTexts)
+	}
+	if sender.editMsgID != 42 {
+		t.Errorf("the list was not redrawn: editMsgID = %d", sender.editMsgID)
+	}
+}
+
+// A configured tunnel the platform does not list - "(unknown)" on the keyboard:
+// a typo, a connection deleted in the router, RCI silent - is one Tunnel
+// Director skips. The move asks first, as for a tunnel that is down.
+func TestClientsHandler_MoveToAnUnknownTunnelAsksFirst(t *testing.T) {
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:wgc1:192.168.50.10"))
+
+	if config.savedConfig != nil || vpn.applyCalls != 0 {
+		t.Fatal("a move to a tunnel the router does not list happens only once confirmed")
+	}
+	want := "wgc1 is not on the router's tunnel list: until it is, Tunnel Director does not route 192.168.50.10 through it. Move anyway?"
+	if !strings.Contains(sender.editText, telegramEscaped(want)) {
+		t.Errorf("edit text = %q", sender.editText)
+	}
+	row := sender.editKeyboard.InlineKeyboard[0]
+	if len(row) != 2 || *row[0].CallbackData != "clients:toyes:wgc1:192.168.50.10" || *row[1].CallbackData != "clients:rm_no" {
+		t.Errorf("confirmation row = %+v", row)
+	}
+}
+
+func TestClientsHandler_MoveConfirmedToAnUnknownTunnel(t *testing.T) {
+	config := &mockConfigClients{vpnConfig: moveCfg()}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: &mockSenderClients{}, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:toyes:wgc1:192.168.50.10"))
+
+	if config.savedConfig == nil || vpn.applyCalls != 1 {
+		t.Fatalf("saved %v, applies %d: the confirmed move goes ahead", config.savedConfig, vpn.applyCalls)
+	}
+	if got := config.savedConfig.TunnelDirector.Tunnels["wgc1"].Clients; strings.Join(got, ",") != "192.168.50.30,192.168.50.10" {
+		t.Errorf("wgc1 = %v", got)
+	}
+}
+
+// The ✓ route of a client on a tunnel that is down: tapping it moves nothing,
+// so it asks nothing either.
+func TestClientsHandler_TappingTheCurrentRouteAsksNothing(t *testing.T) {
+	cfg := moveCfg()
+	cfg.Xray.Clients = nil
+	cfg.TunnelDirector.Tunnels["Wireguard1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.50.10"}}
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: cfg}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:to:Wireguard1:192.168.50.10"))
+
+	if strings.Contains(sender.editText, "Move anyway") {
+		t.Errorf("edit text = %q: a tap on the current route asked", sender.editText)
+	}
+	if config.savedConfig != nil || vpn.applyCalls != 0 {
+		t.Errorf("saved %v, applies %d: nothing may happen", config.savedConfig, vpn.applyCalls)
+	}
+	if sender.editMsgID != 42 {
+		t.Errorf("the list was not redrawn: editMsgID = %d", sender.editMsgID)
+	}
+}
+
+// main is Tunnel Director's own route, which no platform lists: never
+// "(unknown)", and a move to it asks nothing - the platform included, once
+// the config has main.
+func TestClientsHandler_MainIsNeverUnknown(t *testing.T) {
+	cfg := moveCfg()
+	cfg.TunnelDirector.Tunnels["main"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.50.40"}}
+	sender := &mockSenderClients{}
+	config := &mockConfigClients{vpnConfig: cfg}
+	vpn := &mockVPNClients{platform: movePlatform()}
+	h := NewClientsHandler(&Deps{Sender: sender, Config: config, VPN: vpn})
+
+	h.HandleCallback(moveCallback("clients:move:192.168.50.10"))
+	found := false
+	for _, row := range sender.editKeyboard.InlineKeyboard {
+		if *row[0].CallbackData == "clients:to:main:192.168.50.10" {
+			found = true
+			if row[0].Text != "main" {
+				t.Errorf("main's button = %q", row[0].Text)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("no main button: %+v", sender.editKeyboard.InlineKeyboard)
+	}
+
+	asked := vpn.platformCalls
+	h.HandleCallback(moveCallback("clients:to:main:192.168.50.10"))
+	if config.savedConfig == nil || vpn.applyCalls != 1 {
+		t.Fatalf("saved %v, applies %d: a move to main asks nothing", config.savedConfig, vpn.applyCalls)
+	}
+	if vpn.platformCalls != asked {
+		t.Errorf("platform calls %d: a move to a configured main asks the platform nothing", vpn.platformCalls-asked)
+	}
+}
+
+// telegramEscaped is s as the bot sends it in MarkdownV2.
+func telegramEscaped(s string) string {
+	return telegram.EscapeMarkdownV2(s)
 }

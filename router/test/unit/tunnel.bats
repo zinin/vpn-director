@@ -113,7 +113,7 @@ load '../test_helper'
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
-    grep -q -- '-t mangle -I PREROUTING 4 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    grep -q -- '-t mangle -I PREROUTING 4 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW' /tmp/bats_iptables_calls.log
 }
 
 # ============================================================================
@@ -476,11 +476,11 @@ marks_in_place() {
 }
 
 # Deleting the hash on a failover route failure sent every later apply down the
-# rebuild path: tunnel_stop removes TUN_DIR, the PREROUTING jumps and every
-# ip rule, so unrelated Tunnel Director clients lose routing until the
-# fallback interface is up. The watch retries apply every 30s while
-# pendingApply is set; hooks and Web UI Apply do the same.
-@test "tunnel_apply: a failed failover route still records the hash so the next apply does not tear down" {
+# rebuild path, which then began with tunnel_stop: it removed TUN_DIR, the
+# PREROUTING jumps and every ip rule, so unrelated Tunnel Director clients lost
+# routing until the fallback interface was up. The watch retries apply every
+# 30s while pendingApply is set; hooks and Web UI Apply do the same.
+@test "tunnel_apply: a failed failover route still records the hash so the next apply does not rebuild" {
     load_common
     source "$LIB_DIR/firewall.sh"
     local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-failover-route-hash.json"
@@ -513,7 +513,7 @@ marks_in_place() {
 }
 
 # iproute2 4.4 refuses "ip rule show pref N". A missing failover ip rule must
-# not delete the hash (that would tunnel_stop every client) and must not
+# not delete the hash (the up-to-date path puts the rule back) and must not
 # return 1 (that would fail S99 start). The watch reads failover_ready instead.
 @test "tunnel_apply: a missing failover ip rule keeps the hash and does not fail the apply" {
     load_common
@@ -554,10 +554,9 @@ marks_in_place() {
 }
 
 # A transient ip rule add failure used to be permanent. The rebuild records the
-# hash anyway - dropping it would send the next apply through tunnel_stop and
-# take TUN_DIR down for every client - so every later apply takes the up-to-date
-# path, which only looked for the rule. With one fallback tunnel the watch then
-# waited for failover_ready that nothing would ever write.
+# hash anyway, so every later apply takes the up-to-date path, which only looked
+# for the rule. With one fallback tunnel the watch then waited for
+# failover_ready that nothing would ever write.
 @test "tunnel_apply: up-to-date path re-installs a missing failover ip rule" {
     load_common
     source "$LIB_DIR/firewall.sh"
@@ -854,12 +853,13 @@ load_tunnel_module_with() {
 }
 
 # Recording the hash is skipped when a tunnel is unknown to the platform, but
-# TUN_DIR_TABLES is written all the same. The cleanup gate keyed off the hash
-# alone, so the next apply skipped tunnel_stop and never released the recorded
-# tables: on Keenetic table 2000+idx keeps the previous tunnel's route while the
-# index is handed to another tunnel, and marked traffic leaves through the wrong
-# tunnel while the log reports the fallback to main.
-@test "tunnel_apply: releases the recorded tables before reusing their indices when no hash was recorded" {
+# TUN_DIR_TABLES is written all the same, and a rebuild reads the slots in use
+# from it, not from the hash. A slot the new layout drops is released after the
+# swap - its ip rule, and on Keenetic table 2000+idx with its route. A cleanup
+# keyed off the hash alone once left such a table holding the previous tunnel's
+# route while its index went to another tunnel, and marked traffic left through
+# the wrong tunnel while the log reported the fallback to main.
+@test "tunnel_apply: releases a recorded slot the new layout drops when no hash was recorded" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc9":{"clients":["192.168.1.6"]}}'
     run tunnel_apply
     assert_success
@@ -977,7 +977,7 @@ load_tunnel_module_with() {
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
-    grep -q -- '-I PREROUTING 2 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 2 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW' /tmp/bats_iptables_calls.log
 }
 
 # The jump is the whole point of the chain. A platform that cannot name its LAN
@@ -1032,8 +1032,8 @@ load_tunnel_module_with() {
     # Each interface asks for its own position (base_pos, base_pos + 1, ...), so
     # no jump displaces another and the next apply finds both already in place
     # instead of purging and re-inserting every one of them.
-    grep -q -- '-I PREROUTING 4 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
-    grep -q -- '-I PREROUTING 5 -i br1 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 4 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 5 -i br1 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW' /tmp/bats_iptables_calls.log
 }
 
 # ============================================================================
@@ -1117,10 +1117,10 @@ load_tunnel_module_with() {
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
-    run grep -- '-A TUN_DIR' /tmp/bats_iptables_calls.log
-    assert_line --index 0 'iptables -t mangle -A TUN_DIR -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
-    assert_line --index 1 'iptables -t mangle -A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j PPE'
-    assert_line --index 2 'iptables -t mangle -A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run grep -- '-A TUN_DIR_NEW' /tmp/bats_iptables_calls.log
+    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
+    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j PPE'
+    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
 }
 
 # Merlin names no target (platform_tunnel_offload_target returns 1), and the
@@ -1132,9 +1132,9 @@ load_tunnel_module_with() {
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
-    run grep -- '-A TUN_DIR' /tmp/bats_iptables_calls.log
-    assert_line --index 0 'iptables -t mangle -A TUN_DIR -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
-    assert_line --index 1 'iptables -t mangle -A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run grep -- '-A TUN_DIR_NEW' /tmp/bats_iptables_calls.log
+    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
+    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
     assert_equal "${#lines[@]}" 2
 }
 
@@ -1162,9 +1162,9 @@ load_tunnel_module_with() {
 
     tunnel_apply
 
-    grep -q -- '-A TUN_DIR -s 192.168.1.5 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
-    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
-    refute grep -q -- '-A TUN_DIR -s 192.168.1.1000' /tmp/bats_iptables_calls.log
+    grep -q -- '-A TUN_DIR_NEW -s 192.168.1.5 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW' /tmp/bats_iptables_calls.log
+    refute grep -q -- '-A TUN_DIR_NEW -s 192.168.1.1000' /tmp/bats_iptables_calls.log
     grep -q "WARN.*192.168.1.1000" "$LOG_FILE"
     # A bad address is a state of the configuration, not a failure to retry.
     [ -f "$TUN_DIR_HASH" ]
@@ -1175,7 +1175,7 @@ load_tunnel_module_with() {
 @test "tunnel_apply: a MARK rule that does not go in costs that client only" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
     iptables() {
-        if [[ $* == *"-A TUN_DIR -s 192.168.1.5 "*"-j MARK"* ]]; then
+        if [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.5 "*"-j MARK"* ]]; then
             echo "iptables $*" >> /tmp/bats_iptables_calls.log
             return 4
         fi
@@ -1185,8 +1185,8 @@ load_tunnel_module_with() {
 
     tunnel_apply
 
-    grep -q -- '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
-    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    grep -q -- '-A TUN_DIR_NEW -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR_NEW' /tmp/bats_iptables_calls.log
     grep -q "ERROR.*192.168.1.5" "$LOG_FILE"
     # Not recorded as up-to-date: the next apply rebuilds and retries the rule.
     [ ! -f "$TUN_DIR_HASH" ]
@@ -1209,7 +1209,25 @@ load_tunnel_module_with() {
     export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
     platform_tunnel_route_ensure() { return 0; }
     iptables() {
-        [[ $* == *"-A TUN_DIR -s 192.168.1.8 "*"-j MARK"* ]] && return 4
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.8 "*"-j MARK"* ]] && return 4
+        command iptables "$@"
+    }
+
+    tunnel_apply
+
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# Marked, yet not carried: the fast path takes the client's flows past mangle
+# after their first packets, and those leave through the WAN unmarked. On
+# failover_ready the watch would commit the failover and count the client carried.
+@test "tunnel_apply: no failover_ready when a failover client's offload opt-out did not go in" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.8 "*"-j PPE"* ]] && return 4
         command iptables "$@"
     }
 
@@ -1234,30 +1252,28 @@ load_tunnel_module_with() {
 
     [ ! -e "$TUN_DIR_FAILOVER_READY" ]
     grep -q "ERROR.*PREROUTING" "$LOG_FILE"
+    [ ! -f "$TUN_DIR_HASH" ]
 }
 
-# The rebuild records its hash anyway - dropping it would send the next apply
-# through tunnel_stop - so the up-to-date path is the only one left to put a
-# missing jump back. It used to look at the routes and rules only.
+# A jump that goes missing after a recorded rebuild is put back by the
+# up-to-date path, which leaves a jump that is there where it is. (A rebuild
+# whose own jumps did not go in records no hash: the next apply rebuilds.)
 @test "tunnel_apply: the up-to-date path puts a missing PREROUTING jump back" {
     load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
     export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
     platform_tunnel_route_ensure() { return 0; }
-    iptables() {
-        [[ $* == *" -I PREROUTING "* ]] && return 4
-        command iptables "$@"
-    }
-    tunnel_apply
-    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
 
-    unset -f iptables
+    # The stateless mock lists no jump: the one the rebuild put in is gone.
     fw_chain_exists() { return 0; }
     marks_in_place
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
     assert_output --partial "up-to-date"
-    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR$' /tmp/bats_iptables_calls.log
     [ -f "$TUN_DIR_FAILOVER_READY" ]
 }
 
@@ -1281,7 +1297,7 @@ load_tunnel_module_with() {
     run tunnel_apply
     assert_success
     assert_output --partial "rebuilding"
-    grep -q -- '-A TUN_DIR -s 192.168.1.8 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
+    grep -q -- '-A TUN_DIR_NEW -s 192.168.1.8 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000' /tmp/bats_iptables_calls.log
     [ -f "$TUN_DIR_FAILOVER_READY" ]
 }
 
@@ -1299,11 +1315,11 @@ load_tunnel_module_with() {
     run tunnel_apply
     assert_success
     assert_output --partial "rebuilding"
-    grep -q -- '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000' /tmp/bats_iptables_calls.log
+    grep -q -- '-A TUN_DIR_NEW -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000' /tmp/bats_iptables_calls.log
 }
 
-# A chain that still holds every MARK rule is left alone: a rebuild starts with
-# tunnel_stop, a window in which no client of any tunnel is marked.
+# A chain that still holds every MARK rule is left alone: a rebuild would put
+# every rule and every jump in again for nothing.
 @test "tunnel_apply: the up-to-date path leaves a chain with every MARK rule alone" {
     load_tunnel_module
     run tunnel_apply
@@ -1325,7 +1341,7 @@ load_tunnel_module_with() {
 
 # A client the rebuild does not mark - no IPv4 address, or one outside RFC1918 -
 # has no MARK rule to find. Looking for one would rebuild the chain on every
-# apply, each time a window in which no client is marked.
+# apply.
 @test "tunnel_apply: a client the rebuild skips does not rebuild the chain on every apply" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","100.64.0.8","192.168.1.1000"]}}'
     run tunnel_apply
@@ -1412,4 +1428,697 @@ ip_rule_show_cut_short() {
     run _tunnel_rule_ensure 0 ovpnc2
     assert_success
     [ ! -e "$BATS_TEST_TMPDIR/ip_writes.log" ]
+}
+
+# ============================================================================
+# The rebuild in place: stable slots, make before break
+# ============================================================================
+
+@test "_tunnel_collect_applied: without a record the slots follow the JSON order from 0" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    _tunnel_init
+    _tunnel_collect_applied /dev/null > "$BATS_TEST_TMPDIR/slots" 2>/dev/null
+    run cat "$BATS_TEST_TMPDIR/slots"
+    assert_output $'0 wgc1\n1 ovpnc2'
+}
+
+# A slot is a mark, a preference and on Keenetic a table. A tunnel that keeps its
+# clients keeps its slot; a new one takes a slot neither layout holds, since the
+# slot this apply frees still carries marks until the swap.
+@test "_tunnel_collect_applied: a recorded tunnel keeps its idx, a new one takes the lowest idx neither layout holds" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.7"]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    _tunnel_init
+    printf '0 wgc1\n1 ovpnc2\n' > "$BATS_TEST_TMPDIR/prev"
+    _tunnel_collect_applied "$BATS_TEST_TMPDIR/prev" > "$BATS_TEST_TMPDIR/slots" 2>/dev/null
+    run cat "$BATS_TEST_TMPDIR/slots"
+    assert_output $'2 ovpnc1\n1 ovpnc2'
+}
+
+@test "_tunnel_collect_applied: a tunnel that lost its clients gives up its slot" {
+    load_tunnel_module_with '{"wgc1":{"clients":[]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    _tunnel_init
+    printf '0 wgc1\n1 ovpnc2\n' > "$BATS_TEST_TMPDIR/prev"
+    _tunnel_collect_applied "$BATS_TEST_TMPDIR/prev" > "$BATS_TEST_TMPDIR/slots" 2>/dev/null
+    run cat "$BATS_TEST_TMPDIR/slots"
+    assert_output '1 ovpnc2'
+}
+
+# A rebuild used to start with tunnel_stop: every Tunnel Director client left
+# through the WAN until the last rule was back - on every change of any client.
+@test "tunnel_apply: a rebuild moves the jump to the rebuilt chain and never flushes the live one" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+
+    run tunnel_apply
+    assert_success
+    refute_output --partial "Stopping Tunnel Director"
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+    run iptables -t mangle -S PREROUTING
+    assert_output $'-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run iptables -t mangle -S TUN_DIR_NEW
+    assert_failure
+}
+
+# The move of a client off its tunnel (Review Focus 4): the tunnel that loses
+# its last client gives up its slot after the swap; the other keeps its mark,
+# its rule and its table, touched by nothing.
+@test "tunnel_apply: a tunnel that keeps its clients keeps its slot, its ip rule and its table" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n1 ovpnc2'
+
+    platform_tunnel_table_release() { echo "release $1 $2" >> "$BATS_TEST_TMPDIR/release.log"; }
+    : > /tmp/bats_ip_calls.log
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":[]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+
+    run cat "$TUN_DIR_TABLES"
+    assert_output '1 ovpnc2'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000'
+    refute grep -q 'pref 16385' /tmp/bats_ip_calls.log
+    grep -q 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1' /tmp/bats_ip_calls.log
+    run cat "$BATS_TEST_TMPDIR/release.log"
+    assert_output 'release wgc1 0'
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x20000/0xff0000 lookup ovpnc2'
+    refute_line --partial '16384:'
+}
+
+@test "tunnel_apply: a new slot's ip rule goes in before the swap, a released one's goes after it" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    ip() {
+        if [[ ${1:-} == rule && ( ${2:-} == add || ${2:-} == del ) ]]; then
+            echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
+        fi
+        command ip "$@"
+    }
+    iptables() {
+        [[ $* == *" -E "* ]] && echo "iptables $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command iptables "$@"
+    }
+    TUN_DIR_TUNNELS_JSON='{"ovpnc2":{"clients":["192.168.1.6"]}}'
+
+    run tunnel_apply
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/order.log"
+    assert_line --index 0 'ip rule del pref 16385'
+    assert_line --index 1 'ip rule add pref 16385 fwmark 0x20000/0xff0000 lookup ovpnc2'
+    assert_line --index 2 'iptables -t mangle -E TUN_DIR_NEW TUN_DIR'
+    assert_line --index 3 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+}
+
+# Review Focus 2: an NDM rebuild deletes our chain and jumps; the ip rules,
+# the routes and TUN_DIR_TABLES survive it. The rebuild puts the chain back and
+# leaves every rule of a kept tunnel as it is.
+@test "tunnel_apply: after NDM deleted the chain, the rebuild touches no ip rule of a kept tunnel" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    rm -rf "$BATS_IPT_DIR/mangle"
+    platform_tunnel_table_release() { echo "release $1 $2" >> "$BATS_TEST_TMPDIR/release.log"; }
+    : > /tmp/bats_ip_calls.log
+
+    run tunnel_apply
+    assert_success
+    assert_output --partial "rebuilding"
+    refute grep -qE 'ip rule (add|del)' /tmp/bats_ip_calls.log
+    [ ! -e "$BATS_TEST_TMPDIR/release.log" ]
+    run iptables -t mangle -S PREROUTING
+    assert_output $'-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    [ -f "$TUN_DIR_HASH" ]
+}
+
+# Review Focus 1: Merlin's firewall start empties TUN_DIR, deletes nothing and
+# takes the jump; firewall-start applies again.
+@test "tunnel_apply: after Merlin emptied mangle, the rebuild marks every client again" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    iptables -t mangle -F
+
+    run tunnel_apply
+    assert_success
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.5 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run iptables -t mangle -S PREROUTING
+    assert_output $'-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+# A swap that did not take over every interface leaves the old chain marking with
+# the old slots: they are not released, and the hash is not recorded, so the
+# next apply rebuilds, finishes the swap and releases them.
+@test "tunnel_apply: a rebuild whose swap did not finish records no hash and releases no slot" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+
+    eval "real_$(declare -f swap_fw_chain)"
+    swap_fw_chain() { return 3; }
+    platform_tunnel_table_release() { echo "release $1 $2" >> "$BATS_TEST_TMPDIR/release.log"; }
+    TUN_DIR_TUNNELS_JSON='{"ovpnc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    [ ! -f "$TUN_DIR_HASH" ]
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n1 ovpnc2'
+    refute grep -q "release wgc1" "$BATS_TEST_TMPDIR/release.log"
+
+    swap_fw_chain() { real_swap_fw_chain "$@"; }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
+    run cat "$TUN_DIR_TABLES"
+    assert_output '1 ovpnc2'
+    grep -q "release wgc1 0" "$BATS_TEST_TMPDIR/release.log"
+}
+
+@test "tunnel_apply: TUN_DIR_FORCE_REBUILD rebuilds a chain that reads up to date" {
+    load_tunnel_module
+    run tunnel_apply
+    assert_success
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    export TUN_DIR_FORCE_REBUILD=1
+
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rebuilding Tunnel Director in place"
+    refute_output --partial "up-to-date"
+}
+
+@test "tunnel_stop: removes a shadow chain an interrupted swap left" {
+    load_tunnel_module
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_stop
+    assert_success
+    grep -q -- '-t mangle -X TUN_DIR_NEW' /tmp/bats_iptables_calls.log
+}
+
+# tunnel_stop, which every rebuild used to start with, removed failover_ready
+# with the rest. The watch trusts the marker over the apply's exit status, so a
+# rebuild that dies part-way must not leave an earlier apply's "ready" behind.
+@test "tunnel_apply: a rebuild that dies part-way leaves no failover_ready" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+
+    swap_fw_chain() { exit 1; }
+    TUN_DIR_TUNNELS_JSON='{"ovpnc2":{"clients":["192.168.1.8","192.168.1.9"]}}'
+    run tunnel_apply
+    assert_failure
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# A rebuild the platform refuses changes nothing, and must not leave an earlier
+# apply's failover_ready either: the watch takes the marker without an apply of
+# its own. After Merlin's firewall start emptied mangle, a busy xtables lock
+# fails the PREROUTING listing Merlin reads the position from; the failover
+# clients, off Xray, would have no MARK rule and no jump, and leave through the
+# WAN.
+@test "tunnel_apply: a rebuild refused for want of a PREROUTING position leaves no failover_ready" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    [ -f "$TUN_DIR_HASH" ]
+
+    iptables -t mangle -F
+    platform_prerouting_base_pos() { return 1; }
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "Cannot determine the PREROUTING insert position"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+    [ ! -e "$TUN_DIR_HASH" ]
+}
+
+@test "tunnel_apply: a rebuild refused for want of a LAN interface leaves no failover_ready" {
+    load_tunnel_module_with '{"ovpnc2":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc2 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    platform_tunnel_route_ensure() { return 0; }
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    [ -f "$TUN_DIR_HASH" ]
+
+    iptables -t mangle -F
+    platform_lan_ifaces() { return 1; }
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "Cannot determine the LAN interfaces"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+    [ ! -e "$TUN_DIR_HASH" ]
+}
+
+# With stable slots the mark field can be full while the tunnels would fit it:
+# the slot this apply frees still carries marks until the swap, so it is not
+# handed out before the next apply. That apply has to come - the hash is not
+# recorded - or the skipped tunnel's clients would stay unrouted until the
+# configuration changed again. A two-bit field holds three slots.
+@test "tunnel_apply: a tunnel skipped for a slot the same apply frees gets it on the next apply" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]},"ovpnc1":{"clients":["192.168.1.7"]}}'
+    export TUN_DIR_MARK_MASK=0x00030000
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n1 wgc2\n2 ovpnc1'
+
+    # 192.168.1.5 moves from wgc1 to ovpnc2.
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":[]},"wgc2":{"clients":["192.168.1.6"]},"ovpnc1":{"clients":["192.168.1.7"]},"ovpnc2":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Too many tunnels (max 3); skipping 'ovpnc2'"
+    [ ! -f "$TUN_DIR_HASH" ]
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'1 wgc2\n2 ovpnc1'
+
+    run tunnel_apply
+    assert_success
+    refute_output --partial "Too many tunnels"
+    [ -f "$TUN_DIR_HASH" ]
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'1 wgc2\n2 ovpnc1\n0 ovpnc2'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.5 -m mark --mark 0x0/0x30000 -j MARK --set-xmark 0x10000/0x30000'
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0x30000 lookup ovpnc2'
+}
+
+# ============================================================================
+# What tunnel_apply reports as not carried (TUNNEL_UNCARRIED)
+# ============================================================================
+
+@test "tunnel_apply: every run starts its report afresh, the no-tunnels branch included" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    TUNNEL_UNCARRIED=(192.168.1.99)
+    tunnel_apply
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+
+    TUNNEL_UNCARRIED=(192.168.1.99)
+    TUN_DIR_TUNNELS_JSON='{}'
+    tunnel_apply
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+}
+
+# KeeneticOS binds an established forwarded flow to a fast path that never
+# returns to mangle. Without the opt-out rule only a flow's first packets are
+# marked, and the rest leave through the WAN: the client is not carried.
+@test "tunnel_apply: reports a client whose fast-path opt-out did not go in" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    use_stateful_iptables
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.5 "*"-j PPE" ]] && return 4
+        command iptables "$@"
+    }
+    tunnel_apply
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.5"
+}
+
+# The up-to-date path re-ensures the routes, the ip rules and the jumps. A slot
+# whose route does not go in routes nowhere, and a jump that does not go back in
+# leaves an interface with no Tunnel Director at all.
+@test "tunnel_apply: the up-to-date path reports the clients of a slot whose route does not go in" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    tunnel_apply
+    [ -f "$TUN_DIR_HASH" ]
+    platform_tunnel_route_ensure() { [[ $1 != wgc2 ]]; }
+
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.6"
+}
+
+@test "tunnel_apply: the up-to-date path reports every client when a missing jump does not go back in" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    tunnel_apply
+    [ -f "$TUN_DIR_HASH" ]
+    iptables -t mangle -D PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR
+    iptables() {
+        [[ $* == *" -I PREROUTING "* ]] && return 4
+        command iptables "$@"
+    }
+
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.5 192.168.1.6"
+}
+
+# M2: TUN_DIR_TABLES was written in place, emptied before the new lines went in.
+# An apply killed in that instant - or a full /tmp failing the write - left an
+# empty or partial record after the hash was already gone, and the next rebuild
+# handed out live slots as free ones. What the file holds while a write runs is
+# what such a kill leaves.
+@test "tunnel_apply: TUN_DIR_TABLES holds a whole record while it is written" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"ovpnc2":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n1 ovpnc2'
+
+    awk() {
+        if [[ ${1:-} == '!seen[$0]++' ]]; then
+            cat "$TUN_DIR_TABLES" >> "$BATS_TEST_TMPDIR/during_write"
+            printf -- '--\n' >> "$BATS_TEST_TMPDIR/during_write"
+        fi
+        command awk "$@"
+    }
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"ovpnc2":{"clients":[]},"wgc2":{"clients":["192.168.1.7"]}}'
+    run tunnel_apply
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/during_write"
+    assert_output $'0 wgc1\n1 ovpnc2\n--\n0 wgc1\n1 ovpnc2\n2 wgc2\n--'
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n2 wgc2'
+}
+
+# ============================================================================
+# The full apply keeps on Xray what Tunnel Director did not take (C1)
+# ============================================================================
+
+# full_apply - vpn-director.sh apply: Xray adds, Tunnel Director applies, and the
+# prune lets go of the clients that left Xray, except those Tunnel Director
+# reported it does not carry.
+full_apply() {
+    tproxy_apply
+    tunnel_apply
+    tproxy_prune ${TUNNEL_UNCARRIED[@]+"${TUNNEL_UNCARRIED[@]}"}
+}
+
+# load_full_apply - both modules on the stateful mocks: 192.168.1.100,
+# 192.168.1.101 and 100.64.0.8 on Xray, 192.168.1.5 on wgc1, applied once.
+load_full_apply() {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_TPROXY_PORT=12345 XRAY_ROUTE_TABLE=100 XRAY_RULE_PREF=200
+    export XRAY_FWMARK=0x100 XRAY_FWMARK_MASK=0x100 XRAY_CHAIN=XRAY_TPROXY
+    export XRAY_CLIENTS_IPSET=XRAY_CLIENTS XRAY_BYPASS_IPSET=TPROXY_BYPASS
+    export XRAY_SERVERS=1.2.3.4 XRAY_EXCLUDE_IPS= XRAY_EXCLUDE_SETS=
+    export XRAY_CLIENTS='192.168.1.100 192.168.1.101 100.64.0.8'
+    source "$LIB_DIR/tproxy.sh" --source-only
+    use_stateful_iptables
+    use_stateful_ipset
+    full_apply > /dev/null 2>&1
+    ipset test XRAY_CLIENTS 192.168.1.100 2>/dev/null
+}
+
+# move_100_to_wgc1 - the move under test, one change of the config:
+# 192.168.1.100 leaves Xray for wgc1.
+move_100_to_wgc1() {
+    XRAY_CLIENTS='192.168.1.101 100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.100"]}}'
+}
+
+@test "full apply: a client moved from Xray to a tunnel is let go once TUN_DIR marks it" {
+    load_full_apply
+    move_100_to_wgc1
+
+    run full_apply
+    assert_success
+    refute_output --partial "Kept in XRAY_CLIENTS"
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.100 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+    run ipset test XRAY_CLIENTS 192.168.1.101
+    assert_success
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+# (A) A busy xtables lock refuses "iptables -N TUN_DIR_NEW": swap_fw_chain leaves
+# the live chain, which never marked the client, and tunnel_apply returns 0. The
+# prune let the client go all the same, out through the WAN until the next
+# complete apply. That apply lets it go.
+@test "full apply: a client moved to a tunnel stays proxied when the rebuilt chain cannot be made" {
+    load_full_apply
+    move_100_to_wgc1
+    iptables() {
+        [[ $* == "-t mangle -N TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S TUN_DIR
+    refute_output --partial '192.168.1.100'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+
+    unset -f iptables
+    run full_apply
+    assert_success
+    refute_output --partial "Kept in XRAY_CLIENTS"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+}
+
+# (B) One refused rule, the moved client's MARK.
+@test "full apply: a client moved to a tunnel stays proxied when its MARK rule is refused" {
+    load_full_apply
+    move_100_to_wgc1
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.100 "*"-j MARK"* ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S TUN_DIR
+    refute_output --partial '-s 192.168.1.100 -m mark --mark 0x0/0xff0000 -j MARK'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+}
+
+# (C) The new PREROUTING jump is refused: br0 stays on the old chain. Every
+# client of the layout is reported, and only the one Xray still holds is kept:
+# 192.168.1.5 was never proxied and is not now.
+@test "full apply: a client moved to a tunnel stays proxied when the new PREROUTING jump is refused" {
+    load_full_apply
+    move_100_to_wgc1
+    iptables() {
+        [[ $* == *"-I PREROUTING "*"-j TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S PREROUTING
+    assert_line '-A PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.5
+    assert_failure
+}
+
+# (D) The fixture's rt_tables has no wgc9: the tunnel is skipped.
+@test "full apply: a client moved to a tunnel the platform does not list stays proxied" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.101 100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"wgc9":{"clients":["192.168.1.100"]}}'
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+}
+
+# (E) Tunnel Director skips an address outside RFC1918, and records the hash:
+# the skip is a state of the configuration. The next apply takes the up-to-date
+# path, which marks no such client either.
+@test "full apply: an address outside RFC1918 moved to a tunnel stays proxied, on the next apply too" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","100.64.0.8"]}}'
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 100.64.0.8 - they stay proxied"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_success
+
+    run full_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_success
+}
+
+# (F) The new slot's ip rule is refused: the client is marked, and the mark
+# goes nowhere but main. The rule goes back in on the up-to-date path, and the
+# prune after it lets the client go.
+@test "full apply: a client moved to a new tunnel stays proxied while the slot's ip rule is refused" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.101 100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.100"]}}'
+    ip() {
+        [[ $* == "rule add pref 16385 "* ]] && return 2
+        command ip "$@"
+    }
+
+    run full_apply
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.100 - they stay proxied"
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.100 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000'
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+
+    unset -f ip
+    run full_apply
+    assert_success
+    assert_output --partial "re-installed the ip rule at pref 16385"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_failure
+}
+
+# A client that left Xray for direct - deleted, or paused, which config.sh
+# subtracts the same way - is let go by the same prune that keeps the one
+# Tunnel Director did not take.
+@test "full apply: a client deleted from Xray is let go while one Tunnel Director did not take stays" {
+    load_full_apply
+    XRAY_CLIENTS='100.64.0.8'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.100"]}}'
+    iptables() {
+        [[ $* == "-t mangle -N TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+
+    run full_apply
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.101
+    assert_failure
+}
+
+# ============================================================================
+# main is no tunnel: its clients are never reported, nor kept on Xray
+# ============================================================================
+
+# main's slot sends a mark to the main table, which an unmarked packet reaches as
+# well: a client of main that Tunnel Director does not mark or route still goes
+# direct, which is what main means. Kept on Xray, it would be proxied instead.
+
+@test "tunnel_clients: prints the clients of every tunnel, main's left out" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.0/28"]},"main":{"clients":["192.168.1.6"]},"ovpnc1":{"clients":["10.0.0.7"]}}'
+    run tunnel_clients
+    assert_success
+    assert_output $'192.168.1.5\n192.168.1.0/28\n10.0.0.7'
+}
+
+@test "tunnel_apply: a swap that did not finish reports no client of main" {
+    load_tunnel_module_with '{"main":{"clients":["192.168.1.6"]},"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    iptables() {
+        [[ $* == *"-I PREROUTING "*"-j TUN_DIR_NEW" ]] && return 4
+        command iptables "$@"
+    }
+    tunnel_apply
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.5"
+}
+
+@test "tunnel_apply: a client of main whose offload opt-out or MARK is refused is not reported" {
+    load_tunnel_module_with '{"main":{"clients":["192.168.1.6","192.168.1.7"]},"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
+    iptables() {
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.6 "*"-j PPE" ]] && return 4
+        [[ $* == *"-A TUN_DIR_NEW -s 192.168.1.7 "*"-j MARK"* ]] && return 4
+        command iptables "$@"
+    }
+    tunnel_apply
+    grep -q "Client '192.168.1.7' is not marked for tunnel 'main'" "$LOG_FILE"
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+}
+
+# main takes slot 0, pref 16384, in JSON order.
+@test "tunnel_apply: a client of main is not reported while its slot's ip rule is refused" {
+    load_tunnel_module_with '{"main":{"clients":["192.168.1.6"]},"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    ip() {
+        [[ $* == "rule add pref 16384 "* ]] && return 2
+        command ip "$@"
+    }
+    tunnel_apply
+    grep -q "Failed to add ip rule: pref=16384" "$LOG_FILE"
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+}
+
+# A one-bit mark field holds one slot: wgc1 takes it, main and wgc2 get none.
+@test "tunnel_apply: a client of main that gets no slot is not reported" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["192.168.1.6"]},"wgc2":{"clients":["192.168.1.7"]}}'
+    export TUN_DIR_MARK_MASK=0x00010000
+    use_stateful_iptables
+    tunnel_apply
+    grep -q "Too many tunnels (max 1); skipping 'main'" "$LOG_FILE"
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.7"
+}
+
+# The rebuild skips an address outside RFC1918 on main as on any tunnel, and it
+# goes direct: main's route. It left Xray for direct, and the prune lets it go.
+@test "full apply: an address outside RFC1918 moved from Xray to main is let go" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["100.64.0.8"]}}'
+
+    full_apply > "$BATS_TEST_TMPDIR/out" 2>&1
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+    run cat "$BATS_TEST_TMPDIR/out"
+    assert_output --partial "Client '100.64.0.8' is not RFC1918; skipping"
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_failure
+}
+
+# The same move reaching a full apply through the up-to-date path: Tunnel Director
+# alone ("apply tunnel") recorded the layout first, and Xray still has the
+# address. That path reports the configured clients outside RFC1918 of a tunnel:
+# main is none.
+@test "full apply: an address outside RFC1918 moved from Xray to main is let go by an up-to-date apply" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101'
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["100.64.0.8"]}}'
+    tunnel_apply > /dev/null 2>&1
+    ipset test XRAY_CLIENTS 100.64.0.8 2>/dev/null
+
+    full_apply > "$BATS_TEST_TMPDIR/out" 2>&1
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+    run cat "$BATS_TEST_TMPDIR/out"
+    assert_output --partial "Rules are applied and up-to-date"
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 100.64.0.8
+    assert_failure
 }

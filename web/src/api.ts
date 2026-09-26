@@ -106,6 +106,10 @@ export default {
     api.post<OkResponse>('/api/clients/pause', null, { params: { ip } }),
   resumeClient: (ip: string) =>
     api.post<OkResponse>('/api/clients/resume', null, { params: { ip } }),
+  // One change and one apply: the router takes the client off its old route
+  // only once the new one carries it.
+  moveClient: (ip: string, route: string) =>
+    api.post<OkResponse>('/api/clients/route', { ip, route }),
   deleteClient: (ip: string) =>
     api.delete<OkResponse>('/api/clients', { params: { ip } }),
 

@@ -49,6 +49,8 @@ router/test/
 │   ├── insmod               # Mock insmod (Keenetic modules)
 │   ├── cru                  # Mock cru (Merlin cron)
 │   ├── xray                 # Mock "xray run -test" (XRAY_MOCK_EXIT, XRAY_MOCK_OUTPUT, XRAY_MOCK_LOG)
+│   ├── stateful/iptables    # Chains and rules kept per test (use_stateful_iptables)
+│   ├── stateful-ipset/ipset # XRAY_CLIENTS, TPROXY_BYPASS and their shadows kept per test (use_stateful_ipset)
 │   └── keenetic/
 │       └── curl             # RCI fixtures, per-test PATH
 ├── unit/                    # Unit tests for lib/ modules
@@ -105,6 +107,8 @@ prefixes every path `platform_detect` looks at. Seams for Keenetic unit tests:
 | `load_ipset_module` | Source lib/ipset.sh module (uses `--source-only` flag) |
 | `load_tunnel_module` | Source lib/tunnel.sh module (uses `--source-only` flag) |
 | `load_tproxy_module` | Source lib/tproxy.sh module (uses `--source-only` flag) |
+| `use_stateful_iptables` | For the rest of the test, `mocks/stateful/iptables` ahead of the stateless mock: chains and rules kept under `$BATS_IPT_DIR`, a flush of a live chain appended to `$BATS_IPT_DIR/live_flushes`; call it after the `load_*` helper |
+| `use_stateful_ipset` | For the rest of the test, `mocks/stateful-ipset/ipset` ahead of the stateless mock: the members of `XRAY_CLIENTS`, `TPROXY_BYPASS` and their `_NEW` shadows kept under `$BATS_IPSET_DIR` (missing until created), so `ipset test` after an apply reads what the set holds; every other set stays with the stateless mock; call it after the `load_*` helper |
 
 **Note:** Modules support `--source-only` flag for test sourcing without executing main logic.
 
@@ -137,7 +141,9 @@ Mocks are shell scripts in `router/test/mocks/` that simulate router commands:
 
 - **nvram**: Returns predefined values for router settings
 - **iptables/ip6tables**: Tracks rule operations
+- **stateful/iptables**: Remembers chains and rules per table under `$BATS_IPT_DIR` (`-S`, `-N`, `-F`, `-X`, `-E`, `-A`, `-I`, `-D`, `-C`); records a flush of a chain a rule still jumps to (a whole-table `-F` is not recorded). Turned on per test by `use_stateful_iptables`
 - **ipset**: Simulates ipset management
+- **stateful-ipset/ipset**: Remembers `XRAY_CLIENTS`, `TPROXY_BYPASS` and their `_NEW` shadows under `$BATS_IPSET_DIR` (`list`, `create`, `add`, `del`, `test`, `flush`, `destroy`, `swap`). Members compare as in the kernel's `hash:net` sets: `x` and `x/32` are one element, kept as `x`; `add` and `del` take an element as written, so a host inside a network the set holds is added as an element of its own; `test` of a host (no prefix, or `/32`) finds it through any element that holds it, the address itself or a network around it, and `test` of a network finds only the identical element. Everything else goes to the stateless mock. Turned on per test by `use_stateful_ipset`; the processes a test starts inherit it
 - **nslookup**: Returns mock DNS responses
 - **logger**: Silent (no syslog in tests)
 - **ip**: Returns mock interface info

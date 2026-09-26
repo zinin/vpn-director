@@ -99,6 +99,7 @@ func registerProtectedRoutes(mux *http.ServeMux, deps *Deps) {
 	mux.HandleFunc("POST /api/clients", handleAddClient(deps))
 	mux.HandleFunc("POST /api/clients/pause", handlePauseClient(deps))
 	mux.HandleFunc("POST /api/clients/resume", handleResumeClient(deps))
+	mux.HandleFunc("POST /api/clients/route", handleMoveClient(deps))
 	mux.HandleFunc("DELETE /api/clients", handleDeleteClient(deps))
 
 	// Exclusions — sets

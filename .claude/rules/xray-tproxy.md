@@ -12,15 +12,17 @@ Module location: `lib/tproxy.sh`
 
 ```bash
 vpn-director.sh status xray       # Show Xray TPROXY status
-vpn-director.sh restart xray      # Restart Xray TPROXY
+vpn-director.sh restart xray      # Restart the Xray process and apply TPROXY again in place
 vpn-director.sh restart xray-process  # Restart the Xray process only, TPROXY rules kept
 vpn-director.sh apply             # Apply all (including TPROXY)
 ```
 
-`restart xray` is the process restart plus a stop and an apply of the TPROXY rules, and between the
-two the jump is gone and the Xray clients leave through the WAN. `restart xray-process` restarts the
-process alone: a client meets a restarting Xray and waits. It is for a caller whose only change is
-`config.json` — the subscription watch trying one server after another.
+`restart xray` restarts the process, then applies the TPROXY rules in place (`tproxy_apply`,
+`tproxy_prune`): nothing is stopped, so a client meets a restarting Xray and waits — TPROXY drops
+what no socket takes. The Web UI server switch, `/xray` and the wizard use it; its apply also swaps
+in `TPROXY_BYPASS`, whose `xray.servers` a switch may have recomputed. `restart xray-process`
+restarts the process alone, for a caller whose only change is `config.json` — the subscription
+watch trying one server after another.
 
 ## How It Works
 
@@ -28,6 +30,30 @@ process alone: a client meets a restarting Xray and waits. It is for a caller wh
 2. Exclude: servers, private IPs, specified countries
 3. Remaining traffic → TPROXY to Xray port
 4. Xray dokodemo-door inbound → the selected server's outbound (proxy-out; any protocol the import stored)
+
+## Applying without a window
+
+`tproxy_apply` flushes nothing a packet is crossing:
+
+- `XRAY_TPROXY` is built as `XRAY_TPROXY_NEW` on every apply (`_tproxy_build_chain`) and swapped in
+  by `swap_fw_chain`. Flushing the live chain and refilling it one rule per call left every Xray
+  client unproxied — out through the WAN — for the length of the refill, on every apply.
+- `TPROXY_BYPASS` is built as `TPROXY_BYPASS_NEW` and swapped in (`ipset swap`).
+- `XRAY_CLIENTS` is only added to, by the soft-fails as well: with xt_TPROXY missing or an
+  exclusion set not ready, a live set still takes every effective client
+  (`_tproxy_add_to_live_clients`). `tproxy_prune`, the last step of an apply, swaps in the
+  effective clients - `xray.clients` less `paused_clients`, an entry that is no IPv4 address or
+  CIDR skipped - plus every client the caller names that the live set holds: after `tunnel_apply`
+  (a full apply) the clients it reported as not carried, for `apply xray` and `restart xray` every
+  client the config puts on a tunnel, `main`'s left out (`tunnel-director.md`, "What tunnel_apply
+  reports as not carried"). A client moving to a tunnel stays proxied that way until an apply in
+  which Tunnel Director carries it (`packet-flow.md`, "The apply: make before break"); one that left
+  Xray for direct - moved to `main` as well - is let go. A named client the new set already matches
+  gets no element of its own: `ipset test` finds a host through any network the set holds, so a host
+  inside an effective network is in through that network, and `x/32` of an effective `x` is `x`. A
+  WARN names the clients kept.
+- A name from `advanced.xray.chain` leaves room for `_NEW` (24 characters at most), and so does
+  one from `advanced.xray.clients_ipset` or `bypass_ipset` (27).
 
 ## Outbound Generation
 
@@ -193,9 +219,13 @@ mark or our table, because other firmware versions may still park policies at 20
 
 ## Fail-Safe
 
-Script exits without changes if:
+`tproxy_apply` sets up no rule, no route and no bypass set if:
 - Required exclusion ipsets not found
 - xt_TPROXY module unavailable
+
+It still adds every effective client to an `XRAY_CLIENTS` that exists: the rules of an earlier apply
+may still intercept with it, and a client moving from a tunnel to Xray has to be in it before
+`tunnel_apply` takes its mark away.
 
 > An unknown country code in `xray.exclude_sets` is **not** one of those
 > reasons: `_tproxy_exclude_sets` drops it with a WARN before the check, so a
@@ -215,8 +245,9 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | Function | Purpose |
 |----------|---------|
 | `tproxy_status()` | Show XRAY_TPROXY chain, routing, xray process |
-| `tproxy_apply()` | Apply TPROXY rules (idempotent), soft-fail if unavailable |
-| `tproxy_stop()` | Remove chain and routing |
+| `tproxy_apply()` | The make half of an apply: routing, sets, chain swapped in; clients added, never removed; soft-fail if unavailable |
+| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; always returns 0 and leaves the ready marker alone |
+| `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) |
 | `tproxy_restart_process()` | Restart Xray process via Entware init script |
 | `tproxy_get_required_ipsets()` | Return list of valid exclude ipsets (unknown codes dropped with a WARN) |
 
@@ -231,27 +262,34 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | `_tproxy_resolve_exclude_set(key)` | Try `{set}_ext` first, fall back to `{set}` |
 | `_tproxy_setup_routing()` | Create route table + ip rule |
 | `_tproxy_teardown_routing()` | Remove route table + ip rule |
-| `_tproxy_setup_clients_ipset()` | Create and populate client ipset |
-| `_tproxy_setup_bypass_ipset()` | Create and populate bypass ipset |
+| `_tproxy_setup_clients_ipset()` | Create the client ipset and add every effective client (never removes) |
+| `_tproxy_add_to_live_clients()` | The same for the soft-fails, only when the client ipset already exists |
+| `_tproxy_shadow_set(name)` | An empty `<name>_NEW` to fill and swap in |
+| `_tproxy_swap_set(name)` | `ipset swap` of `<name>_NEW` into `<name>`, then destroy the shadow |
+| `_tproxy_setup_bypass_ipset()` | Build `TPROXY_BYPASS_NEW` from the three sources and swap it in |
 | `_tproxy_validate_ipv4_cidr()` | Validate IPv4 CIDR format |
-| `_tproxy_setup_iptables()` | Build XRAY_TPROXY chain with exclusions |
+| `_tproxy_build_chain(chain)` | Fill a fresh chain with the TPROXY rules: 0, 1 (a narrowing RETURN missing), 2 (a bounding RETURN or a target missing) |
+| `_tproxy_jump_pos()` | Position of the first jump: 1 |
+| `_tproxy_setup_iptables()` | Platform rules, then `XRAY_TPROXY` swapped in with its jumps |
 | `_tproxy_teardown_iptables()` | Remove chain and ipsets |
 
-**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue.
+**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client.
 
 **Ready marker**: `tproxy_apply()` writes `/tmp/xray_tproxy/ready` (`XRAY_TPROXY_READY`) only when
 every rule went in, the platform's own included, and removes it on any soft-fail. The Telegram
 bot's subscription watch waits for it before Xray clients leave the fallback tunnel. A failed
 `platform_tproxy_extra_rules apply` (Keenetic's mangle INPUT accept) fails `_tproxy_setup_iptables`
 only after the PREROUTING jumps are in place, so interception stays as it was and only the marker
-is withheld. The chain flush, rule 1 (`! XRAY_CLIENTS`) or a private-range RETURN that does not go
-in ends it before the TPROXY targets instead, on a flushed chain that intercepts nothing: without
-those rules the targets would take every LAN client, or traffic to the router and the rest of the
-LAN. Every other RETURN (bypass, loopback, link-local, multicast, broadcast, an exclusion) only
-decides what a client reaches directly instead of through the proxy: its failure is logged, the
-targets and the jumps still go in, and only the marker is withheld — ending the setup there left
-every Xray client on the WAN over one busy xtables lock. A PREROUTING jump that does not go in
-withholds the marker as well: `sync_fw_rule` returns 1 for an insert the kernel refused.
+is withheld. Rule 1 (`! XRAY_CLIENTS`), a private-range RETURN or a TPROXY target that does not
+go in keeps the rebuilt chain out (`_tproxy_build_chain` returns 2): the chain already in place
+keeps working and the marker is withheld. Without rule 1 or the private-range RETURNs the
+targets would take every LAN client, or traffic to the router and the rest of the LAN. Every
+other RETURN (bypass, loopback, link-local, multicast, broadcast, an exclusion) only decides
+what a client reaches directly instead of through the proxy: its failure is logged, the targets
+and the jumps still go in, and only the marker is withheld — ending the setup there left every
+Xray client on the WAN over one busy xtables lock. A PREROUTING jump that does not go in
+withholds the marker as well: `swap_fw_chain` returns 3, and that interface stays on the old
+chain until the next apply finishes the swap.
 `XRAY_CLIENTS` has to be complete too: nothing validates `xray.clients`, and an address the set
 does not take is RETURNed by rule 1 and left unproxied, so `_tproxy_setup_clients_ipset` reports it
 and the marker is withheld although the chain itself is in place. The adds pass `-exist`, so a

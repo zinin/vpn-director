@@ -406,6 +406,7 @@ EOF
     # Check that public API functions exist
     declare -f tproxy_status >/dev/null
     declare -f tproxy_apply >/dev/null
+    declare -f tproxy_prune >/dev/null
     declare -f tproxy_stop >/dev/null
     declare -f tproxy_get_required_ipsets >/dev/null
 }
@@ -634,8 +635,8 @@ duplicate_last_rule() {
     : > /tmp/bats_ipset_calls.log
     run _tproxy_setup_bypass_ipset
     assert_success
-    grep -q "ipset add TPROXY_BYPASS 203.0.113.7" /tmp/bats_ipset_calls.log
-    grep -q "ipset add TPROXY_BYPASS 198.51.100.9" /tmp/bats_ipset_calls.log
+    grep -q "ipset add TPROXY_BYPASS_NEW 203.0.113.7" /tmp/bats_ipset_calls.log
+    grep -q "ipset add TPROXY_BYPASS_NEW 198.51.100.9" /tmp/bats_ipset_calls.log
 }
 
 @test "_tproxy_setup_iptables: applies platform extra rules with the configured mark and one jump per LAN interface" {
@@ -648,8 +649,8 @@ duplicate_last_rule() {
     grep -qF "extra apply 0x100/0x100" "$BATS_TEST_TMPDIR/extra.log"
     # Each interface asks for its own position, so no jump displaces another and
     # the next apply finds both already in place instead of rewriting them.
-    grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log
-    grep -q -- '-I PREROUTING 2 -i br1 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY_NEW' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 2 -i br1 -j XRAY_TPROXY_NEW' /tmp/bats_iptables_calls.log
 }
 
 # The jump is the whole point of the chain. A platform that cannot name its LAN
@@ -691,14 +692,14 @@ duplicate_last_rule() {
     run _tproxy_setup_iptables
     assert_failure
     assert_output --partial "Failed to apply platform TPROXY rules"
-    grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log
+    grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY_NEW' /tmp/bats_iptables_calls.log
 }
 
 # Two rules decide who the targets take at all: without the "! XRAY_CLIENTS"
 # return TPROXY takes every LAN client, without the private ranges traffic to
 # the router and the rest of the LAN. errexit is off under "if !", so a failed
-# one has to stop the setup itself - before the targets, and without a status
-# that lets tproxy_apply publish ready.
+# one has to stop the build itself - before the targets - and the chain built so
+# far must never take the jumps: the chain already in place stays.
 @test "_tproxy_setup_iptables: fails before the TPROXY targets when a rule that bounds them fails" {
     load_tproxy_module
     local failing
@@ -707,11 +708,11 @@ duplicate_last_rule() {
         command iptables "$@"
     }
     for failing in \
-        "-F XRAY_TPROXY" \
-        "-A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN" \
-        "-A XRAY_TPROXY -d 10.0.0.0/8 -j RETURN" \
-        "-A XRAY_TPROXY -d 172.16.0.0/12 -j RETURN" \
-        "-A XRAY_TPROXY -d 192.168.0.0/16 -j RETURN"
+        "-N XRAY_TPROXY_NEW" \
+        "-A XRAY_TPROXY_NEW -m set ! --match-set XRAY_CLIENTS src -j RETURN" \
+        "-A XRAY_TPROXY_NEW -d 10.0.0.0/8 -j RETURN" \
+        "-A XRAY_TPROXY_NEW -d 172.16.0.0/12 -j RETURN" \
+        "-A XRAY_TPROXY_NEW -d 192.168.0.0/16 -j RETURN"
     do
         FAILING="$failing"
         : > /tmp/bats_iptables_calls.log
@@ -722,6 +723,10 @@ duplicate_last_rule() {
         fi
         if grep -q -- "-j TPROXY" /tmp/bats_iptables_calls.log; then
             echo "reached the TPROXY targets although \"$failing\" failed"
+            return 1
+        fi
+        if grep -qE -- "-I PREROUTING .*-j XRAY_TPROXY_NEW|-E XRAY_TPROXY_NEW" /tmp/bats_iptables_calls.log; then
+            echo "swapped the chain in although \"$failing\" failed"
             return 1
         fi
     done
@@ -741,12 +746,12 @@ duplicate_last_rule() {
         command iptables "$@"
     }
     for failing in \
-        "-A XRAY_TPROXY -m set --match-set TPROXY_BYPASS dst -j RETURN" \
-        "-A XRAY_TPROXY -d 127.0.0.0/8 -j RETURN" \
-        "-A XRAY_TPROXY -d 169.254.0.0/16 -j RETURN" \
-        "-A XRAY_TPROXY -d 224.0.0.0/4 -j RETURN" \
-        "-A XRAY_TPROXY -d 255.255.255.255/32 -j RETURN" \
-        "-A XRAY_TPROXY -m set --match-set ru dst -j RETURN"
+        "-A XRAY_TPROXY_NEW -m set --match-set TPROXY_BYPASS dst -j RETURN" \
+        "-A XRAY_TPROXY_NEW -d 127.0.0.0/8 -j RETURN" \
+        "-A XRAY_TPROXY_NEW -d 169.254.0.0/16 -j RETURN" \
+        "-A XRAY_TPROXY_NEW -d 224.0.0.0/4 -j RETURN" \
+        "-A XRAY_TPROXY_NEW -d 255.255.255.255/32 -j RETURN" \
+        "-A XRAY_TPROXY_NEW -m set --match-set ru dst -j RETURN"
     do
         FAILING="$failing"
         : > /tmp/bats_iptables_calls.log
@@ -755,13 +760,14 @@ duplicate_last_rule() {
             echo "reported success although \"$failing\" failed"
             return 1
         fi
-        if ! grep -q -- "-A XRAY_TPROXY -p tcp -j TPROXY" /tmp/bats_iptables_calls.log ||
-            ! grep -q -- "-A XRAY_TPROXY -p udp -j TPROXY" /tmp/bats_iptables_calls.log; then
+        if ! grep -q -- "-A XRAY_TPROXY_NEW -p tcp -j TPROXY" /tmp/bats_iptables_calls.log ||
+            ! grep -q -- "-A XRAY_TPROXY_NEW -p udp -j TPROXY" /tmp/bats_iptables_calls.log; then
             echo "no TPROXY targets after \"$failing\" failed"
             return 1
         fi
-        if ! grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY' /tmp/bats_iptables_calls.log; then
-            echo "no PREROUTING jump after \"$failing\" failed"
+        if ! grep -q -- '-I PREROUTING 1 -i br0 -j XRAY_TPROXY_NEW' /tmp/bats_iptables_calls.log ||
+            ! grep -q -- '-E XRAY_TPROXY_NEW XRAY_TPROXY' /tmp/bats_iptables_calls.log; then
+            echo "the chain was not swapped in after \"$failing\" failed"
             return 1
         fi
     done
@@ -789,4 +795,315 @@ duplicate_last_rule() {
 
     grep -q -- '-t mangle -S PREROUTING' /tmp/bats_iptables_calls.log
     grep -q -- '-t mangle -X XRAY_TPROXY' /tmp/bats_iptables_calls.log
+}
+
+# ============================================================================
+# Make before break: the chain and the sets are swapped, never flushed
+# ============================================================================
+
+# tproxy_apply used to flush XRAY_TPROXY and fill it one rule per call on every
+# apply - the hooks and the daily update included - and every Xray client left
+# through the WAN until the TPROXY targets were back.
+@test "tproxy_apply: rebuilds XRAY_TPROXY beside the live chain and never flushes it" {
+    load_tproxy_module
+    use_stateful_iptables
+    run tproxy_apply
+    assert_success
+    run tproxy_apply
+    assert_success
+
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+    run iptables -t mangle -S PREROUTING
+    assert_output $'-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -j XRAY_TPROXY'
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line '-A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN'
+    assert_line '-A XRAY_TPROXY -p tcp -j TPROXY --on-port 12345 --tproxy-mark 0x100/0x100'
+    run iptables -t mangle -S XRAY_TPROXY_NEW
+    assert_failure
+    [ -f "$XRAY_TPROXY_READY" ]
+}
+
+# Merlin's firewall start runs "iptables -t mangle -F": every chain emptied, the
+# jumps with them, and firewall-start applies again.
+@test "tproxy_apply: puts the chain and its jump back after the firmware emptied mangle" {
+    load_tproxy_module
+    use_stateful_iptables
+    run tproxy_apply
+    assert_success
+    iptables -t mangle -F
+
+    run tproxy_apply
+    assert_success
+    run iptables -t mangle -S PREROUTING
+    assert_output $'-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -j XRAY_TPROXY'
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line '-A XRAY_TPROXY -p udp -j TPROXY --on-port 12345 --tproxy-mark 0x100/0x100'
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+# Rule 1 and the private ranges bound what the targets take. One that does not
+# go in keeps the new chain out; the chain already in place goes on working.
+@test "tproxy_apply: a rule that bounds the targets and fails leaves the live chain in place" {
+    load_tproxy_module
+    use_stateful_iptables
+    run tproxy_apply
+    assert_success
+    iptables() {
+        [[ $* == *"-A XRAY_TPROXY_NEW -d 10.0.0.0/8 -j RETURN"* ]] && return 1
+        command iptables "$@"
+    }
+
+    run tproxy_apply
+    assert_success
+    assert_output --partial "TPROXY rules not rebuilt"
+    [ ! -e "$XRAY_TPROXY_READY" ]
+    run iptables -t mangle -S PREROUTING
+    assert_output $'-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -j XRAY_TPROXY'
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line '-A XRAY_TPROXY -p tcp -j TPROXY --on-port 12345 --tproxy-mark 0x100/0x100'
+    run iptables -t mangle -S XRAY_TPROXY_NEW
+    assert_failure
+}
+
+# XRAY_CLIENTS only grows in tproxy_apply: a client on its way from Xray to a
+# tunnel stays intercepted until Tunnel Director has it, and tproxy_prune lets
+# it go after. The bypass set is built beside the live one and swapped in.
+@test "tproxy_apply: adds to XRAY_CLIENTS and flushes neither set" {
+    load_tproxy_module
+    : > /tmp/bats_ipset_calls.log
+    run tproxy_apply
+    assert_success
+    grep -qx 'ipset add -exist XRAY_CLIENTS 192.168.1.100' /tmp/bats_ipset_calls.log
+    refute grep -qx 'ipset flush XRAY_CLIENTS' /tmp/bats_ipset_calls.log
+    refute grep -qx 'ipset flush TPROXY_BYPASS' /tmp/bats_ipset_calls.log
+    refute grep -q 'swap XRAY_CLIENTS' /tmp/bats_ipset_calls.log
+    grep -qx 'ipset add TPROXY_BYPASS_NEW 1.2.3.4' /tmp/bats_ipset_calls.log
+    grep -qx 'ipset swap TPROXY_BYPASS_NEW TPROXY_BYPASS' /tmp/bats_ipset_calls.log
+    grep -qx 'ipset destroy TPROXY_BYPASS_NEW' /tmp/bats_ipset_calls.log
+}
+
+@test "tproxy_prune: swaps in exactly the clients xray.clients names" {
+    load_tproxy_module
+    : > /tmp/bats_ipset_calls.log
+    run tproxy_prune
+    assert_success
+    run cat /tmp/bats_ipset_calls.log
+    assert_line 'ipset create XRAY_CLIENTS_NEW hash:net'
+    assert_line 'ipset add -exist XRAY_CLIENTS_NEW 192.168.1.100'
+    assert_line 'ipset swap XRAY_CLIENTS_NEW XRAY_CLIENTS'
+    assert_line 'ipset destroy XRAY_CLIENTS_NEW'
+    refute_line 'ipset flush XRAY_CLIENTS'
+}
+
+# The swap would drop a client from the live set the moment the new set lacked
+# it. Stopping there leaves the clients that left Xray proxied until the next
+# apply: no leak.
+@test "tproxy_prune: keeps the live set when a client does not go into the new one" {
+    load_tproxy_module
+    ipset() {
+        if [[ $1 == add && $* == *XRAY_CLIENTS_NEW* ]]; then
+            echo "ipset $*" >> /tmp/bats_ipset_calls.log
+            return 1
+        fi
+        command ipset "$@"
+    }
+    : > /tmp/bats_ipset_calls.log
+    run tproxy_prune
+    assert_success
+    assert_output --partial "stay proxied until the next apply"
+    refute grep -q 'ipset swap' /tmp/bats_ipset_calls.log
+    grep -qx 'ipset destroy XRAY_CLIENTS_NEW' /tmp/bats_ipset_calls.log
+}
+
+@test "tproxy_prune: does nothing when tproxy_apply never made the set" {
+    load_tproxy_module
+    _ipset_exists() { return 1; }
+    : > /tmp/bats_ipset_calls.log
+    run tproxy_prune
+    assert_success
+    [ ! -s /tmp/bats_ipset_calls.log ]
+}
+
+@test "_tproxy_teardown_iptables: removes what an interrupted apply left" {
+    load_tproxy_module
+    : > /tmp/bats_iptables_calls.log
+    : > /tmp/bats_ipset_calls.log
+    run _tproxy_teardown_iptables
+    assert_success
+    grep -q -- '-t mangle -X XRAY_TPROXY_NEW' /tmp/bats_iptables_calls.log
+    grep -qx 'ipset destroy XRAY_CLIENTS_NEW' /tmp/bats_ipset_calls.log
+    grep -qx 'ipset destroy TPROXY_BYPASS_NEW' /tmp/bats_ipset_calls.log
+}
+
+# ============================================================================
+# The keep-list: a client Tunnel Director did not take stays proxied
+# ============================================================================
+
+# live_xray_clients <member>... - a live XRAY_CLIENTS holding <member>..., on the
+# stateful ipset. The fixture's xray.clients is 192.168.1.100.
+live_xray_clients() {
+    use_stateful_ipset
+    ipset create XRAY_CLIENTS hash:net
+    local m
+    for m in "$@"; do
+        ipset add XRAY_CLIENTS "$m"
+    done
+    : > /tmp/bats_ipset_calls.log
+}
+
+@test "tproxy_prune: keeps a named address the live set holds, and says so" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.1.7 192.168.1.8
+    run tproxy_prune 192.168.1.7
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.7 - they stay proxied"
+    run ipset test XRAY_CLIENTS 192.168.1.7
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    # Left Xray for direct: let go.
+    run ipset test XRAY_CLIENTS 192.168.1.8
+    assert_failure
+}
+
+# A client that was not proxied - one moving between two tunnels, say - is not
+# made one now.
+@test "tproxy_prune: a named address the live set does not hold is not added" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100
+    run tproxy_prune 192.168.1.9
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 192.168.1.9
+    assert_failure
+}
+
+@test "tproxy_prune: an Xray client named as well is not reported as kept" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100
+    run tproxy_prune 192.168.1.100
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+}
+
+# The swap would drop a client the new set lacks: a kept address the set refuses
+# ends the prune as an Xray client the set refuses does, and every client stays.
+@test "tproxy_prune: a kept address the new set refuses leaves the live set as it is" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.1.7 192.168.1.8
+    ipset() {
+        if [[ $1 == add && $* == *"XRAY_CLIENTS_NEW 192.168.1.7" ]]; then
+            return 1
+        fi
+        command ipset "$@"
+    }
+    run tproxy_prune 192.168.1.7
+    assert_success
+    assert_output --partial "stay proxied until the next apply"
+    run ipset test XRAY_CLIENTS 192.168.1.8
+    assert_success
+    run ipset list -n XRAY_CLIENTS_NEW
+    assert_failure
+}
+
+# load_tproxy_module_with_clients <json array> - load_tproxy_module on a copy of
+# the fixture whose xray.clients is <json array>: config.sh marks XRAY_CLIENTS
+# readonly, so a test cannot set it afterwards.
+load_tproxy_module_with_clients() {
+    load_common
+    jq --argjson c "$1" '.xray.clients = $c' "$TEST_ROOT/fixtures/vpn-director.json" \
+        > "$BATS_TEST_TMPDIR/vpn-director.json"
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/tproxy.sh" --source-only
+}
+
+# The overlap packet-flow.md documents ("Example 3"): the network on Xray, a host
+# of it on a tunnel. The kernel's "ipset test" finds the host through the
+# network, and "apply xray", which names every tunnel client, added it as an
+# element of its own - with a WARN - on every run, though Tunnel Director never
+# takes it while the network is on Xray.
+@test "tproxy_prune: a named host inside an effective network is not kept on its own" {
+    load_tproxy_module_with_clients '["192.168.50.0/24"]'
+    live_xray_clients 192.168.50.0/24
+    run tproxy_prune 192.168.50.10
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset list XRAY_CLIENTS
+    assert_output $'Name: XRAY_CLIENTS\nType: hash:net\nNumber of entries: 1\nMembers:\n192.168.50.0/24'
+}
+
+@test "tproxy_prune: a named x/32 of an effective x is not kept on its own" {
+    load_tproxy_module_with_clients '["192.168.1.7"]'
+    live_xray_clients 192.168.1.7
+    run tproxy_prune 192.168.1.7/32
+    assert_success
+    refute_output --partial "Kept in"
+    run ipset list XRAY_CLIENTS
+    assert_output $'Name: XRAY_CLIENTS\nType: hash:net\nNumber of entries: 1\nMembers:\n192.168.1.7'
+}
+
+@test "tproxy_prune: an address named twice, in either spelling, is kept once" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.1.7
+    run tproxy_prune 192.168.1.7 192.168.1.7/32
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.7 - they stay proxied"
+}
+
+# The network has left Xray while the live set still holds it: the host was
+# proxied through it and Tunnel Director has not taken it, so it is kept, as an
+# element of its own, and the rest of the network is let go.
+@test "tproxy_prune: a named host is kept on its own once its network has left Xray" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100 192.168.50.0/24
+    run tproxy_prune 192.168.50.10
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.50.10 - they stay proxied"
+    run ipset list XRAY_CLIENTS
+    assert_output $'Name: XRAY_CLIENTS\nType: hash:net\nNumber of entries: 2\nMembers:\n192.168.1.100\n192.168.50.10'
+    run ipset test XRAY_CLIENTS 192.168.50.11
+    assert_failure
+}
+
+# M1: both soft-fails returned before any client was added. A client moving
+# from a tunnel to Xray then entered XRAY_CLIENTS only at the prune - after the
+# TUN_DIR swap had already taken its mark.
+@test "tproxy_apply: a soft-fail for missing ipsets still adds the clients to a live XRAY_CLIENTS" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.7
+    _tproxy_check_required_ipsets() { return 1; }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "Required ipsets not ready"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.7
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+@test "tproxy_apply: a soft-fail for a missing xt_TPROXY still adds the clients to a live XRAY_CLIENTS" {
+    load_tproxy_module
+    live_xray_clients
+    _tproxy_check_module() { return 1; }
+    run tproxy_apply
+    assert_success
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    [ ! -e "$XRAY_TPROXY_READY" ]
+}
+
+@test "tproxy_apply: a soft-fail makes no XRAY_CLIENTS where there was none" {
+    load_tproxy_module
+    use_stateful_ipset
+    _tproxy_check_required_ipsets() { return 1; }
+    run tproxy_apply
+    assert_success
+    run ipset list -n XRAY_CLIENTS
+    assert_failure
 }

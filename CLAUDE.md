@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 /opt/vpn-director/vpn-director.sh status              # Show all status
 /opt/vpn-director/vpn-director.sh apply               # Apply configuration
 /opt/vpn-director/vpn-director.sh stop                # Stop all components
-/opt/vpn-director/vpn-director.sh restart             # Restart all
+/opt/vpn-director/vpn-director.sh restart             # Restart Xray, rebuild all in place without a stop
 /opt/vpn-director/vpn-director.sh update              # Update ipsets + reapply
 /opt/vpn-director/vpn-director.sh platform            # Platform facts as JSON (tunnels, WAN, password file)
 /opt/vpn-director/vpn-director.sh cron install        # Schedule the daily update (S99 does this)
@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 
 # Component-specific commands
 /opt/vpn-director/vpn-director.sh status tunnel       # Tunnel Director status only
-/opt/vpn-director/vpn-director.sh restart xray        # Restart Xray TPROXY only
+/opt/vpn-director/vpn-director.sh restart xray        # Restart the Xray process, TPROXY applied again in place
 /opt/vpn-director/vpn-director.sh restart xray-process  # Restart the Xray process, TPROXY rules kept
 
 # Subscriptions: add, refresh, rename, delete (a menu)
