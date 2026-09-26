@@ -193,9 +193,11 @@ looks for the MARK rules only, not for an exclusion or offload rule.
 The PREROUTING jumps: a rebuild whose new jumps did not all go in records no hash, and the next
 apply finishes the swap. A jump that goes missing after a recorded rebuild is put back by the
 up-to-date branch (`_tunnel_jumps_ensure`), which leaves one that is there where it is.
-`failover_ready` needs the jumps, and every failover client still on the failover tunnel marked —
-one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it would leave
-through the WAN.
+`failover_ready` needs the jumps, and every failover client still on the failover tunnel marked and,
+on KeeneticOS, out of the fast path (its offload opt-out in place) — one outside RFC1918 is TPROXY's
+to take but never TUN_DIR's, and dropped from Xray it would leave through the WAN; a marked one
+without its opt-out is marked for its first packets only, as the fast path takes the rest past
+mangle (`_tunnel_emit_client` returns 4).
 
 A chain can also lose rules a recorded rebuild put in. Merlin's firewall start runs
 `iptables -t mangle -F`, which empties `TUN_DIR` without deleting it (the pitfall in

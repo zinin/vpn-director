@@ -359,10 +359,10 @@ _tunnel_failover_rule_present() {
 # the failover tunnel? One outside RFC1918 is TPROXY's to take but never marked
 # here: dropped from Xray on failover_ready, it would leave through the WAN.
 # An entry that is no IPv4 address at all is neither TPROXY's nor ours and does
-# not count. A MARK rule the kernel refused is the rebuild's to see - that
-# rebuild is not recorded, so the up-to-date path never runs on one - and one
-# that went missing since sends the apply back through a rebuild before this is
-# asked (_tunnel_marks_present).
+# not count. A MARK rule or an offload opt-out the kernel refused is the
+# rebuild's to see - that rebuild is not recorded, so the up-to-date path never
+# runs on one - and a MARK rule that went missing since sends the apply back
+# through a rebuild before this is asked (_tunnel_marks_present).
 _tunnel_failover_carried() {
     local fo_client fo_on_tunnel
     fo_on_tunnel=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "${XRAY_FAILOVER_TUNNEL:-}" '.[$t].clients // [] | .[]')
@@ -1181,7 +1181,8 @@ tunnel_apply() {
     # hooks and Web UI Apply would then skip cron and report failure while the
     # fallback interface is still coming up. The watch reads
     # TUN_DIR_FAILOVER_READY instead of the apply exit status, and drops Xray
-    # membership on it: every failover client has to be marked, and the jump
+    # membership on it: every failover client has to be marked - and, where the
+    # platform names an offload target, out of the fast path - and the jump
     # that sends LAN traffic to those marks has to be there.
     if _tunnel_failover_needed && [[ $fo_applied -eq 1 && $fo_route_ok -eq 1 && $fo_rule_ok -eq 1 \
         && $fo_carried -eq 1 && $jumps_ok -eq 1 ]]; then
