@@ -58,7 +58,7 @@ After installation:
   ```bash
   opkg install curl coreutils-base64 coreutils-sha256sum gawk jq xray-core procps-ng-pgrep procps-ng-pkill procps-ng-ps
   ```
-- OpenVPN client configured in router UI (for Tunnel Director)
+- OpenVPN client configured in router UI, with "Redirect Internet traffic through tunnel" set to "VPN Director (policy rules)" (for Tunnel Director)
 
 ### KeeneticOS
 
@@ -232,7 +232,7 @@ Up to ten subscriptions live side by side; you pick the running server from any 
 
 ### Tunnel Director
 
-Routes traffic from specified LAN clients through OpenVPN/WireGuard tunnels based on destination. Configurable exclusions allow direct access to specified countries for optimal performance. A tunnel key is an id the platform lists (`wgc1` / `ovpnc1` on Merlin, `OpenVPN0` / `Wireguard1` on KeeneticOS). An OpenVPN tunnel may set optional `gateway` (the next hop; otherwise the subnet's first host). WireGuard ignores it.
+Routes traffic from specified LAN clients through OpenVPN/WireGuard tunnels based on destination. Configurable exclusions allow direct access to specified countries for optimal performance. A tunnel key is an id the platform lists (`wgc1` / `ovpnc1` on Merlin, `OpenVPN0` / `Wireguard1` on KeeneticOS). On Merlin an OpenVPN client is listed only in "VPN Director (policy rules)" mode: in "No" and "Yes (all)" the firmware sends all of the router's traffic through the client's routing table, so a route Tunnel Director put there would take every device into the tunnel. An apply skips such a client with a warning that names its mode. If Tunnel Director still has the tunnel on record, an apply also takes out a default route an earlier version left in its table in "No" mode. An OpenVPN tunnel may set optional `gateway` (the next hop; otherwise the subnet's first host). WireGuard ignores it.
 
 ```json
 {
