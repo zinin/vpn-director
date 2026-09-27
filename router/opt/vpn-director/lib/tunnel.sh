@@ -111,8 +111,9 @@ _tunnel_init() {
     # Skip if already initialized
     [[ $_tunnel_initialized -eq 1 ]] && return 0
 
-    # Valid tunnel ids come from the platform (Merlin: wgcN and ovpncN tables
-    # from rt_tables; Keenetic: OpenVPN*/Wireguard* interfaces), "main" last.
+    # Valid tunnel ids come from the platform (Merlin: wgcN tables from
+    # rt_tables, and ovpncN ones while their OpenVPN client is in VPN Director
+    # mode; Keenetic: OpenVPN*/Wireguard* interfaces), "main" last.
     local tables_list
     tables_list="$(platform_tunnels || true)"
 
@@ -450,8 +451,14 @@ _tunnel_collect_applied() {
                 log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
             fi
             warnings=1
-            skipped_unknown=1
-            _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
+            # A tunnel with no clients gets no slot whether the platform lists it
+            # or not, so there is nothing for a later apply to retry: it does not
+            # keep the hash from being recorded.
+            clients="$(_tunnel_clients_of "$tunnel")"
+            if [[ -n $clients ]]; then
+                skipped_unknown=1
+                _tunnel_not_carried_on "$tunnel" "$clients"
+            fi
             continue
         fi
         tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
@@ -851,7 +858,8 @@ tunnel_clients() {
 # tunnel_stop - remove chain, ip rules and tunnel tables
 # -------------------------------------------------------------------------------------------------
 # Removes TUN_DIR chain, all associated ip rules and the tunnel tables this
-# module owns (a no-op on a platform whose firmware owns them).
+# module owns. Where the firmware owns them, the platform may only clear a
+# default route Tunnel Director left in a table it no longer uses.
 # -------------------------------------------------------------------------------------------------
 tunnel_stop() {
     _tunnel_init
@@ -1169,14 +1177,15 @@ tunnel_apply() {
 
     # 4. The hash is what makes the next apply take the up-to-date branch, so it
     # is recorded only when every configured tunnel was applied, every client
-    # rule went in and the chain took over. A tunnel the platform does not list
-    # is not a configuration state: the platform's tunnel list may be temporarily
-    # incomplete, a tunnel's settings may change, or its id may be wrong. Recording
-    # the hash would send later applies down the up-to-date branch and leave routing
-    # unrestored until a rebuild. Keeping the hash absent repeats the warning and
-    # retries on the next apply. A refused chain rule is the same: the up-to-date
-    # branch looks for the MARK rules alone, so a refused exclusion or offload rule
-    # would stay missing, and only a rebuild retries it.
+    # rule went in and the chain took over. A tunnel with clients that the
+    # platform does not list is not a configuration state: the platform's tunnel
+    # list may be temporarily incomplete, a tunnel's settings may change, or its
+    # id may be wrong. Recording the hash would send later applies down the
+    # up-to-date branch and leave routing unrestored until a rebuild. Keeping the
+    # hash absent repeats the warning and retries on the next apply. A refused
+    # chain rule is the same: the up-to-date branch looks for the MARK rules
+    # alone, so a refused exclusion or offload rule would stay missing, and only
+    # a rebuild retries it.
     if [[ $skipped_unknown -eq 0 && $incomplete -eq 0 && $jumps_ok -eq 1 ]]; then
         printf '%s\n' "$new_hash" > "$TUN_DIR_HASH"
     elif [[ $skipped_unknown -ne 0 ]]; then

@@ -2227,6 +2227,33 @@ tun11_addressed() {
     [[ ! -f "$TUN_DIR_HASH" ]]
 }
 
+# DELETE /api/clients and a move leave the tunnel key with no clients, and
+# config.sh empties a tunnel whose clients are all paused: listed or not, such
+# a tunnel gets no slot, so there is nothing for a later apply to retry.
+@test "tunnel_apply: records the hash when a tunnel out of VPN Director mode has no clients" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":[]},"wgc1":{"clients":["192.168.1.5"]}}'
+    ovpn_mode 1 0
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
+    refute_output --partial "not recorded as up-to-date"
+    [[ -f "$TUN_DIR_HASH" ]]
+
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+}
+
+@test "tunnel_apply: records the hash when a tunnel unknown to the platform has no clients" {
+    load_tunnel_module_with '{"wgc9":{"clients":[]},"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'wgc9' is not a tunnel this platform knows; skipping"
+    [[ -f "$TUN_DIR_HASH" ]]
+}
+
 # `restart` and `restart tunnel` rebuild with the config unchanged
 # (TUN_DIR_FORCE_REBUILD=1). The client's slot is on record from before the
 # switch; the rebuild gives it none, so the slot is released after the swap -
@@ -2263,5 +2290,26 @@ tun11_addressed() {
     assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
     run cat "$TUN_DIR_TABLES"
     refute_output --partial "ovpnc1"
+    [[ ! -e "$TUN_DIR_FAILOVER_READY" ]]
+}
+
+# The same case on the up-to-date branch: the mode is switched after the apply
+# that recorded the failover tunnel and wrote failover_ready.
+@test "tunnel_apply: the up-to-date path withholds failover_ready for a failover tunnel switched out of VPN Director mode" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc1 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    tun11_addressed
+    run tunnel_apply
+    assert_success
+    [[ -f "$TUN_DIR_HASH" ]]
+    [[ -f "$TUN_DIR_FAILOVER_READY" ]]
+
+    ovpn_mode 1 0
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    assert_output --partial "Failover tunnel 'ovpnc1' is not carrying traffic; Xray membership stays"
     [[ ! -e "$TUN_DIR_FAILOVER_READY" ]]
 }

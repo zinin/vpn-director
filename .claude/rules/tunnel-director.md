@@ -73,9 +73,10 @@ Director left. In "Yes (all)" the default is the firmware's and stays.
 its warning: `Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode ("Redirect
 Internet traffic through tunnel" is "No")` on a rebuild, `route not installed: <reason>; Tunnel
 Director does not route through it` for a recorded tunnel on the up-to-date branch. KeeneticOS has
-no reason to give. A configuration that names such a tunnel records no hash, as one with a typo in
-the id does: every apply rebuilds in place and repeats the warning, and the first apply after the
-switch to VPN Director carries the tunnel's clients.
+no reason to give. A configuration that gives such a tunnel clients records no hash, as one with a
+typo in the id does: every apply rebuilds in place and repeats the warning, and the first apply
+after the switch to VPN Director carries the tunnel's clients. One left with no clients (moved,
+deleted or paused) is skipped with the same warning and records the hash: it has nothing to carry.
 
 ## Chain Architecture
 

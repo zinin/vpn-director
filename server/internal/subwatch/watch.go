@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/platform"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -519,7 +520,7 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 	}
 	w.lastFallbackCheck = now
 	plat, err := w.LoadPlatform()
-	if err != nil || (len(plat.Tunnels) == 0 && plat.Platform != "merlin") {
+	if err != nil || (len(plat.Tunnels) == 0 && plat.Platform != platform.Merlin) {
 		return cfg
 	}
 	// LoadPlatform shells out and takes no lock; a /stop may have finished.
