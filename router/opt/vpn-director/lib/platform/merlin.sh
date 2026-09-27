@@ -80,6 +80,28 @@ platform_tunnels() {
     printf '%s\n' main
 }
 
+# Why an OpenVPN client rt_tables names is not listed: its redirect mode, for
+# the warning tunnel.sh logs where it would otherwise call the tunnel unknown.
+# Nothing and rc 1 for a tunnel platform_tunnels lists, a WireGuard client,
+# main, and an id rt_tables does not name - a typo has no mode.
+platform_tunnel_unlisted_reason() {
+    local id="${1:-}" rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" rgw setting
+    [[ $id =~ ^ovpnc[0-9]+$ ]] || return 1
+    awk -v id="$id" '$0 !~ /^#/ && $2 == id { found = 1 } END { exit !found }' "$rt_tables" 2>/dev/null ||
+        return 1
+    if _merlin_tunnel_routable "$id"; then
+        return 1
+    fi
+    rgw="$(_merlin_ovpn_rgw "$id")"
+    case "$rgw" in
+        ''|0) setting="No" ;;
+        1)    setting="Yes (all)" ;;
+        *)    setting="$rgw" ;;
+    esac
+    printf 'OpenVPN client %s is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "%s")\n' \
+        "${id#ovpnc}" "$setting"
+}
+
 # OpenVPN client N runs on tun1N; WireGuard clients are named after their table.
 platform_tunnel_iface() {
     case "${1:-}" in

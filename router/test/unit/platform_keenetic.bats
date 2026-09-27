@@ -156,6 +156,18 @@ with_mock() {
     assert_output "main"
 }
 
+# Every OpenVPN and WireGuard interface RCI lists is one Tunnel Director may
+# route through, and its tables are Tunnel Director's own: nothing to explain.
+@test "platform_tunnel_unlisted_reason: Keenetic has no reason to give" {
+    load_platform
+    run platform_tunnel_unlisted_reason OpenVPN0
+    assert_failure
+    refute_output
+    run platform_tunnel_unlisted_reason ovpnc1
+    assert_failure
+    refute_output
+}
+
 @test "platform_tunnel_iface: OpenVPNN is ovpn_brN, WireguardN is nwgN" {
     load_platform
     run platform_tunnel_iface OpenVPN0

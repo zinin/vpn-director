@@ -122,6 +122,37 @@ esac"
     assert_output "$(printf '%s\n' wgc1 wgc2 main)"
 }
 
+@test "platform_tunnel_unlisted_reason: names the redirect mode of an OpenVPN client it leaves out" {
+    load_platform
+    with_ovpn_modes 0 1
+    run platform_tunnel_unlisted_reason ovpnc1
+    assert_success
+    assert_output 'OpenVPN client 1 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "No")'
+    run platform_tunnel_unlisted_reason ovpnc2
+    assert_success
+    assert_output 'OpenVPN client 2 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "Yes (all)")'
+    with_ovpn_modes "" 3
+    run platform_tunnel_unlisted_reason ovpnc1
+    assert_success
+    assert_output 'OpenVPN client 1 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "No")'
+    run platform_tunnel_unlisted_reason ovpnc2
+    assert_success
+    assert_output 'OpenVPN client 2 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "3")'
+}
+
+# A typo in the tunnel id has no mode: ovpnc9 is not in the fixture rt_tables,
+# so its warning stays the generic "not a tunnel this platform knows".
+@test "platform_tunnel_unlisted_reason: nothing for a listed tunnel, WireGuard, main or an id rt_tables does not name" {
+    load_platform
+    with_ovpn_modes 0 2
+    local id
+    for id in ovpnc2 wgc1 main ovpnc9 eth0 ""; do
+        run platform_tunnel_unlisted_reason "$id"
+        assert_failure
+        refute_output
+    done
+}
+
 @test "_merlin_tunnel_routable: only complete ovpncN ids consult the current mode" {
     load_platform
     with_ovpn_modes "" ""
@@ -355,7 +386,7 @@ with_tun_addr() {
     assert_success
     run platform_tunnel_table_release wgc1 0
     assert_success
-    [ ! -s /tmp/bats_ip_calls.log ]
+    [[ ! -s /tmp/bats_ip_calls.log ]]
 }
 
 @test "_merlin_drop_default: only complete ovpncN ids can have a default removed" {
@@ -368,7 +399,7 @@ with_tun_addr() {
         assert_success
         refute_output
     done
-    [ ! -s /tmp/bats_ip_calls.log ]
+    [[ ! -s /tmp/bats_ip_calls.log ]]
 }
 
 # Merlin's firmware puts nothing between a forwarded packet and mangle, so
