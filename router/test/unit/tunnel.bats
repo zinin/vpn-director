@@ -2122,3 +2122,91 @@ move_100_to_wgc1() {
     run ipset test XRAY_CLIENTS 100.64.0.8
     assert_failure
 }
+
+# ============================================================================
+# Merlin: an OpenVPN client out of VPN Director mode
+# ============================================================================
+
+# In "No" and "Yes (all)" the firmware routes the whole router through the
+# client's table (a "from all" rule at 10000+N). These run the real Merlin
+# implementation: its platform_tunnels leaves such a client out, its route
+# ensure installs no default for it, and in "No" its route ensure and release
+# take out a default an earlier apply left there.
+
+# ovpn_mode <client> <rgw> - from here on, nvram answers the redirect mode of
+# that OpenVPN client as given ("" for unset) and defers to the mock for every
+# other key. A function, so the subshells of `run` see it as well.
+ovpn_mode() {
+    OVPN_MODE_KEY="get vpn_client$1_rgw"
+    OVPN_MODE_VALUE="$2"
+    nvram() {
+        if [[ $* == "$OVPN_MODE_KEY" ]]; then
+            printf '%s\n' "$OVPN_MODE_VALUE"
+            return 0
+        fi
+        command nvram "$@"
+    }
+}
+
+# tun11_addressed - tun11 carries 10.8.0.2/24, so a route ensure that is not
+# refused installs "default via 10.8.0.1 dev tun11 table ovpnc1".
+tun11_addressed() {
+    export BATS_IP_ADDRS_FILE="$BATS_TEST_TMPDIR/addrs"
+    printf '%s\n' "br0 192.168.1.1/24" "tun11 10.8.0.2/24" > "$BATS_IP_ADDRS_FILE"
+}
+
+# The mode is switched after the apply that recorded the tunnel; the config
+# stays, so the next apply takes the up-to-date branch, which ensures the
+# route of every tunnel on record.
+@test "tunnel_apply: the up-to-date path installs no default for a client switched out of VPN Director mode" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
+    tun11_addressed
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_success
+    grep -qx 'ip route replace default via 10.8.0.1 dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    [ -f "$TUN_DIR_HASH" ]
+
+    ovpn_mode 1 0
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    : > /tmp/bats_ip_calls.log
+    : > "$LOG_FILE"
+    # Not through `run`: TUNNEL_UNCARRIED has to outlive the call.
+    tunnel_apply
+
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
+    grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    run tunnel_uncarried
+    assert_output "192.168.1.5"
+}
+
+@test "tunnel_apply: the up-to-date path leaves the firmware's default of a client in Yes (all) mode" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
+    tun11_addressed
+    run tunnel_apply
+    assert_success
+
+    ovpn_mode 1 1
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    refute grep -qE 'ip route (replace|del)' /tmp/bats_ip_calls.log
+}
+
+@test "tunnel_stop: takes out the default of a recorded client switched out of VPN Director mode" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+
+    ovpn_mode 1 0
+    : > /tmp/bats_ip_calls.log
+    run tunnel_stop
+    assert_success
+    grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    [ ! -f "$TUN_DIR_TABLES" ]
+}

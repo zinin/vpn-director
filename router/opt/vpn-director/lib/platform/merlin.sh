@@ -183,22 +183,49 @@ platform_tunnel_route() {
     esac
 }
 
+# Take the default out of the table of an OpenVPN client in "No" mode
+# (vpn_clientN_rgw 0 or unset). Whenever the client comes up in that mode the
+# firmware deletes its own ("ip route del default table ovpncN" in
+# libovpn/openvpn_control.c), so a default found there is one an earlier
+# Tunnel Director apply installed - and the firmware's "from all" rule sends
+# every packet of the router to it. The dev selector keeps the delete to a
+# default through the tunnel, the only kind Tunnel Director installs. In "Yes
+# (all)" the default is the firmware's and stays. Prints nothing; rc 0.
+_merlin_drop_default() {
+    local id="${1:-}" rgw iface
+    [[ $id =~ ^ovpnc[0-9]+$ ]] || return 0
+    rgw="$(_merlin_ovpn_rgw "$id")"
+    [[ -z $rgw || $rgw == 0 ]] || return 0
+    iface="$(platform_tunnel_iface "$id")" || return 0
+    ip route del default dev "$iface" table "$id" 2>/dev/null || true
+}
+
 # "ip route replace" is idempotent, which tunnel.sh relies on: it calls this
 # on every apply, including those that change nothing, so the default follows
-# the interface across OpenVPN flaps once wan-event fires an apply.
+# the interface across OpenVPN flaps once wan-event fires an apply. A tunnel
+# _merlin_tunnel_routable refuses gets none: the configuration can still name
+# it, and TUN_DIR_TABLES can still hold it after its mode was switched, but
+# its table is the one the firmware routes the whole router through. In "No"
+# mode a default an earlier apply left there goes as well.
 platform_tunnel_route_ensure() {
     local id="${1:-}" idx="${2:-}" gateway="${3:-}" table spec
     table="$(platform_tunnel_table "$id" "$idx")" || return 1
     [[ $table != main ]] || return 0
+    if ! _merlin_tunnel_routable "$id"; then
+        _merlin_drop_default "$id"
+        return 1
+    fi
     spec="$(platform_tunnel_route "$id" "$gateway")" || return 1
     # shellcheck disable=SC2086
     ip route replace $spec table "$table" 2>/dev/null
 }
 
 # The rest of ovpncN/wgcN is firmware's (LAN routes, the tunnel prefix, DNS).
-# Flushing it would drop those. tunnel_stop only needs the ip rule gone; the
-# default we installed is inert without it.
+# Flushing it would drop those. tunnel_stop only needs the ip rule gone; in VPN
+# Director mode the default we installed is inert without it. In "No" mode the
+# firmware's own "from all" rule reads the table, so that default goes.
 platform_tunnel_table_release() {
+    _merlin_drop_default "${1:-}"
     return 0
 }
 

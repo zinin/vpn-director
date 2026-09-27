@@ -215,8 +215,8 @@ esac"
 # Firmware OpenVPN in policy mode (rgw=2) copies WAN into ovpncN when the
 # server does not push redirect-gateway. Tunnel Director then marks packets
 # into a table whose default is still the WAN. The spec is the default that
-# replace puts in that table; release stays a no-op because the rest of the
-# table is firmware's.
+# replace puts in that table. In that mode release stays a no-op because the
+# rest of the table is firmware's.
 
 with_tun_addr() {
     printf '%s\n' "$@" > "$BATS_TEST_TMPDIR/addrs"
@@ -299,6 +299,75 @@ with_tun_addr() {
     assert_success
     run platform_tunnel_table_release wgc1 0
     assert_success
+    [ ! -s /tmp/bats_ip_calls.log ]
+}
+
+# Out of VPN Director mode the client's table is the one the firmware routes the
+# whole router through, so no default goes in. In "No" the firmware deletes its
+# own default whenever the client comes up, so one found there is Tunnel
+# Director's and goes; in "Yes (all)" the default is the firmware's and stays.
+@test "platform_tunnel_route_ensure: installs nothing for an OpenVPN client out of VPN Director mode" {
+    load_platform
+    with_tun_addr "tun11 10.73.149.53/24"
+    local mode
+    for mode in 0 1 ""; do
+        with_ovpn_modes "$mode" 2
+        : > /tmp/bats_ip_calls.log
+        run platform_tunnel_route_ensure ovpnc1 0
+        assert_failure
+        refute_output
+        refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
+    done
+}
+
+@test "platform_tunnel_route_ensure: takes the default out of the table of a client in No mode" {
+    load_platform
+    local mode
+    for mode in 0 ""; do
+        with_ovpn_modes "$mode" 2
+        : > /tmp/bats_ip_calls.log
+        run platform_tunnel_route_ensure ovpnc1 0
+        assert_failure
+        grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    done
+    with_ovpn_modes 1 2
+    : > /tmp/bats_ip_calls.log
+    run platform_tunnel_route_ensure ovpnc1 0
+    assert_failure
+    refute grep -q 'ip route del' /tmp/bats_ip_calls.log
+}
+
+@test "platform_tunnel_table_release: takes the default out of a table in No mode only" {
+    load_platform
+    local mode
+    for mode in 0 ""; do
+        with_ovpn_modes "$mode" 2
+        : > /tmp/bats_ip_calls.log
+        run platform_tunnel_table_release ovpnc1 0
+        assert_success
+        grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    done
+    with_ovpn_modes 1 2
+    : > /tmp/bats_ip_calls.log
+    run platform_tunnel_table_release ovpnc1 0
+    assert_success
+    run platform_tunnel_table_release ovpnc2 1
+    assert_success
+    run platform_tunnel_table_release wgc1 0
+    assert_success
+    [ ! -s /tmp/bats_ip_calls.log ]
+}
+
+@test "_merlin_drop_default: only complete ovpncN ids can have a default removed" {
+    load_platform
+    with_ovpn_modes 0 0
+    : > /tmp/bats_ip_calls.log
+    local id
+    for id in ovpnc2junk ovpnc ovpncx2 xovpnc2 wgc1 main ""; do
+        run _merlin_drop_default "$id"
+        assert_success
+        refute_output
+    done
     [ ! -s /tmp/bats_ip_calls.log ]
 }
 
