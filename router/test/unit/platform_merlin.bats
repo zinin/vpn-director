@@ -81,10 +81,18 @@ with_mock() {
     assert_line --index 4 "main"
 }
 
-@test "platform_tunnels: only main when rt_tables is missing" {
+@test "platform_tunnels: reports a missing rt_tables while keeping main for local callers" {
     load_platform
     RT_TABLES_FILE="$BATS_TEST_TMPDIR/absent" run platform_tunnels
-    assert_success
+    assert_failure
+    assert_output "main"
+}
+
+@test "platform_tunnels: reports a routing table read error" {
+    load_platform
+    mkdir "$BATS_TEST_TMPDIR/rt_tables_directory"
+    RT_TABLES_FILE="$BATS_TEST_TMPDIR/rt_tables_directory" run platform_tunnels
+    assert_failure
     assert_output "main"
 }
 

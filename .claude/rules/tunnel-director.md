@@ -61,6 +61,12 @@ Tunnel Director's fwmark rule, so a default there takes them all into the tunnel
 clients, the router itself, Xray's upstream and the other tunnels' clients. A WireGuard client has
 no such setting; the firmware routes every `wgcN` by VPN Director rules alone.
 
+If Merlin cannot read `rt_tables`, `platform_tunnels` returns an error while still printing `main`
+for local routing callers. The `platform` CLI propagates that error instead of reporting an empty
+tunnel list: the failover watch treats a successful empty Merlin list as no remaining exits, but a
+failed lookup is no answer. A readable table with no eligible tunnels still produces a successful
+empty list.
+
 The configuration can still name such a client, and `TUN_DIR_TABLES` can still hold one whose mode
 was switched after it was applied, which the up-to-date branch ensures like any tunnel on record.
 So Merlin's `platform_tunnel_route_ensure` refuses a client `platform_tunnels` does not list, and

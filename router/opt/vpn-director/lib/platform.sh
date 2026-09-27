@@ -21,7 +21,9 @@
 #   platform_ipv6_enabled                  1 | 0
 #   platform_lan_ifaces                    LAN interface names, one per line
 #   platform_tunnels                       the tunnels Tunnel Director may route through,
-#                                          one id per line, "main" last
+#                                          one id per line, "main" last; on a failed
+#                                          inventory it may print only "main" for
+#                                          local callers, but returns 1
 #   platform_tunnel_unlisted_reason <id>   why a tunnel the firmware has is not listed,
 #                                          one line for a log message; nothing and rc 1
 #                                          when there is no such reason

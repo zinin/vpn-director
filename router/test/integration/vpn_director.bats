@@ -590,6 +590,22 @@ run_stubbed_cli() {
     echo "$output" | jq -e '[.tunnels[].id] == ["wgc1","wgc2","ovpnc2"]' >/dev/null
 }
 
+@test "vpn-director: platform refuses an incomplete Merlin tunnel inventory" {
+    RT_TABLES_FILE="$BATS_TEST_TMPDIR/absent" \
+        run --separate-stderr "$SCRIPTS_DIR/vpn-director.sh" platform
+    assert_failure
+    refute_output
+}
+
+@test "vpn-director: platform accepts a readable Merlin table with no tunnels" {
+    : > "$BATS_TEST_TMPDIR/empty_rt_tables"
+    RT_TABLES_FILE="$BATS_TEST_TMPDIR/empty_rt_tables" \
+        run --separate-stderr "$SCRIPTS_DIR/vpn-director.sh" platform
+    assert_success
+    [ "${#lines[@]}" -eq 1 ]
+    echo "$output" | jq -e '.platform == "merlin" and .tunnels == []' >/dev/null
+}
+
 @test "vpn-director: platform reports wan_if as empty when the platform has no answer" {
     mkdir -p "$BATS_TEST_TMPDIR/mock"
     printf '#!/bin/bash\necho ""\n' > "$BATS_TEST_TMPDIR/mock/nvram"

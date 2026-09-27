@@ -69,9 +69,34 @@ _merlin_tunnel_routable() {
 # (_merlin_tunnel_routable). A TAP client never is: its page offers no such
 # mode, and Tunnel Director, which routes through tun1N, could not use it.
 platform_tunnels() {
-    local rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" ovpn id
-    { awk '$0!~/^#/ && $2 ~ /^wgc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null | sort; } || true
-    ovpn="$({ awk '$0!~/^#/ && $2 ~ /^ovpnc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null | sort; } || true)"
+    local rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" wgc ovpn id
+    # Keep main available to local callers, but report an incomplete inventory
+    # so cmd_platform cannot mistake it for a valid empty Merlin tunnel list.
+    if [[ ! -f $rt_tables || ! -r $rt_tables ]]; then
+        printf '%s\n' main
+        return 1
+    fi
+    wgc="$(awk '$0!~/^#/ && $2 ~ /^wgc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null)" || {
+        printf '%s\n' main
+        return 1
+    }
+    ovpn="$(awk '$0!~/^#/ && $2 ~ /^ovpnc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null)" || {
+        printf '%s\n' main
+        return 1
+    }
+    if [[ -n $wgc ]]; then
+        wgc="$(printf '%s\n' "$wgc" | sort)" || {
+            printf '%s\n' main
+            return 1
+        }
+        printf '%s\n' "$wgc"
+    fi
+    if [[ -n $ovpn ]]; then
+        ovpn="$(printf '%s\n' "$ovpn" | sort)" || {
+            printf '%s\n' main
+            return 1
+        }
+    fi
     while IFS= read -r id; do
         if [[ -n $id ]] && _merlin_tunnel_routable "$id"; then
             printf '%s\n' "$id"
