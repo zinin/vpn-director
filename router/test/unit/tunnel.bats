@@ -2165,7 +2165,7 @@ tun11_addressed() {
     run tunnel_apply
     assert_success
     grep -qx 'ip route replace default via 10.8.0.1 dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
-    [ -f "$TUN_DIR_HASH" ]
+    [[ -f "$TUN_DIR_HASH" ]]
 
     ovpn_mode 1 0
     fw_chain_exists() { return 0; }
@@ -2176,6 +2176,7 @@ tun11_addressed() {
     tunnel_apply
 
     grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    grep -qF "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\"); Tunnel Director does not route through it" "$LOG_FILE"
     refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
     grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
     run tunnel_uncarried
@@ -2195,6 +2196,7 @@ tun11_addressed() {
     run tunnel_apply
     assert_success
     assert_output --partial "Rules are applied and up-to-date"
+    assert_output --partial "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"Yes (all)\"); Tunnel Director does not route through it"
     refute grep -qE 'ip route (replace|del)' /tmp/bats_ip_calls.log
 }
 
@@ -2208,5 +2210,58 @@ tun11_addressed() {
     run tunnel_stop
     assert_success
     grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
-    [ ! -f "$TUN_DIR_TABLES" ]
+    [[ ! -f "$TUN_DIR_TABLES" ]]
+}
+
+@test "tunnel_apply: skips an OpenVPN client out of VPN Director mode and says why" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
+    ovpn_mode 1 0
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\")"
+    refute_output --partial "not a tunnel this platform knows"
+    assert_output --partial "not recorded as up-to-date"
+    refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
+    refute grep -q 'lookup ovpnc1' /tmp/bats_ip_calls.log
+    [[ ! -f "$TUN_DIR_HASH" ]]
+}
+
+# `restart` and `restart tunnel` rebuild with the config unchanged
+# (TUN_DIR_FORCE_REBUILD=1). The client's slot is on record from before the
+# switch; the rebuild gives it none, so the slot is released after the swap -
+# its ip rule, and in "No" mode the default in its table.
+@test "tunnel_apply: a rebuild releases the slot of a client switched out of VPN Director mode" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    run cat "$TUN_DIR_TABLES"
+    assert_output "0 ovpnc1"
+
+    ovpn_mode 1 0
+    export TUN_DIR_FORCE_REBUILD=1
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
+    grep -qx 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup ovpnc1' /tmp/bats_ip_calls.log
+    grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    run cat "$TUN_DIR_TABLES"
+    refute_output --partial "ovpnc1"
+}
+
+# The watch drops Xray membership on failover_ready. A failover tunnel the
+# platform leaves out gets no slot, so no marker goes out and the Xray clients
+# stay proxied. tun11 has an address: listed, the tunnel would be carried.
+@test "tunnel_apply: no slot and no failover_ready for a failover tunnel out of VPN Director mode" {
+    load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.8"]}}'
+    export XRAY_FAILOVER_TUNNEL=ovpnc1 XRAY_FAILOVER_CLIENTS=192.168.1.8
+    tun11_addressed
+    ovpn_mode 1 0
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
+    run cat "$TUN_DIR_TABLES"
+    refute_output --partial "ovpnc1"
+    [[ ! -e "$TUN_DIR_FAILOVER_READY" ]]
 }
