@@ -81,11 +81,113 @@ with_mock() {
     assert_line --index 4 "main"
 }
 
-@test "platform_tunnels: only main when rt_tables is missing" {
+@test "platform_tunnels: reports a missing rt_tables while keeping main for local callers" {
     load_platform
     RT_TABLES_FILE="$BATS_TEST_TMPDIR/absent" run platform_tunnels
-    assert_success
+    assert_failure
     assert_output "main"
+}
+
+@test "platform_tunnels: reports a routing table read error" {
+    load_platform
+    mkdir "$BATS_TEST_TMPDIR/rt_tables_directory"
+    RT_TABLES_FILE="$BATS_TEST_TMPDIR/rt_tables_directory" run platform_tunnels
+    assert_failure
+    assert_output "main"
+}
+
+# "Redirect Internet traffic through tunnel" is nvram vpn_clientN_rgw: 0 "No",
+# 1 "Yes (all)", 2 "VPN Director (policy rules)"; the firmware reads an empty
+# value as 0. In "No" and "Yes (all)" it adds "from all lookup ovpncN" at
+# priority 10000+N while the client runs, so every packet of the router reads
+# the client's table first, and a default Tunnel Director put there would take
+# them all into the tunnel.
+
+# with_ovpn_modes <client 1> <client 2> - an nvram that answers the redirect
+# mode of OpenVPN clients 1 and 2 as given ("" for unset) and nothing for any
+# other key.
+with_ovpn_modes() {
+    with_mock nvram "case \"\$*\" in
+    \"get vpn_client1_rgw\") echo '$1' ;;
+    \"get vpn_client2_rgw\") echo '$2' ;;
+    *) echo '' ;;
+esac"
+}
+
+@test "platform_tunnels: an OpenVPN client is listed only in VPN Director mode" {
+    load_platform
+    with_ovpn_modes 0 2
+    run platform_tunnels
+    assert_success
+    assert_output "$(printf '%s\n' wgc1 wgc2 ovpnc2 main)"
+    with_ovpn_modes 2 1
+    run platform_tunnels
+    assert_success
+    assert_output "$(printf '%s\n' wgc1 wgc2 ovpnc1 main)"
+    with_ovpn_modes "" ""
+    run platform_tunnels
+    assert_success
+    assert_output "$(printf '%s\n' wgc1 wgc2 main)"
+}
+
+@test "platform_tunnel_unlisted_reason: names the redirect mode of an OpenVPN client it leaves out" {
+    load_platform
+    with_ovpn_modes 0 1
+    run platform_tunnel_unlisted_reason ovpnc1
+    assert_success
+    assert_output 'OpenVPN client 1 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "No")'
+    run platform_tunnel_unlisted_reason ovpnc2
+    assert_success
+    assert_output 'OpenVPN client 2 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "Yes (all)")'
+    with_ovpn_modes "" 3
+    run platform_tunnel_unlisted_reason ovpnc1
+    assert_success
+    assert_output 'OpenVPN client 1 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "No")'
+    run platform_tunnel_unlisted_reason ovpnc2
+    assert_success
+    assert_output 'OpenVPN client 2 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "3")'
+}
+
+# A typo in the tunnel id has no mode: ovpnc9 is not in the fixture rt_tables,
+# so its warning stays the generic "not a tunnel this platform knows".
+@test "platform_tunnel_unlisted_reason: nothing for a listed tunnel, WireGuard, main or an id rt_tables does not name" {
+    load_platform
+    with_ovpn_modes 0 2
+    local id
+    for id in ovpnc2 wgc1 main ovpnc9 eth0 ""; do
+        run platform_tunnel_unlisted_reason "$id"
+        assert_failure
+        refute_output
+    done
+}
+
+@test "_merlin_tunnel_routable: only complete ovpncN ids consult the current mode" {
+    load_platform
+    with_ovpn_modes "" ""
+    for id in ovpnc2junk ovpnc ovpncx2 xovpnc2 wgc1 main eth0 ""; do
+        run _merlin_tunnel_routable "$id"
+        assert_success
+        refute_output
+    done
+    run _merlin_tunnel_routable ovpnc1
+    assert_failure
+    refute_output
+
+    with_ovpn_modes 2 1
+    run _merlin_tunnel_routable ovpnc1
+    assert_success
+    refute_output
+    run _merlin_tunnel_routable ovpnc2
+    assert_failure
+    refute_output
+
+    with_ovpn_modes 0 2
+    run _merlin_tunnel_routable ovpnc1
+    assert_failure
+    refute_output
+    run _merlin_tunnel_routable ovpnc2
+    assert_success
+    refute_output
 }
 
 @test "platform_tunnel_iface: wgcN is its own interface, ovpncN is tun1N" {
@@ -152,8 +254,8 @@ with_mock() {
 # Firmware OpenVPN in policy mode (rgw=2) copies WAN into ovpncN when the
 # server does not push redirect-gateway. Tunnel Director then marks packets
 # into a table whose default is still the WAN. The spec is the default that
-# replace puts in that table; release stays a no-op because the rest of the
-# table is firmware's.
+# replace puts in that table. In that mode release stays a no-op because the
+# rest of the table is firmware's.
 
 with_tun_addr() {
     printf '%s\n' "$@" > "$BATS_TEST_TMPDIR/addrs"
@@ -237,6 +339,75 @@ with_tun_addr() {
     run platform_tunnel_table_release wgc1 0
     assert_success
     [ ! -s /tmp/bats_ip_calls.log ]
+}
+
+# Out of VPN Director mode the client's table is the one the firmware routes the
+# whole router through, so no default goes in. In "No" the firmware deletes its
+# own default whenever the client comes up, so one found there is Tunnel
+# Director's and goes; in "Yes (all)" the default is the firmware's and stays.
+@test "platform_tunnel_route_ensure: installs nothing for an OpenVPN client out of VPN Director mode" {
+    load_platform
+    with_tun_addr "tun11 10.73.149.53/24"
+    local mode
+    for mode in 0 1 ""; do
+        with_ovpn_modes "$mode" 2
+        : > /tmp/bats_ip_calls.log
+        run platform_tunnel_route_ensure ovpnc1 0
+        assert_failure
+        refute_output
+        refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
+    done
+}
+
+@test "platform_tunnel_route_ensure: takes the default out of the table of a client in No mode" {
+    load_platform
+    local mode
+    for mode in 0 ""; do
+        with_ovpn_modes "$mode" 2
+        : > /tmp/bats_ip_calls.log
+        run platform_tunnel_route_ensure ovpnc1 0
+        assert_failure
+        grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    done
+    with_ovpn_modes 1 2
+    : > /tmp/bats_ip_calls.log
+    run platform_tunnel_route_ensure ovpnc1 0
+    assert_failure
+    refute grep -q 'ip route del' /tmp/bats_ip_calls.log
+}
+
+@test "platform_tunnel_table_release: takes the default out of a table in No mode only" {
+    load_platform
+    local mode
+    for mode in 0 ""; do
+        with_ovpn_modes "$mode" 2
+        : > /tmp/bats_ip_calls.log
+        run platform_tunnel_table_release ovpnc1 0
+        assert_success
+        grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
+    done
+    with_ovpn_modes 1 2
+    : > /tmp/bats_ip_calls.log
+    run platform_tunnel_table_release ovpnc1 0
+    assert_success
+    run platform_tunnel_table_release ovpnc2 1
+    assert_success
+    run platform_tunnel_table_release wgc1 0
+    assert_success
+    [[ ! -s /tmp/bats_ip_calls.log ]]
+}
+
+@test "_merlin_drop_default: only complete ovpncN ids can have a default removed" {
+    load_platform
+    with_ovpn_modes 0 0
+    : > /tmp/bats_ip_calls.log
+    local id
+    for id in ovpnc2junk ovpnc ovpncx2 xovpnc2 wgc1 main ""; do
+        run _merlin_drop_default "$id"
+        assert_success
+        refute_output
+    done
+    [[ ! -s /tmp/bats_ip_calls.log ]]
 }
 
 # Merlin's firmware puts nothing between a forwarded packet and mangle, so

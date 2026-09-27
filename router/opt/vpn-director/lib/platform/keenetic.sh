@@ -107,6 +107,13 @@ platform_tunnels() {
     printf '%s\n' main
 }
 
+# Every OpenVPN and WireGuard interface RCI lists is one Tunnel Director may
+# route through: its tables are Tunnel Director's own (KEENETIC_TABLE_BASE +
+# idx), and no firmware rule reads them. There is never a reason to give.
+platform_tunnel_unlisted_reason() {
+    return 1
+}
+
 # The Linux name is a convention (OpenVPNN -> ovpn_brN, WireguardN -> nwgN):
 # RCI does not expose it. While the tunnel is up the interface must carry the
 # address RCI reports, or the convention does not hold on this router and the

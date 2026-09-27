@@ -38,7 +38,7 @@ Routes LAN client traffic through VPN tunnels. All traffic goes through the tunn
 
 | Field | Description |
 |-------|-------------|
-| Tunnel key | A tunnel id `platform_tunnels` lists (Merlin: `wgcN`, `ovpncN` from `/etc/iproute2/rt_tables`, plus `main`; Keenetic: `OpenVPNN`, `WireguardN` from RCI, plus `main`) |
+| Tunnel key | A tunnel id `platform_tunnels` lists (Merlin: `wgcN` from `/etc/iproute2/rt_tables`, and `ovpncN` while its OpenVPN client is in "VPN Director (policy rules)" mode, plus `main`; Keenetic: `OpenVPNN`, `WireguardN` from RCI, plus `main`); see "Which tunnels the platform lists" |
 | `clients` | Array of LAN IPs/CIDRs (RFC1918 only) |
 | `exclude` | Array of country codes for direct routing |
 | `gateway` | Optional. OpenVPN next hop; ignored on WireGuard. On Merlin it fills ovpncN when the server does not push redirect-gateway |
@@ -48,6 +48,50 @@ Routes LAN client traffic through VPN tunnels. All traffic goes through the tunn
 - All traffic from `clients` routes through the tunnel
 - Traffic to destinations in `exclude` ipsets bypasses VPN (goes direct)
 - Order of tunnels in JSON decides which rule a client meets first; a tunnel's fwmark comes from its slot, which it keeps while it has clients (see "Stable slots and the rebuild in place")
+
+## Which tunnels the platform lists
+
+`platform_tunnels` lists the tunnels Tunnel Director may route through. On Merlin that is every
+`wgcN` in `rt_tables`, and an `ovpncN` only while its OpenVPN client's "Redirect Internet traffic
+through tunnel" (nvram `vpn_clientN_rgw`) is "VPN Director (policy rules)" (`2`). In "No" (`0`, or
+unset: the firmware reads an empty value as 0) and "Yes (all)" (`1`) the firmware adds
+`from all lookup ovpncN` at priority 10000+N while the client runs (`amvpn_set_routing_rules`,
+`libovpn/amvpn_routing.c` in Merlin 388). Every packet of the router reads that table ahead of
+Tunnel Director's fwmark rule, so a default there takes them all into the tunnel: the direct
+clients, the router itself, Xray's upstream and the other tunnels' clients. A WireGuard client has
+no such setting; the firmware routes every `wgcN` by VPN Director rules alone.
+
+If Merlin cannot read `rt_tables`, `platform_tunnels` returns an error while still printing `main`
+for local routing callers. The `platform` CLI propagates that error instead of reporting an empty
+tunnel list: the failover watch treats a successful empty Merlin list as no remaining exits, but a
+failed lookup is no answer. A readable table with no eligible tunnels still produces a successful
+empty list.
+
+The configuration can still name such a client, and `TUN_DIR_TABLES` can still hold one whose mode
+was switched after it was applied, which the up-to-date branch ensures like any tunnel on record.
+So Merlin's `platform_tunnel_route_ensure` refuses a client `platform_tunnels` does not list, and
+in "No" mode it and `platform_tunnel_table_release` take out a default through the tunnel
+(`ip route del default dev tun1N table ovpncN`). The firmware deletes its own default in that mode
+whenever the client comes up (`libovpn/openvpn_control.c`), so a default found there is one Tunnel
+Director left. In "Yes (all)" the default is the firmware's and stays.
+
+The mode is read from nvram, and a switch in the router UI writes it just before the firmware
+restarts the client. An apply in between acts on the new mode while the firmware's rules are still
+those of the old one. From "No" to VPN Director, the route ensure puts the default into a table the
+`from all` rule still reads, and the whole router follows it into the tunnel until the client's stop
+takes the rule and the table away; the other way, the default goes a moment before the restart
+flushes the table anyway. A mode changed with `nvram set` and no restart of the client leaves the
+firmware's rules in the old mode until the client restarts, and Tunnel Director, which reads nvram
+alone, follows the new one all that time.
+
+`tunnel.sh` asks `platform_tunnel_unlisted_reason` why a tunnel is left out and puts the answer in
+its warning: `Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode ("Redirect
+Internet traffic through tunnel" is "No")` on a rebuild, `route not installed: <reason>; Tunnel
+Director does not route through it` for a recorded tunnel on the up-to-date branch. KeeneticOS has
+no reason to give. A configuration that gives such a tunnel clients records no hash, as one with a
+typo in the id does: every apply rebuilds in place and repeats the warning, and the first apply
+after the switch to VPN Director carries the tunnel's clients. One left with no clients (moved,
+deleted or paused) is skipped with the same warning and records the hash: it has nothing to carry.
 
 ## Chain Architecture
 
@@ -268,10 +312,12 @@ From `lib/firewall.sh`: `swap_fw_chain`, `delete_fw_chain`, `ensure_fw_rule`, `s
 From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`, `TUN_DIR_TABLES`
 
 From the platform contract (`lib/platform.sh`, sourced by `common.sh`): `platform_tunnels`,
-`platform_tunnel_table`, `platform_tunnel_route_ensure`, `platform_tunnel_table_release`,
-`platform_tunnel_offload_target`, `platform_prerouting_base_pos`, `platform_lan_ifaces`
+`platform_tunnel_unlisted_reason`, `platform_tunnel_table`, `platform_tunnel_route_ensure`,
+`platform_tunnel_table_release`, `platform_tunnel_offload_target`, `platform_prerouting_base_pos`,
+`platform_lan_ifaces`
 
 ## Requirements
 
 - Requires ipsets from `lib/ipset.sh` (country codes in exclude lists)
 - VPN client must be active with NAT enabled
+- On Asuswrt-Merlin, an OpenVPN client in "VPN Director (policy rules)" mode (see "Which tunnels the platform lists")

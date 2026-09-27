@@ -93,9 +93,11 @@ cd server && go run ./cmd/webui --dev
 ```
 - All traffic from `clients` goes through tunnel
 - Traffic to destinations in `exclude` bypasses VPN (direct)
-- A tunnel key is any id `platform_tunnels` lists (Merlin: `wgcN` and `ovpncN` from
-  `/etc/iproute2/rt_tables`, plus `main`; Keenetic: `OpenVPNN` and `WireguardN` from
-  RCI, plus `main`); a key the platform does not list is skipped with a warning
+- A tunnel key is any id `platform_tunnels` lists (Merlin: `wgcN` from
+  `/etc/iproute2/rt_tables`, and `ovpncN` while that OpenVPN client is in "VPN Director
+  (policy rules)" mode, plus `main`; Keenetic: `OpenVPNN` and `WireguardN` from RCI, plus
+  `main`); a key the platform does not list is skipped with a warning, which on Merlin
+  names the OpenVPN client's mode
 - Optional `gateway` is the OpenVPN next hop; ignored on WireGuard. On Merlin it
   is also what fills ovpncN when the server does not push redirect-gateway.
 

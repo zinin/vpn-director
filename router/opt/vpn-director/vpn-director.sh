@@ -461,18 +461,25 @@ cmd_update() {
 # cmd_platform - print the platform facts the daemons need, as one JSON document
 # -------------------------------------------------------------------------------------------------
 # Tunnels are listed without "main"; a tunnel whose interface or info lookup
-# fails is omitted with a WARN so the rest of the document stays usable. The
-# document is one line: the daemons read the command's combined output, WARN
-# lines included, and take the last non-empty line as the document.
+# fails is omitted with a WARN so the rest of the document stays usable. An
+# incomplete tunnel inventory aborts: an empty Merlin list is authoritative
+# to the failover watch. The document is one line: the daemons read the
+# command's combined output, WARN lines included, and take the last non-empty
+# line as the document.
 # -------------------------------------------------------------------------------------------------
 cmd_platform() {
     _load_common
 
-    local arch wan pw_file lan_json tunnels_json
+    local arch wan pw_file lan_json tunnels_json tunnel_ids
     arch="$(uname -m)"
     wan="$(platform_wan_if)" || wan=""
     pw_file="$(platform_password_file)"
     lan_json="$(platform_lan_ifaces | jq -R . | jq -s -c .)"
+
+    if ! tunnel_ids="$(platform_tunnels)"; then
+        log -l ERROR "platform: cannot read tunnel inventory"
+        return 1
+    fi
 
     tunnels_json="[]"
     local id iface info type connected desc
@@ -495,7 +502,7 @@ cmd_platform() {
             --argjson connected "$([[ $connected == 1 ]] && echo true || echo false)" \
             --arg desc "$desc" \
             -n '$list + [{id:$id, iface:$iface, type:$type, connected:$connected, description:$desc}]')"
-    done < <(platform_tunnels || true)
+    done <<< "$tunnel_ids"
 
     jq -c -n \
         --arg platform "$(platform_name)" \

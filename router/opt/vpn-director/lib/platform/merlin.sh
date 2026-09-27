@@ -41,13 +41,90 @@ platform_lan_ifaces() {
     printf 'br0\n'
 }
 
+# The "Redirect Internet traffic through tunnel" setting of OpenVPN client N
+# (ovpncN): nvram vpn_clientN_rgw, "" when it is not set. 0 "No", 1 "Yes (all)",
+# 2 "VPN Director (policy rules)"; the firmware reads an empty value as 0
+# (nvram_pf_get_int).
+_merlin_ovpn_rgw() {
+    nvram get "vpn_client${1#ovpnc}_rgw" 2>/dev/null || true
+}
+
+# Whether Tunnel Director may route through <id>. In "No" and "Yes (all)" the
+# firmware adds "from all lookup ovpncN" at priority 10000+N while the client
+# runs (amvpn_set_routing_rules in libovpn/amvpn_routing.c, Merlin 388): every
+# packet of the router reads that table ahead of Tunnel Director's fwmark rule,
+# and a default there takes them all into the tunnel - the direct clients, the
+# router itself, Xray's upstream and the other tunnels' clients. Only VPN
+# Director mode leaves the table to the rules that name their sources. A
+# WireGuard client has no such setting - the firmware routes every wgcN by VPN
+# Director rules alone (it sets rgw = OVPN_RGW_POLICY for WireGuard) - and main
+# is no tunnel. Read on every call: the mode can be switched at any time.
+_merlin_tunnel_routable() {
+    [[ ${1:-} =~ ^ovpnc[0-9]+$ ]] || return 0
+    [[ "$(_merlin_ovpn_rgw "$1")" == 2 ]]
+}
+
 # wgcN first, ovpncN next, main always last. RT_TABLES_FILE overrides the path
-# for tests.
+# for tests. An OpenVPN client is listed only in VPN Director mode
+# (_merlin_tunnel_routable). A TAP client never is: its page offers no such
+# mode, and Tunnel Director, which routes through tun1N, could not use it.
 platform_tunnels() {
-    local rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}"
-    { awk '$0!~/^#/ && $2 ~ /^wgc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null | sort; } || true
-    { awk '$0!~/^#/ && $2 ~ /^ovpnc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null | sort; } || true
+    local rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" wgc ovpn id
+    # Keep main available to local callers, but report an incomplete inventory
+    # so cmd_platform cannot mistake it for a valid empty Merlin tunnel list.
+    if [[ ! -f $rt_tables || ! -r $rt_tables ]]; then
+        printf '%s\n' main
+        return 1
+    fi
+    wgc="$(awk '$0!~/^#/ && $2 ~ /^wgc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null)" || {
+        printf '%s\n' main
+        return 1
+    }
+    ovpn="$(awk '$0!~/^#/ && $2 ~ /^ovpnc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null)" || {
+        printf '%s\n' main
+        return 1
+    }
+    if [[ -n $wgc ]]; then
+        wgc="$(printf '%s\n' "$wgc" | sort)" || {
+            printf '%s\n' main
+            return 1
+        }
+        printf '%s\n' "$wgc"
+    fi
+    if [[ -n $ovpn ]]; then
+        ovpn="$(printf '%s\n' "$ovpn" | sort)" || {
+            printf '%s\n' main
+            return 1
+        }
+    fi
+    while IFS= read -r id; do
+        if [[ -n $id ]] && _merlin_tunnel_routable "$id"; then
+            printf '%s\n' "$id"
+        fi
+    done <<< "$ovpn"
     printf '%s\n' main
+}
+
+# Why an OpenVPN client rt_tables names is not listed: its redirect mode, for
+# the warning tunnel.sh logs where it would otherwise call the tunnel unknown.
+# Nothing and rc 1 for a tunnel platform_tunnels lists, a WireGuard client,
+# main, and an id rt_tables does not name - a typo has no mode.
+platform_tunnel_unlisted_reason() {
+    local id="${1:-}" rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" rgw setting
+    [[ $id =~ ^ovpnc[0-9]+$ ]] || return 1
+    awk -v id="$id" '$0 !~ /^#/ && $2 == id { found = 1 } END { exit !found }' "$rt_tables" 2>/dev/null ||
+        return 1
+    if _merlin_tunnel_routable "$id"; then
+        return 1
+    fi
+    rgw="$(_merlin_ovpn_rgw "$id")"
+    case "$rgw" in
+        ''|0) setting="No" ;;
+        1)    setting="Yes (all)" ;;
+        *)    setting="$rgw" ;;
+    esac
+    printf 'OpenVPN client %s is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "%s")\n' \
+        "${id#ovpnc}" "$setting"
 }
 
 # OpenVPN client N runs on tun1N; WireGuard clients are named after their table.
@@ -153,22 +230,49 @@ platform_tunnel_route() {
     esac
 }
 
+# Take the default out of the table of an OpenVPN client in "No" mode
+# (vpn_clientN_rgw 0 or unset). Whenever the client comes up in that mode the
+# firmware deletes its own ("ip route del default table ovpncN" in
+# libovpn/openvpn_control.c), so a default found there is one an earlier
+# Tunnel Director apply installed - and the firmware's "from all" rule sends
+# every packet of the router to it. The dev selector keeps the delete to a
+# default through the tunnel, the only kind Tunnel Director installs. In "Yes
+# (all)" the default is the firmware's and stays. Prints nothing; rc 0.
+_merlin_drop_default() {
+    local id="${1:-}" rgw iface
+    [[ $id =~ ^ovpnc[0-9]+$ ]] || return 0
+    rgw="$(_merlin_ovpn_rgw "$id")"
+    [[ -z $rgw || $rgw == 0 ]] || return 0
+    iface="$(platform_tunnel_iface "$id")" || return 0
+    ip route del default dev "$iface" table "$id" 2>/dev/null || true
+}
+
 # "ip route replace" is idempotent, which tunnel.sh relies on: it calls this
 # on every apply, including those that change nothing, so the default follows
-# the interface across OpenVPN flaps once wan-event fires an apply.
+# the interface across OpenVPN flaps once wan-event fires an apply. A tunnel
+# _merlin_tunnel_routable refuses gets none: the configuration can still name
+# it, and TUN_DIR_TABLES can still hold it after its mode was switched, but
+# its table is the one the firmware routes the whole router through. In "No"
+# mode a default an earlier apply left there goes as well.
 platform_tunnel_route_ensure() {
     local id="${1:-}" idx="${2:-}" gateway="${3:-}" table spec
     table="$(platform_tunnel_table "$id" "$idx")" || return 1
     [[ $table != main ]] || return 0
+    if ! _merlin_tunnel_routable "$id"; then
+        _merlin_drop_default "$id"
+        return 1
+    fi
     spec="$(platform_tunnel_route "$id" "$gateway")" || return 1
     # shellcheck disable=SC2086
     ip route replace $spec table "$table" 2>/dev/null
 }
 
 # The rest of ovpncN/wgcN is firmware's (LAN routes, the tunnel prefix, DNS).
-# Flushing it would drop those. tunnel_stop only needs the ip rule gone; the
-# default we installed is inert without it.
+# Flushing it would drop those. tunnel_stop only needs the ip rule gone; in VPN
+# Director mode the default we installed is inert without it. In "No" mode the
+# firmware's own "from all" rule reads the table, so that default goes.
 platform_tunnel_table_release() {
+    _merlin_drop_default "${1:-}"
     return 0
 }
 

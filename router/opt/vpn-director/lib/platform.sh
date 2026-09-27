@@ -20,7 +20,13 @@
 #   platform_wan_if                        active WAN interface name
 #   platform_ipv6_enabled                  1 | 0
 #   platform_lan_ifaces                    LAN interface names, one per line
-#   platform_tunnels                       tunnel ids, one per line, "main" last
+#   platform_tunnels                       the tunnels Tunnel Director may route through,
+#                                          one id per line, "main" last; on a failed
+#                                          inventory it may print only "main" for
+#                                          local callers, but returns 1
+#   platform_tunnel_unlisted_reason <id>   why a tunnel the firmware has is not listed,
+#                                          one line for a log message; nothing and rc 1
+#                                          when there is no such reason
 #   platform_tunnel_iface <id>             Linux interface of a tunnel
 #   platform_tunnel_info <id>              three lines: type, connected (1|0), description
 #   platform_tunnel_table <id> <idx>       routing table for "ip rule ... lookup"
@@ -49,6 +55,12 @@
 #   * platform_tunnel_route_ensure must be idempotent: tunnel.sh calls it for
 #     every recorded tunnel on every apply that finds the configuration already
 #     up to date, not only when something changed.
+#   * platform_tunnel_route_ensure may refuse a tunnel platform_tunnels does
+#     not list. TUN_DIR_TABLES can still hold one whose mode changed after it
+#     was applied, and on Merlin its table is then the one the firmware routes
+#     the whole router through: a default there would take every packet along.
+#   * platform_tunnel_unlisted_reason is read for messages only; nothing in
+#     the core decides on it.
 #   * platform_tunnel_table_release may be called for an index that was never
 #     ensured. tunnel_stop walks the recorded state file unconditionally, and
 #     tunnel_apply records an index even when its route_ensure failed.
