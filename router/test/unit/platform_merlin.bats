@@ -122,6 +122,35 @@ esac"
     assert_output "$(printf '%s\n' wgc1 wgc2 main)"
 }
 
+@test "_merlin_tunnel_routable: only complete ovpncN ids consult the current mode" {
+    load_platform
+    with_ovpn_modes "" ""
+    for id in ovpnc2junk ovpnc ovpncx2 xovpnc2 wgc1 main eth0 ""; do
+        run _merlin_tunnel_routable "$id"
+        assert_success
+        refute_output
+    done
+    run _merlin_tunnel_routable ovpnc1
+    assert_failure
+    refute_output
+
+    with_ovpn_modes 2 1
+    run _merlin_tunnel_routable ovpnc1
+    assert_success
+    refute_output
+    run _merlin_tunnel_routable ovpnc2
+    assert_failure
+    refute_output
+
+    with_ovpn_modes 0 2
+    run _merlin_tunnel_routable ovpnc1
+    assert_failure
+    refute_output
+    run _merlin_tunnel_routable ovpnc2
+    assert_success
+    refute_output
+}
+
 @test "platform_tunnel_iface: wgcN is its own interface, ovpncN is tun1N" {
     load_platform
     run platform_tunnel_iface wgc1

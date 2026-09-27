@@ -60,10 +60,8 @@ _merlin_ovpn_rgw() {
 # Director rules alone (it sets rgw = OVPN_RGW_POLICY for WireGuard) - and main
 # is no tunnel. Read on every call: the mode can be switched at any time.
 _merlin_tunnel_routable() {
-    case "${1:-}" in
-        ovpnc[0-9]*) [[ "$(_merlin_ovpn_rgw "$1")" == 2 ]] ;;
-        *)           return 0 ;;
-    esac
+    [[ ${1:-} =~ ^ovpnc[0-9]+$ ]] || return 0
+    [[ "$(_merlin_ovpn_rgw "$1")" == 2 ]]
 }
 
 # wgcN first, ovpncN next, main always last. RT_TABLES_FILE overrides the path
