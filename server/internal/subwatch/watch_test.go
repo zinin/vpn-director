@@ -3787,14 +3787,70 @@ func TestTick_AFallbackBackWithinAMinuteKeepsTheClients(t *testing.T) {
 	}
 }
 
-// No tunnel list is no answer: on Keenetic "vpn-director.sh platform" prints an
-// empty list while RCI does not reply.
+// Merlin can successfully report no eligible tunnels after its last OpenVPN
+// client leaves VPN Director mode. A committed failover must then leave it.
+func TestTick_AnEmptyMerlinPlatformAnswerRestoresCommittedFailover(t *testing.T) {
+	f := &fake{cfg: committedCfg(), plat: connected("ovpnc2"), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	f.plat.Platform = "merlin"
+	w := runningWatch(f.watch())
+	w.Tick(context.Background())
+	f.plat = vpnconfig.PlatformInfo{Platform: "merlin", Tunnels: []vpnconfig.PlatformTunnel{}}
+	w.FallbackReady = func(string) bool { return false }
+
+	tickFor(w, f, FallbackCheck+FallbackDownAfter-ProbeInterval)
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" || contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v; must retain the failover during the grace period", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") || f.applies != 0 {
+		t.Fatalf("tunnel clients %v, applies %d; moved before the grace period elapsed", f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, f.applies)
+	}
+
+	w.Tick(context.Background())
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v; no eligible Merlin tunnel remains", f.cfg.Xray.Failover)
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("xray.clients %v; the client must return to Xray", f.cfg.Xray.Clients)
+	}
+	if contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+		t.Fatal("the client must leave the tunnel that is no longer eligible")
+	}
+	if f.applies != 1 {
+		t.Fatalf("applies %d, want the restored routing applied once", f.applies)
+	}
+}
+
+// On Keenetic "vpn-director.sh platform" prints an empty list while RCI does
+// not reply. An unknown platform's empty list is also still no answer.
 func TestTick_AnEmptyPlatformAnswerIsNotADeadFallback(t *testing.T) {
+	for _, platform := range []string{"keenetic", "unknown", ""} {
+		t.Run(platform, func(t *testing.T) {
+			f := &fake{cfg: committedCfg(), plat: vpnconfig.PlatformInfo{Platform: platform}, probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+			w := runningWatch(f.watch())
+			w.FallbackReady = func(string) bool { return false }
+			tickFor(w, f, 10*time.Minute)
+			if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" || contains(f.cfg.Xray.Clients, "192.168.1.8") {
+				t.Fatalf("failover %+v, xray.clients %v", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+			}
+			if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") || f.applies != 0 {
+				t.Fatalf("tunnel clients %v, applies %d; no platform answer must keep the committed failover", f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, f.applies)
+			}
+		})
+	}
+}
+
+func TestTick_AFailedMerlinPlatformLookupIsNotADeadFallback(t *testing.T) {
 	f := &fake{cfg: committedCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	w := runningWatch(f.watch())
+	w.LoadPlatform = func() (vpnconfig.PlatformInfo, error) {
+		return vpnconfig.PlatformInfo{Platform: "merlin"}, errors.New("platform command failed")
+	}
 	tickFor(w, f, 10*time.Minute)
 	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" || contains(f.cfg.Xray.Clients, "192.168.1.8") {
 		t.Fatalf("failover %+v, xray.clients %v", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") || f.applies != 0 {
+		t.Fatalf("tunnel clients %v, applies %d; a failed lookup must keep the committed failover", f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, f.applies)
 	}
 }
 

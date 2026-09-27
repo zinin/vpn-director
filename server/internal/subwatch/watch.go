@@ -506,8 +506,9 @@ func (w *Watch) extendFailover(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPND
 // apply of the watch's own has not brought it back. Gone for
 // FallbackDownAfter, it is replaced by another exit; with none left the clients
 // go back to Xray, where a dead outbound takes them nowhere - what a death with
-// no fallback does too. An empty tunnel list is no answer (Keenetic prints one
-// while RCI does not reply), and neither is a failed lookup.
+// no fallback does too. A failed lookup is no answer. An empty list is also
+// no answer except on Merlin: Keenetic prints one while RCI does not reply,
+// but Merlin can have no eligible tunnels after its last client changes mode.
 func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDirectorConfig {
 	if w.LoadPlatform == nil || w.UpdateVPN == nil || !committedFailover(cfg) {
 		return cfg
@@ -518,7 +519,7 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 	}
 	w.lastFallbackCheck = now
 	plat, err := w.LoadPlatform()
-	if err != nil || len(plat.Tunnels) == 0 {
+	if err != nil || (len(plat.Tunnels) == 0 && plat.Platform != "merlin") {
 		return cfg
 	}
 	// LoadPlatform shells out and takes no lock; a /stop may have finished.
