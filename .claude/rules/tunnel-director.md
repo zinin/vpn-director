@@ -69,6 +69,15 @@ in "No" mode it and `platform_tunnel_table_release` take out a default through t
 whenever the client comes up (`libovpn/openvpn_control.c`), so a default found there is one Tunnel
 Director left. In "Yes (all)" the default is the firmware's and stays.
 
+The mode is read from nvram, and a switch in the router UI writes it just before the firmware
+restarts the client. An apply in between acts on the new mode while the firmware's rules are still
+those of the old one. From "No" to VPN Director, the route ensure puts the default into a table the
+`from all` rule still reads, and the whole router follows it into the tunnel until the client's stop
+takes the rule and the table away; the other way, the default goes a moment before the restart
+flushes the table anyway. A mode changed with `nvram set` and no restart of the client leaves the
+firmware's rules in the old mode until the client restarts, and Tunnel Director, which reads nvram
+alone, follows the new one all that time.
+
 `tunnel.sh` asks `platform_tunnel_unlisted_reason` why a tunnel is left out and puts the answer in
 its warning: `Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode ("Redirect
 Internet traffic through tunnel" is "No")` on a rebuild, `route not installed: <reason>; Tunnel
