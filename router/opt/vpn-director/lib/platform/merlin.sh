@@ -41,12 +41,44 @@ platform_lan_ifaces() {
     printf 'br0\n'
 }
 
+# The "Redirect Internet traffic through tunnel" setting of OpenVPN client N
+# (ovpncN): nvram vpn_clientN_rgw, "" when it is not set. 0 "No", 1 "Yes (all)",
+# 2 "VPN Director (policy rules)"; the firmware reads an empty value as 0
+# (nvram_pf_get_int).
+_merlin_ovpn_rgw() {
+    nvram get "vpn_client${1#ovpnc}_rgw" 2>/dev/null || true
+}
+
+# Whether Tunnel Director may route through <id>. In "No" and "Yes (all)" the
+# firmware adds "from all lookup ovpncN" at priority 10000+N while the client
+# runs (amvpn_set_routing_rules in libovpn/amvpn_routing.c, Merlin 388): every
+# packet of the router reads that table ahead of Tunnel Director's fwmark rule,
+# and a default there takes them all into the tunnel - the direct clients, the
+# router itself, Xray's upstream and the other tunnels' clients. Only VPN
+# Director mode leaves the table to the rules that name their sources. A
+# WireGuard client has no such setting - the firmware routes every wgcN by VPN
+# Director rules alone (it sets rgw = OVPN_RGW_POLICY for WireGuard) - and main
+# is no tunnel. Read on every call: the mode can be switched at any time.
+_merlin_tunnel_routable() {
+    case "${1:-}" in
+        ovpnc[0-9]*) [[ "$(_merlin_ovpn_rgw "$1")" == 2 ]] ;;
+        *)           return 0 ;;
+    esac
+}
+
 # wgcN first, ovpncN next, main always last. RT_TABLES_FILE overrides the path
-# for tests.
+# for tests. An OpenVPN client is listed only in VPN Director mode
+# (_merlin_tunnel_routable). A TAP client never is: its page offers no such
+# mode, and Tunnel Director, which routes through tun1N, could not use it.
 platform_tunnels() {
-    local rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}"
+    local rt_tables="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}" ovpn id
     { awk '$0!~/^#/ && $2 ~ /^wgc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null | sort; } || true
-    { awk '$0!~/^#/ && $2 ~ /^ovpnc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null | sort; } || true
+    ovpn="$({ awk '$0!~/^#/ && $2 ~ /^ovpnc[0-9]+$/ { print $2 }' "$rt_tables" 2>/dev/null | sort; } || true)"
+    while IFS= read -r id; do
+        if [[ -n $id ]] && _merlin_tunnel_routable "$id"; then
+            printf '%s\n' "$id"
+        fi
+    done <<< "$ovpn"
     printf '%s\n' main
 }
 

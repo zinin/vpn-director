@@ -88,6 +88,40 @@ with_mock() {
     assert_output "main"
 }
 
+# "Redirect Internet traffic through tunnel" is nvram vpn_clientN_rgw: 0 "No",
+# 1 "Yes (all)", 2 "VPN Director (policy rules)"; the firmware reads an empty
+# value as 0. In "No" and "Yes (all)" it adds "from all lookup ovpncN" at
+# priority 10000+N while the client runs, so every packet of the router reads
+# the client's table first, and a default Tunnel Director put there would take
+# them all into the tunnel.
+
+# with_ovpn_modes <client 1> <client 2> - an nvram that answers the redirect
+# mode of OpenVPN clients 1 and 2 as given ("" for unset) and nothing for any
+# other key.
+with_ovpn_modes() {
+    with_mock nvram "case \"\$*\" in
+    \"get vpn_client1_rgw\") echo '$1' ;;
+    \"get vpn_client2_rgw\") echo '$2' ;;
+    *) echo '' ;;
+esac"
+}
+
+@test "platform_tunnels: an OpenVPN client is listed only in VPN Director mode" {
+    load_platform
+    with_ovpn_modes 0 2
+    run platform_tunnels
+    assert_success
+    assert_output "$(printf '%s\n' wgc1 wgc2 ovpnc2 main)"
+    with_ovpn_modes 2 1
+    run platform_tunnels
+    assert_success
+    assert_output "$(printf '%s\n' wgc1 wgc2 ovpnc1 main)"
+    with_ovpn_modes "" ""
+    run platform_tunnels
+    assert_success
+    assert_output "$(printf '%s\n' wgc1 wgc2 main)"
+}
+
 @test "platform_tunnel_iface: wgcN is its own interface, ovpncN is tun1N" {
     load_platform
     run platform_tunnel_iface wgc1

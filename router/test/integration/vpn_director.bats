@@ -575,6 +575,21 @@ run_stubbed_cli() {
     echo "$output" | jq -e '.tunnels[2] == {id:"ovpnc1", iface:"tun11", type:"openvpn", connected:false, description:"Office OVPN"}' >/dev/null
 }
 
+# An OpenVPN client in "No" or "Yes (all)" routes the whole router through its
+# table, so the platform leaves it out. vpn_client1_rgw is 0 here; every other
+# key comes from the standard mock, and the fixture rt_tables names ovpnc1 and
+# ovpnc2.
+@test "vpn-director: platform leaves out an OpenVPN client that is not in VPN Director mode" {
+    mkdir -p "$BATS_TEST_TMPDIR/mock"
+    printf '#!/bin/bash\n[ "$*" = "get vpn_client1_rgw" ] && { echo 0; exit 0; }\nexec "$TEST_ROOT/mocks/nvram" "$@"\n' \
+        > "$BATS_TEST_TMPDIR/mock/nvram"
+    chmod +x "$BATS_TEST_TMPDIR/mock/nvram"
+    PATH="$BATS_TEST_TMPDIR/mock:$PATH" run --separate-stderr "$SCRIPTS_DIR/vpn-director.sh" platform
+    assert_success
+    [ "${#lines[@]}" -eq 1 ]
+    echo "$output" | jq -e '[.tunnels[].id] == ["wgc1","wgc2","ovpnc2"]' >/dev/null
+}
+
 @test "vpn-director: platform reports wan_if as empty when the platform has no answer" {
     mkdir -p "$BATS_TEST_TMPDIR/mock"
     printf '#!/bin/bash\necho ""\n' > "$BATS_TEST_TMPDIR/mock/nvram"
@@ -582,6 +597,9 @@ run_stubbed_cli() {
     PATH="$BATS_TEST_TMPDIR/mock:$PATH" run --separate-stderr "$SCRIPTS_DIR/vpn-director.sh" platform
     assert_success
     echo "$output" | jq -e '.wan_if == ""' >/dev/null
+    # With no redirect mode to read, no OpenVPN client is routable; the
+    # WireGuard tables do not depend on nvram.
+    echo "$output" | jq -e '[.tunnels[].id] == ["wgc1","wgc2"]' >/dev/null
 }
 
 @test "vpn-director: platform on Keenetic lists NDM's tunnels with their Linux interfaces" {
