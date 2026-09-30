@@ -273,8 +273,8 @@ func OutboundJSON(server vpnconfig.Server, tag string) (json.RawMessage, error) 
 	if err != nil {
 		return nil, err
 	}
-	var m map[string]interface{}
-	if err := json.Unmarshal(raw, &m); err != nil {
+	m, err := vpnconfig.DecodeOutbound(raw)
+	if err != nil {
 		return nil, err
 	}
 	m["tag"] = tag

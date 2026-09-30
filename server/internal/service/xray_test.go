@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -590,5 +591,64 @@ func TestOutboundJSON_TagsTheOutboundGenerateWouldWrite(t *testing.T) {
 		Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.12","port":443,"users":[{"id":"u"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"extra":{"downloadSettings":{}}}}}`)}
 	if _, err := OutboundJSON(refused, "m9"); err == nil || !strings.Contains(err.Error(), "downloadSettings without an address") {
 		t.Fatalf("err %v, want the refusal Generate makes", err)
+	}
+}
+
+// Retagging must preserve the numeric literals the shared validator inspected.
+func TestOutboundJSON_PreservesNumericLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		name, literal string
+		refused       bool
+	}{
+		{name: "decimal packet-up limit", literal: "8192.0"},
+		{name: "integer above 2^53", literal: "9007199254740993"},
+		{name: "small integer packet-up limit", literal: "8192", refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := vpnconfig.Server{Name: "Numbers", Address: "numbers.example", Port: 443,
+				Outbound: json.RawMessage(fmt.Sprintf(`{"protocol":"vless","settings":{"vnext":[{"address":"numbers.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","mode":"packet-up","extra":{"scMaxEachPostBytes":%s,"numbers":[%s]}}},"tag":"stored"}`, tc.literal, tc.literal))}
+			ob, wantErr := serverOutbound(server)
+			raw, err := OutboundJSON(server, "m10")
+			if tc.refused {
+				if wantErr == nil || !strings.Contains(wantErr.Error(), "scMaxEachPostBytes") {
+					t.Fatalf("shared error %v, want the small packet-up refusal", wantErr)
+				}
+				if err == nil || err.Error() != wantErr.Error() || len(raw) != 0 {
+					t.Fatalf("wrapper error %v, want %v and no outbound", err, wantErr)
+				}
+				return
+			}
+			if wantErr != nil {
+				t.Fatal(wantErr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantRaw, err := json.Marshal(ob)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := vpnconfig.DecodeOutbound(wantRaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := vpnconfig.DecodeOutbound(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := got["streamSettings"].(map[string]interface{})
+			extra := stream["xhttpSettings"].(map[string]interface{})["extra"].(map[string]interface{})
+			if number, ok := extra["scMaxEachPostBytes"].(json.Number); !ok || number.String() != tc.literal {
+				t.Errorf("packet-up literal %v, want exactly %s", extra["scMaxEachPostBytes"], tc.literal)
+			}
+			if got["tag"] != "m10" {
+				t.Errorf("tag %v, want m10", got["tag"])
+			}
+			delete(got, "tag")
+			delete(want, "tag")
+			if !reflect.DeepEqual(got, want) {
+				t.Error("outbound differs from the marshalled shared outbound beyond its tag")
+			}
+		})
 	}
 }
