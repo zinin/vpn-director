@@ -556,3 +556,39 @@ func TestGenerateConfig_WithoutXrayNothingIsTested(t *testing.T) {
 		t.Fatal("config.json was not replaced")
 	}
 }
+
+// The monitor's prober holds the outbound Generate would write, under a tag of
+// its own, and refuses what Generate refuses.
+func TestOutboundJSON_TagsTheOutboundGenerateWouldWrite(t *testing.T) {
+	stored := vpnconfig.Server{Name: "Oslo", Address: "192.0.2.10", Port: 443,
+		Outbound: json.RawMessage(`{"protocol":"trojan","settings":{"servers":[{"address":"192.0.2.10","port":443,"password":"p"}]},"tag":"proxy-out"}`)}
+	raw, err := OutboundJSON(stored, "m7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ob map[string]interface{}
+	if err := json.Unmarshal(raw, &ob); err != nil {
+		t.Fatal(err)
+	}
+	if ob["tag"] != "m7" || ob["protocol"] != "trojan" {
+		t.Fatalf("outbound %s", raw)
+	}
+
+	legacy := vpnconfig.Server{Name: "Legacy", Address: "192.0.2.11", Port: 443, UUID: "u", Security: "tls", SNI: "l.example"}
+	raw, err = OutboundJSON(legacy, "m8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &ob); err != nil {
+		t.Fatal(err)
+	}
+	if ob["tag"] != "m8" || ob["protocol"] != "vless" {
+		t.Fatalf("legacy outbound %s", raw)
+	}
+
+	refused := vpnconfig.Server{Name: "X", Address: "192.0.2.12", Port: 443,
+		Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.12","port":443,"users":[{"id":"u"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"extra":{"downloadSettings":{}}}}}`)}
+	if _, err := OutboundJSON(refused, "m9"); err == nil || !strings.Contains(err.Error(), "downloadSettings without an address") {
+		t.Fatalf("err %v, want the refusal Generate makes", err)
+	}
+}

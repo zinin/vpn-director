@@ -260,6 +260,27 @@ func serverOutbound(server vpnconfig.Server) (interface{}, error) {
 	return buildOutbound(server), nil
 }
 
+// OutboundJSON is the outbound Generate would write for server, as JSON and
+// tagged tag: the outbound its import stored, or for a record from before
+// outbounds were stored the one built from its flat VLESS fields. It refuses
+// what Generate refuses. The server monitor's prober holds one per endpoint.
+func OutboundJSON(server vpnconfig.Server, tag string) (json.RawMessage, error) {
+	ob, err := serverOutbound(server)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(ob)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	m["tag"] = tag
+	return json.Marshal(m)
+}
+
 // downloadWithoutAddress reports whether v, however deep, holds a
 // downloadSettings object whose address is not a non-empty string. Xray reads
 // an xhttp extra's downloadSettings as a stream config of its own and gives it
