@@ -2,7 +2,6 @@ package subwatch
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/platform"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
@@ -665,30 +665,6 @@ func pickOrder(servers []vpnconfig.Server, chosen *vpnconfig.ActiveServer) []vpn
 	return append(order, servers[i+1:]...)
 }
 
-// perAddress lists each server once for every address it resolved to, each copy
-// with that address alone, so the walk dials them one after another; a server
-// with none is listed as it is. An endpoint ban takes an address, not the name:
-// a host can resolve to one the router cannot reach and another it can, and
-// dialing only the first rejected the whole server.
-func perAddress(servers []vpnconfig.Server) []vpnconfig.Server {
-	out := make([]vpnconfig.Server, 0, len(servers))
-	for _, s := range servers {
-		n := len(out)
-		for _, ip := range s.IPs {
-			if ip == "" {
-				continue
-			}
-			c := s
-			c.IPs = []string{ip}
-			out = append(out, c)
-		}
-		if len(out) == n {
-			out = append(out, s)
-		}
-	}
-	return out
-}
-
 func (w *Watch) fallbackReady(cfg *vpnconfig.VPNDirectorConfig) bool {
 	if w.FallbackReady == nil {
 		return true
@@ -942,7 +918,7 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 }
 
 // walk tries the servers of subs in walkOrder, each address once per outbound
-// (dialKey), and brings the clients back to Xray on the first live one. With
+// (endpoint.DialKey), and brings the clients back to Xray on the first live one. With
 // none live it returns Xray to the server the user chose and backs the next
 // wave off.
 func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription) {
@@ -980,17 +956,17 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 	lastSeq := startedSeq
 	gone := map[string]bool{}
 	seen := map[string]bool{}
-	for _, s := range perAddress(order) {
+	for _, s := range endpoint.PerAddress(order) {
 		if ctx.Err() != nil || w.stopped() {
 			return
 		}
 		if gone[s.Subscription] {
 			continue
 		}
-		// A copy whose dialKey the walk has written already is that server
+		// A copy whose endpoint.DialKey the walk has written already is that server
 		// again. A copy the guard refused or that did not generate was not
 		// tried, and leaves its twins their turn.
-		key := dialKey(s)
+		key := endpoint.DialKey(s)
 		if key != "" && seen[key] {
 			continue
 		}
@@ -1237,137 +1213,6 @@ func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) b
 		return false
 	}
 	return w.Probe(ctx, w.socksPort(cfg)) == nil
-}
-
-// ServerForDial uses a tunnel-resolved IPv4 for vnext so Xray does not go
-// back to the system resolver. A TLS server name keeps the hostname. A REALITY
-// one is the site the handshake borrows, never the proxy's own host, so an
-// entry without one stays without one and is refused as the Web UI refuses it.
-// Web UI /xray keep s.Address and let Xray resolve, so a CDN IP change still
-// works there.
-//
-// A server whose import stored its outbound gets the IP in the outbound's own
-// address slot (vpnconfig.OutboundTarget). Where the source left the name to
-// the address, dialing an IP would change it, so the hostname goes there
-// instead: an empty tlsSettings.serverName, and for a stream without security
-// an empty Host of ws or httpupgrade, an empty Host of the xhttpSettings or
-// splithttpSettings the record has - Xray reads the former over the latter
-// and drops the other - or an empty grpcSettings.authority, which a
-// cleartext gRPC stream otherwise takes from the address. With TLS, Xray
-// takes that Host, and gRPC's authority, from the server name.
-//
-// The download host of an xhttp extra (downloadSettings.address) keeps its
-// name: the record's IPs are the main address's, and Xray resolves that host
-// itself through the system resolver. So with the WAN resolver silent, a
-// server whose download host is another name is judged dead although its main
-// address resolved; looking that host up over the tunnel is a separate task.
-func ServerForDial(s vpnconfig.Server) vpnconfig.Server {
-	ip := ""
-	for _, v := range s.IPs {
-		if v != "" {
-			ip = v
-			break
-		}
-	}
-	if ip == "" {
-		return s
-	}
-	host := s.Address
-	if len(s.Outbound) == 0 {
-		s.Address = ip
-		if s.SNI == "" && s.Security != "reality" {
-			s.SNI = host
-		}
-		return s
-	}
-	ob, err := vpnconfig.DecodeOutbound(s.Outbound)
-	if err != nil {
-		return s
-	}
-	target := vpnconfig.OutboundTarget(ob)
-	if target == nil {
-		return s
-	}
-	target["address"] = ip
-	if net.ParseIP(host) == nil {
-		keepHostname(ob, host)
-	}
-	raw, err := json.Marshal(ob)
-	if err != nil {
-		return s
-	}
-	s.Outbound = raw
-	s.Address = ip
-	return s
-}
-
-// keepHostname writes host where the stream would otherwise take the name
-// from an address that is now an IP. The xhttp Host goes into the
-// xhttpSettings or splithttpSettings the record has: Xray reads xhttpSettings
-// over splithttpSettings and drops the other, so a new xhttpSettings beside a
-// splithttpSettings would dial without its path, mode and extra. A cleartext
-// gRPC stream takes its :authority from the address when
-// grpcSettings.authority is empty, so the hostname goes there.
-func keepHostname(ob map[string]interface{}, host string) {
-	ss, _ := ob["streamSettings"].(map[string]interface{})
-	if ss == nil {
-		return
-	}
-	switch security, _ := ss["security"].(string); security {
-	case "tls":
-		tls, _ := ss["tlsSettings"].(map[string]interface{})
-		if tls == nil {
-			tls = map[string]interface{}{}
-			ss["tlsSettings"] = tls
-		}
-		if name, _ := tls["serverName"].(string); name == "" {
-			tls["serverName"] = host
-		}
-	case "", "none":
-		key := ""
-		switch ss["network"] {
-		case "ws", "websocket":
-			key = "wsSettings"
-		case "httpupgrade":
-			key = "httpupgradeSettings"
-		case "xhttp", "splithttp":
-			key = "xhttpSettings"
-			if _, ok := ss[key].(map[string]interface{}); !ok {
-				if _, ok := ss["splithttpSettings"].(map[string]interface{}); ok {
-					key = "splithttpSettings"
-				}
-			}
-		case "grpc":
-			grpc, _ := ss["grpcSettings"].(map[string]interface{})
-			if grpc == nil {
-				grpc = map[string]interface{}{}
-				ss["grpcSettings"] = grpc
-			}
-			if authority, _ := grpc["authority"].(string); authority == "" {
-				grpc["authority"] = host
-			}
-			return
-		}
-		if key == "" {
-			return
-		}
-		transport, _ := ss[key].(map[string]interface{})
-		if transport == nil {
-			transport = map[string]interface{}{}
-			ss[key] = transport
-		}
-		headers, _ := transport["headers"].(map[string]interface{})
-		if h, _ := transport["host"].(string); h != "" {
-			return
-		}
-		// Xray's ws builder takes a host header in any case.
-		for key, value := range headers {
-			if h, _ := value.(string); strings.EqualFold(key, "host") && h != "" {
-				return
-			}
-		}
-		transport["host"] = host
-	}
 }
 
 func (w *Watch) tproxyReady() bool {

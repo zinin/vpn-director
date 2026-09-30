@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -78,7 +79,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	// A server no TCP dial can see is returned to without one: the attempt
 	// itself is then the only check there is, and a failed one backs the next
 	// off as any other does.
-	candidates := dialable(perAddress(servers[i : i+1]))
+	candidates := dialable(endpoint.PerAddress(servers[i : i+1]))
 	if tcpChecked(servers[i]) {
 		candidates = w.reachable(ctx, candidates)
 	}
@@ -237,7 +238,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, last *vpnconfig.Server) []vpnconfig.Server {
 	var copies []vpnconfig.Server
 	if j := chosenIndex(servers, before); j >= 0 {
-		copies = perAddress(servers[j : j+1])
+		copies = endpoint.PerAddress(servers[j : j+1])
 	}
 	if last == nil {
 		return copies

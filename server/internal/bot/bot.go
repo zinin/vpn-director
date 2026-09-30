@@ -12,6 +12,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/chatstore"
 	"github.com/zinin/vpn-director/server/internal/config"
+	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/handler"
 	"github.com/zinin/vpn-director/server/internal/paths"
 	"github.com/zinin/vpn-director/server/internal/service"
@@ -132,7 +133,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				}
 				ports := service.InboundPorts{}
 				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
-				return service.GenerateAndRecordWalkedServer(configSvc, xraySvc, subwatch.ServerForDial(s), s, ports, guard)
+				return service.GenerateAndRecordWalkedServer(configSvc, xraySvc, endpoint.ServerForDial(s), s, ports, guard)
 			},
 			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
 				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)

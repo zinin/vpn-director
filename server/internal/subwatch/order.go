@@ -58,15 +58,3 @@ func walkOrder(subs []vpnconfig.Subscription, chosen *vpnconfig.ActiveServer) (o
 	}
 	return order, chosenFirst
 }
-
-// dialKey is what a walk's copy of a server dials: its outbound with the
-// address in place, as Generate writes it (ServerForDial). Copies with one key
-// are one server to Xray whatever their names - one provider lists 62 names on
-// 9 endpoints - and a walk tries each key once. A record without an outbound
-// has no key and is never taken for another.
-func dialKey(c vpnconfig.Server) string {
-	if len(c.Outbound) == 0 {
-		return ""
-	}
-	return string(ServerForDial(c).Outbound)
-}
