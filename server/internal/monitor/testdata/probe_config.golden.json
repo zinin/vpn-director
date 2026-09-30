@@ -1,0 +1,84 @@
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 20000,
+      "protocol": "socks",
+      "settings": {
+        "accounts": [
+          {
+            "pass": "p0",
+            "user": "e0"
+          },
+          {
+            "pass": "p1",
+            "user": "e1"
+          }
+        ],
+        "auth": "password",
+        "udp": false
+      },
+      "tag": "probe-in"
+    }
+  ],
+  "log": {
+    "access": "none",
+    "loglevel": "warning"
+  },
+  "outbounds": [
+    {
+      "protocol": "blackhole",
+      "tag": "block"
+    },
+    {
+      "protocol": "trojan",
+      "settings": {
+        "servers": [
+          {
+            "address": "192.0.2.1",
+            "password": "p",
+            "port": 443
+          }
+        ]
+      },
+      "tag": "m0"
+    },
+    {
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "192.0.2.2",
+            "port": 443,
+            "users": [
+              {
+                "encryption": "none",
+                "id": "u"
+              }
+            ]
+          }
+        ]
+      },
+      "tag": "m1"
+    }
+  ],
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "outboundTag": "m0",
+        "type": "field",
+        "user": [
+          "e0"
+        ]
+      },
+      {
+        "outboundTag": "m1",
+        "type": "field",
+        "user": [
+          "e1"
+        ]
+      }
+    ]
+  }
+}
