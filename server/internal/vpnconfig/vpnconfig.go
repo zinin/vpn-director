@@ -58,9 +58,61 @@ type WebUIConfig struct {
 	LogLevel  string `json:"log_level,omitempty"` // debug, info, warn, error; empty means info
 }
 
+// MonitorConfig is the monitor section: how vpn-director-watchd checks the
+// servers of every subscription. Every key is optional, and the daemon fills
+// in its defaults (monitor.SettingsFrom). Enabled is a pointer so that a
+// missing key reads as the default, true.
+type MonitorConfig struct {
+	Enabled         *bool  `json:"enabled,omitempty"`
+	Interval        string `json:"interval,omitempty"`
+	DeadIntervalMax string `json:"dead_interval_max,omitempty"`
+	Concurrency     int    `json:"concurrency,omitempty"`
+	LogLevel        string `json:"log_level,omitempty"`
+
+	// concurrencySet distinguishes an explicit JSON zero from an absent key.
+	concurrencySet bool
+}
+
+// UnmarshalJSON preserves whether concurrency was supplied.
+func (c *MonitorConfig) UnmarshalJSON(data []byte) error {
+	type plain MonitorConfig
+	var decoded struct {
+		plain
+		Concurrency *int `json:"concurrency"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = MonitorConfig(decoded.plain)
+	if decoded.Concurrency != nil {
+		c.Concurrency = *decoded.Concurrency
+		c.concurrencySet = true
+	}
+	return nil
+}
+
+// HasConcurrency reports an explicit JSON value or a nonzero value set by a caller.
+func (c MonitorConfig) HasConcurrency() bool {
+	return c.concurrencySet || c.Concurrency != 0
+}
+
+// MarshalJSON keeps an explicit zero across a daemon's config write.
+func (c MonitorConfig) MarshalJSON() ([]byte, error) {
+	type plain MonitorConfig
+	var concurrency *int
+	if c.HasConcurrency() {
+		concurrency = &c.Concurrency
+	}
+	return json.Marshal(struct {
+		plain
+		Concurrency *int `json:"concurrency,omitempty"`
+	}{plain: plain(c), Concurrency: concurrency})
+}
+
 type VPNDirectorConfig struct {
 	DataDir        string                 `json:"data_dir"`
 	WebUI          WebUIConfig            `json:"webui,omitempty"`
+	Monitor        *MonitorConfig         `json:"monitor,omitempty"`
 	PausedClients  []string               `json:"paused_clients,omitempty"`
 	TunnelDirector TunnelDirectorConfig   `json:"tunnel_director"`
 	Xray           XrayConfig             `json:"xray"`
