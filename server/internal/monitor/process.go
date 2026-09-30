@@ -81,6 +81,7 @@ func (t *tail) String() string {
 type process struct {
 	cmd    *exec.Cmd
 	out    *tail
+	err    error
 	exited chan struct{}
 }
 
@@ -96,6 +97,7 @@ func startProcess(bin string, args ...string) (*process, error) {
 		cmd := exec.Command(bin, args...)
 		cmd.Stdout = p.out
 		cmd.Stderr = p.out
+		cmd.WaitDelay = 2 * time.Second
 		cmd.SysProcAttr = childAttr()
 		if err := cmd.Start(); err != nil {
 			started <- err
@@ -103,13 +105,25 @@ func startProcess(bin string, args ...string) (*process, error) {
 		}
 		p.cmd = cmd
 		started <- nil
-		_ = cmd.Wait()
+		p.err = cmd.Wait()
 		close(p.exited)
 	}()
 	if err := <-started; err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// wait returns the published result, or kills and reaps on cancellation.
+func (p *process) wait(ctx context.Context) error {
+	select {
+	case <-p.exited:
+		return p.err
+	case <-ctx.Done():
+		_ = p.cmd.Process.Kill()
+		<-p.exited
+		return ctx.Err()
+	}
 }
 
 // waitListening waits until 127.0.0.1:port accepts, the process exits

@@ -168,16 +168,20 @@ func (l *XrayLauncher) Test(ctx context.Context, eps []Endpoint) error {
 	}
 	ctx, cancel := context.WithTimeout(ctx, testTimeout)
 	defer cancel()
-	out := &tail{max: 20}
-	cmd := exec.CommandContext(ctx, l.ProbeBinary, "run", "-test", "-format", "json", "-c", path)
-	cmd.Stdout, cmd.Stderr = out, out
-	if err := cmd.Run(); err != nil {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	proc, err := startProcess(l.ProbeBinary, "run", "-test", "-format", "json", "-c", path)
+	if err != nil {
+		return &launchError{operation: "start the prober config test", cause: err}
+	}
+	if err := proc.wait(ctx); err != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 		var exit *exec.ExitError
 		if errors.As(err, &exit) && exit.Exited() {
-			if refused := configRejection(out.String(), eps); refused != nil {
+			if refused := configRejection(proc.out.String(), eps); refused != nil {
 				return refused
 			}
 		}
@@ -368,6 +372,16 @@ func copyFile(src, dst string) error {
 // KillLeftovers kills every process running bin: a prober an earlier daemon
 // left behind when it died too fast for Pdeathsig.
 func KillLeftovers(bin string) {
+	bin, err := filepath.Abs(bin)
+	if err != nil {
+		return
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(bin))
+	if err != nil {
+		return
+	}
+	// Keep the leaf name: a probe hard link shares the live Xray's inode.
+	bin = filepath.Join(parent, filepath.Base(bin))
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return
