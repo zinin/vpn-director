@@ -52,11 +52,12 @@ func (h *XrayHandler) firstStep() (string, tgbotapi.InlineKeyboardMarkup, error)
 		return telegram.EscapeMarkdownV2("Серверы не найдены. Используйте /import для импорта"), tgbotapi.InlineKeyboardMarkup{}, nil
 	}
 	active := h.active()
+	health := monitorHealth(h.deps.Monitor, subs)
 	if len(subs) == 1 {
-		text, kb := xrayServersPage(subs[0], 0, false, active)
+		text, kb := xrayServersPage(subs[0], 0, false, active, health)
 		return text, kb, nil
 	}
-	text, kb := xraySubscriptions(subs, active)
+	text, kb := xraySubscriptions(subs, active, health)
 	return text, kb, nil
 }
 
@@ -69,25 +70,34 @@ func (h *XrayHandler) active() *vpnconfig.ActiveServer {
 }
 
 // xraySubscriptions is the first step: a button per subscription with its
-// server count, the running server's subscription checked.
-func xraySubscriptions(subs []vpnconfig.Subscription, active *vpnconfig.ActiveServer) (string, tgbotapi.InlineKeyboardMarkup) {
+// server count - its live servers of all, with the monitor's health - the
+// running server's subscription checked.
+func xraySubscriptions(subs []vpnconfig.Subscription, active *vpnconfig.ActiveServer, h health) (string, tgbotapi.InlineKeyboardMarkup) {
 	kb := telegram.NewKeyboard()
 	for _, s := range subs {
 		if len(s.Servers) == 0 {
 			continue
 		}
 		label := fmt.Sprintf("%s (%d)", s.Name, len(s.Servers))
+		if h.ok {
+			label = fmt.Sprintf("%s (%d/%d)", s.Name, h.alive[s.ID], len(s.Servers))
+		}
 		if active != nil && active.Subscription == s.ID {
 			label = "✓ " + label
 		}
 		kb.Button(label, "xray:sub:"+s.ID+":0").Row()
 	}
-	return telegram.EscapeMarkdownV2("Выберите подписку:"), kb.Build()
+	text := "Выберите подписку:"
+	if note := h.header(); note != "" {
+		text += "\n" + note
+	}
+	return telegram.EscapeMarkdownV2(text), kb.Build()
 }
 
 // xrayServersPage is one page of a subscription's servers, two a row, with ◀ ▶
-// between pages and « Back to the subscriptions when back is set.
-func xrayServersPage(sub vpnconfig.Subscription, page int, back bool, active *vpnconfig.ActiveServer) (string, tgbotapi.InlineKeyboardMarkup) {
+// between pages and « Back to the subscriptions when back is set. With the
+// monitor's health each button starts with the server's status.
+func xrayServersPage(sub vpnconfig.Subscription, page int, back bool, active *vpnconfig.ActiveServer, h health) (string, tgbotapi.InlineKeyboardMarkup) {
 	pages := max(1, (len(sub.Servers)+xrayPerPage-1)/xrayPerPage)
 	page = max(0, min(page, pages-1))
 	start := page * xrayPerPage
@@ -97,6 +107,9 @@ func xrayServersPage(sub vpnconfig.Subscription, page int, back bool, active *vp
 		s := sub.Servers[i]
 		s.Subscription = sub.ID
 		label := fmt.Sprintf("%d. %s", i+1, s.Name)
+		if hs, ok := h.of(sub.ID, i); ok {
+			label = mark(hs) + " " + label + latency(hs)
+		}
 		if active != nil && active.Subscription == s.Subscription && active.Name == s.Name && active.Address == s.Address && active.Port == s.Port {
 			label = "✓ " + label
 		}
@@ -116,6 +129,9 @@ func xrayServersPage(sub vpnconfig.Subscription, page int, back bool, active *vp
 	text := fmt.Sprintf("%s: выберите сервер", sub.Name)
 	if pages > 1 {
 		text += fmt.Sprintf(" (стр. %d/%d)", page+1, pages)
+	}
+	if note := h.header(); note != "" {
+		text += "\n" + note
 	}
 	return telegram.EscapeMarkdownV2(text), kb.Build()
 }
@@ -156,7 +172,7 @@ func (h *XrayHandler) HandleCallback(cb *tgbotapi.CallbackQuery) {
 			h.stale(chatID, msgID)
 			return
 		}
-		text, kb := xrayServersPage(subs[i], page, len(subs) > 1, h.active())
+		text, kb := xrayServersPage(subs[i], page, len(subs) > 1, h.active(), monitorHealth(h.deps.Monitor, subs))
 		h.deps.Sender.EditMessage(chatID, msgID, text, kb)
 	case strings.HasPrefix(data, "xray:select:"):
 		h.selectServer(chatID, msgID, strings.TrimPrefix(data, "xray:select:"))

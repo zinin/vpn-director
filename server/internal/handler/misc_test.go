@@ -164,10 +164,11 @@ func TestMiscHandler_HandleLogs_DefaultArgs(t *testing.T) {
 	sender := &mockSender{}
 	logReader := &mockLogReader{output: "log line 1\nlog line 2"}
 	testPaths := paths.Paths{
-		BotLogPath:   "/tmp/bot.log",
-		VPNLogPath:   "/tmp/vpn.log",
-		XrayLogPath:  "/tmp/xray-error.log",
-		WebUILogPath: "/tmp/webui.log",
+		BotLogPath:    "/tmp/bot.log",
+		VPNLogPath:    "/tmp/vpn.log",
+		XrayLogPath:   "/tmp/xray-error.log",
+		WebUILogPath:  "/tmp/webui.log",
+		WatchdLogPath: "/tmp/vpn-director-watchd.log",
 	}
 	deps := &Deps{Sender: sender, Logs: logReader, Paths: testPaths}
 	h := NewMiscHandler(deps)
@@ -181,9 +182,9 @@ func TestMiscHandler_HandleLogs_DefaultArgs(t *testing.T) {
 	}
 	h.HandleLogs(msg)
 
-	// Default is "all" which reads bot, vpn, xray and webui logs
-	if len(logReader.calls) != 4 {
-		t.Fatalf("expected 4 log read calls, got %d", len(logReader.calls))
+	// Default is "all" which reads bot, vpn, xray, webui and watchd logs
+	if len(logReader.calls) != 5 {
+		t.Fatalf("expected 5 log read calls, got %d", len(logReader.calls))
 	}
 	// Check first call (bot logs)
 	if logReader.calls[0].path != "/tmp/bot.log" {
@@ -203,6 +204,10 @@ func TestMiscHandler_HandleLogs_DefaultArgs(t *testing.T) {
 	// Check fourth call (webui log)
 	if logReader.calls[3].path != "/tmp/webui.log" {
 		t.Errorf("expected webui log path, got %q", logReader.calls[3].path)
+	}
+	// Check fifth call (the server monitor's log)
+	if logReader.calls[4].path != "/tmp/vpn-director-watchd.log" {
+		t.Errorf("expected watchd log path, got %q", logReader.calls[4].path)
 	}
 }
 
@@ -366,8 +371,8 @@ func TestMiscHandler_HandleLogs_LinesOnly(t *testing.T) {
 	h.HandleLogs(msg)
 
 	// When only a number is given, source defaults to "all"
-	if len(logReader.calls) != 4 {
-		t.Fatalf("expected 4 log read calls, got %d", len(logReader.calls))
+	if len(logReader.calls) != 5 {
+		t.Fatalf("expected 5 log read calls, got %d", len(logReader.calls))
 	}
 	if logReader.calls[0].lines != 30 {
 		t.Errorf("expected 30 lines, got %d", logReader.calls[0].lines)
@@ -400,5 +405,103 @@ func TestMiscHandler_HandleLogs_MaxLinesLimit(t *testing.T) {
 	// Should be capped at maxLogLines (500)
 	if logReader.calls[0].lines != 500 {
 		t.Errorf("expected 500 lines (maxLogLines), got %d", logReader.calls[0].lines)
+	}
+}
+
+func TestMiscHandler_HandleLogs_SourceWatchd(t *testing.T) {
+	sender := &mockSender{}
+	logReader := &mockLogReader{output: "log"}
+	deps := &Deps{Sender: sender, Logs: logReader, Paths: paths.Paths{WatchdLogPath: "/tmp/vpn-director-watchd.log"}}
+	h := NewMiscHandler(deps)
+
+	h.HandleLogs(&tgbotapi.Message{
+		Chat:     &tgbotapi.Chat{ID: 100},
+		Text:     "/logs watchd",
+		Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 5}},
+	})
+
+	if len(logReader.calls) != 1 || logReader.calls[0].path != "/tmp/vpn-director-watchd.log" {
+		t.Fatalf("log reads %+v, want the monitor's log", logReader.calls)
+	}
+}
+
+func TestMiscHandler_HandleLogs_WatchdGolden(t *testing.T) {
+	for _, tc := range []struct {
+		command string
+		lines   int
+		content string
+		want    string
+	}{
+		{"/logs watchd", 20, "monitor started\nstate=ok", "📋 *Server monitor logs* \\(last 20 lines\\):\nmonitor started\nstate=ok"},
+		{"/logs watchd 50", 50, "monitor started", "📋 *Server monitor logs* \\(last 50 lines\\):\nmonitor started"},
+		{"/logs watchd 99999", 500, "monitor started", "📋 *Server monitor logs* \\(last 500 lines\\):\nmonitor started"},
+		{"/logs watchd", 20, "", "📋 *Server monitor logs* \\(last 20 lines\\):\n(empty)"},
+	} {
+		t.Run(tc.command+tc.content, func(t *testing.T) {
+			sender := &recordingSender{}
+			reader := &mockLogReader{output: tc.content}
+			h := NewMiscHandler(&Deps{Sender: sender, Logs: reader, Paths: paths.Paths{WatchdLogPath: "/tmp/vpn-director-watchd.log"}})
+			h.HandleLogs(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 100}, Text: tc.command, Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 5}}})
+			if got := sender.last(); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+			if len(reader.calls) != 1 || reader.calls[0] != (logReadCall{path: "/tmp/vpn-director-watchd.log", lines: tc.lines}) {
+				t.Fatalf("log reads %+v", reader.calls)
+			}
+		})
+	}
+}
+
+func TestMiscHandler_HandleLogs_AllGolden(t *testing.T) {
+	for _, command := range []string{"/logs", "/logs all"} {
+		t.Run(command, func(t *testing.T) {
+			sender := &recordingSender{}
+			reader := &mockLogReader{output: "log"}
+			h := NewMiscHandler(&Deps{Sender: sender, Logs: reader, Paths: paths.Paths{
+				BotLogPath: "/tmp/bot.log", VPNLogPath: "/tmp/vpn.log", XrayLogPath: "/tmp/xray-error.log", WebUILogPath: "/tmp/webui.log", WatchdLogPath: "/tmp/vpn-director-watchd.log",
+			}})
+			h.HandleLogs(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 100}, Text: command, Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 5}}})
+			const want = `📋 *Bot logs* \(last 20 lines\):
+log
+📋 *VPN Director logs* \(last 20 lines\):
+log
+📋 *Xray logs* \(last 20 lines\):
+log
+📋 *Web UI logs* \(last 20 lines\):
+log
+📋 *Server monitor logs* \(last 20 lines\):
+log`
+			if got := sender.all(); got != want {
+				t.Fatalf("got %q, want %q", got, want)
+			}
+			wantPaths := []string{"/tmp/bot.log", "/tmp/vpn.log", "/tmp/xray-error.log", "/tmp/webui.log", "/tmp/vpn-director-watchd.log"}
+			if len(reader.calls) != len(wantPaths) {
+				t.Fatalf("log reads %+v", reader.calls)
+			}
+			for i, path := range wantPaths {
+				if reader.calls[i] != (logReadCall{path: path, lines: 20}) {
+					t.Errorf("log read %d: %+v", i, reader.calls[i])
+				}
+			}
+		})
+	}
+}
+
+func TestMiscHandler_HandleLogs_WatchdReadError(t *testing.T) {
+	sender := &mockSender{}
+	reader := &mockLogReader{err: errors.New("disk [offline]")}
+	h := NewMiscHandler(&Deps{Sender: sender, Logs: reader, Paths: paths.Paths{WatchdLogPath: "/tmp/vpn-director-watchd.log"}})
+	h.HandleLogs(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 100}, Text: "/logs watchd", Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 5}}})
+	if want := `Error reading Server monitor logs: disk \[offline\]`; sender.lastText != want {
+		t.Fatalf("got %q, want %q", sender.lastText, want)
+	}
+}
+
+func TestMiscHandler_HandleLogs_UsageIncludesWatchd(t *testing.T) {
+	sender := &mockSender{}
+	h := NewMiscHandler(&Deps{Sender: sender})
+	h.HandleLogs(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 100}, Text: "/logs invalid", Entities: []tgbotapi.MessageEntity{{Type: "bot_command", Offset: 0, Length: 5}}})
+	if want := "Usage: `/logs [bot|vpn|xray|webui|watchd|all] [lines]`"; sender.lastText != want {
+		t.Fatalf("got %q, want %q", sender.lastText, want)
 	}
 }

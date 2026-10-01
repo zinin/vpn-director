@@ -143,7 +143,7 @@ func TestBuildServersPage_HeadsEachSubscriptionAndNumbersWithinIt(t *testing.T) 
 		{ID: "1b2c3d4e", Name: "Beta", Servers: servers(3)},
 	}
 
-	text, kb := buildServersPage(serverLines(subs), len(subs), 0)
+	text, kb := buildServersPage(serverLines(subs), len(subs), 0, health{})
 
 	if !strings.Contains(text, "*Alpha*") || !strings.Contains(text, "*Beta*") || !strings.Contains(text, "in 2 subscriptions, page 1/2") {
 		t.Fatalf("page 1: %q", text)
@@ -157,7 +157,7 @@ func TestBuildServersPage_HeadsEachSubscriptionAndNumbersWithinIt(t *testing.T) 
 	}
 
 	// A page that starts in the middle of a subscription names it again.
-	text, _ = buildServersPage(serverLines(subs), len(subs), 1)
+	text, _ = buildServersPage(serverLines(subs), len(subs), 1, health{})
 	if !strings.Contains(text, "*Beta*") || !strings.Contains(text, "3\\. S3") {
 		t.Fatalf("page 2: %q", text)
 	}
@@ -183,5 +183,66 @@ func TestServersHandler_PageButtonsTurnThePage(t *testing.T) {
 
 	if !strings.Contains(sender.last(), "page 2/2") || !strings.Contains(sender.last(), "16\\. S16") {
 		t.Fatalf("page %q", sender.last())
+	}
+}
+
+func TestServersHandler_MonitorGolden(t *testing.T) {
+	sub := vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha_[x]", Servers: servers(4)}
+	for _, tc := range monitorPageCases(sub) {
+		t.Run(tc.name, func(t *testing.T) {
+			want := "🖥 *Servers* \\(4\\) in 1 subscriptions, page 1/1:\n"
+			if tc.note != "" {
+				want += tc.note + "\n"
+			}
+			want += "\n*Alpha\\_\\[x\\]*"
+			if tc.marked {
+				want += " — 1/4 живы"
+			}
+			want += "\n"
+			if tc.marked {
+				want += `🟢 1\. S1 — a\.example\.com \(192\.0\.2\.1\) · vless·tls · 142 ms
+🔴 2\. S2 — a\.example\.com \(192\.0\.2\.1\) · vless·tls
+⚪ 3\. S3 — a\.example\.com \(192\.0\.2\.1\) · vless·tls
+⛔ 4\. S4 — a\.example\.com \(192\.0\.2\.1\) · vless·tls
+`
+			} else {
+				want += `1\. S1 — a\.example\.com \(192\.0\.2\.1\) · vless·tls
+2\. S2 — a\.example\.com \(192\.0\.2\.1\) · vless·tls
+3\. S3 — a\.example\.com \(192\.0\.2\.1\) · vless·tls
+4\. S4 — a\.example\.com \(192\.0\.2\.1\) · vless·tls
+`
+			}
+			for _, callback := range []bool{false, true} {
+				sender := &recordingSender{}
+				h := NewServersHandler(&Deps{Sender: sender, Config: newSubsStore(sub), Monitor: tc.api})
+				if callback {
+					h.HandleCallback(xrayCallback("servers:page:0"))
+				} else {
+					h.HandleServers(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}})
+				}
+				if got := sender.last(); got != want {
+					t.Fatalf("callback=%t\ngot:\n%s\nwant:\n%s", callback, got, want)
+				}
+				data := sender.buttons()
+				if len(data) != 1 || data[0] != "servers:noop" || sender.keyboard.InlineKeyboard[0][0].Text != "1/1" {
+					t.Fatalf("navigation %+v", sender.keyboard)
+				}
+			}
+		})
+	}
+}
+
+func TestServersHandler_PaginationKeepsHealthAndSubscriptionTotals(t *testing.T) {
+	sub := vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha", Servers: servers(16)}
+	cases := monitorPageCases(sub)
+	sender := &recordingSender{}
+	h := NewServersHandler(&Deps{Sender: sender, Config: newSubsStore(sub), Monitor: cases[2].api})
+	h.HandleCallback(xrayCallback("servers:page:1"))
+	const want = "🖥 *Servers* \\(16\\) in 1 subscriptions, page 2/2:\n\n*Alpha* — 4/16 живы\n⛔ 16\\. S16 — a\\.example\\.com \\(192\\.0\\.2\\.1\\) · vless·tls\n"
+	if got := sender.last(); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got := sender.buttons(); len(got) != 2 || got[0] != "servers:page:0" || got[1] != "servers:noop" {
+		t.Fatalf("navigation %v", got)
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/updateflow"
 	"github.com/zinin/vpn-director/server/internal/updater"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 	"github.com/zinin/vpn-director/server/internal/wizard"
 )
 
@@ -169,6 +170,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Commit:      commit,
 			BuildDate:   buildDate,
 			DevMode:     b.devMode,
+			Monitor:     watchdapi.NewClient(p.WatchdSocket),
 		}
 		if pm := b.pathManager; pm != nil {
 			deps.TelegramPath = func() string { return pm.Current().String() }
