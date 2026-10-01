@@ -1,7 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import api from '../api'
-import type { ActiveServer, Server, Subscription, SubscriptionServers } from '../types'
+import type {
+  ActiveServer,
+  MonitorResponse,
+  Server,
+  ServerHealth,
+  Subscription,
+  SubscriptionServers,
+} from '../types'
 
 const subscriptions = ref<Subscription[]>([])
 const groups = ref<SubscriptionServers[]>([])
@@ -17,6 +24,14 @@ const renaming = ref('')
 const renameText = ref('')
 // What the last add or refresh came to, a line per subscription.
 const summaries = ref<string[]>([])
+// The server monitor's answer, polled while the tab is open.
+const monitor = ref<MonitorResponse | null>(null)
+const monitorUnavailable = ref(false)
+// The check being sent: 'all' or '<subscription>:<index>'.
+const checking = ref('')
+let poll: ReturnType<typeof setInterval> | undefined
+let recheck: ReturnType<typeof setTimeout> | undefined
+let unmounted = false
 
 function errorText(e: any): string {
   return e?.response?.data?.error || e?.message || 'unknown error'
@@ -67,6 +82,136 @@ function isActive(sub: string, server: Server): boolean {
 
 function runsFrom(sub: string): boolean {
   return active.value?.subscription === sub
+}
+
+// "in 40 s", "in 5 min" or "now" for a time the router wrote; nothing for
+// Go's zero time.
+function until(iso: string): string {
+  const t = Date.parse(iso)
+  if (isNaN(t) || t < Date.UTC(2000, 0, 1)) return ''
+  const s = Math.round((t - Date.now()) / 1000)
+  if (s <= 0) return 'now'
+  if (s < 60) return `in ${s} s`
+  return `in ${Math.round(s / 60)} min`
+}
+
+async function loadMonitor() {
+  try {
+    const resp = await api.getMonitor()
+    if (unmounted) return
+    monitorUnavailable.value = false
+    monitor.value = resp.data
+    if (listChanged()) await load()
+  } catch {
+    if (unmounted) return
+    monitorUnavailable.value = true
+    monitor.value = null
+  }
+}
+
+// The monitor's rows go by index; a count or a fingerprint that differs from
+// the page's means a refresh moved the list since the page loaded it.
+function listChanged(): boolean {
+  const subs = monitor.value?.subscriptions ?? []
+  if (subs.length !== groups.value.length) return true
+  for (const group of groups.value) {
+    const rows = subs.find((s) => s.id === group.id)?.servers ?? []
+    const servers = group.servers ?? []
+    if (rows.length !== servers.length) return true
+    if (servers.some((server, i) => rows[i].fingerprint !== server.fingerprint)) return true
+  }
+  return false
+}
+
+// The status of a server as the page shows it, never another server's.
+function healthOf(group: SubscriptionServers, idx: number, server: Server): ServerHealth | null {
+  const row = monitor.value?.subscriptions?.find((s) => s.id === group.id)?.servers?.[idx]
+  return row && row.fingerprint === server.fingerprint ? row : null
+}
+
+function healthText(h: ServerHealth | null): string {
+  switch (h?.status) {
+    case 'alive':
+      return `● ${h.latency_ms} ms`
+    case 'dead':
+      return '● down'
+    case 'rejected':
+      return 'rejected'
+    default:
+      return '● —'
+  }
+}
+
+function healthTitle(h: ServerHealth | null): string {
+  if (!h || h.status === 'unknown') return 'Not checked yet'
+  if (h.status === 'rejected') return h.error || 'Xray refused this server'
+  const lines = [`Checked ${ago(h.checked_at)}`, `${h.status === 'alive' ? 'Alive' : 'Down'} since ${ago(h.since)}`]
+  if (h.error) lines.push(`Error: ${h.error}`)
+  const next = until(h.next_at)
+  if (next) lines.push(`Next check ${next}`)
+  return lines.join('\n')
+}
+
+function aliveText(groupId: string): string {
+  const m = monitor.value
+  if (!m || m.state === 'not_running') return ''
+  const sub = m.subscriptions?.find((s) => s.id === groupId)
+  return sub ? `${sub.alive}/${sub.total} alive` : ''
+}
+
+const monitorLine = computed(() => {
+  if (monitorUnavailable.value) return 'Monitoring: unavailable'
+  const m = monitor.value
+  if (!m) return ''
+  switch (m.state) {
+    case 'ok': {
+      if (m.lag_seconds > m.interval_seconds) return 'Monitoring: checks are falling behind'
+      const s = m.interval_seconds
+      return `Monitoring every ${s % 60 === 0 ? `${s / 60} min` : `${s} s`}`
+    }
+    case 'stopped':
+      return 'Monitoring: stopped with VPN Director'
+    case 'disabled':
+      return 'Monitoring: disabled in settings'
+    case 'no_xray':
+      return 'Monitoring: xray not found'
+    case 'wan_down':
+      return 'Monitoring: WAN down, statuses kept'
+    case 'prober_error':
+      return `Monitoring: the prober does not start: ${m.message ?? ''}`
+    default:
+      return 'Monitoring: not running'
+  }
+})
+
+const canCheck = computed(() => monitor.value?.state === 'ok' || monitor.value?.state === 'wan_down')
+
+// A check answers within seconds: the page looks again before the next poll.
+async function sendCheck(what: string, fn: () => Promise<unknown>) {
+  checking.value = what
+  try {
+    await fn()
+    if (!unmounted) {
+      clearTimeout(recheck)
+      recheck = setTimeout(loadMonitor, 3000)
+    }
+  } catch (e: any) {
+    if (e.response?.status === 409 && e.response?.data?.error === 'server list changed') {
+      await load()
+    } else {
+      alert('Error: ' + errorText(e))
+    }
+  } finally {
+    checking.value = ''
+  }
+}
+
+function checkServer(group: SubscriptionServers, idx: number, server: Server) {
+  return sendCheck(`${group.id}:${idx}`, () => api.checkServer(group.id, idx, server.fingerprint))
+}
+
+function checkAll() {
+  return sendCheck('all', () => api.checkAllServers())
 }
 
 async function run(what: string, fn: () => Promise<void>) {
@@ -157,65 +302,77 @@ async function selectServer(group: SubscriptionServers, index: number) {
   }
 }
 
-onMounted(load)
+onMounted(() => {
+  load()
+  loadMonitor()
+  poll = setInterval(loadMonitor, 15000)
+})
+
+onUnmounted(() => {
+  unmounted = true
+  clearInterval(poll)
+  clearTimeout(recheck)
+})
 </script>
 
 <template>
   <div class="card">
     <div class="card-title">Subscriptions</div>
 
-    <table v-if="subscriptions.length > 0">
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Host</th>
-          <th>Servers</th>
-          <th>Refreshed</th>
-          <th>Status</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr v-for="sub in subscriptions" :key="sub.id">
-          <td>
-            <template v-if="renaming === sub.id">
-              <input
-                v-model="renameText"
-                type="text"
-                maxlength="32"
-                style="width: 10rem;"
-                @keyup.enter="saveRename(sub)"
-                @keyup.esc="renaming = ''"
-              />
-              <button class="btn btn-green" :disabled="!!busy" @click="saveRename(sub)">✓</button>
-              <button class="btn btn-blue" @click="renaming = ''">✕</button>
-            </template>
-            <template v-else>{{ sub.name }}</template>
-          </td>
-          <td>{{ sub.static ? 'static list' : sub.host }}</td>
-          <td>{{ sub.servers }}</td>
-          <td>{{ ago(sub.refreshed) }}</td>
-          <td>
-            <span v-if="sub.error" class="badge badge-red" :title="sub.error">{{ sub.error }}</span>
-            <span v-else class="badge badge-green">OK</span>
-          </td>
-          <td style="white-space: nowrap;">
-            <button
-              class="btn btn-blue"
-              :disabled="!!busy || sub.static"
-              :title="sub.static ? 'A static list has no link to refresh' : 'Refresh'"
-              @click="refresh(sub.id)"
-            >
-              {{ busy === 'refresh:' + sub.id ? '...' : '⟳' }}
-            </button>
-            <button class="btn btn-blue" :disabled="!!busy" title="Rename" @click="startRename(sub)">✎</button>
-            <button class="btn btn-red" :disabled="!!busy" title="Delete" @click="remove(sub)">
-              {{ busy === 'delete:' + sub.id ? '...' : '🗑' }}
-            </button>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-if="subscriptions.length > 0" class="servers-table">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Host</th>
+            <th>Servers</th>
+            <th>Refreshed</th>
+            <th>Status</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="sub in subscriptions" :key="sub.id">
+            <td>
+              <template v-if="renaming === sub.id">
+                <input
+                  v-model="renameText"
+                  type="text"
+                  maxlength="32"
+                  style="width: 10rem;"
+                  @keyup.enter="saveRename(sub)"
+                  @keyup.esc="renaming = ''"
+                />
+                <button class="btn btn-green" :disabled="!!busy" @click="saveRename(sub)">✓</button>
+                <button class="btn btn-blue" @click="renaming = ''">✕</button>
+              </template>
+              <template v-else>{{ sub.name }}</template>
+            </td>
+            <td>{{ sub.static ? 'static list' : sub.host }}</td>
+            <td>{{ sub.servers }}</td>
+            <td>{{ ago(sub.refreshed) }}</td>
+            <td>
+              <span v-if="sub.error" class="badge badge-red" :title="sub.error">{{ sub.error }}</span>
+              <span v-else class="badge badge-green">OK</span>
+            </td>
+            <td style="white-space: nowrap;">
+              <button
+                class="btn btn-blue"
+                :disabled="!!busy || sub.static"
+                :title="sub.static ? 'A static list has no link to refresh' : 'Refresh'"
+                @click="refresh(sub.id)"
+              >
+                {{ busy === 'refresh:' + sub.id ? '...' : '⟳' }}
+              </button>
+              <button class="btn btn-blue" :disabled="!!busy" title="Rename" @click="startRename(sub)">✎</button>
+              <button class="btn btn-red" :disabled="!!busy" title="Delete" @click="remove(sub)">
+                {{ busy === 'delete:' + sub.id ? '...' : '🗑' }}
+              </button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
     <p v-else-if="!loading && !error" style="color: #999; font-size: 0.875rem;">
       No subscriptions yet. Add one below.
     </p>
@@ -244,6 +401,18 @@ onMounted(load)
 
   <div class="card">
     <div class="card-title">Servers</div>
+    <p v-if="monitorLine" style="font-size: 0.875rem; margin: 0 0 0.75rem;">
+      {{ monitorLine }}
+      <button
+        v-if="canCheck"
+        class="btn btn-blue"
+        style="margin-left: 0.5rem;"
+        :disabled="checking !== ''"
+        @click="checkAll"
+      >
+        {{ checking === 'all' ? '...' : 'Check all now' }}
+      </button>
+    </p>
     <details
       v-for="group in groups"
       :key="group.id"
@@ -251,38 +420,58 @@ onMounted(load)
       style="margin-bottom: 0.75rem;"
     >
       <summary style="cursor: pointer; font-weight: 600;">
-        {{ group.name }} — {{ (group.servers ?? []).length }} servers
+        {{ group.name }} — {{ (group.servers ?? []).length }} servers<template v-if="aliveText(group.id)">, {{ aliveText(group.id) }}</template>
         <span v-if="runsFrom(group.id)" class="badge badge-green" style="margin-left: 0.5rem;">running</span>
       </summary>
-      <table>
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>Name</th>
-            <th>Address</th>
-            <th>Port</th>
-            <th>Protocol</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr v-for="(server, idx) in group.servers ?? []" :key="idx">
-            <td>{{ idx + 1 }}</td>
-            <td>
-              {{ server.name }}
-              <span v-if="isActive(group.id, server)" class="badge badge-green" style="margin-left: 0.5rem;">Active</span>
-            </td>
-            <td>{{ server.address }}</td>
-            <td>{{ server.port }}</td>
-            <td>{{ server.protocol }}</td>
-            <td>
-              <button class="btn btn-green" :disabled="!!busy" @click="selectServer(group, idx)">
-                {{ busy === `select:${group.id}:${idx}` ? '...' : 'Select' }}
-              </button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="servers-table">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Name</th>
+              <th>Address</th>
+              <th>Port</th>
+              <th>Protocol</th>
+              <th>Health</th>
+              <th>Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(server, idx) in group.servers ?? []" :key="idx">
+              <td>{{ idx + 1 }}</td>
+              <td>
+                {{ server.name }}
+                <span v-if="isActive(group.id, server)" class="badge badge-green" style="margin-left: 0.5rem;">Active</span>
+              </td>
+              <td>{{ server.address }}</td>
+              <td>{{ server.port }}</td>
+              <td>{{ server.protocol }}</td>
+              <td
+                :class="'health-' + (healthOf(group, idx, server)?.status ?? 'unknown')"
+                :title="healthTitle(healthOf(group, idx, server))"
+                style="white-space: nowrap;"
+              >
+                {{ healthText(healthOf(group, idx, server)) }}
+                <button
+                  v-if="canCheck"
+                  class="btn btn-blue"
+                  style="padding: 0 0.4rem; margin-left: 0.4rem;"
+                  :disabled="checking !== ''"
+                  title="Check now"
+                  @click="checkServer(group, idx, server)"
+                >
+                  {{ checking === `${group.id}:${idx}` ? '...' : '↻' }}
+                </button>
+              </td>
+              <td>
+                <button class="btn btn-green" :disabled="!!busy" @click="selectServer(group, idx)">
+                  {{ busy === `select:${group.id}:${idx}` ? '...' : 'Select' }}
+                </button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
     </details>
     <p v-if="groups.length === 0 && !loading && !error" style="color: #999; font-size: 0.875rem;">
       No servers found. Add a subscription to get started.

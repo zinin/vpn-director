@@ -2,7 +2,7 @@
 import { ref, onMounted, watch } from 'vue'
 import api from '../api'
 
-const logSources = ['vpn', 'xray', 'webui', 'bot'] as const
+const logSources = ['vpn', 'xray', 'webui', 'bot', 'watchd'] as const
 const source = ref<string>('')
 const logData = ref<Record<string, string>>({})
 const loading = ref(false)

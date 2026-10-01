@@ -1,11 +1,54 @@
 /** A server as GET /api/servers shows it: no credentials. protocol is its
- *  label, e.g. "vless·reality", "trojan·tls", "ss", "hysteria2". */
+ *  label, e.g. "vless·reality", "trojan·tls", "ss", "hysteria2". fingerprint
+ *  matches it with its row of GET /api/monitor. */
 export interface Server {
   name: string
   address: string
   port: number
   ips: string[]
   protocol: string
+  fingerprint: string
+}
+
+/** What the server monitor (vpn-director-watchd) knows of a server. */
+export type HealthStatus = 'alive' | 'dead' | 'unknown' | 'rejected'
+
+/** One server's status in GET /api/monitor; index and fingerprint match it
+ *  with its row of GET /api/servers. Times are RFC 3339; Go writes a zero time
+ *  as 0001-01-01T00:00:00Z. */
+export interface ServerHealth {
+  index: number
+  fingerprint: string
+  status: HealthStatus
+  latency_ms: number
+  checked_at: string
+  since: string
+  next_at: string
+  error?: string
+}
+
+export interface MonitorSubscription {
+  id: string
+  alive: number
+  total: number
+  servers: ServerHealth[] | null
+}
+
+export type MonitorState =
+  | 'ok'
+  | 'stopped'
+  | 'disabled'
+  | 'no_xray'
+  | 'wan_down'
+  | 'prober_error'
+  | 'not_running'
+
+export interface MonitorResponse {
+  state: MonitorState
+  message?: string
+  interval_seconds: number
+  lag_seconds: number
+  subscriptions: MonitorSubscription[] | null
 }
 
 export interface ClientInfo {

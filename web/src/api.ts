@@ -12,6 +12,7 @@ import type {
   PlatformInfo,
   RefreshResponse,
   Server,
+  MonitorResponse,
   ServersResponse,
   StatusResponse,
   SubscriptionResult,
@@ -96,6 +97,16 @@ export default {
     api.post<OkResponse>('/api/subscriptions/rename', { name }, { params: { id } }),
   deleteSubscription: (id: string) =>
     api.delete<DeleteSubscriptionResponse>('/api/subscriptions', { params: { id } }),
+
+  // Server monitor
+  getMonitor: () =>
+    api.get<MonitorResponse>('/api/monitor'),
+  // One server as the page shows it - the router answers 409 when the list
+  // changed since - or, with no server, every server.
+  checkServer: (subscription: string, index: number, fingerprint: string) =>
+    api.post<{ queued: number }>('/api/monitor/check', { subscription, index, fingerprint }),
+  checkAllServers: () =>
+    api.post<{ queued: number }>('/api/monitor/check', {}),
 
   // Clients
   getClients: () =>
