@@ -1,8 +1,10 @@
 package webapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
@@ -76,6 +78,26 @@ type monitorCheckRequest struct {
 	Subscription string `json:"subscription"`
 	Index        *int   `json:"index"`
 	Fingerprint  string `json:"fingerprint"`
+}
+
+func (req *monitorCheckRequest) UnmarshalJSON(data []byte) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	if fields == nil {
+		return errors.New("expected a check target or an empty object")
+	}
+	type target monitorCheckRequest
+	var value target
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	if len(fields) != 0 && (value.Index == nil || strings.TrimSpace(value.Subscription) == "" || strings.TrimSpace(value.Fingerprint) == "") {
+		return errors.New("incomplete check target")
+	}
+	*req = monitorCheckRequest(value)
+	return nil
 }
 
 // handleMonitorCheck queues a check of one server - every address of it - or

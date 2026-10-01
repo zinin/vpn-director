@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -35,12 +36,12 @@ func socks5Server(t *testing.T, user, pass string) string {
 
 func serveSOCKS5(c net.Conn, user, pass string) {
 	defer c.Close()
-	b := make([]byte, 256)
 	read := func(n int) []byte {
-		if _, err := io.ReadFull(c, b[:n]); err != nil {
+		b := make([]byte, n)
+		if _, err := io.ReadFull(c, b); err != nil {
 			return nil
 		}
-		return b[:n]
+		return b
 	}
 	if h := read(2); h == nil || read(int(h[1])) == nil { // VER NMETHODS METHODS
 		return
@@ -50,9 +51,19 @@ func serveSOCKS5(c net.Conn, user, pass string) {
 	if h == nil {
 		return
 	}
-	u := string(read(int(h[1])))
-	p := string(read(int(read(1)[0])))
-	if u != user || p != pass {
+	u := read(int(h[1]))
+	if u == nil {
+		return
+	}
+	length := read(1)
+	if length == nil {
+		return
+	}
+	p := read(int(length[0]))
+	if p == nil {
+		return
+	}
+	if string(u) != user || string(p) != pass {
 		c.Write([]byte{1, 1})
 		return
 	}
@@ -64,13 +75,28 @@ func serveSOCKS5(c net.Conn, user, pass string) {
 	var host string
 	switch req[3] {
 	case 1:
-		host = net.IP(append([]byte(nil), read(4)...)).String()
+		ip := read(4)
+		if ip == nil {
+			return
+		}
+		host = net.IP(append([]byte(nil), ip...)).String()
 	case 3:
-		host = string(read(int(read(1)[0])))
+		length := read(1)
+		if length == nil {
+			return
+		}
+		domain := read(int(length[0]))
+		if domain == nil {
+			return
+		}
+		host = string(domain)
 	default:
 		return
 	}
 	pb := read(2)
+	if pb == nil {
+		return
+	}
 	port := int(pb[0])<<8 | int(pb[1])
 	target, err := net.Dial("tcp", net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
@@ -144,5 +170,67 @@ func TestClassify_ATimeoutIsATimeout(t *testing.T) {
 	}
 	if got := classify(errors.New("read: connection reset by peer")); got != "connection closed" {
 		t.Fatalf("classified %q", got)
+	}
+}
+
+type truncatedSOCKSConn struct {
+	*bytes.Reader
+	closed bool
+}
+
+func (c *truncatedSOCKSConn) Write(p []byte) (int, error)    { return len(p), nil }
+func (c *truncatedSOCKSConn) Close() error                   { c.closed = true; return nil }
+func (*truncatedSOCKSConn) LocalAddr() net.Addr              { return nil }
+func (*truncatedSOCKSConn) RemoteAddr() net.Addr             { return nil }
+func (*truncatedSOCKSConn) SetDeadline(time.Time) error      { return nil }
+func (*truncatedSOCKSConn) SetReadDeadline(time.Time) error  { return nil }
+func (*truncatedSOCKSConn) SetWriteDeadline(time.Time) error { return nil }
+
+func TestSOCKS5Helper_TruncatedHandshakesCloseWithoutPanic(t *testing.T) {
+	auth := append([]byte{5, 1, 2, 1, 2, 'e', '0', 6}, []byte("secret")...)
+	for _, target := range [][]byte{{5, 1, 0, 1, 127, 0, 0, 1, 0, 80}, append(append([]byte{5, 1, 0, 3, 9}, []byte("localhost")...), 0, 80)} {
+		full := append(append([]byte(nil), auth...), target...)
+		for i := 0; i < len(full); i++ {
+			t.Run(strconv.Itoa(int(target[3]))+"/"+strconv.Itoa(i), func(t *testing.T) {
+				conn := &truncatedSOCKSConn{Reader: bytes.NewReader(full[:i])}
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("truncated handshake panicked: %v", r)
+					}
+					if !conn.closed {
+						t.Error("truncated connection not closed")
+					}
+				}()
+				serveSOCKS5(conn, "e0", "secret")
+			})
+		}
+	}
+}
+
+func TestSOCKS5Helper_ACancelledHandshakeEndsItsWaiter(t *testing.T) {
+	server, client := net.Pipe()
+	done := make(chan any, 1)
+	go func() {
+		defer func() { done <- recover() }()
+		serveSOCKS5(server, "e0", "secret")
+	}()
+	t.Cleanup(func() { client.Close(); server.Close() })
+	if _, err := client.Write([]byte{5, 1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadFull(client, make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Write([]byte{1, 2, 'e', '0'}); err != nil {
+		t.Fatal(err)
+	}
+	client.Close()
+	select {
+	case r := <-done:
+		if r != nil {
+			t.Fatalf("cancelled handshake panicked: %v", r)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled handshake left a waiter")
 	}
 }

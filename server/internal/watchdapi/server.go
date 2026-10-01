@@ -44,7 +44,16 @@ func NewHandler(src Source) http.Handler {
 		var req checkRequest
 		body := http.MaxBytesReader(w, r.Body, 1<<20)
 		// An empty body is a check of every endpoint, like {}.
-		if err := json.NewDecoder(body).Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+		decoder := json.NewDecoder(body)
+		err := decoder.Decode(&req)
+		if err == nil {
+			var trailing any
+			if !errors.Is(decoder.Decode(&trailing), io.EOF) {
+				writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
+				return
+			}
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
 			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
 			return
 		}

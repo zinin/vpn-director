@@ -32,6 +32,7 @@ const checking = ref('')
 let poll: ReturnType<typeof setInterval> | undefined
 let recheck: ReturnType<typeof setTimeout> | undefined
 let unmounted = false
+let monitorRequest = 0
 
 function errorText(e: any): string {
   return e?.response?.data?.error || e?.message || 'unknown error'
@@ -96,14 +97,16 @@ function until(iso: string): string {
 }
 
 async function loadMonitor() {
+  if (unmounted) return
+  const request = ++monitorRequest
   try {
     const resp = await api.getMonitor()
-    if (unmounted) return
+    if (unmounted || request !== monitorRequest) return
     monitorUnavailable.value = false
     monitor.value = resp.data
     if (listChanged()) await load()
   } catch {
-    if (unmounted) return
+    if (unmounted || request !== monitorRequest) return
     monitorUnavailable.value = true
     monitor.value = null
   }
@@ -156,7 +159,13 @@ function aliveText(groupId: string): string {
   const m = monitor.value
   if (!m || m.state === 'not_running') return ''
   const sub = m.subscriptions?.find((s) => s.id === groupId)
-  return sub ? `${sub.alive}/${sub.total} alive` : ''
+  const group = groups.value.find((g) => g.id === groupId)
+  if (!sub || !group) return ''
+  const servers = group.servers ?? []
+  const rows = sub.servers ?? []
+  if (sub.total !== servers.length || rows.length !== servers.length) return ''
+  if (servers.some((server, i) => rows[i].index !== i || rows[i].fingerprint !== server.fingerprint)) return ''
+  return `${sub.alive}/${sub.total} alive`
 }
 
 const monitorLine = computed(() => {

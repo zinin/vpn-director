@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -251,5 +252,147 @@ func TestSettingsReader_RereadsAndWarnsOnlyForDistinctInvalidValues(t *testing.T
 	}
 	if n := strings.Count(logs.String(), "level=WARN"); n != 2 {
 		t.Fatalf("reintroduced invalid settings warned %d times, want 2", n)
+	}
+}
+
+func TestEndpointsReader_LiteralDataPathsSeeSubscriptionOnlyChanges(t *testing.T) {
+	for _, name := range []string{"data[1]", "data*", "data?", "data["} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "vpn-director.json")
+			raw, _ := json.Marshal(map[string]any{"data_dir": name, "xray": map[string]any{}})
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			store := service.NewConfigService(root, filepath.Join(root, name), path)
+			dir, err := store.SubscriptionsDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := vpnconfig.Server{Name: "synthetic", Address: "192.0.2.10", Port: 443, IPs: []string{"192.0.2.10"}, UUID: "00000000-0000-0000-0000-000000000001"}
+			sub := vpnconfig.Subscription{ID: "0a1b2c3d", Name: "synthetic", Servers: []vpnconfig.Server{server}}
+			if err := vpnconfig.SaveSubscription(dir, sub); err != nil {
+				t.Fatal(err)
+			}
+			read := endpointsReader(store)
+			before, _, err := read()
+			if err != nil || len(before) != 1 {
+				t.Fatalf("initial set count=%d err=%v", len(before), err)
+			}
+			info, err := os.Stat(filepath.Join(dir, sub.ID+".json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sub.Servers[0].UUID = "00000000-0000-0000-0000-000000000002"
+			if err := vpnconfig.SaveSubscription(dir, sub); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(filepath.Join(dir, sub.ID+".json"), info.ModTime(), info.ModTime()); err != nil {
+				t.Fatal(err)
+			}
+			after, _, err := read()
+			if err != nil || len(after) != 1 || after[0].Key == before[0].Key {
+				t.Error("same-size/time subscription-only replacement kept old key")
+			}
+			sub.ID = "1b2c3d4e"
+			sub.Servers[0].UUID = "00000000-0000-0000-0000-000000000003"
+			if err := vpnconfig.SaveSubscription(dir, sub); err != nil {
+				t.Fatal(err)
+			}
+			if eps, _, err := read(); err != nil || len(eps) != 2 {
+				t.Errorf("subscription-only add count=%d err=%v", len(eps), err)
+			}
+			for _, id := range []string{"0a1b2c3d", "1b2c3d4e"} {
+				if err := vpnconfig.DeleteSubscriptionFile(dir, id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if eps, _, err := read(); err != nil || len(eps) != 0 {
+				t.Errorf("removed endpoints count=%d err=%v", len(eps), err)
+			}
+			if current, err := os.ReadFile(path); err != nil || !bytes.Equal(current, raw) {
+				t.Fatal("regression changed config")
+			}
+		})
+	}
+}
+
+func TestWatchdInit_RestartRetainsStopFailure(t *testing.T) {
+	raw, err := os.ReadFile("../../../router/opt/etc/init.d/S98vpn-director-watchd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, survivor := range []bool{true, false} {
+		t.Run(map[bool]string{true: "surviving", false: "stopped"}[survivor], func(t *testing.T) {
+			dir := t.TempDir()
+			binary := filepath.Join(dir, "watchd")
+			if err := os.WriteFile(binary, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			src := strings.Replace(string(raw), `WATCHD_PATH="/opt/vpn-director/vpn-director-watchd"`, `WATCHD_PATH="`+binary+`"`, 1)
+			stub := `
+pidof() { [ -f "$SANDBOX/running" ]; }
+killall() { printf 'kill %s\n' "$*" >> "$SANDBOX/events"; [ "$SURVIVE" = 1 ] || rm -f "$SANDBOX/running"; }
+sleep() { if [ "$1" = 2 ]; then n=0; while [ ! -f "$SANDBOX/running" ] && [ "$n" -lt 100 ]; do /bin/sleep 0.01; n=$((n+1)); done; fi; }
+logger() { :; }
+nohup() { printf 'start\n' >> "$SANDBOX/events"; touch "$SANDBOX/running"; }
+`
+			src = strings.Replace(src, "start() {", stub+"\nstart() {", 1)
+			init := filepath.Join(dir, "init")
+			if err := os.WriteFile(init, []byte(src), 0755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "running"), nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			flag := "0"
+			if survivor {
+				flag = "1"
+			}
+			cmd := exec.Command("/bin/sh", init, "restart")
+			cmd.Env = append(os.Environ(), "SANDBOX="+dir, "SURVIVE="+flag)
+			out, err := cmd.CombinedOutput()
+			events, _ := os.ReadFile(filepath.Join(dir, "events"))
+			if survivor {
+				if err == nil || !bytes.Contains(out, []byte("Failed to stop")) || bytes.Contains(out, []byte("Starting")) || bytes.Contains(events, []byte("start")) {
+					t.Fatalf("failed stop was masked: err=%v output=%s events=%s", err, out, events)
+				}
+			} else if err != nil || !bytes.Contains(events, []byte("start")) {
+				t.Fatalf("successful restart err=%v output=%s events=%s", err, out, events)
+			}
+		})
+	}
+}
+
+func TestEndpointsReader_AListingFailureDoesNotReuseAMissingDirectorySnapshot(t *testing.T) {
+	store := testConfigService(t)
+	dir, err := store.SubscriptionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := endpointsReader(store)
+	if eps, _, err := read(); err != nil || len(eps) != 0 {
+		t.Fatalf("missing directory count=%d err=%v", len(eps), err)
+	}
+	if err := os.MkdirAll(filepath.Dir(dir), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir, []byte("not a directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, err := read(); err == nil {
+			t.Fatal("failed directory listing reused a successful snapshot")
+		}
+	}
+	if err := os.Remove(dir); err != nil {
+		t.Fatal(err)
+	}
+	sub := vpnconfig.Subscription{ID: "0a1b2c3d", Servers: []vpnconfig.Server{{Address: "192.0.2.10", Port: 443, UUID: "00000000-0000-0000-0000-000000000001"}}}
+	if err := vpnconfig.SaveSubscription(dir, sub); err != nil {
+		t.Fatal(err)
+	}
+	if eps, _, err := read(); err != nil || len(eps) != 1 {
+		t.Fatalf("repaired listing count=%d err=%v", len(eps), err)
 	}
 }

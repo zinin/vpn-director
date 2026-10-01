@@ -287,7 +287,7 @@ func TestHandleMonitor_LoadFailuresAndMalformedChecksQueueNothing(t *testing.T) 
 	if rec.Code != http.StatusInternalServerError {
 		t.Fatalf("load: %d %s", rec.Code, rec.Body)
 	}
-	if rec := post(t, deps, `{"subscription":"0a1b2c3d","index":0}`); rec.Code != http.StatusInternalServerError {
+	if rec := post(t, deps, `{"subscription":"0a1b2c3d","index":0,"fingerprint":"x"}`); rec.Code != http.StatusInternalServerError {
 		t.Fatalf("check load: %d %s", rec.Code, rec.Body)
 	}
 	for _, body := range []string{`{`, `{"index":"zero"}`} {
@@ -329,5 +329,22 @@ func TestMonitorRoutes_AreRegisteredAndAuthenticated(t *testing.T) {
 	}
 	if len(mon.checked) != 1 {
 		t.Fatalf("checked %v", mon.checked)
+	}
+}
+
+func TestHandleMonitorCheck_PartialTargetsNeverCheckAll(t *testing.T) {
+	for _, body := range []string{
+		`{"subscription":"0a1b2c3d","fingerprint":"x"}`, `{"subscription":"0a1b2c3d","index":null,"fingerprint":"x"}`,
+		`{"subscription":"0a1b2c3d"}`, `{"fingerprint":"x"}`, `{"index":0}`, `{"index":null}`,
+		`{"subscription":"","index":0,"fingerprint":"x"}`, `{"subscription":"0a1b2c3d","index":0}`, `{"subscription":null}`, `null`, `{"subscription":" ","index":0,"fingerprint":"x"}`, `{"subscription":"0a1b2c3d","index":0,"fingerprint":" "}`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			mon := &fakeMonitor{}
+			deps, _ := monitorDeps(t, mon)
+			rec := post(t, deps, body)
+			if rec.Code != http.StatusBadRequest || len(mon.checked) != 0 {
+				t.Fatalf("status=%d checked=%d; want 400 without Check", rec.Code, len(mon.checked))
+			}
+		})
 	}
 }

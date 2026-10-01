@@ -100,13 +100,13 @@ export default {
 
   // Server monitor
   getMonitor: () =>
-    api.get<MonitorResponse>('/api/monitor'),
+    api.get<MonitorResponse>('/api/monitor', { timeout: 8000 }),
   // One server as the page shows it - the router answers 409 when the list
   // changed since - or, with no server, every server.
   checkServer: (subscription: string, index: number, fingerprint: string) =>
-    api.post<{ queued: number }>('/api/monitor/check', { subscription, index, fingerprint }),
+    api.post<{ queued: number }>('/api/monitor/check', { subscription, index, fingerprint }, { timeout: 8000 }),
   checkAllServers: () =>
-    api.post<{ queued: number }>('/api/monitor/check', {}),
+    api.post<{ queued: number }>('/api/monitor/check', {}, { timeout: 8000 }),
 
   // Clients
   getClients: () =>

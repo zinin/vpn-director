@@ -101,3 +101,17 @@ func TestSettingsFrom_JSONConcurrency(t *testing.T) {
 		})
 	}
 }
+
+func TestSettingsFrom_IntervalMustLeaveRoomForTheFirstDeadPause(t *testing.T) {
+	const largest = time.Duration(1<<63 - 1)
+	for _, d := range []time.Duration{largest/2 + 1, largest} {
+		s, warns := SettingsFrom(&vpnconfig.MonitorConfig{Interval: d.String()})
+		if s.Interval != DefaultInterval || s.DeadMax != DefaultDeadMax || len(warns) != 1 || !strings.Contains(warns[0], "monitor.interval") {
+			t.Fatalf("unrepresentable first pause: interval=%s settings=%+v warnings=%v", d, s, warns)
+		}
+	}
+	s, warns := SettingsFrom(&vpnconfig.MonitorConfig{Interval: (largest / 2).String(), DeadIntervalMax: largest.String()})
+	if len(warns) != 0 || s.Interval != largest/2 || s.DeadMax != largest {
+		t.Fatalf("boundary settings=%+v warnings=%v", s, warns)
+	}
+}

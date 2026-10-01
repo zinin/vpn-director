@@ -69,3 +69,29 @@ func TestEntry_AFailureKeepsTheLastLatency(t *testing.T) {
 		t.Fatalf("state %+v", e.st)
 	}
 }
+
+func TestEntry_LargeDeadPausesSaturateBeforeDoubling(t *testing.T) {
+	const largest = time.Duration(1<<63 - 1)
+	s := Settings{Interval: largest / 4, DeadMax: largest}
+	e := &entry{}
+	for i, want := range []time.Duration{2 * s.Interval, 4 * s.Interval, largest, largest} {
+		e.fail(t0, "timeout", s)
+		if e.pause != want || e.st.NextAt.Sub(t0) != want || !e.st.NextAt.After(t0) {
+			t.Fatalf("failure %d pause=%s next=%s; want %s", i, e.pause, e.st.NextAt, want)
+		}
+	}
+	s.Interval = largest
+	e.succeed(t0, time.Millisecond, s, 0.999)
+	if !e.st.NextAt.After(t0) || e.st.NextAt.Sub(t0) != largest {
+		t.Fatalf("jitter overflowed next=%s", e.st.NextAt)
+	}
+}
+
+func TestEntry_LargeAliveJitterNeverWraps(t *testing.T) {
+	const largest = time.Duration(1<<63 - 1)
+	e := &entry{}
+	e.succeed(t0, time.Millisecond, Settings{Interval: largest}, 0.999)
+	if !e.st.NextAt.After(t0) || e.st.NextAt.Sub(t0) != largest {
+		t.Fatalf("jitter overflowed next=%s", e.st.NextAt)
+	}
+}

@@ -53,7 +53,12 @@ func (e *entry) succeed(now time.Time, latency time.Duration, s Settings, jitter
 	e.st.Fails = 0
 	e.st.Error = ""
 	e.pause = 0
-	e.st.NextAt = now.Add(time.Duration(float64(s.Interval) * (1 + jitterShare*jitter)))
+	delay := float64(s.Interval) * (1 + jitterShare*jitter)
+	wait := time.Duration(1<<63 - 1)
+	if delay < float64(wait) {
+		wait = time.Duration(delay)
+	}
+	e.st.NextAt = now.Add(wait)
 	return changed
 }
 
@@ -70,11 +75,13 @@ func (e *entry) fail(now time.Time, reason string, s Settings) bool {
 	e.st.Fails++
 	e.st.Error = reason
 	if e.pause == 0 {
-		e.pause = 2 * s.Interval
+		e.pause = s.Interval
+	}
+	if e.pause > s.DeadMax/2 {
+		e.pause = s.DeadMax
 	} else {
 		e.pause *= 2
 	}
-	e.pause = min(e.pause, s.DeadMax)
 	e.st.NextAt = now.Add(e.pause)
 	return changed
 }

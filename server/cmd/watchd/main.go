@@ -180,7 +180,7 @@ func endpointsReader(configSvc *service.ConfigService) func() ([]monitor.Endpoin
 			return nil, nil, err
 		}
 		stamp := monitor.Stamp(dir, configSvc.ConfigPath())
-		if stamp == lastStamp {
+		if stamp != "" && stamp == lastStamp {
 			return lastEps, lastRefused, nil
 		}
 		subs, err := cache.Load(dir)

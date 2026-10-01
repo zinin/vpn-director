@@ -567,8 +567,27 @@ type helperIdentity struct {
 }
 
 func readHelperIdentity(pid int) (helperIdentity, error) {
+	return readHelperIdentityWith(pid, os.ReadFile, os.Readlink)
+}
+
+func readHelperIdentityWith(pid int, readFile func(string) ([]byte, error), readlink func(string) (string, error)) (helperIdentity, error) {
+	id, err := readHelperStat(pid, readFile)
+	if err != nil || id.State == "Z" || id.State == "X" {
+		return id, err
+	}
+	id.Exe, err = readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if errors.Is(err, os.ErrNotExist) {
+		terminated, statErr := readHelperStat(pid, readFile)
+		if statErr == nil && terminated.Started == id.Started && (terminated.State == "Z" || terminated.State == "X") {
+			return terminated, nil
+		}
+	}
+	return id, err
+}
+
+func readHelperStat(pid int, readFile func(string) ([]byte, error)) (helperIdentity, error) {
 	id := helperIdentity{PID: pid}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	data, err := readFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
 		return id, err
 	}
@@ -582,10 +601,6 @@ func readHelperIdentity(pid int) (helperIdentity, error) {
 	}
 	id.State, id.Started = fields[0], fields[19]
 	id.PPID, err = strconv.Atoi(fields[1])
-	if err != nil || id.State == "Z" || id.State == "X" {
-		return id, err
-	}
-	id.Exe, err = os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	return id, err
 }
 
@@ -1318,5 +1333,42 @@ func cleanupParentGroup(parent *exec.Cmd, parentDone <-chan struct{}, report *he
 			return errors.New("cleanup did not reap the owned process group")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestHelperIdentity_ExeDisappearanceRequiresTheSameTerminatedProcess(t *testing.T) {
+	stat := func(state, started string) []byte {
+		fields := strings.Fields(state + " 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 " + started)
+		return []byte("123 (probe) " + strings.Join(fields, " "))
+	}
+	for _, tc := range []struct {
+		name, state, started string
+		statErr, exeErr      error
+		wantOK               bool
+	}{
+		{"zombie", "Z", "42", nil, os.ErrNotExist, true},
+		{"dead", "X", "42", nil, os.ErrNotExist, true},
+		{"pid reused", "Z", "43", nil, os.ErrNotExist, false},
+		{"still running", "S", "42", nil, os.ErrNotExist, false},
+		{"disappeared", "", "", os.ErrNotExist, os.ErrNotExist, false},
+		{"permission error", "Z", "42", nil, os.ErrPermission, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reads := 0
+			id, err := readHelperIdentityWith(123, func(string) ([]byte, error) {
+				reads++
+				if reads == 1 {
+					return stat("S", "42"), nil
+				}
+				return stat(tc.state, tc.started), tc.statErr
+			}, func(string) (string, error) { return "", tc.exeErr })
+			if tc.wantOK {
+				if err != nil || id.PID != 123 || id.Started != "42" || id.State != tc.state || reads != 2 {
+					t.Fatalf("same-process termination not confirmed: id=%+v err=%v reads=%d", id, err, reads)
+				}
+			} else if err == nil {
+				t.Fatalf("unverified identity was accepted: %+v", id)
+			}
+		})
 	}
 }

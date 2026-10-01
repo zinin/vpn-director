@@ -18,6 +18,8 @@ const (
 	DefaultConcurrency = 8
 	MinInterval        = 10 * time.Second
 	MaxConcurrency     = 32
+	// MaxInterval leaves room for the first dead pause.
+	MaxInterval = time.Duration(1<<63-1) / 2
 )
 
 // Settings is the monitor section with its defaults filled in.
@@ -46,8 +48,8 @@ func SettingsFrom(c *vpnconfig.MonitorConfig) (Settings, []string) {
 	s.LogLevel = c.LogLevel
 	if c.Interval != "" {
 		d, err := time.ParseDuration(c.Interval)
-		if err != nil || d < MinInterval {
-			warns = append(warns, fmt.Sprintf("monitor.interval %q is not a duration of at least %s; using %s", c.Interval, MinInterval, DefaultInterval))
+		if err != nil || d < MinInterval || d > MaxInterval {
+			warns = append(warns, fmt.Sprintf("monitor.interval %q is not between %s and %s; using %s", c.Interval, MinInterval, MaxInterval, DefaultInterval))
 		} else {
 			s.Interval = d
 		}

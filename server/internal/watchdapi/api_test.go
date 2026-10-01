@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -59,15 +62,25 @@ func serve(t *testing.T, src Source) (*Client, string) {
 			t.Errorf("Serve() = %v", err)
 		}
 	})
+	client, err := waitForSocket(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, path
+}
+
+func waitForSocket(path string) (*Client, error) {
 	for i := 0; i < 100; i++ {
-		if c, err := net.Dial("unix", path); err == nil {
-			c.Close()
-			return NewClient(path), path
+		client := NewClient(path)
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, err := client.Monitor(ctx)
+		cancel()
+		if err == nil {
+			return client, nil
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatal("the socket never answered")
-	return nil, ""
+	return nil, errors.New("the socket never answered")
 }
 
 func TestClient_MonitorReadsTheSnapshot(t *testing.T) {
@@ -240,5 +253,94 @@ func TestClient_AHungDaemonTimesOutWithinTheBound(t *testing.T) {
 				t.Fatalf("took %s with timeout %s", elapsed, clientTimeout)
 			}
 		})
+	}
+}
+
+func TestHandler_CheckRequiresTheWholeJSONDocument(t *testing.T) {
+	for _, body := range []string{`{} garbage`, `{} {}`, `{"keys":["a"]} null`, `{} ` + strings.Repeat(" ", 1<<20)} {
+		t.Run(body[:min(len(body), 24)], func(t *testing.T) {
+			src := &fakeSource{}
+			rec := httptest.NewRecorder()
+			NewHandler(src).ServeHTTP(rec, httptest.NewRequest("POST", "/v1/monitor/check", strings.NewReader(body)))
+			if rec.Code != http.StatusBadRequest || len(src.requests) != 0 {
+				t.Fatalf("status=%d requests=%d; want 400 without Request", rec.Code, len(src.requests))
+			}
+		})
+	}
+	for _, body := range []string{"", " \n\t", `{}`, "{\"keys\":[\"a\"]} \n"} {
+		src := &fakeSource{}
+		rec := httptest.NewRecorder()
+		NewHandler(src).ServeHTTP(rec, httptest.NewRequest("POST", "/v1/monitor/check", strings.NewReader(body)))
+		if rec.Code != http.StatusAccepted || len(src.requests) != 1 {
+			t.Fatalf("valid body status=%d requests=%d", rec.Code, len(src.requests))
+		}
+	}
+}
+
+type readinessListener struct {
+	net.Listener
+	connected chan struct{}
+	once      sync.Once
+}
+
+func (l *readinessListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.once.Do(func() { close(l.connected) })
+	}
+	return c, err
+}
+
+func TestSocketReadiness_WaitsForHTTPAfterPermissions(t *testing.T) {
+	dir, err := os.MkdirTemp("", "wd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	path := filepath.Join(dir, "ready.sock")
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := make(chan struct{})
+	var release sync.Once
+	unblock := func() { release.Do(func() { close(gate) }) }
+	t.Cleanup(unblock)
+	l := &readinessListener{Listener: listener, connected: make(chan struct{})}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-gate
+		if err := os.Chmod(path, 0600); err != nil {
+			t.Error(err)
+			return
+		}
+		NewHandler(&fakeSource{}).ServeHTTP(w, r)
+	})}
+	done := make(chan error, 1)
+	go func() { done <- srv.Serve(l) }()
+	t.Cleanup(func() { unblock(); srv.Close(); <-done })
+	ready := make(chan error, 1)
+	go func() { _, err := waitForSocket(path); ready <- err }()
+	select {
+	case <-l.connected:
+	case <-time.After(time.Second):
+		t.Fatal("readiness did not connect")
+	}
+	select {
+	case err := <-ready:
+		t.Fatalf("ready before permissions/HTTP: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	unblock()
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("readiness did not finish")
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("permissions not ready: %v", err)
 	}
 }
