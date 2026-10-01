@@ -528,3 +528,339 @@ EOF
     PLATFORM=merlin run print_next_steps
     assert_output --partial "router admin username and password"
 }
+
+# fake_watchd_init writes a stand-in for the monitor's init script that records
+# its arguments and exits with the given code.
+fake_watchd_init() {
+    local code="${1:-0}"
+    cat > "$INIT_DIR/S98vpn-director-watchd" <<EOF2
+#!/bin/sh
+echo "\$1" >> "$BATS_TEST_TMPDIR/watchd.calls"
+exit $code
+EOF2
+    chmod +x "$INIT_DIR/S98vpn-director-watchd"
+}
+
+@test "start_watchd: does nothing when the monitor binary was not installed" {
+    load_installer
+    fake_watchd_init 0
+
+    run start_watchd
+
+    assert_success
+    [[ ! -f "$BATS_TEST_TMPDIR/watchd.calls" ]]
+}
+
+@test "start_watchd: starts the monitor" {
+    load_installer
+    touch "$VPD_DIR/vpn-director-watchd"
+    chmod +x "$VPD_DIR/vpn-director-watchd"
+    fake_watchd_init 0
+
+    run start_watchd
+
+    assert_success
+    assert_output --partial "Server monitor started"
+    run cat "$BATS_TEST_TMPDIR/watchd.calls"
+    assert_output "start"
+}
+
+@test "start_watchd: a failed start is reported without aborting the installer" {
+    load_installer
+    touch "$VPD_DIR/vpn-director-watchd"
+    chmod +x "$VPD_DIR/vpn-director-watchd"
+    fake_watchd_init 1
+
+    run start_watchd
+
+    assert_success
+    assert_output --partial "Failed to start the server monitor"
+}
+
+@test "start_watchd: skips a missing or non-executable init script" {
+    load_installer
+    touch "$VPD_DIR/vpn-director-watchd"
+    chmod +x "$VPD_DIR/vpn-director-watchd"
+
+    run start_watchd
+    assert_success
+    assert_output --partial "Server monitor init script not found, skipping start"
+    refute_output --partial "Server monitor started"
+
+    fake_watchd_init 0
+    chmod -x "$INIT_DIR/S98vpn-director-watchd"
+    run start_watchd
+    assert_success
+    assert_output --partial "Server monitor init script not found, skipping start"
+    [[ ! -f "$BATS_TEST_TMPDIR/watchd.calls" ]]
+}
+
+# All download and process commands are sandbox stubs, including the fallback
+# killall; the liveness marker never represents a real process.
+watchd_download_sandbox() {
+    RELEASE_ASSET_URL="https://releases.example/v1.0.0"
+    export WATCHD_ARCH=aarch64 WATCHD_DOWNLOAD_EXIT=0 WATCHD_STOP_EXIT=0 WATCHD_STOP_SURVIVES=0
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/curl" <<'EOF'
+#!/bin/bash
+out=""; url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="$1"; shift ;;
+    esac
+done
+[[ $url == https://releases.example/v1.0.0/vpn-director-watchd-* ]] || exit 99
+[[ $out == "$BATS_TEST_TMPDIR/vpn-director/vpn-director-watchd.tmp" ]] || exit 99
+printf '%s\n' "$url" > "$BATS_TEST_TMPDIR/watchd.url"
+printf 'curl\n' >> "$BATS_TEST_TMPDIR/watchd.events"
+printf 'new monitor\n' > "$out"
+exit "$WATCHD_DOWNLOAD_EXIT"
+EOF
+    cat > "$BATS_TEST_TMPDIR/bin/uname" <<'EOF'
+#!/bin/sh
+[ "$1" = -m ] || exit 99
+printf '%s\n' "$WATCHD_ARCH"
+EOF
+    cat > "$BATS_TEST_TMPDIR/bin/pidof" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = vpn-director-watchd ] || exit 99
+if [ -f "$BATS_TEST_TMPDIR/watchd.running" ]; then
+    printf 'pidof:alive\n' >> "$BATS_TEST_TMPDIR/watchd.events"
+    printf '12345\n'
+    exit 0
+fi
+printf 'pidof:gone\n' >> "$BATS_TEST_TMPDIR/watchd.events"
+exit 1
+EOF
+    cat > "$BATS_TEST_TMPDIR/bin/killall" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = vpn-director-watchd ] || exit 99
+printf 'stop:killall\n' >> "$BATS_TEST_TMPDIR/watchd.events"
+if [ "$WATCHD_STOP_SURVIVES" = 0 ]; then
+    rm -f "$BATS_TEST_TMPDIR/watchd.running"
+fi
+exit "$WATCHD_STOP_EXIT"
+EOF
+    cat > "$BATS_TEST_TMPDIR/bin/sleep" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = 1 ] || exit 99
+printf 'sleep:1\n' >> "$BATS_TEST_TMPDIR/watchd.events"
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/"{curl,uname,pidof,killall,sleep}
+    export PATH="$BATS_TEST_TMPDIR/bin:$PATH"
+    hash -r
+    local file
+    for file in telegram-bot webui vpn-director.json watchd.unrelated.tmp; do
+        printf 'unrelated %s\n' "$file" > "$VPD_DIR/$file"
+    done
+}
+
+fake_watchd_stop_init() {
+    cat > "$INIT_DIR/S98vpn-director-watchd" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = stop ] || exit 99
+printf 'stop:init\n' >> "$BATS_TEST_TMPDIR/watchd.events"
+if [ "$WATCHD_STOP_SURVIVES" = 0 ]; then
+    rm -f "$BATS_TEST_TMPDIR/watchd.running"
+fi
+exit "$WATCHD_STOP_EXIT"
+EOF
+    chmod +x "$INIT_DIR/S98vpn-director-watchd"
+}
+
+old_watchd_binary() {
+    printf 'old monitor\n' > "$VPD_DIR/vpn-director-watchd"
+    chmod 711 "$VPD_DIR/vpn-director-watchd"
+    touch "$BATS_TEST_TMPDIR/watchd.running"
+}
+
+assert_watchd_preserved() {
+    assert_success
+    assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "old monitor"
+    assert_output --partial "Warning: Failed to stop the server monitor"
+    refute_output --partial "Installed the server monitor"
+    [[ -f "$BATS_TEST_TMPDIR/watchd.running" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$VPD_DIR/vpn-director-watchd")" "$old_identity"
+    local file
+    for file in telegram-bot webui vpn-director.json watchd.unrelated.tmp; do
+        assert_equal "$(cat "$VPD_DIR/$file")" "unrelated $file"
+    done
+}
+
+@test "download_watchd: installs the correct optional asset for every supported architecture" {
+    load_installer
+    watchd_download_sandbox
+    local spec arch suffix
+    for spec in "aarch64 arm64" "armv7l arm" "mips mipsle"; do
+        read -r arch suffix <<< "$spec"
+        export WATCHD_ARCH="$arch"
+        run download_watchd
+        assert_success
+        assert_output --partial "Installed the server monitor"
+        assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.url")" "$RELEASE_ASSET_URL/vpn-director-watchd-$suffix"
+        assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "new monitor"
+        [[ -x "$VPD_DIR/vpn-director-watchd" ]]
+        [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+    done
+    run cat "$BATS_TEST_TMPDIR/watchd.events"
+    refute_output --partial "stop:"
+}
+
+@test "download_watchd: an unsupported architecture skips download and preserves a running monitor" {
+    load_installer
+    watchd_download_sandbox
+    old_watchd_binary
+    export WATCHD_ARCH=x86_64
+
+    run download_watchd
+
+    assert_success
+    assert_output --partial "Architecture x86_64 not supported for the server monitor (optional component)"
+    assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "old monitor"
+    [[ -f "$BATS_TEST_TMPDIR/watchd.running" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.events" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+}
+
+@test "download_watchd: a partial failed download is optional and never stops an old monitor" {
+    load_installer
+    watchd_download_sandbox
+    export WATCHD_DOWNLOAD_EXIT=22
+
+    run download_watchd
+    assert_success
+    assert_output --partial "Warning: Failed to download the server monitor (optional component)"
+    [[ ! -e "$VPD_DIR/vpn-director-watchd" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+
+    old_watchd_binary
+    fake_watchd_stop_init
+    run download_watchd
+    assert_success
+    assert_output --partial "Warning: Failed to download the server monitor (optional component)"
+    refute_output --partial "Installed the server monitor"
+    assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "old monitor"
+    [[ -f "$BATS_TEST_TMPDIR/watchd.running" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.events")" $'curl\ncurl'
+}
+
+@test "download_watchd: stops a running monitor through its init script before replacement" {
+    load_installer
+    watchd_download_sandbox
+    old_watchd_binary
+    fake_watchd_stop_init
+
+    run download_watchd
+
+    assert_success
+    assert_output --partial "Installed the server monitor"
+    assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "new monitor"
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+    run cat "$BATS_TEST_TMPDIR/watchd.events"
+    assert_output --partial $'curl\npidof:alive\nstop:init\nsleep:1'
+    refute_output --partial "stop:killall"
+}
+
+@test "download_watchd: a failed init stop may replace the binary when the process is gone" {
+    load_installer
+    watchd_download_sandbox
+    old_watchd_binary
+    fake_watchd_stop_init
+    export WATCHD_STOP_EXIT=1
+
+    run download_watchd
+
+    assert_success
+    assert_output --partial "Installed the server monitor"
+    assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "new monitor"
+    [[ -x "$VPD_DIR/vpn-director-watchd" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+}
+
+@test "download_watchd: preserves the old binary while the monitor survives either init stop result" {
+    load_installer
+    watchd_download_sandbox
+    old_watchd_binary
+    fake_watchd_stop_init
+    export WATCHD_STOP_SURVIVES=1
+    local old_identity code
+    old_identity="$(stat -c '%d:%i:%s:%a:%Y' "$VPD_DIR/vpn-director-watchd")"
+    for code in 1 0; do
+        export WATCHD_STOP_EXIT="$code"
+        run download_watchd
+        assert_watchd_preserved
+        run cat "$BATS_TEST_TMPDIR/watchd.events"
+        assert_output --partial "stop:init"
+        refute_output --partial "stop:killall"
+    done
+}
+
+@test "download_watchd: uses killall when init is missing or non-executable and accepts a gone process" {
+    load_installer
+    watchd_download_sandbox
+    local code
+    for code in 0 1; do
+        old_watchd_binary
+        export WATCHD_STOP_EXIT="$code"
+        if [[ $code == 1 ]]; then
+            fake_watchd_stop_init
+            chmod -x "$INIT_DIR/S98vpn-director-watchd"
+        fi
+        run download_watchd
+        assert_success
+        assert_output --partial "Installed the server monitor"
+        assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "new monitor"
+        [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
+        [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+    done
+    run cat "$BATS_TEST_TMPDIR/watchd.events"
+    assert_output --partial $'curl\npidof:alive\nstop:killall\nsleep:1'
+    refute_output --partial "stop:init"
+}
+
+@test "download_watchd: preserves the old binary while the monitor survives either killall result" {
+    load_installer
+    watchd_download_sandbox
+    old_watchd_binary
+    export WATCHD_STOP_SURVIVES=1
+    local old_identity code
+    old_identity="$(stat -c '%d:%i:%s:%a:%Y' "$VPD_DIR/vpn-director-watchd")"
+    for code in 1 0; do
+        export WATCHD_STOP_EXIT="$code"
+        run download_watchd
+        assert_watchd_preserved
+        run cat "$BATS_TEST_TMPDIR/watchd.events"
+        assert_output --partial "stop:killall"
+        refute_output --partial "stop:init"
+    done
+}
+
+@test "main: downloads the optional monitor and starts it only after the config exists" {
+    load_installer
+    local step
+    for step in print_header detect_platform check_environment resolve_release_tag create_directories \
+        download_scripts load_platform_lib download_telegram_bot download_webui download_watchd \
+        generate_tls_cert start_webui print_next_steps; do
+        eval "$step() { printf '%s\\n' '$step' >> \"\$BATS_TEST_TMPDIR/main.calls\"; }"
+    done
+    setup_webui_config() {
+        printf '{}\n' > "$VPD_DIR/vpn-director.json"
+        printf 'setup_webui_config\n' >> "$BATS_TEST_TMPDIR/main.calls"
+    }
+    start_watchd() {
+        [[ -f "$VPD_DIR/vpn-director.json" ]] || return 1
+        printf 'start_watchd\n' >> "$BATS_TEST_TMPDIR/main.calls"
+    }
+
+    run main
+
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/main.calls"
+    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\ndownload_scripts\nload_platform_lib\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
+}
