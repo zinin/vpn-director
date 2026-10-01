@@ -26,6 +26,12 @@ func TestDefault(t *testing.T) {
 		{"VPNLogPath", p.VPNLogPath, "/tmp/", "vpn-director.log"},
 		{"WebUILogPath", p.WebUILogPath, "/tmp/", "vpn-director-webui.log"},
 		{"XrayLogPath", p.XrayLogPath, "/tmp/", "xray-error.log"},
+		{"WatchdLogPath", p.WatchdLogPath, "/tmp/", "vpn-director-watchd.log"},
+		{"WatchdSocket", p.WatchdSocket, "/tmp/vpn-director/", "watchd.sock"},
+		{"WatchdState", p.WatchdState, "/tmp/vpn-director/", "watchd-state.json"},
+		{"ProbeDir", p.ProbeDir, "/tmp/vpn-director/", "probe"},
+		{"ProbeBinary", p.ProbeBinary, "/opt/vpn-director/", "vpn-director-probe"},
+		{"StoppedMarker", p.StoppedMarker, "/tmp/vpn-director/", "stopped"},
 	}
 
 	for _, tt := range tests {
@@ -93,6 +99,12 @@ func TestDevPaths(t *testing.T) {
 		{"VPNLogPath", p.VPNLogPath, "testdata/dev/", "vpn.log"},
 		{"WebUILogPath", p.WebUILogPath, "testdata/dev/", "webui.log"},
 		{"XrayLogPath", p.XrayLogPath, "testdata/dev/", "xray-error.log"},
+		{"WatchdLogPath", p.WatchdLogPath, "testdata/dev/", "watchd.log"},
+		{"WatchdSocket", p.WatchdSocket, "testdata/dev/", "watchd.sock"},
+		{"WatchdState", p.WatchdState, "testdata/dev/", "watchd-state.json"},
+		{"ProbeDir", p.ProbeDir, "testdata/dev/", "probe"},
+		{"ProbeBinary", p.ProbeBinary, "testdata/dev/", "vpn-director-probe"},
+		{"StoppedMarker", p.StoppedMarker, "testdata/dev/", "stopped"},
 	}
 
 	for _, tt := range tests {
@@ -112,7 +124,7 @@ func TestDevPaths(t *testing.T) {
 
 func TestRotatedLogs(t *testing.T) {
 	p := Default()
-	want := []string{p.BotLogPath, p.VPNLogPath, p.WebUILogPath, p.XrayLogPath}
+	want := []string{p.BotLogPath, p.VPNLogPath, p.WebUILogPath, p.XrayLogPath, p.WatchdLogPath}
 	if got := p.RotatedLogs(); !reflect.DeepEqual(got, want) {
 		t.Errorf("RotatedLogs() = %v, want %v", got, want)
 	}

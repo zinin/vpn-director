@@ -17,6 +17,14 @@ type Paths struct {
 	VPNLogPath     string // /tmp/vpn-director.log
 	WebUILogPath   string // /tmp/vpn-director-webui.log
 	XrayLogPath    string // /tmp/xray-error.log (set by the log section of the Xray template)
+	WatchdLogPath  string // /tmp/vpn-director-watchd.log
+	WatchdSocket   string // /tmp/vpn-director/watchd.sock: the monitor's API
+	WatchdState    string // /tmp/vpn-director/watchd-state.json: the monitor's state across restarts
+	ProbeDir       string // /tmp/vpn-director/probe: the prober's config
+	ProbeBinary    string // /opt/vpn-director/vpn-director-probe: a hard link to xray
+	// StoppedMarker is the file vpn-director.sh stop writes and a full apply
+	// removes; bot/path.go reads the same file for the subscription watch.
+	StoppedMarker string // /tmp/vpn-director/stopped
 }
 
 // Default returns the default paths for production use
@@ -31,6 +39,12 @@ func Default() Paths {
 		VPNLogPath:     "/tmp/vpn-director.log",
 		WebUILogPath:   "/tmp/vpn-director-webui.log",
 		XrayLogPath:    "/tmp/xray-error.log",
+		WatchdLogPath:  "/tmp/vpn-director-watchd.log",
+		WatchdSocket:   "/tmp/vpn-director/watchd.sock",
+		WatchdState:    "/tmp/vpn-director/watchd-state.json",
+		ProbeDir:       "/tmp/vpn-director/probe",
+		ProbeBinary:    "/opt/vpn-director/vpn-director-probe",
+		StoppedMarker:  "/tmp/vpn-director/stopped",
 	}
 }
 
@@ -46,14 +60,20 @@ func DevPaths() Paths {
 		VPNLogPath:     "testdata/dev/vpn.log",
 		WebUILogPath:   "testdata/dev/webui.log",
 		XrayLogPath:    "testdata/dev/xray-error.log",
+		WatchdLogPath:  "testdata/dev/watchd.log",
+		WatchdSocket:   "testdata/dev/watchd.sock",
+		WatchdState:    "testdata/dev/watchd-state.json",
+		ProbeDir:       "testdata/dev/probe",
+		ProbeBinary:    "testdata/dev/vpn-director-probe",
+		StoppedMarker:  "testdata/dev/stopped",
 	}
 }
 
 // RotatedLogs lists every log file the daemons truncate at
-// logging.DefaultMaxSize. The bot and the Web UI rotate the same list;
-// os.Truncate is idempotent, so two processes rotating at once are safe.
+// logging.DefaultMaxSize. Every daemon rotates the same list; os.Truncate is
+// idempotent, so two processes rotating at once are safe.
 func (p Paths) RotatedLogs() []string {
-	return []string{p.BotLogPath, p.VPNLogPath, p.WebUILogPath, p.XrayLogPath}
+	return []string{p.BotLogPath, p.VPNLogPath, p.WebUILogPath, p.XrayLogPath, p.WatchdLogPath}
 }
 
 // DetachFromCallerDirectory resolves the paths behind flagPaths against the

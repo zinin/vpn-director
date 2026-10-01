@@ -15,6 +15,12 @@ server/testdata/dev/vpn-director.json
 # The dev data_dir: a subscription added in dev mode is written there, link and all
 server/testdata/dev/data/
 
+# The server monitor's dev run: its socket, state, log and prober config
+server/testdata/dev/watchd.sock
+server/testdata/dev/watchd-state.json
+server/testdata/dev/watchd.log
+server/testdata/dev/probe/
+
 # Superpowers brainstorming
 .superpowers/
 

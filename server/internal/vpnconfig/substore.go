@@ -80,6 +80,12 @@ func ValidSubscriptionID(id string) bool {
 // warning rather than failing every reader. Each server carries the id of its
 // file.
 func LoadSubscriptions(dir string) ([]Subscription, error) {
+	return loadSubscriptions(dir, func(path, id string) (Subscription, bool) {
+		return loadSubscription(path, id, os.ReadFile, parseSubscription)
+	})
+}
+
+func loadSubscriptions(dir string, load func(path, id string) (Subscription, bool)) ([]Subscription, error) {
 	entries, err := os.ReadDir(dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil
@@ -93,28 +99,9 @@ func LoadSubscriptions(dir string) ([]Subscription, error) {
 		if !ok || !ValidSubscriptionID(id) || e.IsDir() {
 			continue
 		}
-		path := filepath.Join(dir, e.Name())
-		data, err := os.ReadFile(path)
-		if errors.Is(err, fs.ErrNotExist) {
-			continue // deleted since the listing
+		if sub, ok := load(filepath.Join(dir, e.Name()), id); ok {
+			subs = append(subs, sub)
 		}
-		if err != nil {
-			warnSkipped(path, "Skipping a subscription file that cannot be read", "file", e.Name(), "error", err)
-			continue
-		}
-		var sub Subscription
-		if err := json.Unmarshal(data, &sub); err != nil {
-			warnSkipped(path, "Skipping a subscription file that does not parse", "file", e.Name(), "error", err)
-			continue
-		}
-		if sub.ID != id {
-			warnSkipped(path, "Skipping a subscription file whose id is not its name", "file", e.Name(), "id", sub.ID)
-			continue
-		}
-		for i := range sub.Servers {
-			sub.Servers[i].Subscription = id
-		}
-		subs = append(subs, sub)
 	}
 	sort.SliceStable(subs, func(i, j int) bool {
 		if !subs[i].Added.Equal(subs[j].Added) {
@@ -123,6 +110,83 @@ func LoadSubscriptions(dir string) ([]Subscription, error) {
 		return subs[i].ID < subs[j].ID
 	})
 	return subs, nil
+}
+
+func parseSubscription(data []byte, sub *Subscription) error { return json.Unmarshal(data, sub) }
+
+func loadSubscription(path, id string, read func(string) ([]byte, error), parse func([]byte, *Subscription) error) (Subscription, bool) {
+	data, err := read(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return Subscription{}, false // deleted since the listing
+	}
+	name := filepath.Base(path)
+	if err != nil {
+		warnSkipped(path, "Skipping a subscription file that cannot be read", "file", name, "error", err)
+		return Subscription{}, false
+	}
+	var sub Subscription
+	if err := parse(data, &sub); err != nil {
+		warnSkipped(path, "Skipping a subscription file that does not parse", "file", name, "error", err)
+		return Subscription{}, false
+	}
+	if sub.ID != id {
+		warnSkipped(path, "Skipping a subscription file whose id is not its name", "file", name, "id", sub.ID)
+		return Subscription{}, false
+	}
+	for i := range sub.Servers {
+		sub.Servers[i].Subscription = id
+	}
+	return sub, true
+}
+
+// SubscriptionCache reuses unchanged parsed files under the shared store's
+// filtering, validation, ordering and warnings. Callers must not modify the
+// returned records.
+type SubscriptionCache struct {
+	mu       sync.Mutex
+	files    map[string]cachedSubscription
+	readFile func(string) ([]byte, error)
+	parse    func([]byte, *Subscription) error
+}
+
+type cachedSubscription struct {
+	info os.FileInfo
+	sub  Subscription
+	ok   bool
+}
+
+// NewSubscriptionCache creates a parsed cache for one subscription reader.
+func NewSubscriptionCache() *SubscriptionCache {
+	return &SubscriptionCache{
+		files:    map[string]cachedSubscription{},
+		readFile: os.ReadFile,
+		parse:    parseSubscription,
+	}
+}
+
+// Load reads only changed files, including same-size/time inode replacements.
+// Deleted files and records from a previous directory leave the cache.
+func (c *SubscriptionCache) Load(dir string) ([]Subscription, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	next := map[string]cachedSubscription{}
+	subs, err := loadSubscriptions(dir, func(path, id string) (Subscription, bool) {
+		info, err := os.Stat(path)
+		if err != nil {
+			return loadSubscription(path, id, c.readFile, c.parse)
+		}
+		if prev, seen := c.files[path]; seen && os.SameFile(info, prev.info) && info.Size() == prev.info.Size() && info.ModTime().Equal(prev.info.ModTime()) {
+			next[path] = prev
+			return prev.sub, prev.ok
+		}
+		sub, ok := loadSubscription(path, id, c.readFile, c.parse)
+		next[path] = cachedSubscription{info, sub, ok}
+		return sub, ok
+	})
+	if err == nil {
+		c.files = next
+	}
+	return subs, err
 }
 
 // skipped is, for each subscription file a reader skipped, the state - its

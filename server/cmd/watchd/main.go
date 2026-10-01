@@ -1,0 +1,212 @@
+// vpn-director-watchd checks, minute by minute, whether every server of every
+// subscription carries traffic, and serves what it finds on a unix socket to
+// the Web UI and the bot (internal/monitor, internal/watchdapi).
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/zinin/vpn-director/server/internal/endpoint"
+	"github.com/zinin/vpn-director/server/internal/logging"
+	"github.com/zinin/vpn-director/server/internal/monitor"
+	"github.com/zinin/vpn-director/server/internal/paths"
+	"github.com/zinin/vpn-director/server/internal/service"
+	"github.com/zinin/vpn-director/server/internal/updater"
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
+)
+
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildDate = "unknown"
+)
+
+func main() {
+	// Step 2 of a self-update (internal/updater/selfupdate.go): every binary
+	// of the daemon table implements it, and nothing a daemon does at startup
+	// may run first.
+	if len(os.Args) > 1 && os.Args[1] == updater.SelfUpdateCommand {
+		os.Exit(updater.RunSelfUpdate(os.Args[2:], updater.DaemonWatchd, Version, os.Stdout, os.Stderr))
+	}
+	os.Exit(run())
+}
+
+func run() int {
+	configPath := flag.String("config", "/opt/vpn-director/vpn-director.json", "path to vpn-director.json")
+	devFlag := flag.Bool("dev", false, "run in development mode (testdata paths, a fake prober)")
+	flag.Parse()
+
+	var p paths.Paths
+	var detachErr error
+	if *devFlag {
+		p = paths.DevPaths()
+		if *configPath == "/opt/vpn-director/vpn-director.json" {
+			*configPath = p.ScriptsDir + "/vpn-director.json"
+		}
+		if _, err := os.Stat(p.ScriptsDir); os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "Error: %s not found\n", p.ScriptsDir)
+			fmt.Fprintf(os.Stderr, "Run from server/ directory: cd server && go run ./cmd/watchd --dev\n")
+			return 1
+		}
+	} else {
+		p = paths.Default()
+		// The update script starts this daemon from a directory the bot
+		// deletes moments later (paths.DetachFromCallerDirectory).
+		detachErr = paths.DetachFromCallerDirectory(configPath)
+	}
+
+	slogger, logger, err := logging.NewSlogLogger(p.WatchdLogPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to initialize logging: %v\n", err)
+		return 1
+	}
+	defer logger.Close()
+	slog.SetDefault(slogger)
+	slog.Info("starting vpn-director-watchd", "version", Version, "commit", Commit, "dev", *devFlag)
+	if detachErr != nil {
+		slog.Warn("could not leave the directory this process was started in", "error", detachErr)
+	}
+
+	scriptsDir := filepath.Dir(*configPath)
+	configSvc := service.NewConfigService(scriptsDir, filepath.Join(scriptsDir, "data"), *configPath)
+
+	var launcher monitor.Launcher
+	if *devFlag {
+		launcher = monitor.FakeLauncher{}
+	} else {
+		monitor.KillLeftovers(p.ProbeBinary)
+		launcher = &monitor.XrayLauncher{ProbeBinary: p.ProbeBinary, ConfigDir: p.ProbeDir}
+	}
+
+	m := monitor.New(monitor.Deps{
+		Settings:  settingsReader(configSvc),
+		Endpoints: endpointsReader(configSvc),
+		Launcher:  launcher,
+		Stopped: func() bool {
+			_, err := os.Stat(p.StoppedMarker)
+			return err == nil
+		},
+		WANUp: func(ctx context.Context) bool {
+			return monitor.WANUp(ctx, endpoint.WANControls, 3*time.Second)
+		},
+		StatePath:  p.WatchdState,
+		OnSettings: levelSetter(logger),
+	})
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	logger.StartRotation(ctx, p.RotatedLogs(), logging.DefaultMaxSize, time.Minute)
+
+	if err := runDaemon(ctx, p.WatchdSocket, m, watchdapi.Serve); err != nil {
+		slog.Error("the monitor's socket stopped", "path", p.WatchdSocket, "error", err)
+		return 1
+	}
+	slog.Info("vpn-director-watchd stopped")
+	return 0
+}
+
+type daemonMonitor interface {
+	watchdapi.Source
+	Run(context.Context)
+}
+
+type socketError struct{ cause error }
+
+func (*socketError) Error() string   { return "serve the monitor's socket" }
+func (e *socketError) Unwrap() error { return e.cause }
+
+// runDaemon waits for both the monitor's prober/state shutdown and the socket.
+// A listener failure cancels the monitor and retains a safe failure cause.
+func runDaemon(ctx context.Context, path string, m daemonMonitor, serve func(context.Context, string, watchdapi.Source) error) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	served := make(chan error, 1)
+	go func() {
+		err := serve(ctx, path, m)
+		if err != nil {
+			cancel()
+		}
+		served <- err
+	}()
+	m.Run(ctx)
+	cancel()
+	if err := <-served; err != nil {
+		return &socketError{cause: err}
+	}
+	return nil
+}
+
+// settingsReader reads the monitor section at every refresh and warns once
+// about each distinct set of values out of bounds.
+func settingsReader(configSvc *service.ConfigService) func() (monitor.Settings, error) {
+	var lastWarns string
+	return func() (monitor.Settings, error) {
+		cfg, err := configSvc.LoadVPNConfig()
+		if err != nil {
+			return monitor.Settings{}, err
+		}
+		s, warns := monitor.SettingsFrom(cfg.Monitor)
+		if joined := strings.Join(warns, "\n"); joined != lastWarns {
+			lastWarns = joined
+			for _, w := range warns {
+				slog.Warn(w)
+			}
+		}
+		return s, nil
+	}
+}
+
+// endpointsReader rebuilds only when a subscription or config changed
+// (monitor.Stamp), reusing unchanged subscription files from the shared cache.
+func endpointsReader(configSvc *service.ConfigService) func() ([]monitor.Endpoint, map[string]string, error) {
+	cache := vpnconfig.NewSubscriptionCache()
+	var lastStamp string
+	var lastEps []monitor.Endpoint
+	var lastRefused map[string]string
+	return func() ([]monitor.Endpoint, map[string]string, error) {
+		dir, err := configSvc.SubscriptionsDir()
+		if err != nil {
+			return nil, nil, err
+		}
+		stamp := monitor.Stamp(dir, configSvc.ConfigPath())
+		if stamp == lastStamp {
+			return lastEps, lastRefused, nil
+		}
+		subs, err := cache.Load(dir)
+		if err != nil {
+			return nil, nil, err
+		}
+		var active *vpnconfig.ActiveServer
+		if cfg, err := configSvc.LoadVPNConfig(); err == nil {
+			active = cfg.Xray.ActiveServer
+		}
+		eps, refused := monitor.Build(subs, active, func(s vpnconfig.Server) (json.RawMessage, error) {
+			return service.OutboundJSON(s, "")
+		})
+		lastStamp, lastEps, lastRefused = stamp, eps, refused
+		return eps, refused, nil
+	}
+}
+
+// levelSetter follows monitor.log_level, and only when it changes: SetLevel
+// warns about a level it does not know.
+func levelSetter(logger *logging.Logger) func(monitor.Settings) {
+	last := "\x00"
+	return func(s monitor.Settings) {
+		if s.LogLevel != last {
+			last = s.LogLevel
+			logger.SetLevel(s.LogLevel)
+		}
+	}
+}
