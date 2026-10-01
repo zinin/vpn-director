@@ -827,3 +827,359 @@ func TestMonitor_AWrappedConfigurationRefusalIsStillBisected(t *testing.T) {
 		t.Fatal("wrapped typed refusal was not isolated")
 	}
 }
+
+func TestMonitor_RepeatedCrashBatchesEscalateUntilAMainSessionIsStable(t *testing.T) {
+	h := newHarness(t, "k1")
+	h.at(0, true)
+	for batch, wait := range []time.Duration{time.Minute, 2 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
+		h.complete("k1", nil)
+		for range CrashLimit {
+			h.m.session.Stop()
+			h.m.crashed(h.ctx)
+		}
+		deadline := h.now.Add(wait)
+		if h.m.session != nil || h.m.Snapshot().State != watchdapi.StateProberError || h.m.proberAt != deadline {
+			t.Fatalf("batch %d: retry %s, want %s (%s); state %s", batch+1, h.m.proberAt, deadline, wait, h.m.Snapshot().State)
+		}
+		starts := h.l.startCount()
+		h.at(deadline.Sub(t0)-time.Second, true)
+		if h.l.startCount() != starts {
+			t.Fatalf("batch %d restarted before %s", batch+1, deadline)
+		}
+		h.at(deadline.Sub(t0), true)
+		if h.m.session == nil || h.m.Snapshot().State != watchdapi.StateOK || h.state("k1").CheckedAt != deadline {
+			t.Fatalf("batch %d did not resume ordinary endpoint checks", batch+1)
+		}
+	}
+	stableAt := h.now.Add(CrashWindow)
+	h.at(stableAt.Sub(t0), true)
+	if h.state("k1").CheckedAt != stableAt {
+		t.Fatal("stable main session supplied no successful completion")
+	}
+	for range CrashLimit {
+		h.m.session.Stop()
+		h.m.crashed(h.ctx)
+	}
+	if h.m.proberAt != stableAt.Add(time.Minute) {
+		t.Fatalf("stable main session did not reset the crash episode: retry %s", h.m.proberAt)
+	}
+	h.at(stableAt.Sub(t0)+time.Minute, true)
+	if h.m.Snapshot().State != watchdapi.StateOK || h.state("k1").Status != watchdapi.StatusAlive {
+		t.Fatal("normal monitoring did not recover after the reset")
+	}
+}
+
+// pausedCrashHarness keeps one real worker in flight when the guard pauses WAN.
+func pausedCrashHarness(t *testing.T, prime int) (*harness, map[string]watchdapi.EndpointState, map[string]time.Duration, *engineLogs) {
+	t.Helper()
+	h := newHarness(t, "k1", "k2", "k3", "k4", "k5", "k6")
+	h.l.script["k1"] = []error{errTimeout, errTimeout}
+	h.at(0, true)
+	for range prime {
+		h.m.session.Stop()
+		h.m.crashed(h.ctx)
+	}
+	h.now, h.wan = t0.Add(2*time.Minute), false
+	h.m.mu.Lock()
+	pauses := map[string]time.Duration{}
+	for k, e := range h.m.entries {
+		e.st.NextAt = h.now.Add(time.Hour)
+		pauses[k] = e.pause
+	}
+	h.m.entries["k6"].urgent = true
+	h.m.mu.Unlock()
+	gate, entered := make(chan struct{}), make(chan string, 1)
+	cleanGate(t, gate)
+	h.l.mu.Lock()
+	h.l.gates, h.l.entered = map[string]chan struct{}{"k6": gate}, entered
+	h.l.mu.Unlock()
+	h.m.tick(h.ctx, h.now)
+	enteredCheck(t, entered, "k6")
+	h.l.mu.Lock()
+	h.l.gates, h.l.entered = nil, nil
+	h.l.mu.Unlock()
+	before, logs := h.m.Snapshot().Endpoints, captureEngineLogs(t)
+	for i := 1; i <= GuardMin; i++ {
+		h.complete(fmt.Sprintf("k%d", i), errTimeout)
+	}
+	if h.m.Snapshot().State != watchdapi.StateWANDown || !reflect.DeepEqual(h.m.Snapshot().Endpoints, before) {
+		t.Fatal("fixture did not reach wan_down through the all-failed guard")
+	}
+	h.m.session.Stop()
+	h.m.crashed(h.ctx)
+	close(gate)
+	h.answer()
+	return h, before, pauses, logs
+}
+
+func frozenWAN(t *testing.T, h *harness, before map[string]watchdapi.EndpointState, pauses map[string]time.Duration, logs *engineLogs) {
+	t.Helper()
+	if s := h.m.Snapshot(); s.State != watchdapi.StateWANDown || !reflect.DeepEqual(s.Endpoints, before) {
+		t.Errorf("crash/recovery bypassed WAN freeze: state %s; endpoints %+v", s.State, s.Endpoints)
+	}
+	h.m.mu.Lock()
+	for k, e := range h.m.entries {
+		if e.pause != pauses[k] {
+			t.Errorf("WAN-paused crash grew %s pause to %s", k, e.pause)
+		}
+	}
+	h.m.mu.Unlock()
+	if strings.Contains(logs.String(), "Monitor: server down") {
+		t.Error("WAN-paused crash published a server-down log")
+	}
+}
+
+func TestMonitor_AWANPausedCrashDefersIsolationAndRestartUntilControl(t *testing.T) {
+	h, before, pauses, logs := pausedCrashHarness(t, 0)
+	frozenWAN(t, h, before, pauses, logs)
+	if h.m.session != nil || h.l.startCount() != 1 || h.l.checkCount("k6") != 2 {
+		t.Error("WAN-paused crash sent isolation/restart endpoint traffic")
+	}
+	if t.Failed() {
+		return
+	}
+	done := h.ask([]string{"k1"})
+	dials := h.wanDials
+	for i := 1; i <= 4; i++ {
+		h.at(2*time.Minute+time.Duration(i)*ControlEvery, i == 4)
+		frozenWAN(t, h, before, pauses, logs)
+		if h.wanDials != dials+i || h.l.startCount() != 1 || h.l.checkCount("k6") != 2 || h.inFlight() != 0 {
+			t.Fatalf("WAN tick %d bypassed freeze or lost ControlEvery polling", i)
+		}
+	}
+	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	fresh := make(chan struct{})
+	cleanGate(t, release)
+	cleanGate(t, fresh)
+	h.l.mu.Lock()
+	h.l.crashOn["k6"] = true
+	h.l.gates = map[string]chan struct{}{}
+	for i := 1; i <= GuardMin; i++ {
+		h.l.gates[fmt.Sprintf("k%d", i)] = fresh
+	}
+	h.l.mu.Unlock()
+	h.m.d.WANUp = func(ctx context.Context) bool {
+		close(entered)
+		select {
+		case <-release:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	h.now = t0.Add(3*time.Minute + ControlEvery)
+	go func() { h.m.tick(h.ctx, h.now); close(finished) }()
+	<-entered
+	frozenWAN(t, h, before, pauses, logs)
+	stillWaiting(t, done)
+	if h.l.startCount() != 1 {
+		t.Error("gated control released the WAN pause before success")
+	}
+	close(release)
+	<-finished
+	if h.m.Snapshot().State != watchdapi.StateOK || h.state("k6").Status != watchdapi.StatusRejected || h.state("k6").Error != "crashes Xray" || h.l.checkCount("k6") != 3 || h.l.startCount() != 3 {
+		t.Fatal("recovery lost or duplicated deferred suspect isolation/main restart")
+	}
+	for i := 1; i <= GuardMin; i++ {
+		if st := h.state(fmt.Sprintf("k%d", i)); st.NextAt != h.now {
+			t.Fatalf("recovered endpoint was not due immediately: %+v", st)
+		}
+	}
+	if h.inFlight() != GuardMin {
+		t.Fatal("successful control did not make every checkable endpoint due")
+	}
+	stillWaiting(t, done)
+	close(fresh)
+	for range GuardMin {
+		h.answer()
+	}
+	if got := answered(t, done); got.err != nil || got.states["k1"].Status != watchdapi.StatusAlive || got.states["k1"].CheckedAt != h.now {
+		t.Fatalf("fresh recovered Check = %+v, %v", got.states, got.err)
+	}
+	h.m.tick(h.ctx, h.now)
+	if h.l.startCount() != 3 || h.l.checkCount("k6") != 3 {
+		t.Fatal("deferred suspect was isolated more than once")
+	}
+}
+
+func TestMonitor_AWANPausedCrashLimitKeepsControlsAndItsRetryDeadline(t *testing.T) {
+	h, before, pauses, logs := pausedCrashHarness(t, CrashLimit-1)
+	deadline := t0.Add(3 * time.Minute)
+	frozenWAN(t, h, before, pauses, logs)
+	if h.m.session != nil || h.m.proberAt != deadline || h.l.startCount() != CrashLimit || h.l.checkCount("k6") != 2 {
+		t.Error("WAN crash limit lost its retry deadline or sent endpoint traffic")
+	}
+	if t.Failed() {
+		return
+	}
+	h.l.crashOn["k6"] = true
+	h.at(2*time.Minute+ControlEvery, false)
+	frozenWAN(t, h, before, pauses, logs)
+	if h.wanDials != 2 {
+		t.Fatal("crash backoff suppressed WAN controls")
+	}
+	h.wan = true
+	h.at(2*time.Minute+2*ControlEvery, false)
+	if h.m.Snapshot().State != watchdapi.StateProberError || h.m.proberAt != deadline || h.m.session != nil || h.l.startCount() != CrashLimit || h.l.checkCount("k6") != 2 {
+		t.Fatal("successful control bypassed crash backoff or reported working monitoring")
+	}
+	done := h.ask([]string{"k1"})
+	h.at(deadline.Sub(t0)-time.Second, true)
+	stillWaiting(t, done)
+	if h.l.startCount() != CrashLimit {
+		t.Fatal("recovered WAN restarted/isolation-checked before the retry deadline")
+	}
+	h.at(deadline.Sub(t0), true)
+	if h.m.Snapshot().State != watchdapi.StateOK || h.state("k6").Status != watchdapi.StatusRejected || h.l.checkCount("k6") != 3 {
+		t.Fatal("deadline recovery lost deferred isolation or monitoring")
+	}
+	if got := answered(t, done); got.err != nil || got.states["k1"].Status != watchdapi.StatusAlive {
+		t.Fatalf("Check after crash backoff = %+v, %v", got.states, got.err)
+	}
+	for range CrashLimit {
+		h.m.session.Stop()
+		h.m.crashed(h.ctx)
+	}
+	if h.m.proberAt != deadline.Add(2*time.Minute) {
+		t.Fatalf("control, isolation or brief main success reset crash escalation: %s", h.m.proberAt)
+	}
+}
+
+func TestMonitor_WANRecoverySkipsGoneSuspectsAndAnEmptySetStaysPaused(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty_%v", empty), func(t *testing.T) {
+			h, _, _, _ := pausedCrashHarness(t, 0)
+			if h.m.Snapshot().State != watchdapi.StateWANDown {
+				t.Fatal("crash removed WAN pause before refresh")
+			}
+			h.eps = eps("k1", "k2", "k3", "k4", "k5")
+			if empty {
+				h.eps = nil
+			}
+			h.now = t0.Add(3 * time.Minute)
+			h.m.refresh(h.ctx, h.now)
+			h.m.ensureSession(h.ctx, h.now)
+			h.m.tick(h.ctx, h.now)
+			if h.m.Snapshot().State != watchdapi.StateWANDown || h.l.startCount() != 1 {
+				t.Fatal("refresh/ensureSession or an empty set bypassed WAN pause")
+			}
+			h.wan = true
+			h.at(3*time.Minute+ControlEvery, false)
+			if h.m.Snapshot().State != watchdapi.StateOK || h.l.checkCount("k6") != 2 {
+				t.Fatal("WAN recovery probed/rejected a gone or changed suspect")
+			}
+			if _, ok := h.m.Snapshot().Endpoints["k6"]; ok {
+				t.Fatal("gone suspect came back on recovery")
+			}
+		})
+	}
+}
+
+func TestMonitor_OnlyANonCancelledControlReleasesACrashedWANPause(t *testing.T) {
+	h, before, pauses, logs := pausedCrashHarness(t, 0)
+	if h.m.Snapshot().State != watchdapi.StateWANDown {
+		t.Fatal("crash removed WAN pause")
+	}
+	ctx, cancel := context.WithCancel(h.ctx)
+	h.m.d.WANUp = func(context.Context) bool { cancel(); return true }
+	h.now = t0.Add(2*time.Minute + ControlEvery)
+	h.m.tick(ctx, h.now)
+	frozenWAN(t, h, before, pauses, logs)
+	if h.l.startCount() != 1 || h.l.checkCount("k6") != 2 {
+		t.Fatal("cancelled successful control restarted or isolated endpoints")
+	}
+	h.l.fail = fs.ErrPermission
+	h.m.d.WANUp = func(context.Context) bool { return true }
+	h.m.tick(h.ctx, h.now)
+	if h.m.Snapshot().State != watchdapi.StateProberError || h.m.proberAt != h.now.Add(time.Minute) {
+		t.Fatal("failed recovery did not preserve ordinary prober-error backoff")
+	}
+	for _, st := range h.m.Snapshot().Endpoints {
+		if st.Status == watchdapi.StatusRejected {
+			t.Fatal("recovery infrastructure error became sticky rejection")
+		}
+	}
+}
+
+func TestMonitor_AQueuedPreStableSuccessDoesNotResetCrashEscalation(t *testing.T) {
+	h := newHarness(t, "k1")
+	h.at(0, true)
+	for range CrashLimit {
+		h.m.session.Stop()
+		h.m.crashed(h.ctx)
+	}
+	h.at(time.Minute, true)
+	h.now = t0.Add(time.Minute + CrashWindow - time.Second)
+	if _, err := h.m.Request([]string{"k1"}); err != nil {
+		t.Fatal(err)
+	}
+	h.m.tick(h.ctx, h.now)
+	h.queued()
+	h.now = t0.Add(time.Minute + CrashWindow)
+	h.answer()
+	for range CrashLimit {
+		h.m.session.Stop()
+		h.m.crashed(h.ctx)
+	}
+	if h.m.proberAt != h.now.Add(2*time.Minute) {
+		t.Fatalf("consumption after CrashWindow retimed a pre-stable completion: %s", h.m.proberAt)
+	}
+}
+
+func TestMonitor_RefreshKeepsAnExitedSessionsCrashSuspects(t *testing.T) {
+	h := newHarness(t, "k1", "k2")
+	h.at(0, true)
+	h.now = t0.Add(time.Minute)
+	h.m.mu.Lock()
+	h.m.entries["k1"].st.NextAt = h.now.Add(time.Hour)
+	h.m.mu.Unlock()
+	gate, entered := make(chan struct{}), make(chan string, 1)
+	cleanGate(t, gate)
+	h.l.mu.Lock()
+	h.l.gates, h.l.entered = map[string]chan struct{}{"k2": gate}, entered
+	h.l.mu.Unlock()
+	h.m.tick(h.ctx, h.now)
+	enteredCheck(t, entered, "k2")
+	h.l.mu.Lock()
+	h.l.gates, h.l.entered, h.l.crashOn["k2"] = nil, nil, true
+	h.l.mu.Unlock()
+	old := h.m.session
+	old.Stop()
+	h.m.refresh(h.ctx, h.now)
+	if h.m.session != old || h.inFlight() != 1 || h.l.startCount() != 1 {
+		t.Fatal("refresh replaced an exited session before crash isolation captured its suspect")
+	}
+	h.m.crashed(h.ctx)
+	close(gate)
+	h.answer()
+	if st := h.state("k2"); st.Status != watchdapi.StatusRejected || st.Error != "crashes Xray" {
+		t.Fatalf("refresh lost the crashing endpoint: %+v", st)
+	}
+}
+
+func TestMonitor_WANPauseAndDeferredSuspectsSurviveIdleLifecycle(t *testing.T) {
+	for _, idle := range []watchdapi.State{watchdapi.StateStopped, watchdapi.StateDisabled, watchdapi.StateNoXray} {
+		t.Run(string(idle), func(t *testing.T) {
+			h, before, _, _ := pausedCrashHarness(t, 0)
+			h.stopped = idle == watchdapi.StateStopped
+			h.settings.Enabled = idle != watchdapi.StateDisabled
+			if idle == watchdapi.StateNoXray {
+				h.l.ready = ErrNoXray
+			}
+			h.at(3*time.Minute, true)
+			if s := h.m.Snapshot(); s.State != idle || !reflect.DeepEqual(s.Endpoints, before) || h.l.startCount() != 1 || h.l.checkCount("k6") != 2 {
+				t.Fatalf("idle lifecycle changed WAN-paused state/traffic: %s", s.State)
+			}
+			h.stopped, h.settings.Enabled, h.l.ready = false, true, nil
+			h.at(4*time.Minute, true)
+			if h.m.Snapshot().State != watchdapi.StateWANDown || h.l.startCount() != 1 || !reflect.DeepEqual(h.m.Snapshot().Endpoints, before) {
+				t.Fatal("leaving idle bypassed the outstanding WAN guard")
+			}
+			h.wan = true
+			h.at(4*time.Minute+ControlEvery, false)
+			if h.m.Snapshot().State != watchdapi.StateOK || h.l.startCount() != 3 || h.l.checkCount("k6") != 4 || h.state("k6").Status != watchdapi.StatusAlive {
+				t.Fatal("idle lifecycle lost or duplicated deferred isolation and fresh checks")
+			}
+		})
+	}
+}

@@ -25,8 +25,12 @@ type entry struct {
 	inFlight bool
 	// pending holds a failed completion until WAN evidence resolves it.
 	pending bool
-	// completed is the sequence of the last published check.
-	completed uint64
+	// completed identifies the last resolved check of completedSession.
+	completed        uint64
+	completedSession Session
+	// followUp keeps Check urgent until a completion newer than after resolves.
+	followUp bool
+	after    uint64
 	// urgent puts the endpoint ahead of the rest (Request).
 	urgent bool
 }
@@ -89,4 +93,5 @@ func (e *entry) reject(now time.Time, reason string, sticky bool) {
 	e.inFlight = false
 	e.pending = false
 	e.urgent = false
+	e.followUp = false
 }

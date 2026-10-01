@@ -362,3 +362,120 @@ func TestRun_ConcurrentSnapshotsRequestsAndChecks(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestMonitor_CheckDoesNotAcceptAQueuedPreCallCompletion(t *testing.T) {
+	h := newHarness(t, "k1")
+	h.m.refresh(h.ctx, t0)
+	h.m.tick(h.ctx, t0)
+	h.queued()
+	gate, entered := make(chan struct{}), make(chan string, 2)
+	cleanGate(t, gate)
+	h.l.mu.Lock()
+	h.l.gate, h.l.entered = gate, entered
+	h.l.mu.Unlock()
+	one, all := h.ask([]string{"k1"}), h.ask(nil)
+	h.answer()
+	stillWaiting(t, one)
+	stillWaiting(t, all)
+	h.m.tick(h.ctx, t0)
+	if h.inFlight() != 1 {
+		t.Error("the queued old answer left no urgent follow-up despite its future NextAt")
+	}
+	if t.Failed() {
+		return
+	}
+	enteredCheck(t, entered, "k1")
+	h.m.tick(h.ctx, t0)
+	if h.inFlight() != 1 || h.l.checkCount("k1") != 1 {
+		t.Fatal("coalesced Check calls started parallel duplicate checks")
+	}
+	stillWaiting(t, one)
+	stillWaiting(t, all)
+	close(gate)
+	h.answer()
+	for _, done := range []<-chan checkAnswer{one, all} {
+		if got := answered(t, done); got.err != nil || got.states["k1"].Status != watchdapi.StatusAlive || got.states["k1"].CheckedAt != t0 {
+			t.Fatalf("fresh stationary-clock answer = %+v, %v", got.states, got.err)
+		}
+	}
+	h.m.tick(h.ctx, t0)
+	if h.inFlight() != 0 || h.l.checkCount("k1") != 2 {
+		t.Fatal("satisfied coalesced follow-up was dispatched again")
+	}
+}
+
+func TestMonitor_CheckDoesNotRetokenAQueuedWANFailure(t *testing.T) {
+	h := newHarness(t, "k1", "k2", "k3", "k4", "k5", "k6")
+	h.at(0, true)
+	h.now = t0.Add(time.Minute)
+	h.m.mu.Lock()
+	for k, e := range h.m.entries {
+		if k != "k1" {
+			e.st.NextAt = h.now.Add(time.Hour)
+		}
+	}
+	h.m.mu.Unlock()
+	before := h.state("k1")
+	h.l.script["k1"] = []error{errTimeout, errTimeout}
+	h.m.tick(h.ctx, h.now)
+	h.queued()
+	gate := make(chan struct{})
+	cleanGate(t, gate)
+	h.l.mu.Lock()
+	h.l.gate = gate
+	h.l.mu.Unlock()
+	done := h.ask([]string{"k1"})
+	h.answer()
+	stillWaiting(t, done)
+	h.m.tick(h.ctx, h.now)
+	if h.state("k1") != before || h.inFlight() != 0 || h.l.checkCount("k1") != 3 {
+		t.Fatal("an unresolved queued failure was published or redispatched")
+	}
+	entered, release, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	cleanGate(t, release)
+	h.m.d.WANUp = func(ctx context.Context) bool {
+		close(entered)
+		select {
+		case <-release:
+			return true
+		case <-ctx.Done():
+			return false
+		}
+	}
+	h.now = h.now.Add(GuardWindow)
+	go func() { h.m.tick(h.ctx, h.now); close(finished) }()
+	<-entered
+	stillWaiting(t, done)
+	if h.state("k1") != before {
+		t.Error("gated WAN evidence exposed a provisional failure")
+	}
+	close(release)
+	<-finished
+	stillWaiting(t, done)
+	if h.state("k1").Status != watchdapi.StatusDead || h.inFlight() != 1 {
+		t.Error("late publication failed to retain the urgent post-call follow-up")
+	}
+	if t.Failed() {
+		return
+	}
+	close(gate)
+	h.answer()
+	if got := answered(t, done); got.err != nil || got.states["k1"].Status != watchdapi.StatusAlive || got.states["k1"].CheckedAt != h.now {
+		t.Fatalf("fresh post-publication answer = %+v, %v", got.states, got.err)
+	}
+}
+
+func TestMonitor_AnUntaggedResultCannotCreateCheckFreshness(t *testing.T) {
+	h := newHarness(t, "k1")
+	h.at(0, true)
+	done := h.ask([]string{"k1"})
+	h.m.apply(h.ctx, result{sess: h.m.session, key: "k1"})
+	stillWaiting(t, done)
+	if t.Failed() {
+		return
+	}
+	h.at(0, false)
+	if got := answered(t, done); got.err != nil || h.l.checkCount("k1") != 2 {
+		t.Fatalf("tagged fresh check = %+v, %v", got.states, got.err)
+	}
+}

@@ -72,31 +72,36 @@ type Deps struct {
 type Monitor struct {
 	d Deps
 
-	mu          sync.Mutex
-	settings    Settings
-	state       watchdapi.State
-	message     string
-	entries     map[string]*entry
-	order       []string       // the endpoints' keys in Build order
-	pos         map[string]int // each key's place in order: the active server's first
-	session     Session
-	setKey      string                // the keys the session holds
-	restored    map[string]savedEntry // state read at startup, until the first refresh takes it
-	sequence    uint64                // completed checks, including unpublished failures
-	pending     map[string]outcome    // failures awaiting WAN evidence
-	recent      []outcome             // completed checks within GuardWindow
-	controlOK   time.Time             // when a control last answered
-	nextControl time.Time             // the next control dial while the WAN is down
-	proberFails int                   // failed starts in a row
-	proberAt    time.Time             // no start before this
-	crashes     []time.Time
-	lag         time.Duration
-	lagWarned   bool
-	dirty       bool
-	lastSave    time.Time
-	updated     time.Time
-	warned      map[string]string
-	changed     chan struct{} // closed and replaced whenever a result lands
+	mu           sync.Mutex
+	settings     Settings
+	state        watchdapi.State
+	message      string
+	entries      map[string]*entry
+	order        []string       // the endpoints' keys in Build order
+	pos          map[string]int // each key's place in order: the active server's first
+	session      Session
+	setKey       string                // the keys the session holds
+	restored     map[string]savedEntry // state read at startup, until the first refresh takes it
+	sequence     uint64                // completed checks, including unpublished failures
+	pending      map[string]outcome    // failures awaiting WAN evidence
+	recent       []outcome             // completed checks within GuardWindow
+	controlOK    time.Time             // when a control last answered
+	nextControl  time.Time             // the next control dial while the WAN is down
+	proberFails  int                   // failed starts in a row
+	proberAt     time.Time             // no start before this
+	proberError  string                // retry reason, also retained during a WAN pause
+	crashBatches int                   // crash-limit waits since a stable main session
+	sessionSince time.Time             // start of the current uninterrupted main session
+	wanPaused    bool                  // only a successful control releases this guard
+	suspects     []string              // deferred isolation, bounded by MaxConcurrency
+	crashes      []time.Time
+	lag          time.Duration
+	lagWarned    bool
+	dirty        bool
+	lastSave     time.Time
+	updated      time.Time
+	warned       map[string]string
+	changed      chan struct{} // closed and replaced whenever a result lands
 
 	results chan result
 	wake    chan struct{}
@@ -108,6 +113,8 @@ type result struct {
 	key     string
 	latency time.Duration
 	err     error
+	seq     uint64
+	at      time.Time
 }
 
 // outcome is a completed check; failures stay private until WAN evidence.
@@ -202,6 +209,11 @@ func (m *Monitor) Request(keys []string) (int, error) {
 
 // request queues checks with mu held.
 func (m *Monitor) request(keys []string) (int, error) {
+	return m.queue(keys, false)
+}
+
+// queue registers Request or Check intent with mu held.
+func (m *Monitor) queue(keys []string, fresh bool) (int, error) {
 	if m.state == watchdapi.StateStopped || m.state == watchdapi.StateDisabled {
 		return 0, watchdapi.ErrNotActive
 	}
@@ -210,7 +222,9 @@ func (m *Monitor) request(keys []string) (int, error) {
 		if !e.checkable() {
 			return
 		}
-		if !e.inFlight {
+		if fresh {
+			e.followUp, e.after = true, m.sequence
+		} else if !e.inFlight {
 			e.urgent = true
 		}
 		n++
@@ -246,7 +260,7 @@ func (m *Monitor) Check(ctx context.Context, keys []string) (map[string]watchdap
 			keys = append(keys, k)
 		}
 	}
-	_, err := m.request(keys)
+	_, err := m.queue(keys, true)
 	m.mu.Unlock()
 	if err != nil {
 		return nil, err
@@ -262,7 +276,7 @@ func (m *Monitor) Check(ctx context.Context, keys []string) (map[string]watchdap
 				continue
 			}
 			out[k] = e.st
-			if e.checkable() && e.completed <= start {
+			if e.checkable() && (e.completed <= start || e.completedSession != m.session || m.session == nil || exited(m.session)) {
 				done = false
 			}
 		}
@@ -314,6 +328,27 @@ func (m *Monitor) refresh(ctx context.Context, now time.Time) {
 		m.idle(watchdapi.StateStopped, "")
 		return
 	}
+	if m.wanPaused {
+		if ctx.Err() != nil {
+			return
+		}
+		// Re-detect Xray without clearing the guard or its crash retry deadline.
+		err := m.d.Launcher.Ready()
+		if ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, ErrNoXray) {
+			m.idle(watchdapi.StateNoXray, err.Error())
+			return
+		}
+		m.setState(watchdapi.StateWANDown, "")
+		return
+	}
+	m.resume(ctx, now)
+}
+
+// resume retries the prober and any deferred isolation after WAN recovery.
+func (m *Monitor) resume(ctx context.Context, now time.Time) {
 	if ctx.Err() != nil || now.Before(m.proberAt) {
 		return
 	}
@@ -330,10 +365,9 @@ func (m *Monitor) refresh(ctx context.Context, now time.Time) {
 		}
 		return
 	}
-	if m.state == watchdapi.StateWANDown {
-		return
+	if m.isolate(ctx, now) {
+		m.ensureSession(ctx, now)
 	}
-	m.ensureSession(ctx, now)
 }
 
 func (m *Monitor) settingsNow() Settings {
@@ -431,8 +465,14 @@ func keysOf(eps []Endpoint) string {
 // ensureSession runs a prober holding the checkable set, unless one holds it
 // already. Xray refusing an outbound rejects that endpoint and starts again.
 func (m *Monitor) ensureSession(ctx context.Context, now time.Time) {
+	if m.wanPaused || ctx.Err() != nil {
+		return
+	}
 	set := m.checkableSet()
 	if m.session != nil && keysOf(set) == m.setKey {
+		if !exited(m.session) {
+			m.setState(watchdapi.StateOK, "")
+		}
 		return
 	}
 	if len(set) == 0 {
@@ -457,7 +497,7 @@ func (m *Monitor) ensureSession(ctx context.Context, now time.Time) {
 		}
 		if err == nil {
 			m.mu.Lock()
-			m.session, m.setKey = sess, keysOf(set)
+			m.session, m.setKey, m.sessionSince = sess, keysOf(set), m.d.Now()
 			m.mu.Unlock()
 			m.proberFails, m.proberAt = 0, time.Time{}
 			m.setState(watchdapi.StateOK, "")
@@ -579,8 +619,10 @@ func (m *Monitor) rejectKey(now time.Time, key, reason string) {
 func (m *Monitor) startFailed(now time.Time, err error) {
 	wait := proberBackoff[min(m.proberFails, len(proberBackoff)-1)]
 	m.proberFails++
-	m.proberAt = now.Add(wait)
-	m.setState(watchdapi.StateProberError, err.Error())
+	m.proberAt, m.proberError = now.Add(wait), err.Error()
+	if !m.wanPaused {
+		m.setState(watchdapi.StateProberError, m.proberError)
+	}
 	slog.Warn("Monitor: the prober did not start", "error", err, "retry_in", wait)
 }
 
@@ -591,7 +633,7 @@ func (m *Monitor) stopSession() {
 	}
 	sess := m.session
 	m.mu.Lock()
-	m.session, m.setKey = nil, ""
+	m.session, m.setKey, m.sessionSince = nil, "", time.Time{}
 	for _, e := range m.entries {
 		e.inFlight = false
 	}
@@ -628,7 +670,7 @@ func (m *Monitor) tick(ctx context.Context, now time.Time) {
 	if ctx.Err() != nil {
 		return
 	}
-	if m.state == watchdapi.StateWANDown && !now.Before(m.nextControl) {
+	if m.wanPaused && m.state == watchdapi.StateWANDown && !now.Before(m.nextControl) {
 		up := m.d.WANUp(ctx)
 		if ctx.Err() != nil {
 			return
@@ -642,11 +684,15 @@ func (m *Monitor) tick(ctx context.Context, now time.Time) {
 			}
 			m.recent = nil
 			m.controlOK = now
+			m.wanPaused = false
 			m.dirty = true
 			m.mu.Unlock()
-			m.setState(watchdapi.StateOK, "")
 			slog.Info("Monitor: the WAN is back; checking every server")
-			m.ensureSession(ctx, now)
+			if now.Before(m.proberAt) {
+				m.setState(watchdapi.StateProberError, m.proberError)
+			} else {
+				m.resume(ctx, now)
+			}
 		} else {
 			m.nextControl = now.Add(ControlEvery)
 		}
@@ -679,13 +725,14 @@ func (m *Monitor) dispatch(ctx context.Context, now time.Time) {
 		switch {
 		case e.inFlight:
 			busy++
-		case e.checkable() && !e.pending && (e.urgent || !e.st.NextAt.After(now)):
+		case e.checkable() && !e.pending && (e.urgent || e.followUp || !e.st.NextAt.After(now)):
 			due = append(due, e)
 		}
 	}
 	sort.Slice(due, func(i, j int) bool {
-		if due[i].urgent != due[j].urgent {
-			return due[i].urgent
+		iUrgent, jUrgent := due[i].urgent || due[i].followUp, due[j].urgent || due[j].followUp
+		if iUrgent != jUrgent {
+			return iUrgent
 		}
 		if !due[i].st.NextAt.Equal(due[j].st.NextAt) {
 			return due[i].st.NextAt.Before(due[j].st.NextAt)
@@ -699,7 +746,7 @@ func (m *Monitor) dispatch(ctx context.Context, now time.Time) {
 		go m.check(ctx, m.session, e.ep.Key)
 	}
 	m.lag = 0
-	if waiting := due[n:]; len(waiting) > 0 && !waiting[0].urgent {
+	if waiting := due[n:]; len(waiting) > 0 && !waiting[0].urgent && !waiting[0].followUp {
 		m.lag = now.Sub(waiting[0].st.NextAt)
 	}
 	switch {
@@ -723,10 +770,21 @@ func (m *Monitor) check(ctx context.Context, sess Session, key string) {
 			latency, err = sess.Check(ctx, key)
 		}
 	}
+	r := m.finish(result{sess: sess, key: key, latency: latency, err: err})
 	select {
-	case m.results <- result{sess: sess, key: key, latency: latency, err: err}:
+	case m.results <- r:
 	case <-ctx.Done():
 	}
+}
+
+// finish linearizes terminal completion with Check registration before enqueue.
+// Workers allocate only completion metadata; Run owns entries and sessions.
+func (m *Monitor) finish(r result) result {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sequence++
+	r.seq, r.at = m.sequence, m.d.Now()
+	return r
 }
 
 func exited(s Session) bool {
@@ -743,7 +801,7 @@ func exited(s Session) bool {
 func (m *Monitor) apply(ctx context.Context, r result) {
 	m.mu.Lock()
 	e := m.entries[r.key]
-	if e == nil || r.sess != m.session || r.sess == nil || exited(r.sess) {
+	if r.seq == 0 || e == nil || r.sess != m.session || r.sess == nil || exited(r.sess) {
 		// A crashed prober's in-flight endpoints remain isolation suspects.
 		m.mu.Unlock()
 		return
@@ -754,12 +812,14 @@ func (m *Monitor) apply(ctx context.Context, r result) {
 		return
 	}
 	now := m.d.Now()
-	m.sequence++
-	o := outcome{at: now, key: r.key, ok: r.err == nil, seq: m.sequence}
+	o := outcome{at: now, key: r.key, ok: r.err == nil, seq: r.seq}
 	m.recent = append(m.recent, o)
 	m.pruneRecent(now)
 	trip := false
 	if r.err == nil {
+		if r.at.Sub(m.sessionSince) >= CrashWindow {
+			m.crashBatches, m.crashes = 0, nil
+		}
 		if e.succeed(now, r.latency, m.settings, m.d.Jitter()) {
 			slog.Info("Monitor: server alive", "server", e.ep.Label, "latency", r.latency.Round(time.Millisecond))
 		}
@@ -783,7 +843,10 @@ func (m *Monitor) apply(ctx context.Context, r result) {
 
 // completed publishes freshness only for a resolved completion, with mu held.
 func (m *Monitor) completed(e *entry, o outcome) {
-	e.completed = o.seq
+	e.completed, e.completedSession = o.seq, m.session
+	if e.followUp && o.seq > e.after {
+		e.followUp = false
+	}
 	m.dirty = true
 	m.updated = m.d.Now()
 	m.notify()
@@ -894,6 +957,7 @@ func (m *Monitor) guard(ctx context.Context, now time.Time) {
 	m.discardPending()
 	m.recent = nil
 	m.nextControl = now.Add(ControlEvery)
+	m.wanPaused = true
 	m.mu.Unlock()
 	m.setState(watchdapi.StateWANDown, "")
 	slog.Warn("Monitor: the WAN is down; server statuses are kept until it is back")
@@ -911,16 +975,20 @@ func (m *Monitor) crashed(ctx context.Context) {
 		m.mu.Unlock()
 		return
 	}
-	var suspects []Endpoint
+	seen := make(map[string]bool, len(m.suspects))
+	for _, key := range m.suspects {
+		seen[key] = true
+	}
 	for _, k := range m.order {
-		if e := m.entries[k]; e != nil && e.inFlight {
-			suspects = append(suspects, e.ep)
+		if e := m.entries[k]; e != nil && e.inFlight && !seen[k] && len(m.suspects) < MaxConcurrency {
+			m.suspects = append(m.suspects, k)
+			seen[k] = true
 		}
 	}
 	for _, e := range m.entries {
 		e.inFlight = false
 	}
-	m.session, m.setKey = nil, ""
+	m.session, m.setKey, m.sessionSince = nil, "", time.Time{}
 	m.discardPending()
 	m.recent = nil
 	kept := m.crashes[:0]
@@ -933,26 +1001,57 @@ func (m *Monitor) crashed(ctx context.Context) {
 	crashes := len(m.crashes)
 	m.mu.Unlock()
 	sess.Stop()
-	slog.Warn("Monitor: the prober exited", "suspects", len(suspects))
-	for _, ep := range suspects {
-		if ctx.Err() != nil {
-			return
-		}
-		if m.crashesAlone(ctx, ep) && ctx.Err() == nil {
-			m.rejectKey(now, ep.Key, "crashes Xray")
-		}
+	slog.Warn("Monitor: the prober exited", "suspects", len(m.suspects))
+	if !m.wanPaused && !m.isolate(ctx, now) {
+		return
 	}
 	if ctx.Err() != nil {
 		return
 	}
 	if crashes >= CrashLimit {
-		m.mu.Lock()
+		wait := proberBackoff[min(m.crashBatches, len(proberBackoff)-1)]
+		m.crashBatches++
 		m.crashes = nil
-		m.mu.Unlock()
-		m.startFailed(now, fmt.Errorf("the prober crashed %d times in %s", crashes, CrashWindow))
+		m.proberAt = now.Add(wait)
+		m.proberError = fmt.Sprintf("the prober crashed %d times in %s", crashes, CrashWindow)
+		if !m.wanPaused {
+			m.setState(watchdapi.StateProberError, m.proberError)
+		}
+		slog.Warn("Monitor: the crash loop is paused", "retry_in", wait)
 		return
 	}
 	m.ensureSession(ctx, now)
+}
+
+// isolate consumes deferred suspects only while WAN evidence permits traffic.
+func (m *Monitor) isolate(ctx context.Context, now time.Time) bool {
+	if m.wanPaused {
+		return false
+	}
+	for len(m.suspects) > 0 {
+		if ctx.Err() != nil {
+			return false
+		}
+		key := m.suspects[0]
+		m.mu.Lock()
+		e := m.entries[key]
+		var ep Endpoint
+		if e != nil && e.checkable() {
+			ep = e.ep
+		}
+		m.mu.Unlock()
+		if ep.Key != "" {
+			crashed := m.crashesAlone(ctx, ep)
+			if ctx.Err() != nil {
+				return false
+			}
+			if crashed {
+				m.rejectKey(now, key, "crashes Xray")
+			}
+		}
+		m.suspects = m.suspects[1:]
+	}
+	return true
 }
 
 // crashesAlone checks ep in a prober holding it alone and reports whether that
@@ -998,7 +1097,7 @@ func (m *Monitor) untilNext(now, nextRefresh time.Time) time.Duration {
 				if e.inFlight || e.pending || !e.checkable() {
 					continue
 				}
-				if e.urgent {
+				if e.urgent || e.followUp {
 					return 0
 				}
 				if e.st.NextAt.Before(next) {

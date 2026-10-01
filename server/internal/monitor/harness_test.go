@@ -31,6 +31,7 @@ type fakeLauncher struct {
 	latency time.Duration
 	starts  [][]string
 	checks  map[string]int
+	entered chan string
 }
 
 func newFakeLauncher() *fakeLauncher {
@@ -103,7 +104,15 @@ func (s *fakeSession2) Check(ctx context.Context, key string) (time.Duration, er
 	if keyed := s.l.gates[key]; keyed != nil {
 		gate = keyed
 	}
+	entered := s.l.entered
 	s.l.mu.Unlock()
+	if entered != nil {
+		select {
+		case entered <- key:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
 	if gate != nil {
 		select {
 		case <-gate:
@@ -277,7 +286,7 @@ func (h *harness) complete(key string, err error) {
 	e.inFlight, e.urgent = true, false
 	sess := h.m.session
 	h.m.mu.Unlock()
-	h.m.apply(h.ctx, result{sess: sess, key: key, latency: 100 * time.Millisecond, err: err})
+	h.m.apply(h.ctx, h.m.finish(result{sess: sess, key: key, latency: 100 * time.Millisecond, err: err}))
 }
 
 func (h *harness) answer() {
@@ -360,4 +369,40 @@ func captureEngineLogs(t *testing.T) *engineLogs {
 	slog.SetDefault(slog.New(slog.NewTextHandler(logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(old) })
 	return logs
+}
+
+// queued holds engine consumption after a real worker has enqueued its answer.
+func (h *harness) queued() result {
+	h.t.Helper()
+	select {
+	case r := <-h.m.results:
+		h.m.results <- r
+		return r
+	case <-time.After(5 * time.Second):
+		h.t.Fatal("worker did not enqueue its terminal result")
+	}
+	return result{}
+}
+
+func enteredCheck(t *testing.T, entered <-chan string, key string) {
+	t.Helper()
+	select {
+	case got := <-entered:
+		if got != key {
+			t.Fatalf("entered %s, want %s", got, key)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not enter its gated check", key)
+	}
+}
+
+func cleanGate(t *testing.T, gate chan struct{}) {
+	t.Helper()
+	t.Cleanup(func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	})
 }
