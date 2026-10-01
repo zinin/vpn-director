@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -539,10 +540,11 @@ func TestFakeLauncher_StableResultsCancellationAndStop(t *testing.T) {
 }
 
 const (
-	helperRole   = "VPD_TASK6_R1_HELPER_ROLE"
-	helperMethod = "VPD_TASK6_R1_HELPER_METHOD"
-	helperRoot   = "VPD_TASK6_R1_HELPER_ROOT"
-	helperReady  = "VPD_TASK6_R1_HELPER_READY"
+	helperRole     = "VPD_TASK6_R1_HELPER_ROLE"
+	helperMethod   = "VPD_TASK6_R1_HELPER_METHOD"
+	helperRoot     = "VPD_TASK6_R1_HELPER_ROOT"
+	helperReady    = "VPD_TASK6_R1_HELPER_READY"
+	helperScenario = "VPD_TASK6_R2_SCENARIO"
 )
 
 func TestMain(m *testing.M) {
@@ -628,6 +630,14 @@ func runProcessHelper(role string) error {
 		if err != nil {
 			return err
 		}
+		if err := os.WriteFile(filepath.Join(os.Getenv(helperRoot), "probe-owned"), data, 0600); err != nil {
+			return err
+		}
+		if strings.HasPrefix(os.Getenv(helperScenario), "before-ready") && os.Getenv(helperMethod) != "idle" {
+			if err := waitHelperGate(context.Background(), filepath.Join(os.Getenv(helperRoot), "publish-child")); err != nil {
+				return err
+			}
+		}
 		if err := os.WriteFile(os.Getenv(helperReady), data, 0600); err != nil {
 			return err
 		}
@@ -657,6 +667,8 @@ func runProcessHelper(role string) error {
 		}
 	case "supervisor":
 		return superviseParentDeath()
+	case "watchdog":
+		return exerciseWatchdog()
 	default:
 		return errors.New("unknown process helper role")
 	}
@@ -667,13 +679,11 @@ func helperEnvironment(role, method, root, ready string) []string {
 }
 
 // The isolated supervisor adopts and reaps children after their parent dies.
-func superviseParentDeath() error {
-	prctl := map[string]uintptr{"amd64": 157, "arm64": 167, "386": 172, "arm": 172, "mipsle": 4192}[runtime.GOARCH]
-	if prctl == 0 {
-		return errors.New("unsupported Linux subreaper architecture")
-	}
-	if _, _, errno := syscall.Syscall6(prctl, 36, 1, 0, 0, 0, 0); errno != 0 { // PR_SET_CHILD_SUBREAPER
-		return errno
+func superviseParentDeath() (result error) {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
+	defer stop()
+	if err := helperSubreaper(); err != nil {
+		return err
 	}
 	root, method := os.Getenv(helperRoot), os.Getenv(helperMethod)
 	ready := filepath.Join(root, "child-ready")
@@ -683,15 +693,49 @@ func superviseParentDeath() error {
 	}
 	parent := exec.Command(self)
 	parent.Env = helperEnvironment("parent", method, root, ready)
+	parent.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	parent.WaitDelay = 2 * time.Second
+	parentDone := make(chan struct{})
+	var parentErr error
+	var report helperCleanupReport
+	var started, normalReaped bool
+	defer func() {
+		if !started {
+			return
+		}
+		if !normalReaped {
+			cleanupErr := cleanupParentGroup(parent, parentDone, &report)
+			result = errors.Join(result, cleanupErr)
+			if cleanupErr != nil {
+				return
+			}
+		}
+		if parent.ProcessState == nil || !parent.ProcessState.Sys().(syscall.WaitStatus).Signaled() || parent.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+			result = errors.Join(result, fmt.Errorf("parent Wait did not reap SIGKILL: %v", parentErr))
+			return
+		}
+		report.ParentWaited = true
+		data, err := json.Marshal(report)
+		if err == nil {
+			err = os.WriteFile(filepath.Join(root, "cleanup-complete"), data, 0600)
+		}
+		result = errors.Join(result, err)
+	}()
 	if err := parent.Start(); err != nil {
 		return err
 	}
-	parentDone := make(chan struct{})
-	go func() { _ = parent.Wait(); close(parentDone) }()
-	defer func() { _ = parent.Process.Kill(); <-parentDone }()
+	started = true
+	report.Parent, report.Group = parent.Process.Pid, parent.Process.Pid
+	go func() { parentErr = parent.Wait(); close(parentDone) }()
+	if group, err := syscall.Getpgid(parent.Process.Pid); err != nil || group != report.Group || group == syscall.Getpgrp() {
+		return errors.New("parent helper did not establish its isolated process group")
+	}
 	var child helperIdentity
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		data, err := os.ReadFile(ready)
 		if err == nil && json.Unmarshal(data, &child) == nil && child.PID > 0 {
 			break
@@ -699,44 +743,53 @@ func superviseParentDeath() error {
 		select {
 		case <-parentDone:
 			return errors.New("launcher parent exited before its child was ready")
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-time.After(10 * time.Millisecond):
 		}
 	}
 	if child.PID <= 0 {
 		return errors.New("launcher parent did not publish its child")
 	}
-	defer func() {
-		_ = parent.Process.Kill()
-		<-parentDone
-		id, err := readHelperIdentity(child.PID)
-		if err == nil && id.Started == child.Started {
-			if id.State != "Z" && id.State != "X" && id.Exe == child.Exe {
-				_ = syscall.Kill(child.PID, syscall.SIGKILL)
-			}
-			var status syscall.WaitStatus
-			_, _ = syscall.Wait4(child.PID, &status, 0, nil)
-		}
-	}()
 	current, err := readHelperIdentity(child.PID)
 	if err != nil || current.Started != child.Started || current.PPID != parent.Process.Pid || current.Exe != filepath.Join(root, "vpn-director-probe") || current.State == "Z" || current.State == "X" {
 		return errors.New("launcher child is not the owned running executable")
 	}
+	if group, err := syscall.Getpgid(child.PID); err != nil || group != report.Group {
+		return errors.New("probe did not inherit its owned parent process group")
+	}
 	if method == "Start" {
-		deadline = time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			if _, err := os.Stat(filepath.Join(root, "parent-ready")); err == nil {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
+		readyCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := waitHelperGate(readyCtx, filepath.Join(root, "parent-ready"))
+		cancel()
+		if err != nil {
+			return fmt.Errorf("Start never returned its running session: %w", err)
 		}
 		if _, err := os.Stat(filepath.Join(root, "parent-ready")); err != nil {
 			return errors.New("Start never returned its running session")
 		}
 	}
+	if scenario := os.Getenv(helperScenario); scenario != "" && !strings.HasPrefix(scenario, "before-ready") {
+		if err := os.WriteFile(filepath.Join(root, "watchdog-ready"), []byte("ready"), 0600); err != nil {
+			return err
+		}
+		if err := waitHelperGate(ctx, filepath.Join(root, "kill-parent")); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := parent.Process.Kill(); err != nil {
 		return err
 	}
-	<-parentDone
+	select {
+	case <-parentDone:
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(3 * time.Second):
+		return errors.New("parent waiter did not complete after parent-only SIGKILL")
+	}
 	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		id, err := readHelperIdentity(child.PID)
@@ -749,13 +802,19 @@ func superviseParentDeath() error {
 			if err != nil || pid != child.PID || !status.Signaled() || status.Signal() != syscall.SIGKILL {
 				return errors.New("child did not die by SIGKILL or was not reaped")
 			}
+			normalReaped = true
+			report.Children = append(report.Children, pid)
 			fmt.Printf("%s: owned child terminated as %s after parent SIGKILL and was reaped\n", method, id.State)
 			return nil
 		}
 		if id.Exe != child.Exe {
 			return errors.New("owned child executable identity changed")
 		}
-		time.Sleep(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
 	}
 	return fmt.Errorf("%s: owned child is still running after parent SIGKILL", method)
 }
@@ -901,13 +960,363 @@ func TestXrayLauncher_ParentDeathKillsBothLaunchPaths(t *testing.T) {
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			cmd := exec.CommandContext(ctx, self)
-			cmd.Env = helperEnvironment("supervisor", method, root, "")
-			out, err := cmd.CombinedOutput()
+			run, err := startParentDeathSupervisor(ctx, self, method, root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out, err := run.wait(ctx)
 			if err != nil {
 				t.Fatalf("parent-death helper: %v\n%s", err, out)
 			}
 			t.Log(strings.TrimSpace(string(out)))
 		})
+	}
+}
+
+func helperSubreaper() error {
+	prctl := map[string]uintptr{"amd64": 157, "arm64": 167, "386": 172, "arm": 172, "mipsle": 4192}[runtime.GOARCH]
+	if prctl == 0 {
+		return errors.New("unsupported Linux subreaper architecture")
+	}
+	if _, _, errno := syscall.Syscall6(prctl, 36, 1, 0, 0, 0, 0); errno != 0 { // PR_SET_CHILD_SUBREAPER
+		return errno
+	}
+	return nil
+}
+
+type supervisorRun struct {
+	cmd          *exec.Cmd
+	out          *tail
+	err          error
+	cancelErr    error
+	exited       chan struct{}
+	cancelExited chan struct{}
+}
+
+func startParentDeathSupervisor(ctx context.Context, self, method, root string) (*supervisorRun, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	r := &supervisorRun{cmd: exec.Command(self), out: &tail{max: 40}, exited: make(chan struct{}), cancelExited: make(chan struct{})}
+	r.cmd.Env = helperEnvironment("supervisor", method, root, "")
+	r.cmd.Stdout, r.cmd.Stderr = r.out, r.out
+	// No CommandContext: cancellation must not kill the surviving subreaper.
+	r.cmd.WaitDelay = 2 * time.Second
+	if err := r.cmd.Start(); err != nil {
+		return nil, err
+	}
+	go func() { r.err = r.cmd.Wait(); close(r.exited) }()
+	go func() {
+		defer close(r.cancelExited)
+		select {
+		case <-ctx.Done():
+			r.cancelErr = r.cmd.Process.Signal(syscall.SIGTERM)
+			if errors.Is(r.cancelErr, os.ErrProcessDone) {
+				r.cancelErr = nil
+			}
+		case <-r.exited:
+		}
+	}()
+	return r, nil
+}
+
+func (r *supervisorRun) wait(ctx context.Context) ([]byte, error) {
+	<-r.exited
+	<-r.cancelExited
+	if ctx.Err() != nil {
+		return []byte(r.out.String()), errors.Join(ctx.Err(), r.cancelErr)
+	}
+	return []byte(r.out.String()), errors.Join(r.err, r.cancelErr)
+}
+
+func waitHelperGate(ctx context.Context, path string) error {
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func helperIsRunning(id helperIdentity, exe string) bool {
+	current, err := readHelperIdentity(id.PID)
+	return err == nil && current.Started == id.Started && current.Exe == exe && current.State != "Z" && current.State != "X"
+}
+
+func readFixtureChild(ctx context.Context, root string) (helperIdentity, error) {
+	for {
+		data, err := os.ReadFile(filepath.Join(root, "probe-owned"))
+		var id helperIdentity
+		if err == nil && json.Unmarshal(data, &id) == nil && id.PID > 0 && id.Exe == filepath.Join(root, "vpn-director-probe") {
+			return id, nil
+		}
+		select {
+		case <-ctx.Done():
+			return id, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+// Only this isolated driver is a backup reaper for a failing supervisor.
+func reapWatchdogFixture(run *supervisorRun, parent, child helperIdentity) error {
+	for _, id := range []helperIdentity{parent, child} {
+		if id.PID <= 0 {
+			continue
+		}
+		current, err := readHelperIdentity(id.PID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil || current.Started != id.Started || current.State != "Z" && current.State != "X" && current.Exe != id.Exe {
+			return errors.New("backup cleanup refuses an unverified helper PID")
+		}
+		if current.State != "Z" && current.State != "X" {
+			if err := syscall.Kill(id.PID, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return err
+			}
+		}
+	}
+	select {
+	case <-run.exited:
+	case <-time.After(8 * time.Second):
+		return errors.New("supervisor waiter did not complete after cleanup request")
+	}
+	select {
+	case <-run.cancelExited:
+	case <-time.After(time.Second):
+		return errors.New("supervisor cancellation waiter did not complete")
+	}
+	for _, id := range []helperIdentity{parent, child} {
+		if id.PID <= 0 {
+			continue
+		}
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			var status syscall.WaitStatus
+			pid, err := syscall.Wait4(id.PID, &status, syscall.WNOHANG, nil)
+			if pid == id.PID {
+				if !status.Signaled() || status.Signal() != syscall.SIGKILL {
+					return errors.New("backup cleanup reaped an unexpected helper status")
+				}
+				fmt.Printf("backup owner reaped owned PID %d by Wait4\n", pid)
+			}
+			_, identityErr := readHelperIdentity(id.PID)
+			if errors.Is(identityErr, os.ErrNotExist) && (pid == id.PID || errors.Is(err, syscall.ECHILD)) {
+				break
+			}
+			if err != nil && !errors.Is(err, syscall.EINTR) && !errors.Is(err, syscall.ECHILD) {
+				return err
+			}
+			if time.Now().After(deadline) {
+				return errors.New("backup cleanup did not reap an owned helper")
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return nil
+}
+
+func exerciseWatchdog() (result error) {
+	if err := helperSubreaper(); err != nil {
+		return err
+	}
+	root, method, scenario := os.Getenv(helperRoot), os.Getenv(helperMethod), os.Getenv(helperScenario)
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	live := filepath.Join(root, "xray")
+	if err := os.Link(filepath.Join(root, "vpn-director-probe"), live); err != nil {
+		return err
+	}
+	pi, _ := os.Stat(filepath.Join(root, "vpn-director-probe"))
+	li, _ := os.Stat(live)
+	if !os.SameFile(pi, li) {
+		return errors.New("watchdog sibling does not share the probe inode")
+	}
+	sibling := exec.Command(live)
+	sibling.Env = helperEnvironment("child", "idle", root, filepath.Join(root, "sibling-ready"))
+	if err := sibling.Start(); err != nil {
+		return err
+	}
+	defer func() {
+		_ = sibling.Process.Kill()
+		var exit *exec.ExitError
+		if err := sibling.Wait(); !errors.As(err, &exit) || !exit.Sys().(syscall.WaitStatus).Signaled() || exit.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+			result = errors.Join(result, errors.New("sibling cleanup did not complete its SIGKILL Wait"))
+		}
+	}()
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer readyCancel()
+	if err := waitHelperGate(readyCtx, filepath.Join(root, "sibling-ready")); err != nil {
+		return err
+	}
+	siblingID, err := readHelperIdentity(sibling.Process.Pid)
+	if err != nil || !helperIsRunning(siblingID, live) {
+		return errors.New("watchdog isolation sibling is not running")
+	}
+	limit := 12 * time.Second
+	if scenario == "deadline" {
+		limit = 2 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	run, err := startParentDeathSupervisor(ctx, self, method, root)
+	if err != nil {
+		return err
+	}
+	var parent, child helperIdentity
+	defer func() {
+		cancel()
+		result = errors.Join(result, reapWatchdogFixture(run, parent, child))
+	}()
+	child, err = readFixtureChild(ctx, root)
+	if err != nil {
+		return err
+	}
+	parent, err = readHelperIdentity(child.PPID)
+	if err != nil || parent.PPID != run.cmd.Process.Pid || !helperIsRunning(parent, self) || !helperIsRunning(child, filepath.Join(root, "vpn-director-probe")) {
+		return errors.New("watchdog fixture was not a verified running parent/probe tree")
+	}
+	parentGroup, parentGroupErr := syscall.Getpgid(parent.PID)
+	probeGroup, probeGroupErr := syscall.Getpgid(child.PID)
+	supervisorGroup, supervisorGroupErr := syscall.Getpgid(run.cmd.Process.Pid)
+	siblingGroup, siblingGroupErr := syscall.Getpgid(sibling.Process.Pid)
+	if parentGroupErr != nil || probeGroupErr != nil || supervisorGroupErr != nil || siblingGroupErr != nil || parentGroup != parent.PID || probeGroup != parentGroup || supervisorGroup == parentGroup || siblingGroup == parentGroup {
+		return errors.New("watchdog subtree is not an independently established isolated process group")
+	}
+	if !strings.HasPrefix(scenario, "before-ready") {
+		if err := waitHelperGate(ctx, filepath.Join(root, "watchdog-ready")); err != nil {
+			return err
+		}
+	} else if _, err := os.Stat(filepath.Join(root, "child-ready")); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("early-failure fixture already published readiness")
+	}
+	if scenario == "cancel" || scenario == "before-ready-cancel" {
+		cancel()
+	}
+	out, waitErr := run.wait(ctx)
+	var failures []error
+	if scenario == "before-ready-failure" {
+		if waitErr == nil || !strings.Contains(string(out), "launcher parent did not publish its child") {
+			failures = append(failures, fmt.Errorf("readiness failure was not reported: %v, %s", waitErr, out))
+		}
+	} else if !errors.Is(waitErr, ctx.Err()) || waitErr == nil {
+		failures = append(failures, fmt.Errorf("watchdog cause was not preserved: %v", waitErr))
+	}
+	for label, id := range map[string]helperIdentity{"parent": parent, "probe": child} {
+		current, err := readHelperIdentity(id.PID)
+		if !errors.Is(err, os.ErrNotExist) {
+			failures = append(failures, fmt.Errorf("watchdog left owned %s unreaped (state %s, error %v)", label, current.State, err))
+		}
+	}
+	data, reportErr := os.ReadFile(filepath.Join(root, "cleanup-complete"))
+	var report helperCleanupReport
+	if reportErr != nil || json.Unmarshal(data, &report) != nil || !report.ParentWaited || report.Parent != parent.PID || report.Group != parent.PID || !report.GroupKilled {
+		failures = append(failures, errors.New("supervisor did not publish completed cleanup/reaping"))
+	}
+	childReaped := false
+	for _, pid := range report.Children {
+		if pid == child.PID {
+			childReaped = true
+		}
+	}
+	if !childReaped {
+		failures = append(failures, errors.New("probe was not explicitly reaped by the supervisor Wait4"))
+	}
+	if _, err := readHelperIdentity(run.cmd.Process.Pid); !errors.Is(err, os.ErrNotExist) || run.cmd.ProcessState == nil {
+		failures = append(failures, errors.New("supervisor was not reaped by its owning Wait"))
+	}
+	if !helperIsRunning(siblingID, live) {
+		failures = append(failures, errors.New("watchdog killed the unrelated same-inode sibling"))
+	}
+	if len(failures) != 0 {
+		return errors.Join(failures...)
+	}
+	fmt.Printf("%s/%s: expected failure %v; %s\n", method, scenario, waitErr, strings.TrimSpace(string(out)))
+	fmt.Printf("%s/%s: watchdog cause retained; parent/probe reaped; supervisor Wait/output complete; unrelated sibling running\n", method, scenario)
+	return nil
+}
+
+func TestXrayLauncher_WatchdogCleansAndReapsOwnedSubtree(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux watchdog/subreaper regression")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{"Start", "Test"} {
+		for _, scenario := range []string{"cancel", "deadline", "before-ready-cancel", "before-ready-failure"} {
+			t.Run(method+"/"+scenario, func(t *testing.T) {
+				root := t.TempDir()
+				if err := copyFile(self, filepath.Join(root, "vpn-director-probe")); err != nil {
+					t.Fatal(err)
+				}
+				cmd := exec.Command(self)
+				cmd.Env = append(helperEnvironment("watchdog", method, root, ""), helperScenario+"="+scenario)
+				cmd.WaitDelay = 2 * time.Second
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("watchdog helper: %v\n%s", err, out)
+				}
+				requireProcessGone(t, cmd.Process.Pid)
+				t.Log(strings.TrimSpace(string(out)))
+			})
+		}
+	}
+}
+
+type helperCleanupReport struct {
+	Parent       int
+	Group        int
+	ParentWaited bool
+	GroupKilled  bool
+	Children     []int
+}
+
+// This group was created by Setpgid at Start and never contains the subreaper.
+func cleanupParentGroup(parent *exec.Cmd, parentDone <-chan struct{}, report *helperCleanupReport) error {
+	if report.Group <= 0 || report.Group == syscall.Getpgrp() || report.Group != parent.Process.Pid {
+		return errors.New("cleanup refuses an unowned process group")
+	}
+	if err := syscall.Kill(-report.Group, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("owned process-group termination failed: %w", err)
+	}
+	report.GroupKilled = true
+	select {
+	case <-parentDone:
+	case <-time.After(3 * time.Second):
+		return errors.New("cleanup did not complete the parent Wait")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		var status syscall.WaitStatus
+		pid, err := syscall.Wait4(-report.Group, &status, syscall.WNOHANG, nil)
+		if pid > 0 {
+			if !status.Signaled() || status.Signal() != syscall.SIGKILL {
+				return errors.New("owned group child did not terminate by SIGKILL")
+			}
+			report.Children = append(report.Children, pid)
+			fmt.Printf("supervisor reaped owned PID %d by Wait4\n", pid)
+			continue
+		}
+		if errors.Is(err, syscall.ECHILD) {
+			return nil
+		}
+		if err != nil && !errors.Is(err, syscall.EINTR) {
+			return fmt.Errorf("owned process-group reaping failed: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return errors.New("cleanup did not reap the owned process group")
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
