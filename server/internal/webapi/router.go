@@ -11,6 +11,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/auth"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/updateflow"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 // UpdateFlow is the subset of updateflow.Flow the API handlers use. Declared
@@ -30,6 +31,7 @@ type Deps struct {
 	Logs         service.LogReader
 	LogPaths     map[string]string // log source name -> file path, built by main from paths.Paths
 	Update       UpdateFlow        // self-update orchestration, shared with the bot
+	Monitor      watchdapi.API     // vpn-director-watchd's server monitor; nil reads as not running
 	Shadow       *auth.ShadowAuth
 	JWT          *auth.JWTService
 	Version      string
@@ -93,6 +95,10 @@ func registerProtectedRoutes(mux *http.ServeMux, deps *Deps) {
 	mux.HandleFunc("POST /api/subscriptions/refresh", handleRefreshSubscriptions(deps))
 	mux.HandleFunc("POST /api/subscriptions/rename", handleRenameSubscription(deps))
 	mux.HandleFunc("DELETE /api/subscriptions", handleDeleteSubscription(deps))
+
+	// Server monitor (vpn-director-watchd)
+	mux.HandleFunc("GET /api/monitor", handleMonitor(deps))
+	mux.HandleFunc("POST /api/monitor/check", handleMonitorCheck(deps))
 
 	// Clients
 	mux.HandleFunc("GET /api/clients", handleListClients(deps))

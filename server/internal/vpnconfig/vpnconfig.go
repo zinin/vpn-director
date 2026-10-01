@@ -1,7 +1,10 @@
 package vpnconfig
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -29,6 +32,17 @@ type Server struct {
 	// Subscription is the id of the subscription file the server came from.
 	// LoadSubscriptions fills it in; the file does not repeat it.
 	Subscription string `json:"-"`
+}
+
+// ServerFingerprint names a server in a list a client holds - a button of
+// /xray, a row of the Web UI: the first 8 hex digits of
+// sha256("subscription|name|address|port"). The list can change between the
+// moment it is shown and a tap on it - the subscription watch rotates
+// endpoints, a refresh replaces a list - and the index alone then names
+// another server.
+func ServerFingerprint(s Server) string {
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d", s.Subscription, s.Name, s.Address, s.Port)))
+	return hex.EncodeToString(sum[:4])
 }
 
 // ServerIPs returns every non-empty IP across servers, de-duplicated and

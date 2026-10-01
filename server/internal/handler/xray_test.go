@@ -54,7 +54,7 @@ func xrayHandler(store *subsStore) (*XrayHandler, *recordingSender, *mockXrayGen
 func selectData(sub vpnconfig.Subscription, i int) string {
 	s := sub.Servers[i]
 	s.Subscription = sub.ID
-	return fmt.Sprintf("xray:select:%s:%d:%s", sub.ID, i, serverFingerprint(s))
+	return fmt.Sprintf("xray:select:%s:%d:%s", sub.ID, i, vpnconfig.ServerFingerprint(s))
 }
 
 func TestXray_OneSubscriptionOpensOnItsServers(t *testing.T) {
@@ -131,7 +131,7 @@ func TestXray_TheCheckMarksOnlyTheRunningServer(t *testing.T) {
 func TestXray_TheFingerprintTellsSubscriptionsApart(t *testing.T) {
 	a, b := twoGermanies()[0].Servers[0], twoGermanies()[1].Servers[0]
 	a.Subscription, b.Subscription = "0a1b2c3d", "1b2c3d4e"
-	if serverFingerprint(a) == serverFingerprint(b) {
+	if vpnconfig.ServerFingerprint(a) == vpnconfig.ServerFingerprint(b) {
 		t.Fatal("one fingerprint for two subscriptions")
 	}
 }
@@ -211,5 +211,22 @@ func TestXray_BackWithNothingLeftClearsTheKeyboard(t *testing.T) {
 	}
 	if !strings.Contains(sender.last(), "/import") || string(kb) != `{"inline_keyboard":[]}` {
 		t.Fatalf("reply %q, keyboard %s", sender.last(), kb)
+	}
+}
+
+func TestXray_TheExistingButtonFingerprintStillWorks(t *testing.T) {
+	store := newSubsStore(twoGermanies()...)
+	h, sender, gen, vpn := xrayHandler(store)
+	_, kb := xrayServersPage(store.subs[0], 0, true, nil)
+	const callback = "xray:select:0a1b2c3d:0:84130acd"
+	if got := *kb.InlineKeyboard[0][0].CallbackData; got != callback {
+		t.Fatalf("callback %q", got)
+	}
+	h.HandleCallback(xrayCallback(callback))
+	if gen.lastServer.Subscription != "0a1b2c3d" || gen.lastServer.Name != "Germany-1" || !vpn.restartCalled {
+		t.Fatalf("generated %+v, restarted %t", gen.lastServer, vpn.restartCalled)
+	}
+	if a := store.cfg.Xray.ActiveServer; a == nil || a.Subscription != "0a1b2c3d" || !strings.Contains(sender.last(), "Alpha / Germany") {
+		t.Fatalf("active %+v, reply %q", a, sender.last())
 	}
 }

@@ -2,8 +2,6 @@
 package handler
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strconv"
@@ -102,7 +100,7 @@ func xrayServersPage(sub vpnconfig.Subscription, page int, back bool, active *vp
 		if active != nil && active.Subscription == s.Subscription && active.Name == s.Name && active.Address == s.Address && active.Port == s.Port {
 			label = "✓ " + label
 		}
-		kb.Button(label, fmt.Sprintf("xray:select:%s:%d:%s", sub.ID, i, serverFingerprint(s)))
+		kb.Button(label, fmt.Sprintf("xray:select:%s:%d:%s", sub.ID, i, vpnconfig.ServerFingerprint(s)))
 	}
 	kb.Columns(2)
 	if page > 0 {
@@ -120,15 +118,6 @@ func xrayServersPage(sub vpnconfig.Subscription, page int, back bool, active *vp
 		text += fmt.Sprintf(" (стр. %d/%d)", page+1, pages)
 	}
 	return telegram.EscapeMarkdownV2(text), kb.Build()
-}
-
-// serverFingerprint names a server in a button: the first 8 hex digits of
-// sha256("subscription|name|address|port"). The list can change between /xray
-// and the tap - the subscription watch rotates endpoints, a refresh replaces a
-// list - and the index alone then names another server.
-func serverFingerprint(s vpnconfig.Server) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d", s.Subscription, s.Name, s.Address, s.Port)))
-	return hex.EncodeToString(sum[:4])
 }
 
 // HandleCallback handles xray:subs (back to the subscriptions),
@@ -204,7 +193,7 @@ func (h *XrayHandler) selectServer(chatID int64, msgID int, arg string) {
 	}
 	server := subs[si].Servers[idx]
 	server.Subscription = subs[si].ID
-	if parts[2] != serverFingerprint(server) {
+	if parts[2] != vpnconfig.ServerFingerprint(server) {
 		h.stale(chatID, msgID)
 		return
 	}

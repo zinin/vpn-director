@@ -884,3 +884,17 @@ func TestMonitorConfig_ConstructionKeepsConcurrencyAnInt(t *testing.T) {
 		}
 	}
 }
+
+// The Web UI and the bot name a server by it, so it must stay what /xray has
+// always sent: the first 8 hex digits of sha256("subscription|name|address|port").
+func TestServerFingerprint_IsTheButtonsOwn(t *testing.T) {
+	s := Server{Subscription: "0a1b2c3d", Name: "Germany-1", Address: "de.example.com", Port: 443}
+	if got := ServerFingerprint(s); got != "84130acd" {
+		t.Fatalf("fingerprint %q", got)
+	}
+	twin := s
+	twin.Subscription = "1b2c3d4e"
+	if ServerFingerprint(s) == ServerFingerprint(twin) {
+		t.Fatal("one fingerprint for two subscriptions")
+	}
+}
