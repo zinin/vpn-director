@@ -75,16 +75,19 @@ type Daemon struct {
 // Step 1 of a self-update prefers the asset of the daemon it runs in; step 2
 // takes that daemon's payload binary from itself (selfupdate.go).
 const (
-	DaemonBot   = "telegram-bot"
-	DaemonWebUI = "webui"
+	DaemonBot    = "telegram-bot"
+	DaemonWatchd = "vpn-director-watchd"
+	DaemonWebUI  = "webui"
 )
 
 // Daemons lists every daemon a release ships. DownloadRelease fetches one
 // binary per entry and the update script restarts the entries that were
-// running before the update. This table is the single source of truth: the
-// downloader, the script template and install.sh must not drift apart.
+// running before the update or are new with the release. This table is the
+// single source of truth: the downloader, the script template and install.sh
+// must not drift apart.
 var Daemons = []Daemon{
 	{Name: DaemonBot, Binary: "/opt/vpn-director/telegram-bot", InitScript: "S98telegram-bot"},
+	{Name: DaemonWatchd, Binary: "/opt/vpn-director/vpn-director-watchd", InitScript: "S98vpn-director-watchd"},
 	{Name: DaemonWebUI, Binary: "/opt/vpn-director/webui", InitScript: "S98vpn-director-webui"},
 }
 

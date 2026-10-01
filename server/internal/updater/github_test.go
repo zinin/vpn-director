@@ -336,7 +336,7 @@ func TestGetReleaseByTag(t *testing.T) {
 }
 
 // fakeAssets are the assets of the fake GitHub's release by id.
-var fakeAssets = map[string]string{"301": "telegram-bot-arm64", "302": "webui-arm64"}
+var fakeAssets = map[string]string{"301": "telegram-bot-arm64", "302": "webui-arm64", "303": "vpn-director-watchd-arm64"}
 
 // fakeGitHub answers for release v1.2.4 the way GitHub does, over TLS. Each
 // asset has both of its addresses. The API's answers a request that asks for
@@ -359,7 +359,7 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 		switch {
 		case p == "/repos/zinin/vpn-director/releases/latest", p == "/repos/zinin/vpn-director/releases/tags/v1.2.4":
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			fmt.Fprintf(w, `{"tag_name": "v1.2.4", "body": "notes", "assets": [%s, %s]}`, f.asset("301"), f.asset("302"))
+			fmt.Fprintf(w, `{"tag_name": "v1.2.4", "body": "notes", "assets": [%s, %s, %s]}`, f.asset("301"), f.asset("302"), f.asset("303"))
 		case strings.HasPrefix(p, "/repos/zinin/vpn-director/releases/assets/"):
 			id := strings.TrimPrefix(p, "/repos/zinin/vpn-director/releases/assets/")
 			name, ok := fakeAssets[id]

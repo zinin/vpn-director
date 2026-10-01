@@ -417,7 +417,7 @@ func TestCreateLockAt_ClaimsTheDirectoryForTheCallingProcess(t *testing.T) {
 // and step 2 takes that daemon's payload binary from itself. Both key on these
 // names, so they must be the names the daemon table ships under.
 func TestDaemonConstants_NameEntriesOfTheTable(t *testing.T) {
-	for _, name := range []string{DaemonBot, DaemonWebUI} {
+	for _, name := range []string{DaemonBot, DaemonWatchd, DaemonWebUI} {
 		found := false
 		for _, d := range Daemons {
 			if d.Name == name {
@@ -427,6 +427,21 @@ func TestDaemonConstants_NameEntriesOfTheTable(t *testing.T) {
 		if !found {
 			t.Errorf("no Daemons entry named %q", name)
 		}
+	}
+}
+
+func TestDaemons_OrderAndWatchdPaths(t *testing.T) {
+	want := []string{DaemonBot, DaemonWatchd, DaemonWebUI}
+	if len(Daemons) != len(want) {
+		t.Fatalf("Daemons has %d entries, want %d", len(Daemons), len(want))
+	}
+	for i, name := range want {
+		if Daemons[i].Name != name {
+			t.Errorf("Daemons[%d].Name = %q, want %q", i, Daemons[i].Name, name)
+		}
+	}
+	if got := Daemons[1]; got.Binary != "/opt/vpn-director/vpn-director-watchd" || got.InitScript != "S98vpn-director-watchd" {
+		t.Errorf("watchd paths = %+v", got)
 	}
 }
 

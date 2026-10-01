@@ -1,12 +1,15 @@
 package updater
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // validOpts returns options that pass every validation, so a test can flip a
@@ -53,6 +56,7 @@ const testManifest = "common router/opt/vpn-director/vpn-director.sh\n" +
 	"common router/opt/vpn-director/vpn-director.json.template\n" +
 	"common router/opt/etc/init.d/S99vpn-director\n" +
 	"common router/opt/etc/init.d/S98telegram-bot\n" +
+	"common router/opt/etc/init.d/S98vpn-director-watchd\n" +
 	"common router/opt/etc/init.d/S98vpn-director-webui\n" +
 	"merlin router/jffs/scripts/firewall-start\n" +
 	"keenetic router/opt/etc/ndm/netfilter.d/50-vpn-director.sh\n"
@@ -162,6 +166,7 @@ func TestGenerateScript_FileTableInstallsWhatItNames(t *testing.T) {
 		"opt/vpn-director/lib/common.sh":              true,
 		"opt/etc/init.d/S99vpn-director":              true,
 		"opt/etc/init.d/S98telegram-bot":              true,
+		"opt/etc/init.d/S98vpn-director-watchd":       true,
 		"jffs/scripts/firewall-start":                 true,
 		"opt/vpn-director/vpn-director.json.template": false,
 	} {
@@ -923,3 +928,313 @@ func TestGenerateScript_LogSurvivesTheDirectoryTheBotDeletes(t *testing.T) {
 		t.Errorf("output %q, want the shell to carry on past the failed log", out)
 	}
 }
+
+// A daemon a release adds is not running before its first update - nothing
+// ran it - and restarting only the daemons that ran would leave it stopped.
+// Step 1 notes every daemon whose binary is absent, and once the copy has
+// succeeded those join the success-start list: step 6 starts them before the
+// bot. A daemon whose binary is there but stopped stays stopped.
+func TestGenerateScript_StartsADaemonNewWithTheRelease(t *testing.T) {
+	s := &Service{updateDir: t.TempDir()}
+	writeTestManifest(t, s)
+	script, err := s.generateScript(validOpts())
+	if err != nil {
+		t.Fatalf("generateScript() error = %v", err)
+	}
+	steps := afterOnExit(t, script)
+
+	record := strings.Index(steps, `elif [ ! -e "$bin" ]; then`)
+	copyFiles := strings.Index(steps, "# 4. Copy files")
+	join := strings.Index(steps, `START_INITS="$RUNNING_INITS$NEW_INITS"`)
+	start := strings.Index(steps, `if ! start_except "$NOTIFY_INIT"; then`)
+	if record < 0 || copyFiles < 0 || join < 0 || start < 0 {
+		t.Fatalf("missing a step: record %d, copy %d, join %d, start %d", record, copyFiles, join, start)
+	}
+	if !(record < copyFiles && copyFiles < join && join < start) {
+		t.Errorf("the new daemons must be noted before the copy and join the running ones after it, before step 6")
+	}
+	if !strings.Contains(steps, `NEW_INITS="$NEW_INITS $init"`) {
+		t.Error("step 1 does not note a daemon whose binary is absent")
+	}
+	if strings.Contains(onExitBody(t, script), "NEW_INITS") {
+		t.Error("a failed update must not start a daemon it may not have installed")
+	}
+}
+
+func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
+	bot, watchd, webui := "telegram-bot", "vpn-director-watchd", "webui"
+	tests := []struct {
+		name        string
+		failure     string
+		missing     []string
+		running     []string
+		starts      []string
+		afterStart  bool
+		stopFailure bool
+	}{
+		{name: "new daemon starts before the bot", missing: []string{watchd}, running: []string{bot, webui}, starts: []string{webui, watchd, bot}},
+		{name: "existing stopped webui stays stopped", missing: []string{watchd}, running: []string{bot}, starts: []string{watchd, bot}},
+		{name: "existing stopped watchd stays stopped", running: []string{bot}, starts: []string{bot}},
+		{name: "all daemons are new", missing: []string{bot, watchd, webui}, starts: []string{watchd, webui, bot}},
+		{name: "before copying", failure: "before-copy", missing: []string{watchd}, running: []string{bot, webui}},
+		{name: "partial binary copy", failure: "copy-new", missing: []string{watchd}, running: []string{bot, webui}},
+		{name: "binary permissions", failure: "permissions", missing: []string{watchd}, running: []string{bot, webui}},
+		{name: "after successful copy", failure: "after-copy", missing: []string{watchd}, running: []string{bot, webui}},
+		{name: "new start fails after spawning", failure: "vpn-director-watchd-start", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
+		{name: "existing start fails before new start", failure: "webui-start", missing: []string{watchd}, running: []string{bot, webui}},
+		{name: "webui start fails after new start", failure: "webui-start", missing: []string{watchd, webui}, running: []string{bot}, afterStart: true},
+		{name: "notify write fails after new start", failure: "notify", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
+		{name: "bot start fails after new start", failure: "telegram-bot-start", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
+		{name: "lock removal fails after remonitoring", failure: "late-lock", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
+		{name: "failed new stop needs kill", failure: "webui-start", missing: []string{watchd, webui}, running: []string{bot}, afterStart: true, stopFailure: true},
+		{name: "no original daemons and webui start fails", failure: "webui-start", missing: []string{bot, watchd, webui}, afterStart: true},
+		{name: "no original daemons and bot start fails", failure: "telegram-bot-start", missing: []string{bot, watchd, webui}, afterStart: true},
+		{name: "failure leaves existing stopped daemons alone", failure: "telegram-bot-start", running: []string{bot}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			s := &Service{updateDir: filepath.Join(root, "update"), platform: "merlin"}
+			writeTestManifest(t, s)
+			script, err := s.generateScript(validOpts())
+			if err != nil {
+				t.Fatal(err)
+			}
+			tools := filepath.Join(root, "tools")
+			state := filepath.Join(root, "state")
+			for _, dir := range []string{tools, state} {
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			write := func(path, body string, mode os.FileMode) {
+				t.Helper()
+				if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte(body), mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			contains := func(list []string, name string) bool {
+				for _, item := range list {
+					if item == name {
+						return true
+					}
+				}
+				return false
+			}
+			inits := map[string]string{
+				"S98telegram-bot": bot, "S98vpn-director-watchd": watchd, "S98vpn-director-webui": webui,
+			}
+			table := regexp.MustCompile(`(?m)^FILES="([^"]*)"$`).FindStringSubmatch(script)
+			if table == nil {
+				t.Fatal("generated script has no FILES table")
+			}
+			for _, entry := range strings.Fields(table[1]) {
+				src := strings.Split(entry, "|")[0]
+				body := "payload\n"
+				if name, ok := inits[filepath.Base(src)]; ok {
+					body = "#!/bin/sh\nname=" + name + "\n" + sandboxInit
+					write(filepath.Join(root, src), body, 0755)
+				}
+				write(filepath.Join(s.getFilesDir(), src), body, 0644)
+			}
+			for _, name := range []string{bot, watchd, webui} {
+				if !contains(tt.missing, name) {
+					write(filepath.Join(root, "opt/vpn-director", name), "old "+name+"\n", 0755)
+				}
+				if contains(tt.running, name) {
+					write(filepath.Join(state, name+".running"), "", 0644)
+				}
+				write(filepath.Join(s.getFilesDir(), name), "new "+name+"\n", 0644)
+			}
+			write(filepath.Join(tools, "pgrep"), sandboxPgrep, 0755)
+			write(filepath.Join(tools, "pkill"), sandboxPkill, 0755)
+			write(filepath.Join(tools, "monit"), sandboxMonit, 0755)
+			for _, op := range []string{"cp", "chmod", "rm", "cat"} {
+				write(filepath.Join(tools, op), sandboxFault, 0755)
+			}
+
+			// Rehome every router path and replace process tools before executing.
+			script = regexp.MustCompile(`(?m)^PATH=.*$`).ReplaceAllString(script, "PATH="+tools+":/usr/bin:/bin")
+			for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock"} {
+				script = strings.ReplaceAll(script, prefix, root+prefix)
+			}
+			if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock)(/|\b)`).MatchString(script) {
+				t.Fatal("unrehomed router path in sandbox script")
+			}
+			scriptPath := filepath.Join(root, "update.sh")
+			callsPath := filepath.Join(root, "calls")
+			write(scriptPath, script, 0644)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "/bin/sh", scriptPath)
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+root, "STATE_DIR="+state,
+				"FILES_DIR="+s.getFilesDir(), "LOCK_FILE="+filepath.Join(s.getUpdateDir(), "lock"),
+				"CALLS_FILE="+callsPath, "FAIL_AT="+tt.failure,
+				"STOP_NEW_FAIL="+map[bool]string{false: "0", true: "1"}[tt.stopFailure])
+			cmd.WaitDelay = time.Second
+			out, runErr := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("sandbox exceeded its deadline: %v\n%s", ctx.Err(), out)
+			}
+			calls, err := os.ReadFile(callsPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Logf("sandbox calls:\n%s", calls)
+			if (runErr != nil) != (tt.failure != "") {
+				t.Errorf("script error = %v, failure = %q\n%s", runErr, tt.failure, out)
+			}
+			wantStatus := "ok"
+			if tt.failure != "" {
+				wantStatus = "failed"
+			}
+			data, err := os.ReadFile(filepath.Join(s.getUpdateDir(), "notify.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var notify struct{ Status string }
+			if err := json.Unmarshal(data, &notify); err != nil || notify.Status != wantStatus {
+				t.Errorf("notify = %s, error = %v, want %s", data, err, wantStatus)
+			}
+			if _, err := os.Stat(filepath.Join(s.getUpdateDir(), "lock")); !os.IsNotExist(err) {
+				t.Errorf("update lock remains: %v", err)
+			}
+			for _, name := range []string{bot, watchd, webui} {
+				wantRunning := contains(tt.running, name) || (tt.failure == "" && contains(tt.missing, name))
+				if !contains(tt.running, name) && !contains(tt.missing, name) {
+					if strings.Contains(string(calls), name+" start\n") || strings.Contains(string(calls), "monit monitor "+name+"\n") {
+						t.Errorf("existing stopped daemon %s was started or remonitored", name)
+					}
+				}
+				for _, suffix := range []string{".running", ".monitored"} {
+					_, err := os.Stat(filepath.Join(state, name+suffix))
+					if err != nil && !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
+					if got := err == nil; got != wantRunning {
+						t.Errorf("%s%s present = %v, want %v", name, suffix, got, wantRunning)
+					}
+				}
+			}
+			if tt.failure == "" {
+				var starts []string
+				for _, line := range strings.Split(string(calls), "\n") {
+					if strings.HasSuffix(line, " start") {
+						starts = append(starts, strings.TrimSuffix(line, " start"))
+					}
+				}
+				if strings.Join(starts, " ") != strings.Join(tt.starts, " ") {
+					t.Errorf("start order = %v, want %v", starts, tt.starts)
+				}
+				for _, name := range []string{bot, watchd, webui} {
+					path := filepath.Join(root, "opt/vpn-director", name)
+					data, err := os.ReadFile(path)
+					if err != nil || string(data) != "new "+name+"\n" {
+						t.Errorf("installed %s = %q, error = %v", name, data, err)
+					}
+					info, err := os.Stat(path)
+					if err != nil || info.Mode()&0111 == 0 {
+						t.Errorf("installed %s is not executable: %v", name, err)
+					}
+				}
+			} else {
+				fault := strings.Index(string(calls), "FAIL "+tt.failure+"\n")
+				if fault < 0 {
+					t.Fatal("the injected failure was never reached")
+				}
+				for _, name := range tt.missing {
+					if strings.Contains(string(calls)[fault:], name+" start\n") {
+						t.Errorf("recovery started new daemon %s", name)
+					}
+				}
+				for _, name := range tt.running {
+					if !strings.Contains(string(calls)[fault:], name+" start\n") {
+						t.Errorf("recovery did not restart original daemon %s", name)
+					}
+				}
+				if tt.afterStart {
+					start := strings.Index(string(calls), watchd+" start\n")
+					stop := strings.Index(string(calls)[fault:], watchd+" stop\n")
+					if start < 0 || start > fault || stop < 0 {
+						t.Errorf("new daemon must start before the fault and stop during recovery: start=%d fault=%d stop=%d", start, fault, stop)
+					}
+				}
+				if tt.stopFailure && !strings.Contains(string(calls), watchd+" kill\n") {
+					t.Error("a failed new-daemon stop left its process running without a kill attempt")
+				}
+			}
+		})
+	}
+}
+
+const sandboxInit = `printf '%s %s\n' "$name" "$1" >> "$CALLS_FILE"
+case "$1" in
+    start)
+        : > "$STATE_DIR/$name.running"
+        if [ "$FAIL_AT" = "$name-start" ] && [ ! -e "$STATE_DIR/fault" ]; then
+            : > "$STATE_DIR/fault"
+            printf 'FAIL %s\n' "$FAIL_AT" >> "$CALLS_FILE"
+            exit 71
+        fi
+        ;;
+    stop)
+        if [ "$name" = "vpn-director-watchd" ] && [ "$STOP_NEW_FAIL" = "1" ]; then
+            exit 72
+        fi
+        /bin/rm -f "$STATE_DIR/$name.running"
+        ;;
+    *) exit 90 ;;
+esac
+`
+
+const sandboxPgrep = `#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = "-f" ] || exit 90
+case "$2" in
+    "$SANDBOX_ROOT"/opt/vpn-director/*) ;;
+    *) exit 91 ;;
+esac
+[ -f "$STATE_DIR/${2##*/}.running" ]
+`
+
+const sandboxPkill = `#!/bin/sh
+[ "$#" -eq 3 ] && [ "$1" = "-9" ] && [ "$2" = "-f" ] || exit 90
+case "$3" in
+    "$SANDBOX_ROOT"/opt/vpn-director/*) ;;
+    *) exit 91 ;;
+esac
+printf '%s kill\n' "${3##*/}" >> "$CALLS_FILE"
+/bin/rm -f "$STATE_DIR/${3##*/}.running"
+`
+
+const sandboxMonit = `#!/bin/sh
+printf 'monit %s %s\n' "$1" "$2" >> "$CALLS_FILE"
+case "$1" in
+    monitor) : > "$STATE_DIR/$2.monitored" ;;
+    unmonitor) /bin/rm -f "$STATE_DIR/$2.monitored" ;;
+    *) exit 90 ;;
+esac
+`
+
+const sandboxFault = `#!/bin/sh
+fail_once() {
+    if [ ! -e "$STATE_DIR/fault" ]; then
+        : > "$STATE_DIR/fault"
+        printf 'FAIL %s\n' "$FAIL_AT" >> "$CALLS_FILE"
+        exit 71
+    fi
+}
+op="${0##*/}"
+case "$op:$FAIL_AT" in
+    cp:before-copy) [ "${2-}" != "$FILES_DIR/opt/vpn-director/vpn-director.sh" ] || fail_once ;;
+    cp:copy-new) [ "${2-}" != "$FILES_DIR/vpn-director-watchd" ] || fail_once ;;
+    chmod:permissions) [ "${2-}" != "$SANDBOX_ROOT/opt/vpn-director/vpn-director-watchd" ] || fail_once ;;
+    rm:after-copy) [ "${1-}" != "-rf" ] || [ "${2-}" != "$FILES_DIR" ] || fail_once ;;
+    rm:late-lock) [ "${1-}" != "-f" ] || [ "${2-}" != "$LOCK_FILE" ] || fail_once ;;
+    cat:notify) [ ! -e "$STATE_DIR/vpn-director-watchd.running" ] || fail_once ;;
+esac
+exec "/bin/$op" "$@"
+`
