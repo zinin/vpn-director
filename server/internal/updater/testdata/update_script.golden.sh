@@ -34,6 +34,8 @@ RUNNING_INITS=""
 START_INITS=""
 NEW_INITS=""
 STARTED_NEW_INITS=""
+NEW_BINARIES=""
+TOUCHED_NEW_BINARIES=""
 
 # Whether fd 9 (the vpn-director lock) is open. Read by release_apply_lock,
 # which the EXIT trap calls, so it must exist before anything can fail.
@@ -108,6 +110,69 @@ stop_new() {
     STARTED_NEW_INITS=""
 }
 
+# Cleanup refusal must remain visible even when update.log is gone.
+first_copy_error() {
+    log "ERROR: first-install cleanup incomplete for $1: $2; manual recovery required"
+    printf 'ERROR: first-install cleanup incomplete for %s: %s; manual recovery required\n' "$1" "$2" >&2
+}
+
+# A kill may take a moment to become visible to pgrep; wait at most five seconds.
+first_copy_stopped() {
+    first_waited=0
+    while :; do
+        if pgrep -f "$1" >/dev/null 2>&1; then
+            if [ "$first_waited" -ge 5 ]; then
+                first_copy_error "$1" "daemon still running"
+                return 1
+            fi
+            if ! sleep 1; then
+                first_copy_error "$1" "cannot wait for daemon exit"
+                return 1
+            fi
+            first_waited=$((first_waited + 1))
+        else
+            first_status=$?
+            [ "$first_status" -eq 1 ] && return 0
+            first_copy_error "$1" "cannot confirm daemon exit"
+            return 1
+        fi
+    done
+}
+
+# Undo only reached first binary copies, never existing binaries or init scripts.
+discard_first_copies() {
+    first_cleanup_rc=0
+    for first_entry in $DAEMONS; do
+        first_rest="${first_entry#*|}"
+        first_bin="${first_rest%%|*}"
+        for first_absent in $NEW_BINARIES; do
+            [ "$first_absent" = "$first_bin" ] || continue
+            for first_touched in $TOUCHED_NEW_BINARIES; do
+                [ "$first_touched" = "$first_bin" ] || continue
+                if ! first_copy_stopped "$first_bin"; then
+                    first_cleanup_rc=1
+                elif [ -L "$first_bin" ] || { [ -e "$first_bin" ] && [ ! -f "$first_bin" ]; }; then
+                    first_copy_error "$first_bin" "destination is not an owned regular binary"
+                    first_cleanup_rc=1
+                elif rm -f "$first_bin"; then
+                    if [ -e "$first_bin" ] || [ -L "$first_bin" ]; then
+                        first_copy_error "$first_bin" "destination remains after unlink"
+                        first_cleanup_rc=1
+                    else
+                        log "Removed unfinished first binary copy $first_bin"
+                    fi
+                else
+                    first_copy_error "$first_bin" "unlink failed"
+                    first_cleanup_rc=1
+                fi
+                break
+            done
+            break
+        done
+    done
+    return "$first_cleanup_rc"
+}
+
 # The bot reads notify.json on startup and, on status=ok, deletes the whole
 # update directory. Start everyone else first, commit the terminal status,
 # then start the bot so it cannot announce success while Web UI is still down.
@@ -179,8 +244,9 @@ on_exit() {
         exit 0
     fi
     log "ERROR: update failed with exit code $code"
-    release_apply_lock
     stop_new
+    discard_first_copies || log "ERROR: first-install cleanup incomplete; manual recovery required"
+    release_apply_lock
     # Before the daemons come back: the bot reads notify.json once, on
     # startup. Started first, it finds no file, and there is no second look in
     # a running process - the failure would stay unreported until the next
@@ -230,8 +296,12 @@ for entry in $DAEMONS; do
     if pgrep -f "$bin" >/dev/null 2>&1; then
         RUNNING_INITS="$RUNNING_INITS $init"
         log "$name is running"
-    elif [ ! -e "$bin" ]; then
+    elif [ "$?" -ne 1 ]; then
+        log "ERROR: cannot determine whether $name is running"
+        exit 1
+    elif [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
         NEW_INITS="$NEW_INITS $init"
+        NEW_BINARIES="$NEW_BINARIES $bin"
         log "$name is new, it starts after the update"
     else
         log "$name is not running, it stays stopped after the update"
@@ -302,7 +372,15 @@ for entry in $FILES; do
 done
 for entry in $DAEMONS; do
     rest="${entry#*|}"
-    cp -f "$FILES_DIR/${entry%%|*}" "${rest%%|*}"
+    bin="${rest%%|*}"
+    for absent_bin in $NEW_BINARIES; do
+        if [ "$absent_bin" = "$bin" ]; then
+            # A failing cp may already have created a partial destination.
+            TOUCHED_NEW_BINARIES="$TOUCHED_NEW_BINARIES $bin"
+            break
+        fi
+    done
+    cp -f "$FILES_DIR/${entry%%|*}" "$bin"
 done
 
 # 5. Set permissions of the daemon binaries (script files got theirs above)

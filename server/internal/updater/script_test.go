@@ -943,7 +943,7 @@ func TestGenerateScript_StartsADaemonNewWithTheRelease(t *testing.T) {
 	}
 	steps := afterOnExit(t, script)
 
-	record := strings.Index(steps, `elif [ ! -e "$bin" ]; then`)
+	record := strings.Index(steps, `elif [ ! -e "$bin" ] && [ ! -L "$bin" ]; then`)
 	copyFiles := strings.Index(steps, "# 4. Copy files")
 	join := strings.Index(steps, `START_INITS="$RUNNING_INITS$NEW_INITS"`)
 	start := strings.Index(steps, `if ! start_except "$NOTIFY_INIT"; then`)
@@ -1238,3 +1238,500 @@ case "$op:$FAIL_AT" in
 esac
 exec "/bin/$op" "$@"
 `
+
+func TestGenerateScript_FirstInstallationSurvivesAFailedAttempt(t *testing.T) {
+	tests := []struct {
+		name    string
+		failure string
+		mode    string
+		options firstInstallOptions
+	}{
+		{name: "partial new binary copy", failure: "partial-copy"},
+		{name: "binary chmod", failure: "permissions"},
+		{name: "after successful copy", failure: "after-copy"},
+		{name: "init spawned before failure", failure: "vpn-director-watchd-start"},
+		{name: "notify after new start", failure: "notify"},
+		{name: "bot start after new start", failure: "telegram-bot-start"},
+		{name: "late failure after remonitor", failure: "late-lock"},
+		{name: "all new and webui start fails", failure: "webui-start", options: firstInstallOptions{allNew: true}},
+		{name: "exit observed after kill", failure: "vpn-director-watchd-start", mode: "delayed-exit"},
+		{name: "existing stopped watchd", failure: "permissions", options: firstInstallOptions{watchdExists: true}},
+		{name: "another existing stopped daemon", failure: "after-copy", options: firstInstallOptions{webuiStopped: true}},
+		{name: "existing dangling symlink", failure: "after-copy", options: firstInstallOptions{danglingWatchd: true}},
+		{name: "dangling symlink on success", options: firstInstallOptions{danglingWatchd: true}},
+		{name: "copy never reached", failure: "before-copy"},
+		{name: "old binary copy fails before new copy", failure: "copy-old"},
+		{name: "running daemon with absent binary", failure: "after-copy", options: firstInstallOptions{missingRunningBot: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newFirstInstallSandbox(t, tt.options)
+			first := s.run(tt.failure, tt.mode)
+			fault := strings.Index(first.calls, "FAIL "+tt.failure+"\n")
+			if tt.failure != "" {
+				if fault < 0 {
+					t.Fatal("first attempt did not reach the injected failure")
+				}
+				for _, name := range s.originalRunning {
+					if !strings.Contains(first.calls[fault:], name+" start\n") {
+						t.Errorf("failure recovery did not restart original daemon %s", name)
+					}
+				}
+				for _, name := range s.newDaemons {
+					if strings.Contains(first.calls[fault:], name+" start\n") {
+						t.Errorf("failure recovery started new daemon %s", name)
+					}
+				}
+			}
+			for _, name := range []string{DaemonBot, DaemonWatchd, DaemonWebUI} {
+				wantRunning := s.contains(s.originalRunning, name) || (tt.failure == "" && s.contains(s.newDaemons, name))
+				s.assertState(name, wantRunning)
+				if !s.contains(s.newDaemons, name) {
+					if _, err := os.Lstat(s.binary(name)); err != nil {
+						t.Errorf("pre-existing or original-running binary %s disappeared: %v", name, err)
+					}
+					if strings.Contains(first.calls, "unlink "+name+"\n") {
+						t.Errorf("cleanup tried to unlink unowned binary %s", name)
+					}
+				} else if tt.failure != "" {
+					if _, err := os.Lstat(s.binary(name)); !os.IsNotExist(err) {
+						t.Errorf("failed first installation left %s present: %v", name, err)
+					}
+				}
+			}
+			if tt.failure == "before-copy" || tt.failure == "copy-old" {
+				if strings.Contains(first.calls, "unlink "+DaemonWatchd+"\n") {
+					t.Error("cleanup acquired ownership without reaching the new binary copy")
+				}
+			} else if tt.failure != "" && s.contains(s.newDaemons, DaemonWatchd) {
+				unlink := strings.Index(first.calls, "unlink "+DaemonWatchd+"\n")
+				release := strings.Index(first.calls, "update lock released\n")
+				if unlink < fault || release < unlink {
+					t.Errorf("owned first copy must be removed after failure and before lock release: fault=%d unlink=%d release=%d", fault, unlink, release)
+				}
+				for _, name := range s.originalRunning {
+					if restart := strings.Index(first.calls[fault:], name+" start\n"); restart >= 0 && fault+restart < unlink {
+						t.Errorf("original daemon %s restarted before owned first-copy cleanup", name)
+					}
+				}
+			}
+			if strings.Contains(first.log, "manual recovery required") {
+				t.Error("safe first-copy cleanup was reported as incomplete")
+			}
+			if tt.mode == "delayed-exit" && strings.Count(first.calls, "exit wait\n") != 2 {
+				t.Errorf("cleanup did not observe delayed exit: %s", first.calls)
+			}
+			if tt.options.danglingWatchd {
+				s.assertDanglingLinkPreserved()
+			}
+			s.assertIndependentFiles()
+
+			// Only payload and fault controls are reset; installed files and daemon state persist.
+			retry := s.run("", "")
+			watchdNew := s.contains(s.newDaemons, DaemonWatchd)
+			if got := strings.Count(retry.calls, DaemonWatchd+" start\n"); got != map[bool]int{false: 0, true: 1}[watchdNew] {
+				t.Errorf("retry starts watchd %d times, new = %v", got, watchdNew)
+			}
+			if watchdNew {
+				start := strings.Index(retry.calls, DaemonWatchd+" start\n")
+				bot := strings.Index(retry.calls, DaemonBot+" start\n")
+				monitor := strings.Index(retry.calls, "monit monitor "+DaemonWatchd+"\n")
+				if start < 0 || bot < start || monitor < bot {
+					t.Errorf("retry must start watchd once before bot, then remonitor: %s", retry.calls)
+				}
+			}
+			for _, name := range []string{DaemonBot, DaemonWatchd, DaemonWebUI} {
+				wantRunning := s.contains(s.originalRunning, name) || s.contains(s.newDaemons, name)
+				s.assertState(name, wantRunning)
+				if !wantRunning && (strings.Contains(first.calls, name+" start\n") || strings.Contains(retry.calls, name+" start\n")) {
+					t.Errorf("an existing stopped daemon %s was started", name)
+				}
+				data, err := os.ReadFile(s.binary(name))
+				if err != nil || string(data) != "new "+name+"\n" {
+					t.Errorf("retry installed %s = %q, error = %v", name, data, err)
+				}
+				info, err := os.Stat(s.binary(name))
+				if err != nil || info.Mode()&0111 == 0 {
+					t.Errorf("retry binary %s is not executable: %v", name, err)
+				}
+			}
+			if tt.options.danglingWatchd {
+				s.assertDanglingLinkPreserved()
+			}
+			s.assertIndependentFiles()
+		})
+	}
+}
+
+func TestGenerateScript_FirstCopyCleanupRefusesUnsafeRemoval(t *testing.T) {
+	for _, mode := range []string{"unlink-fails", "unlink-noop", "live", "lookup-error", "directory", "replacement-symlink"} {
+		t.Run(mode, func(t *testing.T) {
+			s := newFirstInstallSandbox(t, firstInstallOptions{})
+			failure := "after-copy"
+			if mode == "live" || mode == "lookup-error" {
+				failure = "vpn-director-watchd-start"
+			}
+			result := s.run(failure, mode)
+			if !strings.Contains(result.log, "first-install cleanup incomplete") || !strings.Contains(result.out, "manual recovery required") {
+				t.Errorf("refused cleanup needs an explicit diagnostic, not retry-safe success:\nlog=%s\nout=%s", result.log, result.out)
+			}
+			if _, err := os.Lstat(s.binary(DaemonWatchd)); err != nil {
+				t.Errorf("unsafe destination was deleted: %v", err)
+			}
+			if mode != "unlink-fails" && mode != "unlink-noop" && strings.Contains(result.calls, "unlink "+DaemonWatchd+"\n") {
+				t.Error("cleanup attempted an unsafe unlink")
+			}
+			s.assertState(DaemonWatchd, mode == "live")
+			if mode == "live" {
+				if _, err := os.Stat(filepath.Join(s.state, DaemonWatchd+".monitored")); !os.IsNotExist(err) {
+					t.Errorf("live but failed new daemon was remonitored: %v", err)
+				}
+				if waits := strings.Count(result.calls, "exit wait\n"); waits < 1 || waits > 5 {
+					t.Errorf("live cleanup wait is not bounded: %d", waits)
+				}
+			}
+			fault := strings.Index(result.calls, "FAIL "+failure+"\n")
+			for _, name := range s.originalRunning {
+				s.assertState(name, true)
+				if fault < 0 || !strings.Contains(result.calls[fault:], name+" start\n") {
+					t.Errorf("refused cleanup prevented original recovery for %s", name)
+				}
+				if strings.Contains(result.calls, "unlink "+name+"\n") {
+					t.Errorf("refused cleanup touched original binary %s", name)
+				}
+			}
+			if mode == "directory" {
+				data, err := os.ReadFile(filepath.Join(s.binary(DaemonWatchd), "keep"))
+				if err != nil || string(data) != "do not delete\n" {
+					t.Errorf("directory contents changed: %q (%v)", data, err)
+				}
+			}
+			if mode == "replacement-symlink" {
+				link, err := os.Readlink(s.binary(DaemonWatchd))
+				if err != nil || link != filepath.Join(s.root, "independent", "keep") {
+					t.Errorf("replacement symlink changed: %q (%v)", link, err)
+				}
+			}
+			s.assertIndependentFiles()
+		})
+	}
+}
+
+type firstInstallOptions struct {
+	watchdExists      bool
+	webuiStopped      bool
+	danglingWatchd    bool
+	allNew            bool
+	missingRunningBot bool
+}
+
+type firstInstallSandbox struct {
+	t               *testing.T
+	mode            string
+	root            string
+	state           string
+	tools           string
+	calls           string
+	s               *Service
+	originalRunning []string
+	newDaemons      []string
+}
+
+type firstInstallResult struct{ calls, out, log string }
+
+func newFirstInstallSandbox(t *testing.T, opts firstInstallOptions) *firstInstallSandbox {
+	t.Helper()
+	s := &firstInstallSandbox{t: t, root: t.TempDir()}
+	s.state = filepath.Join(s.root, "state")
+	s.tools = filepath.Join(s.root, "tools")
+	s.calls = filepath.Join(s.root, "calls")
+	s.s = &Service{updateDir: filepath.Join(s.root, "update"), platform: "merlin"}
+	if err := os.MkdirAll(s.state, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{DaemonBot, DaemonWatchd, DaemonWebUI} {
+		exists := name != DaemonWatchd || opts.watchdExists || opts.danglingWatchd
+		running := name != DaemonWatchd && !(name == DaemonWebUI && opts.webuiStopped)
+		if opts.allNew {
+			exists, running = false, false
+		}
+		if name == DaemonBot && opts.missingRunningBot {
+			exists = false
+		}
+		if exists {
+			s.write(s.binary(name), "old "+name+"\n", 0755)
+		}
+		if running {
+			s.write(filepath.Join(s.state, name+".running"), "", 0644)
+			s.write(filepath.Join(s.state, name+".monitored"), "", 0644)
+			s.originalRunning = append(s.originalRunning, name)
+		} else if !exists {
+			s.newDaemons = append(s.newDaemons, name)
+		}
+	}
+	s.write(filepath.Join(s.root, "independent", "keep"), "do not delete\n", 0644)
+	if opts.danglingWatchd {
+		if err := os.Remove(s.binary(DaemonWatchd)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(filepath.Join(s.root, "independent", "dangling"), s.binary(DaemonWatchd)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, d := range Daemons {
+		body := strings.Replace(sandboxInit, "    stop)\n", "    stop)\n        if [ \"$name\" = \"vpn-director-watchd\" ] && { [ \"$CLEANUP_MODE\" = \"live\" ] || [ \"$CLEANUP_MODE\" = \"delayed-exit\" ]; }; then exit 72; fi\n", 1)
+		s.write(filepath.Join(s.root, "opt/etc/init.d", d.InitScript), "#!/bin/sh\nname="+d.Name+"\n"+body, 0755)
+	}
+	s.write(filepath.Join(s.tools, "pgrep"), strings.Replace(sandboxPgrep, `[ -f "$STATE_DIR/${2##*/}.running" ]`, firstCopyPgrep, 1), 0755)
+	s.write(filepath.Join(s.tools, "pkill"), strings.Replace(sandboxPkill, `/bin/rm -f "$STATE_DIR/${3##*/}.running"`, firstCopyPkill, 1), 0755)
+	s.write(filepath.Join(s.tools, "monit"), sandboxMonit, 0755)
+	fault := strings.Replace(sandboxFault, "op=\"${0##*/}\"\n", "op=\"${0##*/}\"\n"+firstCopyBeforeFault, 1)
+	fault = strings.Replace(fault, `exec "/bin/$op" "$@"`, firstCopyAfterFault+`exec "/bin/$op" "$@"`, 1)
+	for _, op := range []string{"cp", "chmod", "rm", "cat"} {
+		s.write(filepath.Join(s.tools, op), fault, 0755)
+	}
+	s.write(filepath.Join(s.tools, "sleep"), "#!/bin/sh\nprintf 'exit wait\\n' >> \"$CALLS_FILE\"\nexec /bin/sleep 0\n", 0755)
+	return s
+}
+
+func (s *firstInstallSandbox) write(path, body string, mode os.FileMode) {
+	s.t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		s.t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), mode); err != nil {
+		s.t.Fatal(err)
+	}
+}
+
+func (s *firstInstallSandbox) binary(name string) string {
+	return filepath.Join(s.root, "opt/vpn-director", name)
+}
+
+func (s *firstInstallSandbox) contains(names []string, name string) bool {
+	for _, n := range names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *firstInstallSandbox) assertState(name string, running bool) {
+	s.t.Helper()
+	for _, suffix := range []string{".running", ".monitored"} {
+		_, err := os.Stat(filepath.Join(s.state, name+suffix))
+		if err != nil && !os.IsNotExist(err) {
+			s.t.Fatal(err)
+		}
+		want := running
+		if suffix == ".monitored" {
+			want = running && !(name == DaemonWatchd && s.mode == "live")
+		}
+		if got := err == nil; got != want {
+			s.t.Errorf("%s%s present = %v, want %v", name, suffix, got, want)
+		}
+	}
+}
+
+func (s *firstInstallSandbox) assertDanglingLinkPreserved() {
+	s.t.Helper()
+	link, err := os.Readlink(s.binary(DaemonWatchd))
+	if err != nil || link != filepath.Join(s.root, "independent", "dangling") {
+		s.t.Errorf("pre-existing symlink changed: %q (%v)", link, err)
+	}
+}
+
+func (s *firstInstallSandbox) assertIndependentFiles() {
+	s.t.Helper()
+	data, err := os.ReadFile(filepath.Join(s.root, "independent", "keep"))
+	if err != nil || string(data) != "do not delete\n" {
+		s.t.Errorf("payload-independent file changed: %q (%v)", data, err)
+	}
+	for _, d := range Daemons {
+		if _, err := os.Stat(filepath.Join(s.root, "opt/etc/init.d", d.InitScript)); err != nil {
+			s.t.Errorf("init script %s was removed: %v", d.InitScript, err)
+		}
+	}
+}
+
+func (s *firstInstallSandbox) run(failure, mode string) firstInstallResult {
+	s.t.Helper()
+	if err := os.RemoveAll(s.s.getFilesDir()); err != nil {
+		s.t.Fatal(err)
+	}
+	writeTestManifest(s.t, s.s)
+	script, err := s.s.generateScript(validOpts())
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	table := regexp.MustCompile(`(?m)^FILES="([^"]*)"$`).FindStringSubmatch(script)
+	if table == nil {
+		s.t.Fatal("generated script has no FILES table")
+	}
+	for _, entry := range strings.Fields(table[1]) {
+		src := strings.Split(entry, "|")[0]
+		body := "payload\n"
+		for _, d := range Daemons {
+			if filepath.Base(src) == d.InitScript {
+				data, err := os.ReadFile(filepath.Join(s.root, "opt/etc/init.d", d.InitScript))
+				if err != nil {
+					s.t.Fatal(err)
+				}
+				body = string(data)
+			}
+		}
+		s.write(filepath.Join(s.s.getFilesDir(), src), body, 0644)
+	}
+	for _, d := range Daemons {
+		s.write(filepath.Join(s.s.getFilesDir(), d.Name), "new "+d.Name+"\n", 0644)
+	}
+	if err := os.Remove(filepath.Join(s.state, "fault")); err != nil && !os.IsNotExist(err) {
+		s.t.Fatal(err)
+	}
+	s.mode = mode
+	s.write(s.calls, "", 0644)
+	script = regexp.MustCompile(`(?m)^PATH=.*$`).ReplaceAllString(script, "PATH="+s.tools+":/usr/bin:/bin")
+	for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock"} {
+		script = strings.ReplaceAll(script, prefix, s.root+prefix)
+	}
+	if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock)(/|\b)`).MatchString(script) {
+		s.t.Fatal("unrehomed router path in same-tree sandbox script")
+	}
+	path := filepath.Join(s.root, "update.sh")
+	s.write(path, script, 0644)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", path)
+	cmd.Dir = s.root
+	cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+s.root, "STATE_DIR="+s.state,
+		"FILES_DIR="+s.s.getFilesDir(), "LOCK_FILE="+filepath.Join(s.s.getUpdateDir(), "lock"),
+		"CALLS_FILE="+s.calls, "FAIL_AT="+failure, "STOP_NEW_FAIL=0", "CLEANUP_MODE="+mode)
+	cmd.WaitDelay = time.Second
+	out, runErr := cmd.CombinedOutput()
+	if ctx.Err() != nil {
+		s.t.Fatalf("same-tree sandbox exceeded deadline: %v\n%s", ctx.Err(), out)
+	}
+	if (runErr != nil) != (failure != "") {
+		s.t.Errorf("attempt failure=%q error=%v\n%s", failure, runErr, out)
+	}
+	data, err := os.ReadFile(filepath.Join(s.s.getUpdateDir(), "notify.json"))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	var notify struct{ Status string }
+	want := "ok"
+	if failure != "" {
+		want = "failed"
+	}
+	if err := json.Unmarshal(data, &notify); err != nil || notify.Status != want {
+		s.t.Errorf("notify=%s error=%v, want %s", data, err, want)
+	}
+	if _, err := os.Stat(filepath.Join(s.s.getUpdateDir(), "lock")); !os.IsNotExist(err) {
+		s.t.Errorf("attempt did not release update lock: %v", err)
+	}
+	calls, err := os.ReadFile(s.calls)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	log, err := os.ReadFile(filepath.Join(s.s.getUpdateDir(), "update.log"))
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	s.t.Logf("failure=%q mode=%q calls:\n%s\noutput:\n%s", failure, mode, calls, out)
+	return firstInstallResult{calls: string(calls), out: string(out), log: string(log)}
+}
+
+const firstCopyPgrep = `if [ "${2##*/}" = "vpn-director-watchd" ] && [ "$CLEANUP_MODE" = "discovery-error" ]; then
+    if [ ! -e "$STATE_DIR/fault" ]; then
+        : > "$STATE_DIR/fault"
+        printf 'FAIL discovery-error\n' >> "$CALLS_FILE"
+    fi
+    exit 2
+fi
+if [ "${2##*/}" = "vpn-director-watchd" ] && [ -e "$STATE_DIR/fault" ]; then
+    if [ "$CLEANUP_MODE" = "lookup-error" ]; then exit 2; fi
+    if [ "$CLEANUP_MODE" = "delayed-exit" ] && [ -e "$STATE_DIR/kill-pending" ]; then
+        left=$(/bin/cat "$STATE_DIR/kill-pending")
+        if [ "$left" -eq 0 ]; then
+            /bin/rm -f "$STATE_DIR/kill-pending" "$STATE_DIR/vpn-director-watchd.running"
+        else
+            printf '%s\n' "$((left - 1))" > "$STATE_DIR/kill-pending"
+        fi
+    fi
+fi
+[ -f "$STATE_DIR/${2##*/}.running" ]`
+
+const firstCopyPkill = `if [ "${3##*/}" = "vpn-director-watchd" ]; then
+    if [ "$CLEANUP_MODE" = "live" ]; then exit 1; fi
+    if [ "$CLEANUP_MODE" = "delayed-exit" ]; then
+        printf '2\n' > "$STATE_DIR/kill-pending"
+        exit 0
+    fi
+fi
+/bin/rm -f "$STATE_DIR/${3##*/}.running"`
+
+const firstCopyBeforeFault = `if [ "$op" = "cp" ]; then
+    case "${3-}" in
+        "$SANDBOX_ROOT"/opt/vpn-director/telegram-bot|"$SANDBOX_ROOT"/opt/vpn-director/vpn-director-watchd|"$SANDBOX_ROOT"/opt/vpn-director/webui)
+            printf 'copy %s\n' "${3##*/}" >> "$CALLS_FILE"
+            ;;
+    esac
+    if [ "$FAIL_AT" = "partial-copy" ] && [ "${3-}" = "$SANDBOX_ROOT/opt/vpn-director/vpn-director-watchd" ] && [ ! -e "$STATE_DIR/fault" ]; then
+        printf 'partial binary\n' > "$3"
+        fail_once
+    fi
+    if [ "$FAIL_AT" = "copy-old" ] && [ "${3-}" = "$SANDBOX_ROOT/opt/vpn-director/telegram-bot" ]; then fail_once; fi
+fi
+`
+
+const firstCopyAfterFault = `if [ "$op" = "cp" ] && [ "${3-}" = "$SANDBOX_ROOT/opt/vpn-director/vpn-director-watchd" ]; then
+    if [ -L "$3" ]; then
+        /bin/cat "$2" > "$3" || exit 74
+    else
+        /bin/cp "$@" || exit 74
+    fi
+    if [ "$CLEANUP_MODE" = "directory" ]; then
+        /bin/rm -f "$3"
+        /bin/mkdir -p "$3"
+        printf 'do not delete\n' > "$3/keep"
+    elif [ "$CLEANUP_MODE" = "replacement-symlink" ]; then
+        /bin/rm -f "$3"
+        /bin/ln -s "$SANDBOX_ROOT/independent/keep" "$3"
+    fi
+    exit 0
+fi
+if [ "$op" = "rm" ] && [ "${1-}" = "-f" ]; then
+    case "${2-}" in
+        "$SANDBOX_ROOT"/opt/vpn-director/telegram-bot|"$SANDBOX_ROOT"/opt/vpn-director/vpn-director-watchd|"$SANDBOX_ROOT"/opt/vpn-director/webui)
+            printf 'unlink %s\n' "${2##*/}" >> "$CALLS_FILE"
+            if [ "$CLEANUP_MODE" = "unlink-fails" ]; then exit 73; fi
+            if [ "$CLEANUP_MODE" = "unlink-noop" ]; then exit 0; fi
+            ;;
+    esac
+    if [ "${2-}" = "$LOCK_FILE" ]; then
+        /bin/rm "$@" || exit 73
+        printf 'update lock released\n' >> "$CALLS_FILE"
+        exit 0
+    fi
+fi
+`
+
+func TestGenerateScript_FirstCopyDiscoveryNeedsRunningEvidence(t *testing.T) {
+	s := newFirstInstallSandbox(t, firstInstallOptions{})
+	result := s.run("discovery-error", "discovery-error")
+	if !strings.Contains(result.log, "cannot determine whether vpn-director-watchd is running") {
+		t.Errorf("unknown running state was treated as first-copy ownership: %s", result.log)
+	}
+	if strings.Contains(result.calls, "copy ") || strings.Contains(result.calls, "unlink ") {
+		t.Errorf("unknown running state must refuse before copying or unlinking: %s", result.calls)
+	}
+	if _, err := os.Lstat(s.binary(DaemonWatchd)); !os.IsNotExist(err) {
+		t.Errorf("unknown ownership created a binary: %v", err)
+	}
+	for _, name := range s.originalRunning {
+		s.assertState(name, true)
+	}
+	s.assertState(DaemonWatchd, false)
+	s.assertIndependentFiles()
+}
