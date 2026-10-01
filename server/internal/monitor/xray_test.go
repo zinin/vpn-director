@@ -577,9 +577,20 @@ func readHelperIdentityWith(pid int, readFile func(string) ([]byte, error), read
 	}
 	id.Exe, err = readlink(fmt.Sprintf("/proc/%d/exe", pid))
 	if errors.Is(err, os.ErrNotExist) {
-		terminated, statErr := readHelperStat(pid, readFile)
-		if statErr == nil && terminated.Started == id.Started && (terminated.State == "Z" || terminated.State == "X") {
-			return terminated, nil
+		// The executable can disappear before stat reports termination.
+		deadline := time.Now().Add(100 * time.Millisecond)
+		for {
+			terminated, statErr := readHelperStat(pid, readFile)
+			if statErr != nil || terminated.Started != id.Started {
+				break
+			}
+			if terminated.State == "Z" || terminated.State == "X" {
+				return terminated, nil
+			}
+			if !time.Now().Before(deadline) {
+				break
+			}
+			time.Sleep(time.Millisecond)
 		}
 	}
 	return id, err
@@ -1333,6 +1344,40 @@ func cleanupParentGroup(parent *exec.Cmd, parentDone <-chan struct{}, report *he
 			return errors.New("cleanup did not reap the owned process group")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestHelperIdentity_MissingExeObservationIsBounded(t *testing.T) {
+	started := time.Now()
+	id, err := readHelperIdentityWith(123, func(string) ([]byte, error) {
+		return []byte("123 (probe) R 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 42"), nil
+	}, func(string) (string, error) { return "", os.ErrNotExist })
+	if err == nil || id.State == "Z" || id.State == "X" {
+		t.Fatalf("running process was accepted as terminated: id=%+v err=%v", id, err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("identity observation exceeded its bound: %s", elapsed)
+	}
+}
+
+func TestHelperIdentity_ExeDisappearanceWaitsForTheSameExit(t *testing.T) {
+	stat := func(state string) []byte {
+		return []byte("123 (probe) " + state + " 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 42")
+	}
+	for _, state := range []string{"Z", "X"} {
+		t.Run(state, func(t *testing.T) {
+			reads := 0
+			id, err := readHelperIdentityWith(123, func(string) ([]byte, error) {
+				reads++
+				if reads < 4 {
+					return stat("R"), nil
+				}
+				return stat(state), nil
+			}, func(string) (string, error) { return "", os.ErrNotExist })
+			if err != nil || id.PID != 123 || id.Started != "42" || id.State != state || reads != 4 {
+				t.Fatalf("exit transition not observed: id=%+v err=%v reads=%d", id, err, reads)
+			}
+		})
 	}
 }
 
