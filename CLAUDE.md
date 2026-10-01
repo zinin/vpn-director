@@ -34,11 +34,14 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 ```bash
 # Build (from the repository root)
 make build-webui         # Vue SPA -> go:embed -> webui binary
-make build-all           # both daemons for arm64 and arm
+make build-all           # all three daemons for arm64, arm and mipsle
 make -C server test      # Go tests
 
 # Web UI in development: plain HTTP, testdata/dev paths, mock shell, admin/admin
 cd server && go run ./cmd/webui --dev
+
+# Server monitor in development: testdata/dev paths, a fake prober, socket testdata/dev/watchd.sock
+cd server && go run ./cmd/watchd --dev
 ```
 
 ## Architecture
@@ -72,6 +75,11 @@ cd server && go run ./cmd/webui --dev
 | `install.sh` | Interactive installer |
 | `server/cmd/bot/main.go` | Telegram bot daemon: DI, signal handling |
 | `server/cmd/webui/main.go` | Web UI daemon: HTTPS server, DI, dev mode |
+| `server/cmd/watchd/main.go` | Server monitor daemon (`vpn-director-watchd`): checks every subscription server, serves the result on a unix socket |
+| `server/internal/monitor/` | The monitor's engine: endpoint set, prober (a second Xray run as `vpn-director-probe`), schedule, WAN guard, state file |
+| `server/internal/watchdapi/` | The socket contract between `vpn-director-watchd` and the other daemons: types, `Health`, server, client |
+| `server/internal/endpoint/` | One address of one server as the walk dials it: `PerAddress`, `ServerForDial`, `DialKey`, the monitor's `Key` |
+| `router/opt/etc/init.d/S98vpn-director-watchd` | Entware init.d script of the server monitor |
 | `server/internal/webapi/` | HTTP API: router, JWT middleware, handlers, response deadlines |
 | `server/internal/subscription/` | Go subscription decoder, the twin of `lib/subscription.sh`; resolution and import summaries |
 | `server/internal/auth/` | Password check against the platform password file, JWT issue and validation |
@@ -122,6 +130,8 @@ cd server && go run ./cmd/webui --dev
 
 **Web UI settings**: the `webui` section of `vpn-director.json` — `port` (8444), `cert_file`, `key_file`, `jwt_secret` (auto-generated when empty), `log_level` (`debug|info|warn|error`).
 
+**Server monitor settings**: the `monitor` section of `vpn-director.json` — `enabled` (true), `interval` (`1m`, a live server's check), `dead_interval_max` (`30m`, the longest pause of a dead one), `concurrency` (8), `log_level`. The daemon rereads it every minute.
+
 ## Shell Conventions
 
 - Shebang: sourced libraries keep `#!/usr/bin/env bash`; a script a router executes
@@ -147,4 +157,5 @@ See `.claude/rules/` for detailed docs:
 - `testing.md` — Bats framework, mocks, fixtures
 - `telegram-bot.md` — Go bot architecture, commands, wizard flow
 - `webui.md` — Web UI architecture, API table, authentication, dev mode, update flow
+- `watchd.md` — server monitor: endpoints, the prober and its name, the schedule, the WAN guard, the socket
 - `entware-init.md` — Entware init system (rc.unslung, rc.func, S* scripts)

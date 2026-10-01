@@ -49,7 +49,7 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET | `/api/ip` | External IP |
 | GET | `/api/version` | Build version and commit |
 | GET | `/api/platform` | `vpn-director.sh platform`: firmware, password file, LAN/WAN interfaces, tunnels; 503 when the script cannot answer |
-| GET | `/api/servers` | The servers grouped by subscription — `subscriptions`, each with `id`, `name` and its `servers`: name, address, port, IPs and the protocol label (`vless·reality`, `ss`, `hysteria2`), no credentials — plus `active`, the recorded server with its `subscription` |
+| GET | `/api/servers` | The servers grouped by subscription — `subscriptions`, each with `id`, `name` and its `servers`: name, address, port, IPs, the protocol label (`vless·reality`, `ss`, `hysteria2`) and the `fingerprint` that matches the server with its row of `/api/monitor`, no credentials — plus `active`, the recorded server with its `subscription` |
 | POST | `/api/servers/active` | Select the active server: `subscription`, the `index` within it, and the `name`, `address` and `port` the page showed there; 409 "server list changed" when the subscription is gone or has another server at that index |
 | GET | `/api/subscriptions` | Every subscription: `id`, `name`, `host`, `static`, `servers` (the count), `added`, `refreshed`, `error`. No link |
 | POST | `/api/subscriptions` | Add `{url, name?}`; a saved link is refreshed instead, and renamed when a free name is given. A body over 1 MiB is refused; the answer carries `count`, `total`, `skipped` by reason, `dns_errors` and the `summary` the page shows, plus `id`, `name` and `existed` |
@@ -61,7 +61,9 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | POST | `/api/clients/route` | Move a client: `{ip, route}`, the route checked as for an add (the 400 for an address Tunnel Director cannot carry included); one config update (`vpnconfig.MoveClient`) and one apply; 404 when no route holds the address, 200 with no write and no apply when the route already holds it alone |
 | GET/POST | `/api/excludes/sets` | Country exclusion sets |
 | GET/POST/DELETE | `/api/excludes/ips` | Excluded IPs and CIDRs |
-| GET | `/api/logs` | One source (`?source=`) or every source at once |
+| GET | `/api/monitor` | The server monitor (`watchd.md`): `state` (`not_running` when `vpn-director-watchd` does not answer), `message`, `interval_seconds`, `lag_seconds`, and per subscription `id`, `alive`, `total` and its servers in list order: `index`, `fingerprint`, `status`, `latency_ms`, `checked_at`, `since`, `next_at`, `error` |
+| POST | `/api/monitor/check` | Check one server now - `{subscription, index, fingerprint}`, every address of it - or `{}` for every server; 409 "server list changed" when the fingerprint at that index is another server's, 409 while the monitor is stopped or disabled, 503 when the daemon does not answer |
+| GET | `/api/logs` | One source (`?source=`: `bot`, `vpn`, `xray`, `webui`, `watchd`) or every source at once |
 | GET | `/api/config` | `vpn-director.json` with `jwt_secret` blanked — subscription links live in their own files |
 | GET | `/api/update/check` | Latest release; `?force=1` pierces the 30-minute cache |
 | POST | `/api/update` | Starts the unified update, answers 202 |
@@ -118,7 +120,7 @@ rename and a recorded error change no address and recompute nothing), through
 `RenameSubscription` and `DeleteSubscription` — the functions the bot's
 `/import` and `/subs` call too — because a subscription file takes no lock of
 its own and `Deps.OpMutex` does not reach the bot or the subscription watch.
-Every reader of the files — both daemons, the watch, `configure.sh` and
+Every reader of the files — all three daemons, the watch, `configure.sh` and
 `import_server_list.sh` — skips with a warning a file that is broken or whose
 id is not its name, and ignores a file not named `<id>.json`, a temp or backup
 file among them, so that no reader fails because of one. A refresh publishes
@@ -187,7 +189,7 @@ switches nothing, and the Servers tab reloads the list.
 - The file paths in `vpn-director.json` — `data_dir`, `webui.cert_file`,
   `webui.key_file` — are read against **the config file's own directory** when
   they are relative (`paths.Resolve`). They cannot be read against the working
-  directory: outside dev mode both daemons move to `/` at startup, and before
+  directory: outside dev mode all three daemons move to `/` at startup, and before
   that the directory was whatever the launcher had. Everything the project
   writes is absolute anyway; the rule is what a hand-edited relative value
   means.

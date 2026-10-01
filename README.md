@@ -139,7 +139,7 @@ A self-signed TLS certificate is generated automatically during installation. Yo
 | **Servers** | Subscriptions (add, refresh, rename, delete) and their Xray servers, switch active server |
 | **Clients** | LAN client routing: add, change the route in place, pause/resume, delete |
 | **Exclusions** | Country and IP/CIDR exclusion lists |
-| **Logs** | Log viewer (bot, vpn, xray, webui) |
+| **Logs** | Log viewer (bot, vpn, xray, webui, watchd) |
 | **Settings** | Version, self-update, configuration |
 
 ### Configuration
@@ -170,13 +170,13 @@ Web UI settings are in `/opt/vpn-director/vpn-director.json` under the `webui` s
 
 ### Updates
 
-The **Settings** tab shows the running version, the latest GitHub release and its changelog. «Update to vX» downloads the release and updates both the Web UI and the Telegram bot, restarting the ones that were running; the page polls for the new version and reloads itself when it comes up. The login session survives the update.
+The **Settings** tab shows the running version, the latest GitHub release and its changelog. «Update to vX» downloads the release and updates every daemon — the Web UI, the Telegram bot and the server monitor — restarting the ones that were running and starting one the release adds; the page polls for the new version and reloads itself when it comes up. The login session survives the update.
 
-An update started from the Web UI is announced in Telegram to every active chat. `/update` in the bot does the same thing from the other side — both paths update both daemons.
+An update started from the Web UI is announced in Telegram to every active chat. `/update` in the bot does the same thing from the other side — both paths update every daemon.
 
 Updates are authenticated by TLS to github.com and nothing else — there is no signature and no checksum on the binaries or the scripts, and they are installed and run as root. This is the same trust model as the `curl … | bash` install command above; anyone who can publish a release to this repository can run code on your router.
 
-> Upgrading **to** the first release with the unified updater is still done by the old bot-only updater, which does not know about the Web UI. Re-run the [Quick Install](#quick-install) command once after that upgrade; every later update handles both.
+> Upgrading **to** the first release with the unified updater is still done by the old bot-only updater, which does not know about the Web UI. Re-run the [Quick Install](#quick-install) command once after that upgrade; every later update handles every daemon.
 
 > **Upgrading from v0.11.x or earlier.** The updater built into those releases downloads a fixed file list without `lib/platform.sh`, so pressing «Update» installs this release incompletely: the shell CLI, the firewall hooks and the daily update stop working (the Xray TPROXY and Tunnel Director rules are no longer re-applied after a firewall restart) until you re-run the [Quick Install](#quick-install) command once. The Web UI and the bot themselves keep running. Every later update reads the release manifest and needs no such step.
 
@@ -207,7 +207,7 @@ Remote management via Telegram with username-based authorization.
 | `/configure` | Configuration wizard |
 | `/restart` | Restart VPN Director |
 | `/stop` | Stop VPN Director |
-| `/logs [bot\|vpn\|xray\|webui\|all] [N]` | Recent logs (default: all, 20 lines) |
+| `/logs [bot\|vpn\|xray\|webui\|watchd\|all] [N]` | Recent logs (default: all, 20 lines) |
 | `/ip` | External IP |
 | `/update` | Update to latest release |
 | `/version` | Bot version |
@@ -219,6 +219,38 @@ The `/configure` command starts a 4-step wizard:
 2. Exclude from proxy (country codes, IPs/CIDRs)
 3. Configure LAN clients with routing (Xray/OpenVPN/WireGuard)
 4. Review and apply
+
+## Server Monitor
+
+`vpn-director-watchd` checks every server of every subscription, once a minute, through a second Xray process of its own — the live Xray and its clients never notice. A check fetches `http://www.gstatic.com/generate_204` through the server; 204 within 10 s is alive. A dead server is checked less and less often: after 2 minutes, then 4, 8, 16, and every 30 minutes at most. When every server fails at once, the monitor asks `1.1.1.1` and `8.8.8.8` whether the WAN is up, and keeps the statuses while it is down.
+
+The Web UI's **Servers** tab shows each server's status and latency, how many of each subscription are alive, and a `↻` to check a server now; the bot marks `/servers` and `/xray` with 🟢 🔴 ⚪ ⛔.
+
+Estimated cost: about 5 KB of traffic per check, so 100 live servers checked every minute take about 0.7 GB a day, 21 GB a month, spread over the subscriptions they belong to. The daemon is estimated to take 10–15 MB of memory, its Xray about 35 MB. On a router with little memory, or subscriptions with a traffic cap, raise `interval` or set `enabled` to false:
+
+```json
+{
+  "monitor": {
+    "enabled": true,
+    "interval": "1m",
+    "dead_interval_max": "30m",
+    "concurrency": 8,
+    "log_level": "info"
+  }
+}
+```
+
+The daemon rereads the section every minute; it logs to `/tmp/vpn-director-watchd.log`.
+
+```bash
+/opt/etc/init.d/S98vpn-director-watchd start
+/opt/etc/init.d/S98vpn-director-watchd stop
+/opt/etc/init.d/S98vpn-director-watchd restart
+```
+
+These are estimates, not router measurements; traffic depends on the protocol and retries. Names sharing the same address and outbound share one check, so the example assumes 100 distinct live endpoints. Stage 1 only reports health; failover stays in the bot's subscription watch.
+
+Router validation is still pending on the RT-AX86U (Merlin, BusyBox 1.25) and Keenetic: memory/CPU with real subscriptions, SOCKS user routing, the long daemon name with `pidof`/`killall` and init start/stop/check, live-Xray isolation through `S24xray` and monit, bytes per check, and the first update that introduces the daemon. If a target cannot route SOCKS users, release compatibility requires the per-endpoint-inbound fallback and fresh validation.
 
 ## How It Works
 
@@ -287,7 +319,7 @@ On Merlin, to enable user scripts: Administration -> System -> Enable JFFS custo
 
 ## Process Monitoring
 
-Xray, Telegram bot, and Web UI may occasionally crash. Use monit for automatic restart.
+Xray, Telegram bot, Web UI, and the server monitor may occasionally crash. Use monit for automatic restart.
 
 ### Setup
 
@@ -321,6 +353,16 @@ Xray, Telegram bot, and Web UI may occasionally crash. Use monit for automatic r
        stop program = "/opt/etc/init.d/S98vpn-director-webui stop"
        if does not exist then restart
    ```
+
+   **vpn-director-watchd:**
+   ```
+   check process vpn-director-watchd matching "vpn-director-watchd"
+       start program = "/opt/etc/init.d/S98vpn-director-watchd start"
+       stop program = "/opt/etc/init.d/S98vpn-director-watchd stop"
+       if does not exist then restart
+   ```
+
+   The monitor's prober runs as `vpn-director-probe`, so the `xray` rule above never takes it for Xray.
 
 3. Enable config directory in `/opt/etc/monitrc`:
    ```
