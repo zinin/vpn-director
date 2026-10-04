@@ -7,8 +7,8 @@ const ts = require('typescript')
 const sourceRoot = path.join(__dirname, '..', 'src')
 const component = fs.readFileSync(path.join(sourceRoot, 'components/ServersTab.vue'), 'utf8')
 const script = component.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
-const exposed = ['groups', 'monitor', 'load', 'loadMonitor', 'healthOf', 'aliveText', 'monitorLine', 'canCheck', 'checkAll']
-const code = ts.transpileModule(script + '\nexport const exposed = {' + exposed.join(',') + '}', {
+const exposed = ['groups', 'monitor', 'load', 'loadMonitor', 'healthOf', 'aliveText', 'monitorLine', 'canCheck', 'checkAll', 'checkServer', 'checking']
+const code = ts.transpileModule(script + '\nexport const exposed = {' + exposed.join(',') + ', checkNotice: typeof checkNotice === "undefined" ? undefined : checkNotice}', {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
 const server = { name: 'Synthetic', fingerprint: 'abcdef01', address: '192.0.2.1', port: 443, ips: [], protocol: 'trojan' }
@@ -23,30 +23,46 @@ function deferred() {
 }
 
 function setup() {
-  const pending = [], timers = new Map(), unmount = []
+  const pending = [], timers = new Map(), unmount = [], checks = [], alerts = []
   let groups = [group]
+  let checkResult = async () => ({ data: { queued: 1 } })
   const api = {
     getMonitor: () => { const d = deferred(); pending.push(d); return d.promise },
     getSubscriptions: async () => ({ data: { subscriptions: [] } }),
     getServers: async () => ({ data: { subscriptions: groups, active: null } }),
-    checkAllServers: async () => ({ data: { queued: 1 } }),
+    checkServer: (...args) => { checks.push({ kind: 'one', args }); return checkResult() },
+    checkAllServers: () => { checks.push({ kind: 'all', args: [] }); return checkResult() },
   }
   let timer = 0
   const vue = { ref: value => ({ value }), computed: fn => ({ get value() { return fn() } }), onMounted: () => {}, onUnmounted: fn => unmount.push(fn) }
   const context = { exports: {}, require: name => name === 'vue' ? vue : { default: api }, Date, AbortController,
-    alert: () => {}, confirm: () => true,
+    alert: message => alerts.push(message), confirm: () => true,
     setTimeout: (fn, ms) => { timers.set(++timer, { fn, ms }); return timer }, clearTimeout: id => timers.delete(id),
     setInterval: (fn, ms) => { timers.set(++timer, { fn, ms }); return timer }, clearInterval: id => timers.delete(id) }
   vm.runInNewContext(code, context)
   const x = context.exports.exposed
   x.groups.value = [group]
-  return { x, api, pending, timers, unmount, setGroups: value => { groups = value } }
+  return { x, api, pending, timers, unmount, checks, alerts, setGroups: value => { groups = value }, setCheck: fn => { checkResult = fn } }
 }
 
 let passes = 0, failures = 0
 async function test(name, fn) {
   try { await fn(); passes++; console.log('PASS ' + name) }
   catch (e) { failures++; console.error('FAIL ' + name + ': ' + e.message) }
+}
+
+const queuedNotice = 'Check queued; waiting for WAN recovery.'
+const wanSnapshot = { ...snapshot, state: 'wan_down' }
+const notice = c => c.x.checkNotice?.value ?? ''
+async function acceptMonitor(c, data) {
+  const request = c.x.loadMonitor()
+  c.pending.at(-1).resolve({ data })
+  await request
+}
+async function showWANNotice(c) {
+  await acceptMonitor(c, wanSnapshot)
+  await c.x.checkAll()
+  assert.equal(notice(c), queuedNotice)
 }
 
 ;(async () => {
@@ -126,6 +142,201 @@ async function test(name, fn) {
     await late
     assert.equal(c.pending.length, 1)
   })
+  for (const kind of ['one', 'all']) {
+    await test(`WAN notice follows successful ${kind} check with unchanged identity and timing`, async () => {
+      const c = setup()
+      await acceptMonitor(c, wanSnapshot)
+      const post = deferred()
+      c.setCheck(() => post.promise)
+      const request = kind === 'one' ? c.x.checkServer(group, 0, server) : c.x.checkAll()
+      assert.equal(notice(c), '')
+      assert.equal(c.x.checking.value, kind === 'one' ? '0a1b2c3d:0' : 'all')
+      assert.deepEqual(c.checks, [{ kind, args: kind === 'one' ? ['0a1b2c3d', 0, 'abcdef01'] : [] }])
+      post.resolve({ data: { queued: 1 } }); await request
+      assert.equal(notice(c), queuedNotice)
+      assert.equal(c.x.checking.value, '')
+      assert.equal(c.x.canCheck.value, true)
+      assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+      assert.equal(c.x.aliveText(group.id), '1/1 alive')
+      assert.equal(c.x.healthOf(group, 0, server).status, 'alive')
+      assert.equal(c.pending.length, 1)
+      assert.equal(c.timers.size, 1)
+      const timer = [...c.timers.values()][0]
+      assert.equal(timer.ms, 3000)
+      const poll = timer.fn()
+      c.pending.at(-1).resolve({ data: wanSnapshot }); await poll
+      assert.equal(notice(c), queuedNotice)
+    })
+    await test(`normal OK ${kind} check keeps the WAN notice empty`, async () => {
+      const c = setup()
+      await acceptMonitor(c, snapshot)
+      await (kind === 'one' ? c.x.checkServer(group, 0, server) : c.x.checkAll())
+      assert.equal(notice(c), '')
+      assert.equal(c.x.monitorLine.value, 'Monitoring every 1 min')
+      assert.equal(c.x.canCheck.value, true)
+      assert.equal([...c.timers.values()][0].ms, 3000)
+    })
+  }
+  await test('successful check uses the latest accepted WAN state', async () => {
+    const c = setup()
+    await acceptMonitor(c, snapshot)
+    const post = deferred()
+    c.setCheck(() => post.promise)
+    const request = c.x.checkAll()
+    await acceptMonitor(c, wanSnapshot)
+    post.resolve({ data: { queued: 1 } }); await request
+    assert.equal(notice(c), queuedNotice)
+  })
+  await test('latest WAN response retains the queued notice', async () => {
+    const c = setup()
+    await showWANNotice(c)
+    await acceptMonitor(c, wanSnapshot)
+    assert.equal(notice(c), queuedNotice)
+    assert.equal(c.x.canCheck.value, true)
+  })
+  await test('latest recovery clears the queued notice', async () => {
+    const c = setup()
+    await showWANNotice(c)
+    await acceptMonitor(c, snapshot)
+    assert.equal(notice(c), '')
+    assert.equal(c.x.monitorLine.value, 'Monitoring every 1 min')
+  })
+  await test('latest monitor failure clears the queued notice', async () => {
+    const c = setup()
+    await showWANNotice(c)
+    const request = c.x.loadMonitor()
+    c.pending.at(-1).reject(Error('offline')); await request
+    assert.equal(notice(c), '')
+    assert.equal(c.x.monitorLine.value, 'Monitoring: unavailable')
+    assert.equal(c.x.canCheck.value, false)
+  })
+  for (const stale of ['recovery', 'failure']) {
+    await test(`stale monitor ${stale} cannot clear the latest WAN notice`, async () => {
+      const c = setup()
+      await showWANNotice(c)
+      const old = c.x.loadMonitor(), oldResponse = c.pending.at(-1)
+      await acceptMonitor(c, wanSnapshot)
+      if (stale === 'failure') oldResponse.reject(Error('old offline'))
+      else oldResponse.resolve({ data: snapshot })
+      await old
+      assert.equal(notice(c), queuedNotice)
+      assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+    })
+  }
+  for (const latest of ['recovery', 'failure']) {
+    await test(`late WAN response cannot restore notice after latest ${latest}`, async () => {
+      const c = setup()
+      await showWANNotice(c)
+      const old = c.x.loadMonitor(), oldResponse = c.pending.at(-1)
+      const fresh = c.x.loadMonitor()
+      if (latest === 'failure') c.pending.at(-1).reject(Error('offline'))
+      else c.pending.at(-1).resolve({ data: snapshot })
+      await fresh
+      assert.equal(notice(c), '')
+      oldResponse.resolve({ data: wanSnapshot }); await old
+      assert.equal(notice(c), '')
+      assert.equal(c.x.monitorLine.value, latest === 'failure' ? 'Monitoring: unavailable' : 'Monitoring every 1 min')
+    })
+  }
+  await test('another attempt clears notice before a failed POST and preserves its alert', async () => {
+    const c = setup()
+    await showWANNotice(c)
+    const post = deferred()
+    c.setCheck(() => post.promise)
+    const request = c.x.checkServer(group, 0, server)
+    assert.equal(notice(c), '')
+    assert.equal(c.x.checking.value, '0a1b2c3d:0')
+    post.reject({ response: { status: 503, data: { error: 'synthetic queue failure' } } }); await request
+    assert.equal(notice(c), '')
+    assert.equal(c.x.checking.value, '')
+    assert.deepEqual(c.alerts, ['Error: synthetic queue failure'])
+  })
+  await test('changed-list POST clears notice and preserves 409 reload without an alert', async () => {
+    const c = setup()
+    await showWANNotice(c)
+    const changed = { ...group, servers: [{ ...server, fingerprint: 'abcdef02' }] }
+    c.setGroups([changed])
+    c.setCheck(() => Promise.reject({ response: { status: 409, data: { error: 'server list changed' } } }))
+    await c.x.checkAll()
+    assert.equal(notice(c), '')
+    assert.deepEqual(c.alerts, [])
+    assert.equal(c.x.groups.value[0].servers[0].fingerprint, 'abcdef02')
+    assert.equal(c.x.aliveText(group.id), '')
+    assert.equal(c.x.checking.value, '')
+  })
+  await test('late successful POST cannot restore notice from an earlier check attempt', async () => {
+    const c = setup()
+    await acceptMonitor(c, wanSnapshot)
+    const post = deferred()
+    c.setCheck(() => post.promise)
+    const old = c.x.checkServer(group, 0, server)
+    c.setCheck(() => Promise.reject(Error('new check failed')))
+    await c.x.checkAll()
+    post.resolve({ data: { queued: 1 } }); await old
+    assert.equal(notice(c), '')
+    assert.deepEqual(c.alerts, ['Error: new check failed'])
+    assert.equal([...c.timers.values()][0].ms, 3000)
+  })
+  for (const cleared of ['recovery', 'failure']) {
+    await test(`late POST cannot restore notice after ${cleared} and a subsequent WAN response`, async () => {
+      const c = setup()
+      await acceptMonitor(c, wanSnapshot)
+      const post = deferred()
+      c.setCheck(() => post.promise)
+      const request = c.x.checkAll()
+      const fresh = c.x.loadMonitor()
+      if (cleared === 'failure') c.pending.at(-1).reject(Error('offline'))
+      else c.pending.at(-1).resolve({ data: snapshot })
+      await fresh
+      await acceptMonitor(c, wanSnapshot)
+      post.resolve({ data: { queued: 1 } }); await request
+      assert.equal(notice(c), '')
+      assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+    })
+  }
+  await test('unmount clears an existing notice and late monitor responses stay inactive', async () => {
+    const c = setup()
+    await showWANNotice(c)
+    const request = c.x.loadMonitor()
+    c.unmount.forEach(fn => fn())
+    assert.equal(notice(c), '')
+    c.pending.at(-1).resolve({ data: wanSnapshot }); await request
+    assert.equal(notice(c), '')
+    assert.equal(c.timers.size, 0)
+  })
+  await test('unmounted successful POST cannot restore notice or leak into a fresh instance', async () => {
+    const old = setup()
+    await acceptMonitor(old, wanSnapshot)
+    const post = deferred()
+    old.setCheck(() => post.promise)
+    const request = old.x.checkAll()
+    old.unmount.forEach(fn => fn())
+    const fresh = setup()
+    await acceptMonitor(fresh, wanSnapshot)
+    post.resolve({ data: { queued: 1 } }); await request
+    assert.equal(notice(old), '')
+    assert.equal(old.timers.size, 0)
+    assert.equal(notice(fresh), '')
+    await fresh.x.checkAll()
+    assert.equal(notice(fresh), queuedNotice)
+    assert.equal(notice(old), '')
+  })
+  for (const kind of ['one', 'all']) {
+    await test(`successful zero-queued WAN ${kind} check clears and leaves the notice empty`, async () => {
+      const c = setup()
+      await showWANNotice(c)
+      c.setCheck(async () => ({ data: { queued: 0 } }))
+      await (kind === 'one' ? c.x.checkServer(group, 0, server) : c.x.checkAll())
+      assert.equal(notice(c), '')
+      assert.equal(c.x.checking.value, '')
+      assert.equal(c.x.canCheck.value, true)
+      assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+      assert.equal(c.x.aliveText(group.id), '1/1 alive')
+      assert.equal(c.x.healthOf(group, 0, server).status, 'alive')
+      assert.deepEqual(c.checks.at(-1), { kind, args: kind === 'one' ? ['0a1b2c3d', 0, 'abcdef01'] : [] })
+      assert.equal([...c.timers.values()][0].ms, 3000)
+    })
+  }
   console.log(`RESULT ${passes} PASS / ${failures} FAIL`)
   process.exitCode = failures ? 1 : 0
 })()

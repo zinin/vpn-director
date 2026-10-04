@@ -29,6 +29,8 @@ const monitor = ref<MonitorResponse | null>(null)
 const monitorUnavailable = ref(false)
 // The check being sent: 'all' or '<subscription>:<index>'.
 const checking = ref('')
+const checkNotice = ref('')
+let checkNoticeGeneration = 0
 let poll: ReturnType<typeof setInterval> | undefined
 let recheck: ReturnType<typeof setTimeout> | undefined
 let unmounted = false
@@ -104,11 +106,13 @@ async function loadMonitor() {
     if (unmounted || request !== monitorRequest) return
     monitorUnavailable.value = false
     monitor.value = resp.data
+    if (monitor.value?.state !== 'wan_down') clearCheckNotice()
     if (listChanged()) await load()
   } catch {
     if (unmounted || request !== monitorRequest) return
     monitorUnavailable.value = true
     monitor.value = null
+    clearCheckNotice()
   }
 }
 
@@ -195,12 +199,22 @@ const monitorLine = computed(() => {
 
 const canCheck = computed(() => monitor.value?.state === 'ok' || monitor.value?.state === 'wan_down')
 
+// Clearing the notice also invalidates a check whose POST is still pending.
+function clearCheckNotice() {
+  checkNotice.value = ''
+  return ++checkNoticeGeneration
+}
+
 // A check answers within seconds: the page looks again before the next poll.
-async function sendCheck(what: string, fn: () => Promise<unknown>) {
+async function sendCheck(what: string, fn: () => Promise<{ data: { queued: number } }>) {
+  const noticeGeneration = clearCheckNotice()
   checking.value = what
   try {
-    await fn()
+    const resp = await fn()
     if (!unmounted) {
+      if (noticeGeneration === checkNoticeGeneration && monitor.value?.state === 'wan_down' && resp.data.queued > 0) {
+        checkNotice.value = 'Check queued; waiting for WAN recovery.'
+      }
       clearTimeout(recheck)
       recheck = setTimeout(loadMonitor, 3000)
     }
@@ -319,6 +333,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   unmounted = true
+  clearCheckNotice()
   clearInterval(poll)
   clearTimeout(recheck)
 })
@@ -422,6 +437,7 @@ onUnmounted(() => {
         {{ checking === 'all' ? '...' : 'Check all now' }}
       </button>
     </p>
+    <p v-if="checkNotice" class="kv-label" style="margin: 0 0 0.75rem;" role="status">{{ checkNotice }}</p>
     <details
       v-for="group in groups"
       :key="group.id"
