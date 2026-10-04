@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -864,4 +865,413 @@ func TestSocketReadiness_WaitsForHTTPAfterPermissions(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("permissions not ready: %v", err)
 	}
+}
+
+func assertOnlyStableLock(t *testing.T, path string) {
+	t.Helper()
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path)+".lock" {
+		t.Errorf("socket/private staging leaked: directory entries %v", entries)
+	}
+	assertLockReleased(t, path)
+}
+
+func openSocketTestFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
+func TestListen_PrivatePublicationUnderPermissiveUmask(t *testing.T) {
+	if os.Getenv("VPD_TEST_PRIVATE_SOCKET_CHILD") != "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestListen_PrivatePublicationUnderPermissiveUmask$", "-test.v")
+		cmd.Env = append(os.Environ(), "VPD_TEST_PRIVATE_SOCKET_CHILD=1")
+		output, err := cmd.CombinedOutput()
+		t.Logf("isolated umask subprocess:\n%s", output)
+		if err != nil {
+			t.Fatalf("private publication subprocess: %v", err)
+		}
+		return
+	}
+	// Only this single-test subprocess changes umask; other Go tests retain theirs.
+	syscall.Umask(0)
+	path := ownedSocketPath(t)
+	parent := filepath.Dir(path)
+	if err := os.Chmod(parent, 0755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var staged string
+	var socketInfo, lockInfo os.FileInfo
+	chmodCalls, publicationCalls := 0, 0
+	assertNotPublic := func() {
+		t.Helper()
+		if _, err := os.Lstat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("public socket exists before safe publication: %v", err)
+		}
+		conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+		if conn != nil {
+			conn.Close()
+		}
+		if err == nil {
+			t.Error("public pathname accepted a connection before permissions were safe")
+		}
+	}
+	listener, err := listenWithPublication(ctx, path, (&net.Dialer{}).DialContext, func(name string, mode os.FileMode) error {
+		chmodCalls++
+		staged = name
+		assertNotPublic()
+		if name == path || filepath.Dir(name) == parent {
+			t.Error("listener bound outside a newly owned private directory")
+		}
+		private, err := os.Lstat(filepath.Dir(name))
+		if err != nil || !private.IsDir() || private.Mode().Perm() != 0700 {
+			t.Errorf("private directory mode: info=%v err=%v", private, err)
+		}
+		socketInfo, err = os.Lstat(name)
+		if err != nil || socketInfo.Mode()&os.ModeSocket == 0 || socketInfo.Mode().Perm() != 0777 {
+			t.Errorf("permissive-umask private bind: info=%v err=%v", socketInfo, err)
+		}
+		parentInfo, err := os.Stat(parent)
+		if err != nil || private.Sys().(*syscall.Stat_t).Dev != parentInfo.Sys().(*syscall.Stat_t).Dev {
+			t.Errorf("private bind is on another filesystem: %v", err)
+		}
+		lockInfo, err = os.Lstat(path + ".lock")
+		if err != nil {
+			return err
+		}
+		if duplicate, err := Listen(context.Background(), path); err == nil {
+			duplicate.Close()
+			t.Error("duplicate acquired the private-bound instance")
+		} else if !errors.Is(err, syscall.EWOULDBLOCK) {
+			t.Errorf("private-bound duplicate lost flock cause: %v", err)
+		}
+		if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(lockInfo, after) {
+			t.Error("duplicate changed the private-bound owner's stable lock")
+		}
+		return os.Chmod(name, mode)
+	}, func(old, final string) error {
+		publicationCalls++
+		assertNotPublic()
+		info, err := os.Lstat(old)
+		if err != nil || info.Mode().Perm() != 0600 || !os.SameFile(info, socketInfo) || final != path {
+			t.Errorf("publication did not receive the private mode-0600 socket: %v", err)
+		}
+		return os.Link(old, final)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { listener.Close() })
+	if chmodCalls != 1 || publicationCalls != 1 {
+		t.Errorf("chmod/publication stages: %d/%d", chmodCalls, publicationCalls)
+	}
+	if info, err := os.Lstat(path); err != nil || info.Mode().Perm() != 0600 || !os.SameFile(info, socketInfo) {
+		t.Errorf("published pathname did not retain the verified socket inode/mode: %v", err)
+	}
+	if listener.Addr().Network() != "unix" || listener.Addr().String() != path {
+		t.Errorf("public listener address changed: %v", listener.Addr())
+	}
+	if staged != path {
+		if _, err := os.Lstat(filepath.Dir(staged)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("private directory remains after publication: %v", err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- ServeListener(ctx, listener, &fakeSource{snap: Snapshot{State: StateOK, Endpoints: map[string]EndpointState{"a": {}, "b": {}}}})
+	}()
+	var stopOnce sync.Once
+	stop := func() {
+		stopOnce.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("published listener shutdown: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("published listener failed to stop")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	client, err := waitForSocket(path)
+	if err != nil {
+		t.Fatal("final-path HTTP connection failed:", err)
+	}
+	if n, err := client.Check(context.Background(), []string{"a"}); err != nil || n != 1 {
+		t.Errorf("final-path one check: %d, %v", n, err)
+	}
+	if n, err := client.Check(context.Background(), nil); err != nil || n != 2 {
+		t.Errorf("final-path all check: %d, %v", n, err)
+	}
+	if err, early := attemptDuplicate(t, path); err == nil || !early {
+		t.Errorf("published instance was taken over: %v early=%v", err, early)
+	}
+	if snap, err := client.Monitor(context.Background()); err != nil || snap.State != StateOK || len(snap.Endpoints) != 2 {
+		t.Errorf("duplicate disturbed the published API: %+v, %v", snap, err)
+	}
+	stop()
+	if next, err := Listen(context.Background(), path); err == nil {
+		next.Close()
+		t.Error("HTTP shutdown released ownership before owner Close")
+	}
+	if err := listener.Close(); err != nil {
+		t.Error(err)
+	}
+	assertOnlyStableLock(t, path)
+	if info, err := os.Stat(parent); err != nil || info.Mode().Perm() != 0755 {
+		t.Errorf("shared directory mode changed: %v", err)
+	}
+	next, err := Listen(context.Background(), path)
+	if err != nil {
+		t.Fatal("restart after private publication:", err)
+	}
+	next.Close()
+	if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(lockInfo, after) {
+		t.Error("publication/shutdown/restart replaced the stable lock")
+	}
+	assertOnlyStableLock(t, path)
+}
+
+func TestListen_PublicationFailuresAndCancellationCleanOwnedResources(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want error
+	}{
+		{"chmod-error", syscall.EACCES},
+		{"chmod-unverified", os.ErrPermission},
+		{"publication-error", syscall.EOPNOTSUPP},
+		{"publication-error-after-link", syscall.EIO},
+		{"cancel-before-chmod", context.Canceled},
+		{"cancel-before-publication", context.Canceled},
+		{"cancel-after-publication", context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := ownedSocketPath(t)
+			// Initialize Go's network poller before counting this attempt's descriptors.
+			warm, err := Listen(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			warm.Close()
+			lockInfo, err := os.Lstat(path + ".lock")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fds := openSocketTestFDs(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var staged string
+			listener, err := listenWithPublication(ctx, path, (&net.Dialer{}).DialContext, func(name string, mode os.FileMode) error {
+				staged = name
+				switch tc.name {
+				case "chmod-error":
+					return syscall.EACCES
+				case "chmod-unverified":
+					return os.Chmod(name, 0666)
+				case "cancel-before-chmod":
+					cancel()
+				}
+				err := os.Chmod(name, mode)
+				if tc.name == "cancel-before-publication" {
+					cancel()
+				}
+				return err
+			}, func(old, final string) error {
+				if tc.name == "publication-error" {
+					return syscall.EOPNOTSUPP
+				}
+				if err := os.Link(old, final); err != nil {
+					return err
+				}
+				if tc.name == "cancel-after-publication" {
+					cancel()
+				}
+				if tc.name == "publication-error-after-link" {
+					return syscall.EIO
+				}
+				return nil
+			})
+			if listener != nil {
+				listener.Close()
+			}
+			if listener != nil || !errors.Is(err, tc.want) {
+				t.Errorf("failed/canceled startup returned listener=%v err=%v; want %v", listener != nil, err, tc.want)
+			}
+			if staged != "" && staged != path {
+				if _, err := os.Lstat(filepath.Dir(staged)); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("failed startup leaked private directory: %v", err)
+				}
+			}
+			assertOnlyStableLock(t, path)
+			if got := openSocketTestFDs(t); got != fds {
+				t.Errorf("startup leaked descriptors: before=%d after=%d", fds, got)
+			}
+			restarted, err := Listen(context.Background(), path)
+			if err != nil {
+				t.Fatal("failure prevented restart:", err)
+			}
+			restarted.Close()
+			if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(lockInfo, after) {
+				t.Error("failed/canceled startup or restart replaced the lock")
+			}
+			assertOnlyStableLock(t, path)
+		})
+	}
+}
+
+func TestListen_PublicationPreservesConcurrentDestinations(t *testing.T) {
+	for _, kind := range []string{"regular", "symlink", "socket"} {
+		t.Run(kind, func(t *testing.T) {
+			path := ownedSocketPath(t)
+			var foreign os.FileInfo
+			var socket *net.UnixListener
+			var staged, target string
+			listener, err := listenWithPublication(context.Background(), path, (&net.Dialer{}).DialContext, os.Chmod, func(old, final string) error {
+				staged = old
+				switch kind {
+				case "regular":
+					if err := os.WriteFile(final, []byte("concurrent foreign file"), 0640); err != nil {
+						return err
+					}
+				case "symlink":
+					target = final + ".target"
+					if err := os.WriteFile(target, []byte("concurrent foreign file"), 0640); err != nil {
+						return err
+					}
+					if err := os.Symlink(target, final); err != nil {
+						return err
+					}
+				case "socket":
+					var err error
+					socket, err = net.ListenUnix("unix", &net.UnixAddr{Name: final, Net: "unix"})
+					if err != nil {
+						return err
+					}
+					socket.SetUnlinkOnClose(false)
+					t.Cleanup(func() { socket.Close() })
+				}
+				var err error
+				foreign, err = os.Lstat(final)
+				if err != nil {
+					return err
+				}
+				return os.Link(old, final)
+			})
+			if listener != nil {
+				listener.Close()
+			}
+			if listener != nil || !errors.Is(err, os.ErrExist) || foreign == nil {
+				t.Fatalf("publication overwrote/missed a concurrent destination: listener=%v err=%v", listener != nil, err)
+			}
+			after, err := os.Lstat(path)
+			if err != nil || !os.SameFile(foreign, after) || after.Mode() != foreign.Mode() || after.Size() != foreign.Size() || !after.ModTime().Equal(foreign.ModTime()) {
+				t.Fatal("publication failure changed the concurrent destination:", err)
+			}
+			switch kind {
+			case "regular", "symlink":
+				if data, err := os.ReadFile(path); err != nil || string(data) != "concurrent foreign file" {
+					t.Error("concurrent file/target changed:", err)
+				}
+				if kind == "symlink" {
+					if got, err := os.Readlink(path); err != nil || got != target {
+						t.Error("concurrent symlink changed:", err)
+					}
+				}
+			case "socket":
+				conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+				if err != nil {
+					t.Error("concurrent accepting socket lost reachability:", err)
+				} else {
+					conn.Close()
+				}
+				socket.Close()
+			}
+			if staged != path {
+				if _, err := os.Lstat(filepath.Dir(staged)); !errors.Is(err, os.ErrNotExist) {
+					t.Error("collision leaked private staging:", err)
+				}
+			}
+			assertLockReleased(t, path)
+			lockInfo, err := os.Lstat(path + ".lock")
+			if err != nil {
+				t.Fatal(err)
+			}
+			// These foreign paths were created by this test and are still the same inode.
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if target != "" {
+				if err := os.Remove(target); err != nil {
+					t.Fatal(err)
+				}
+			}
+			next, err := Listen(context.Background(), path)
+			if err != nil {
+				t.Fatal("collision prevented restart:", err)
+			}
+			next.Close()
+			if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(lockInfo, after) {
+				t.Error("collision/restart replaced the stable lock")
+			}
+			assertOnlyStableLock(t, path)
+		})
+	}
+}
+
+func TestListen_PrivatePublicationKeepsExistingDirectoryModes(t *testing.T) {
+	for _, mode := range []os.FileMode{0700, 0711, 0750, 0777 | os.ModeSticky} {
+		t.Run(fmt.Sprintf("%o", mode), func(t *testing.T) {
+			path := ownedSocketPath(t)
+			parent := filepath.Dir(path)
+			if err := os.Chmod(parent, mode); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Stat(parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener, err := Listen(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener.Close()
+			if after, err := os.Stat(parent); err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+				t.Error("existing shared/restrictive directory mode or inode changed:", err)
+			}
+			assertOnlyStableLock(t, path)
+		})
+	}
+}
+
+func TestListen_PrivateBindSupportsNearBoundPublicPath(t *testing.T) {
+	base := filepath.Dir(ownedSocketPath(t))
+	dir := filepath.Join(base, strings.Repeat("d", 107-len(base)-1-len("/watchd.sock")))
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "watchd.sock")
+	listener, err := Listen(context.Background(), path)
+	if err != nil {
+		t.Fatal("valid near-bound public address could not publish:", err)
+	}
+	defer listener.Close()
+	conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err != nil {
+		t.Fatal("near-bound final pathname did not connect:", err)
+	}
+	conn.Close()
+	listener.Close()
+	assertOnlyStableLock(t, path)
 }

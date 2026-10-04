@@ -91,6 +91,10 @@ type instanceListener struct {
 	closeErr error
 }
 
+func (l *instanceListener) Addr() net.Addr {
+	return &net.UnixAddr{Name: l.path, Net: "unix"}
+}
+
 func (l *instanceListener) Close() error {
 	l.once.Do(func() {
 		l.closeErr = l.Listener.Close()
@@ -117,6 +121,10 @@ func Listen(ctx context.Context, path string) (net.Listener, error) {
 }
 
 func listen(ctx context.Context, path string, dial func(context.Context, string, string) (net.Conn, error)) (net.Listener, error) {
+	return listenWithPublication(ctx, path, dial, os.Chmod, os.Link)
+}
+
+func listenWithPublication(ctx context.Context, path string, dial func(context.Context, string, string) (net.Conn, error), chmod func(string, os.FileMode) error, link func(string, string) error) (net.Listener, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -185,31 +193,125 @@ func listen(ctx context.Context, path string, dial func(context.Context, string,
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	// A shortened private bind must still leave the public address dialable.
+	if len(path) >= len(syscall.RawSockaddrUnix{}.Path) {
+		return nil, &net.OpError{Op: "listen", Net: "unix", Addr: &net.UnixAddr{Name: path, Net: "unix"}, Err: syscall.EINVAL}
+	}
+	listener, info, err := publishSocket(ctx, path, chmod, link)
 	if err != nil {
 		return nil, err
+	}
+	owned = true
+	return &instanceListener{Listener: listener, lock: lock, path: path, info: info}, nil
+}
+
+func removeOwnedSocket(path string, owned os.FileInfo) error {
+	if owned == nil {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSocket != 0 && os.SameFile(info, owned) {
+		return os.Remove(path)
+	}
+	return nil
+}
+
+func publishSocket(ctx context.Context, path string, chmod func(string, os.FileMode) error, link func(string, string) error) (listener *net.UnixListener, info os.FileInfo, err error) {
+	dir, err := os.MkdirTemp(filepath.Dir(path), ".watchd-")
+	if err != nil {
+		return nil, nil, err
+	}
+	var fd *os.File
+	var bindPath string
+	dirInfo, err := os.Lstat(dir)
+	defer func() {
+		if err != nil && listener != nil {
+			listener.Close()
+		}
+		err = errors.Join(err, removeOwnedSocket(bindPath, info))
+		if fd != nil {
+			err = errors.Join(err, fd.Close())
+		}
+		if current, statErr := os.Lstat(dir); statErr == nil && dirInfo != nil && os.SameFile(current, dirInfo) {
+			// Remove only this invocation's empty private directory.
+			err = errors.Join(err, os.Remove(dir))
+		}
+		if err != nil && listener != nil {
+			listener.Close()
+			err = errors.Join(err, removeOwnedSocket(path, info))
+			listener = nil
+		}
+	}()
+	if err != nil {
+		return nil, nil, err
+	}
+	if err = os.Chmod(dir, 0700); err != nil {
+		return nil, nil, err
+	}
+	fd, err = os.Open(dir)
+	if err != nil {
+		return nil, nil, err
+	}
+	current, err := fd.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if !os.SameFile(current, dirInfo) || current.Mode().Perm() != 0700 {
+		return nil, nil, errors.New("monitor private directory changed")
+	}
+	// Linux resolves this short address into the owned directory on the same
+	// filesystem, even when the final address leaves no room for a suffix.
+	bindPath = fmt.Sprintf("/proc/self/fd/%d/s", fd.Fd())
+	listener, err = net.ListenUnix("unix", &net.UnixAddr{Name: bindPath, Net: "unix"})
+	if err != nil {
+		return nil, nil, err
 	}
 	listener.SetUnlinkOnClose(false)
-	info, err = os.Lstat(path)
+	info, err = os.Lstat(bindPath)
 	if err != nil {
-		listener.Close()
-		return nil, err
+		return listener, info, err
 	}
-	if info.Mode()&os.ModeSocket == 0 {
-		listener.Close()
-		return nil, errors.New("monitor socket path changed")
+	staged := filepath.Join(dir, "s")
+	if err = ctx.Err(); err != nil {
+		return listener, info, err
 	}
-	l := &instanceListener{Listener: listener, lock: lock, path: path, info: info}
-	owned = true
-	if err := os.Chmod(path, 0600); err != nil {
-		l.Close()
-		return nil, err
+	if err = chmod(staged, 0600); err != nil {
+		return listener, info, err
 	}
-	if err := ctx.Err(); err != nil {
-		l.Close()
-		return nil, err
+	current, err = os.Lstat(staged)
+	if err != nil {
+		return listener, info, err
 	}
-	return l, nil
+	if current.Mode()&os.ModeSocket == 0 || !os.SameFile(current, info) {
+		return listener, info, errors.New("monitor private socket changed")
+	}
+	if current.Mode().Perm() != 0600 {
+		return listener, info, fmt.Errorf("monitor socket permissions: %w", os.ErrPermission)
+	}
+	if err = ctx.Err(); err != nil {
+		return listener, info, err
+	}
+	// Hard-link publication is atomic and refuses every existing destination.
+	if err = link(staged, path); err != nil {
+		return listener, info, err
+	}
+	current, err = os.Lstat(path)
+	if err != nil {
+		return listener, info, err
+	}
+	if current.Mode()&os.ModeSocket == 0 || !os.SameFile(current, info) || current.Mode().Perm() != 0600 {
+		return listener, info, errors.New("monitor published socket changed")
+	}
+	if err = ctx.Err(); err != nil {
+		return listener, info, err
+	}
+	return listener, info, nil
 }
 
 // Serve answers the API on an owned unix socket until ctx ends.
