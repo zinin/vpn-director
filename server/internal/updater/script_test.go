@@ -1,13 +1,19 @@
 package updater
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -62,11 +68,9 @@ const testManifest = "common router/opt/vpn-director/vpn-director.sh\n" +
 	"keenetic router/opt/etc/ndm/netfilter.d/50-vpn-director.sh\n"
 
 // writeTestManifest gives the update payload the manifest generateScript
-// reads; DownloadRelease writes it there in production. Only the golden test
-// renders with the default paths - it is the one render that has to be
-// deterministic - and so is the only one writing into the real
-// /tmp/vpn-director-update, from which what lands there is taken back out
-// afterwards.
+// reads; DownloadRelease writes it there in production. The golden test
+// renders in its owned directory and normalizes that prefix to the default
+// paths, so its deterministic output needs no shared update directory.
 func writeTestManifest(t *testing.T, s *Service) {
 	t.Helper()
 	dir := s.getFilesDir()
@@ -704,7 +708,7 @@ func TestGenerateScript_Golden(t *testing.T) {
 	// which belongs to the payload and here comes from testManifest.
 	// Regenerate with:
 	//   UPDATE_GOLDEN=1 go test ./internal/updater -run TestGenerateScript_Golden -count=1
-	s := &Service{}
+	s := &Service{updateDir: t.TempDir()}
 	writeTestManifest(t, s)
 	script, err := s.generateScript(RunOptions{
 		OldVersion: "v1.2.0", NewVersion: "v1.3.0", ChatID: 42, Initiator: "bot",
@@ -713,6 +717,7 @@ func TestGenerateScript_Golden(t *testing.T) {
 		t.Fatalf("generateScript() error = %v", err)
 	}
 
+	script = strings.ReplaceAll(script, s.getUpdateDir(), UpdateDir)
 	golden := filepath.Join("testdata", "update_script.golden.sh")
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
 		if err := os.MkdirAll("testdata", 0755); err != nil {
@@ -1071,7 +1076,7 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 			defer cancel()
 			cmd := exec.CommandContext(ctx, "/bin/sh", scriptPath)
 			cmd.Dir = root
-			cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+root, "STATE_DIR="+state,
+			cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+root, "SANDBOX_ROOT_PATTERN="+regexp.QuoteMeta(root), "STATE_DIR="+state,
 				"FILES_DIR="+s.getFilesDir(), "LOCK_FILE="+filepath.Join(s.getUpdateDir(), "lock"),
 				"CALLS_FILE="+callsPath, "FAIL_AT="+tt.failure,
 				"STOP_NEW_FAIL="+map[bool]string{false: "0", true: "1"}[tt.stopFailure])
@@ -1191,23 +1196,36 @@ case "$1" in
 esac
 `
 
-const sandboxPgrep = `#!/bin/sh
-[ "$#" -eq 2 ] && [ "$1" = "-f" ] || exit 90
-case "$2" in
-    "$SANDBOX_ROOT"/opt/vpn-director/*) ;;
+const sandboxProcessPattern = `process_name="${process_pattern##*/}"
+process_anchored=0
+case "$process_pattern" in
+    '^'*'([[:space:]]|$)')
+        process_anchored=1
+        process_name="${process_name%'([[:space:]]|$)'}"
+        ;;
+esac
+case "$process_name" in
+    telegram-bot|vpn-director-watchd|webui) ;;
     *) exit 91 ;;
 esac
-[ -f "$STATE_DIR/${2##*/}.running" ]
+if [ "$process_anchored" = "1" ]; then
+    [ "$process_pattern" = "^$SANDBOX_ROOT_PATTERN/opt/vpn-director/$process_name([[:space:]]|$)" ] || exit 91
+else
+    [ "$process_pattern" = "$SANDBOX_ROOT/opt/vpn-director/$process_name" ] || exit 91
+fi
+`
+
+const sandboxPgrep = `#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = "-f" ] || exit 90
+process_pattern=$2
+` + sandboxProcessPattern + `[ -f "$STATE_DIR/$process_name.running" ]
 `
 
 const sandboxPkill = `#!/bin/sh
 [ "$#" -eq 3 ] && [ "$1" = "-9" ] && [ "$2" = "-f" ] || exit 90
-case "$3" in
-    "$SANDBOX_ROOT"/opt/vpn-director/*) ;;
-    *) exit 91 ;;
-esac
-printf '%s kill\n' "${3##*/}" >> "$CALLS_FILE"
-/bin/rm -f "$STATE_DIR/${3##*/}.running"
+process_pattern=$3
+` + sandboxProcessPattern + `printf '%s kill\n' "$process_name" >> "$CALLS_FILE"
+/bin/rm -f "$STATE_DIR/$process_name.running"
 `
 
 const sandboxMonit = `#!/bin/sh
@@ -1479,13 +1497,15 @@ func newFirstInstallSandbox(t *testing.T, opts firstInstallOptions) *firstInstal
 		}
 	}
 	for _, d := range Daemons {
-		body := strings.Replace(sandboxInit, "    stop)\n", "    stop)\n        if [ \"$name\" = \"vpn-director-watchd\" ] && { [ \"$CLEANUP_MODE\" = \"live\" ] || [ \"$CLEANUP_MODE\" = \"delayed-exit\" ]; }; then exit 72; fi\n", 1)
+		body := strings.ReplaceAll(sandboxInit, "printf 'FAIL %s\\n' \"$FAIL_AT\" >> \"$CALLS_FILE\"\n", "printf 'FAIL %s\\n' \"$FAIL_AT\" >> \"$CALLS_FILE\"\n"+sandboxUnrelated)
+		body = strings.Replace(body, "    stop)\n", "    stop)\n        if [ \"$name\" = \"vpn-director-watchd\" ] && { [ \"$CLEANUP_MODE\" = \"live\" ] || [ \"$CLEANUP_MODE\" = \"delayed-exit\" ]; }; then exit 72; fi\n", 1)
 		s.write(filepath.Join(s.root, "opt/etc/init.d", d.InitScript), "#!/bin/sh\nname="+d.Name+"\n"+body, 0755)
 	}
-	s.write(filepath.Join(s.tools, "pgrep"), strings.Replace(sandboxPgrep, `[ -f "$STATE_DIR/${2##*/}.running" ]`, firstCopyPgrep, 1), 0755)
-	s.write(filepath.Join(s.tools, "pkill"), strings.Replace(sandboxPkill, `/bin/rm -f "$STATE_DIR/${3##*/}.running"`, firstCopyPkill, 1), 0755)
+	s.write(filepath.Join(s.tools, "pgrep"), strings.Replace(sandboxPgrep, `[ -f "$STATE_DIR/$process_name.running" ]`, firstCopyPgrep, 1), 0755)
+	s.write(filepath.Join(s.tools, "pkill"), strings.Replace(sandboxPkill, `/bin/rm -f "$STATE_DIR/$process_name.running"`, firstCopyPkill, 1), 0755)
 	s.write(filepath.Join(s.tools, "monit"), sandboxMonit, 0755)
-	fault := strings.Replace(sandboxFault, "op=\"${0##*/}\"\n", "op=\"${0##*/}\"\n"+firstCopyBeforeFault, 1)
+	fault := strings.ReplaceAll(sandboxFault, "printf 'FAIL %s\\n' \"$FAIL_AT\" >> \"$CALLS_FILE\"\n", "printf 'FAIL %s\\n' \"$FAIL_AT\" >> \"$CALLS_FILE\"\n"+sandboxUnrelated)
+	fault = strings.Replace(fault, "op=\"${0##*/}\"\n", "op=\"${0##*/}\"\n"+firstCopyBeforeFault, 1)
 	fault = strings.Replace(fault, `exec "/bin/$op" "$@"`, firstCopyAfterFault+`exec "/bin/$op" "$@"`, 1)
 	for _, op := range []string{"cp", "chmod", "rm", "cat"} {
 		s.write(filepath.Join(s.tools, op), fault, 0755)
@@ -1604,7 +1624,7 @@ func (s *firstInstallSandbox) run(failure, mode string) firstInstallResult {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "/bin/sh", path)
 	cmd.Dir = s.root
-	cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+s.root, "STATE_DIR="+s.state,
+	cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+s.root, "SANDBOX_ROOT_PATTERN="+regexp.QuoteMeta(s.root), "STATE_DIR="+s.state,
 		"FILES_DIR="+s.s.getFilesDir(), "LOCK_FILE="+filepath.Join(s.s.getUpdateDir(), "lock"),
 		"CALLS_FILE="+s.calls, "FAIL_AT="+failure, "STOP_NEW_FAIL=0", "CLEANUP_MODE="+mode)
 	cmd.WaitDelay = time.Second
@@ -1642,14 +1662,14 @@ func (s *firstInstallSandbox) run(failure, mode string) firstInstallResult {
 	return firstInstallResult{calls: string(calls), out: string(out), log: string(log)}
 }
 
-const firstCopyPgrep = `if [ "${2##*/}" = "vpn-director-watchd" ] && [ "$CLEANUP_MODE" = "discovery-error" ]; then
+const firstCopyPgrep = `if [ "$process_name" = "vpn-director-watchd" ] && [ "$CLEANUP_MODE" = "discovery-error" ]; then
     if [ ! -e "$STATE_DIR/fault" ]; then
         : > "$STATE_DIR/fault"
         printf 'FAIL discovery-error\n' >> "$CALLS_FILE"
     fi
     exit 2
 fi
-if [ "${2##*/}" = "vpn-director-watchd" ] && [ -e "$STATE_DIR/fault" ]; then
+if [ "$process_name" = "vpn-director-watchd" ] && [ -e "$STATE_DIR/fault" ]; then
     if [ "$CLEANUP_MODE" = "lookup-error" ]; then exit 2; fi
     if [ "$CLEANUP_MODE" = "delayed-exit" ] && [ -e "$STATE_DIR/kill-pending" ]; then
         left=$(/bin/cat "$STATE_DIR/kill-pending")
@@ -1660,16 +1680,31 @@ if [ "${2##*/}" = "vpn-director-watchd" ] && [ -e "$STATE_DIR/fault" ]; then
         fi
     fi
 fi
-[ -f "$STATE_DIR/${2##*/}.running" ]`
+[ -f "$STATE_DIR/$process_name.running" ] && exit 0
+if [ "$process_name" = "vpn-director-watchd" ] && [ -f "$STATE_DIR/unrelated.cmdline" ]; then
+    exec /bin/grep -E "$process_pattern" "$STATE_DIR/unrelated.cmdline"
+fi
+exit 1`
 
-const firstCopyPkill = `if [ "${3##*/}" = "vpn-director-watchd" ]; then
+const sandboxUnrelated = `if [ "${CLEANUP_MODE-}" = "unrelated" ]; then
+    printf '%s/helper --mentions %s/opt/vpn-director/vpn-director-watchd\n' "$SANDBOX_ROOT" "$SANDBOX_ROOT" > "$STATE_DIR/unrelated.cmdline"
+fi
+`
+
+const firstCopyPkill = `if [ "$process_name" = "vpn-director-watchd" ]; then
     if [ "$CLEANUP_MODE" = "live" ]; then exit 1; fi
     if [ "$CLEANUP_MODE" = "delayed-exit" ]; then
         printf '2\n' > "$STATE_DIR/kill-pending"
         exit 0
     fi
 fi
-/bin/rm -f "$STATE_DIR/${3##*/}.running"`
+if [ "$process_name" = "vpn-director-watchd" ] && [ -f "$STATE_DIR/unrelated.cmdline" ]; then
+    if /bin/grep -E "$process_pattern" "$STATE_DIR/unrelated.cmdline" >/dev/null; then
+        printf 'unrelated killed\n' >> "$CALLS_FILE"
+        /bin/rm -f "$STATE_DIR/unrelated.cmdline"
+    fi
+fi
+/bin/rm -f "$STATE_DIR/$process_name.running"`
 
 const firstCopyBeforeFault = `if [ "$op" = "cp" ]; then
     case "${3-}" in
@@ -1734,4 +1769,344 @@ func TestGenerateScript_FirstCopyDiscoveryNeedsRunningEvidence(t *testing.T) {
 	}
 	s.assertState(DaemonWatchd, false)
 	s.assertIndependentFiles()
+}
+
+func TestGenerateScript_NewCleanupIgnoresUnrelatedMentions(t *testing.T) {
+	for _, failure := range []string{"after-copy", "vpn-director-watchd-start"} {
+		t.Run(failure, func(t *testing.T) {
+			s := newFirstInstallSandbox(t, firstInstallOptions{})
+			result := s.run(failure, "unrelated")
+			mention := filepath.Join(s.state, "unrelated.cmdline")
+			want := s.root + "/helper --mentions " + s.binary(DaemonWatchd) + "\n"
+			if data, err := os.ReadFile(mention); err != nil || string(data) != want {
+				t.Errorf("new cleanup killed an unrelated process mention: %q (%v)", data, err)
+			}
+			if strings.Contains(result.calls, "unrelated killed\n") || strings.Contains(result.calls, DaemonWatchd+" kill\n") {
+				t.Error("an unrelated mention caused the cleanup kill path")
+			}
+			if _, err := os.Lstat(s.binary(DaemonWatchd)); !os.IsNotExist(err) {
+				t.Errorf("unrelated mention blocked owned first-copy removal: %v", err)
+			}
+			if strings.Contains(result.log, "manual recovery required") || strings.Contains(result.out, "manual recovery required") || strings.Contains(result.calls, "exit wait\n") {
+				t.Error("cleanup waited/refused while only an unrelated mention remained")
+			}
+			for _, name := range s.originalRunning {
+				s.assertState(name, true)
+			}
+			s.assertState(DaemonWatchd, false)
+			s.assertIndependentFiles()
+			// End this owned unrelated fixture before retry: legacy discovery is unchanged.
+			if err := os.Remove(mention); err != nil && !os.IsNotExist(err) {
+				t.Fatal(err)
+			}
+			retry := s.run("", "")
+			if strings.Count(retry.calls, DaemonWatchd+" start\n") != 1 || strings.Contains(retry.log, "manual recovery required") {
+				t.Error("successful retry lost the first-install start/cleanup contract")
+			}
+			s.assertState(DaemonWatchd, true)
+			s.assertIndependentFiles()
+		})
+	}
+}
+
+func cleanupScript(t *testing.T) string {
+	t.Helper()
+	s := &Service{updateDir: t.TempDir()}
+	writeTestManifest(t, s)
+	script, err := s.generateScript(validOpts())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return script
+}
+
+func cleanupPattern(t *testing.T, script, binary string) string {
+	t.Helper()
+	body := functionBody(t, script, "daemon_argv0_pattern")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", "set -e\ndaemon_argv0_pattern() {\n"+body+"\n}\ndaemon_argv0_pattern \"$1\"\n", "owned-pattern", binary)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("POSIX process-pattern helper failed: %v\n%s", err, out)
+	}
+	pattern := strings.TrimSuffix(string(out), "\n")
+	if pattern != "^"+regexp.QuoteMeta(binary)+"([[:space:]]|$)" {
+		t.Fatalf("unsafe/inexact argv[0] pattern %q for %q; real process tools refused", pattern, binary)
+	}
+	return pattern
+}
+
+func TestGenerateScript_CleanupPatternHasLiteralArgvZeroSemantics(t *testing.T) {
+	script := cleanupScript(t)
+	paths := []string{"/owned/plain/daemon", `/owned/a.b[c]d(e)f{g}h+i*j?k^l$m|n\\daemon`}
+	for _, char := range `\\.^$*+?()[]{}|` {
+		paths = append(paths, "/owned/dir"+string(char)+"literal/daemon")
+	}
+	for _, binary := range paths {
+		t.Run(binary, func(t *testing.T) {
+			pattern := cleanupPattern(t, script, binary)
+			re, err := regexp.CompilePOSIX(pattern)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, tc := range []struct {
+				line string
+				want bool
+			}{
+				{binary, true}, {binary + " --dev", true}, {binary + "\t--dev", true},
+				{"/owned/unrelated --mentions " + binary, false}, {"sh " + binary, false},
+				{"prefix" + binary, false}, {binary + "-extra", false}, {binary + "child --dev", false},
+				{strings.Replace(binary, "/owned/", "/owned-other/", 1), false},
+			} {
+				if got := re.MatchString(tc.line); got != tc.want {
+					t.Errorf("pattern matched %q=%v, want %v", tc.line, got, tc.want)
+				}
+			}
+			if strings.Contains(binary, ".") {
+				near := strings.Replace(binary, ".", "x", 1)
+				if re.MatchString(near) {
+					t.Errorf("ERE metacharacter matched a near path: %q", near)
+				}
+			}
+		})
+	}
+}
+
+func TestProcessToolSandboxRetainsStrictPatternGuards(t *testing.T) {
+	s := newFirstInstallSandbox(t, firstInstallOptions{})
+	binary := s.binary(DaemonWatchd)
+	anchored := "^" + regexp.QuoteMeta(binary) + "([[:space:]]|$)"
+	for _, tool := range []string{"pgrep", "pkill"} {
+		for _, pattern := range []string{"/unowned/vpn-director-watchd", "sh " + binary, binary + "-extra", anchored + ".*", "^" + binary + "$", binary + "/../foreign"} {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			args := []string{"-f", pattern}
+			if tool == "pkill" {
+				args = append([]string{"-9"}, args...)
+			}
+			cmd := exec.CommandContext(ctx, filepath.Join(s.tools, tool), args...)
+			cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+s.root, "SANDBOX_ROOT_PATTERN="+regexp.QuoteMeta(s.root), "STATE_DIR="+s.state, "CALLS_FILE="+s.calls, "CLEANUP_MODE=")
+			out, err := cmd.CombinedOutput()
+			cancel()
+			var exit *exec.ExitError
+			if !errors.As(err, &exit) || exit.ExitCode() != 91 {
+				t.Errorf("%s accepted unowned/malformed pattern %q: %v %s", tool, pattern, err, out)
+			}
+		}
+	}
+}
+
+// Re-exec copies of this test ELF are finite synthetic daemons, including a bare argv[0].
+func init() {
+	if os.Getenv("VPD_UPDATER_OWNED_PROCESS") == "1" {
+		fmt.Println("READY")
+		time.Sleep(20 * time.Second)
+		os.Exit(0)
+	}
+}
+
+type ownedCleanupProcess struct {
+	cmd   *exec.Cmd
+	start string
+	group string
+	argv0 string
+	done  chan error
+}
+
+func ownedCleanupIdentity(pid int) ([]string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(data)[strings.LastIndex(string(data), ")")+2:])
+	if len(fields) < 20 {
+		return nil, errors.New("short owned process stat")
+	}
+	return fields, nil
+}
+
+func (p *ownedCleanupProcess) verify(t *testing.T) {
+	t.Helper()
+	fields, err := ownedCleanupIdentity(p.cmd.Process.Pid)
+	if err != nil || fields[19] != p.start || fields[2] != p.group || fields[0] == "Z" {
+		t.Fatalf("owned process identity/liveness changed: pid=%d err=%v", p.cmd.Process.Pid, err)
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", p.cmd.Process.Pid))
+	if err != nil || string(bytes.Split(data, []byte{0})[0]) != p.argv0 {
+		t.Fatalf("owned process argv[0] changed: %v", err)
+	}
+}
+
+func startCleanupProcess(t *testing.T, executable, argv0 string, args []string, group int) *ownedCleanupProcess {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	cmd := exec.CommandContext(ctx, executable, args...)
+	cmd.Args[0] = argv0
+	cmd.Env = append(os.Environ(), "VPD_UPDATER_OWNED_PROCESS=1")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: group}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	fields, err := ownedCleanupIdentity(cmd.Process.Pid)
+	if err != nil {
+		cancel()
+		cmd.Wait()
+		t.Fatal(err)
+	}
+	p := &ownedCleanupProcess{cmd: cmd, start: fields[19], group: fields[2], argv0: argv0, done: make(chan error, 1)}
+	ready := make(chan error, 1)
+	go func() {
+		line, err := bufio.NewReader(stdout).ReadString('\n')
+		if err == nil && line != "READY\n" {
+			err = fmt.Errorf("unexpected ready line: %q", line)
+		}
+		ready <- err
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			cancel()
+			cmd.Wait()
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		cancel()
+		cmd.Wait()
+		<-ready
+		t.Fatal("owned synthetic process did not become ready")
+	}
+	go func() { p.done <- cmd.Wait() }()
+	t.Cleanup(func() {
+		select {
+		case <-p.done:
+			cancel()
+			return
+		default:
+		}
+		p.verify(t)
+		cancel()
+		select {
+		case <-p.done:
+		case <-time.After(3 * time.Second):
+			t.Error("owned process was not reaped")
+		}
+	})
+	return p
+}
+
+func TestGenerateScript_CleanupMatchesAndKillsOnlyOwnedArgvZero(t *testing.T) {
+	pgrep, err := exec.LookPath("pgrep")
+	if err != nil {
+		t.Skip("procps pgrep unavailable")
+	}
+	pkill, err := exec.LookPath("pkill")
+	if err != nil {
+		t.Skip("procps pkill unavailable")
+	}
+	script := cleanupScript(t)
+	for _, withArgs := range []bool{false, true} {
+		t.Run(fmt.Sprint(withArgs), func(t *testing.T) {
+			root := t.TempDir()
+			binary := filepath.Join(root, `daemon.[x]+(core)^$?*{n}\\`)
+			pattern := cleanupPattern(t, script, binary) // Refuse unsafe real tools before starting any child.
+			data, err := os.ReadFile(os.Args[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			paths := []string{binary, binary + "-suffix", strings.Replace(binary, "daemon.", "daemonx", 1), filepath.Join(root, "unrelated")}
+			for _, path := range paths {
+				if err := os.WriteFile(path, data, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var args []string
+			if withArgs {
+				args = []string{"--owned-argument"}
+			}
+			genuine := startCleanupProcess(t, binary, binary, args, 0)
+			group := genuine.cmd.Process.Pid
+			others := []*ownedCleanupProcess{
+				startCleanupProcess(t, paths[3], paths[3], []string{"--mentions", binary}, group),
+				startCleanupProcess(t, paths[1], paths[1], nil, group),
+				startCleanupProcess(t, paths[2], paths[2], nil, group),
+				startCleanupProcess(t, paths[3], "prefix"+binary, nil, group),
+			}
+			for _, p := range append(others, genuine) {
+				p.verify(t)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, pgrep, "-g", strconv.Itoa(group), "-f", pattern).CombinedOutput()
+			if err != nil || strings.TrimSpace(string(out)) != strconv.Itoa(genuine.cmd.Process.Pid) {
+				t.Fatalf("real procps matched more than the owned daemon: %v %s", err, out)
+			}
+			// Guard wrappers constrain real procps to the verified owned group and exact safe pattern.
+			tools := filepath.Join(root, "tools")
+			if err := os.Mkdir(tools, 0700); err != nil {
+				t.Fatal(err)
+			}
+			for _, tool := range []struct{ name, path, args string }{{"pgrep", pgrep, "-f"}, {"pkill", pkill, "-9 -f"}} {
+				body := "#!/bin/sh\n[ \"$*\" = \"" + tool.args + " $SAFE_PATTERN\" ] || exit 93\nprintf '%s %s\\n' \"${0##*/}\" \"$*\" >> \"$TOOL_CALLS\"\n"
+				if tool.name == "pgrep" {
+					body += "exec \"$REAL_PGREP\" -g \"$OWNED_GROUP\" -f \"$SAFE_PATTERN\"\n"
+				} else {
+					body += "exec \"$REAL_PKILL\" -9 -g \"$OWNED_GROUP\" -f \"$SAFE_PATTERN\"\n"
+				}
+				if err := os.WriteFile(filepath.Join(tools, tool.name), []byte(body), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			inits := filepath.Join(root, "inits")
+			if err := os.Mkdir(inits, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(inits, "S-owned"), []byte("#!/bin/sh\nexit 72\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			calls := filepath.Join(root, "process-calls")
+			env := append(os.Environ(), "SAFE_PATTERN="+pattern, "OWNED_GROUP="+strconv.Itoa(group), "REAL_PGREP="+pgrep, "REAL_PKILL="+pkill, "TOOL_CALLS="+calls, "PATH="+tools+":/usr/bin:/bin", "INIT_DIR="+inits, "DAEMONS=owned|"+binary+"|S-owned")
+			functions := "daemon_argv0_pattern() {\n" + functionBody(t, script, "daemon_argv0_pattern") + "\n}\nstop_new() {\n" + functionBody(t, script, "stop_new") + "\n}\n"
+			snippet := functions + "have_cmd() { return 1; }\nlog() { :; }\nfirst_copy_error() { printf '%s\\n' \"$*\" >&2; }\nSTARTED_NEW_INITS=S-owned\nstop_new\n"
+			cmd := exec.CommandContext(ctx, "/bin/sh", "-c", snippet)
+			cmd.Env = env
+			out, err = cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("production stop_new failed in owned procps fixture: %v %s", err, out)
+			}
+			select {
+			case err := <-genuine.done:
+				var exit *exec.ExitError
+				if !errors.As(err, &exit) || genuine.cmd.ProcessState.Sys().(syscall.WaitStatus).Signal() != syscall.SIGKILL {
+					t.Fatalf("genuine daemon was not stopped/reaped by SIGKILL: %v", err)
+				}
+				// Keep the cleanup's completed-process receipt available.
+				genuine.done <- err
+			case <-time.After(3 * time.Second):
+				t.Fatal("production stop_new did not kill the genuine owned daemon")
+			}
+			for _, p := range others {
+				p.verify(t)
+			}
+			snippet = "daemon_argv0_pattern() {\n" + functionBody(t, script, "daemon_argv0_pattern") + "\n}\nfirst_copy_stopped() {\n" + functionBody(t, script, "first_copy_stopped") + "\n}\nfirst_copy_error() { printf '%s\\n' \"$*\" >&2; }\nfirst_copy_stopped \"$1\"\n"
+			cmd = exec.CommandContext(ctx, "/bin/sh", "-c", snippet, "owned-cleanup", binary)
+			cmd.Env = env
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("unrelated mentions blocked real first-copy confirmation: %v %s", err, out)
+			}
+			for _, p := range others {
+				p.verify(t)
+			}
+			actualCalls, err := os.ReadFile(calls)
+			if err != nil || strings.Count(string(actualCalls), "pkill -9 -f "+pattern+"\n") != 1 || strings.Count(string(actualCalls), "pgrep -f "+pattern+"\n") < 2 {
+				t.Fatalf("new cleanup sites did not share the exact safe process pattern: %v %s", err, actualCalls)
+			}
+			t.Logf("procps owned group=%d genuine=%d stopped/reaped; survivor pids=%v; calls:\n%s", group, genuine.cmd.Process.Pid, []int{others[0].cmd.Process.Pid, others[1].cmd.Process.Pid, others[2].cmd.Process.Pid, others[3].cmd.Process.Pid}, actualCalls)
+		})
+	}
 }

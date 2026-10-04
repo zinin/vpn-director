@@ -86,6 +86,12 @@ start_init() {
     "$INIT_DIR/$1" start
 }
 
+# Cleanup matches argv[0] literally, followed by arguments or end of command.
+daemon_argv0_pattern() {
+    daemon_escaped=$(printf '%s\n' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g') || return 1
+    printf '^%s([[:space:]]|$)\n' "$daemon_escaped"
+}
+
 # Undo new-daemon starts without changing the original recovery list.
 stop_new() {
     for entry in $DAEMONS; do
@@ -100,9 +106,13 @@ stop_new() {
             fi
             log "Stopping new daemon $init"
             "$INIT_DIR/$init" stop || log "WARNING: $init stop returned non-zero"
-            if pgrep -f "$bin" >/dev/null 2>&1; then
+            if ! new_process_pattern=$(daemon_argv0_pattern "$bin"); then
+                first_copy_error "$bin" "cannot build process pattern"
+                break
+            fi
+            if pgrep -f "$new_process_pattern" >/dev/null 2>&1; then
                 # The process may exit between pgrep and pkill.
-                pkill -9 -f "$bin" || true
+                pkill -9 -f "$new_process_pattern" || true
             fi
             break
         done
@@ -118,9 +128,13 @@ first_copy_error() {
 
 # A kill may take a moment to become visible to pgrep; wait at most five seconds.
 first_copy_stopped() {
+    if ! first_process_pattern=$(daemon_argv0_pattern "$1"); then
+        first_copy_error "$1" "cannot build process pattern"
+        return 1
+    fi
     first_waited=0
     while :; do
-        if pgrep -f "$1" >/dev/null 2>&1; then
+        if pgrep -f "$first_process_pattern" >/dev/null 2>&1; then
             if [ "$first_waited" -ge 5 ]; then
                 first_copy_error "$1" "daemon still running"
                 return 1
