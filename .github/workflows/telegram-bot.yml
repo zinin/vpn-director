@@ -28,6 +28,9 @@ jobs:
       - name: Build Vue SPA
         run: make web
 
+      - name: Test Vue SPA
+        run: cd web && npm test
+
       - name: Prepare embed
         run: make web-embed
 

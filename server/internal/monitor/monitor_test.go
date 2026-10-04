@@ -6,10 +6,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
@@ -134,6 +136,99 @@ func TestMonitor_AnswersOfAReplacedProberAreDropped(t *testing.T) {
 	}
 	if h.l.startCount() != 2 {
 		t.Fatalf("prober started %d times, want twice", h.l.startCount())
+	}
+}
+
+func TestMonitor_OrderOnlyRefreshKeepsSessionAndInflightCompletion(t *testing.T) {
+	for _, activeOnly := range []bool{false, true} {
+		t.Run(map[bool]string{false: "order-only", true: "active-only"}[activeOnly], func(t *testing.T) {
+			h := newHarness(t, "k1", "k2", "k3")
+			h.settings.Concurrency = 1
+			next := eps("k3", "k1", "k2")
+			if activeOnly {
+				servers := []vpnconfig.Server{
+					{Name: "first", Address: "192.0.2.10", Port: 443, UUID: "00000000-0000-4000-8000-000000000001", Subscription: "0a1b2c3d"},
+					{Name: "second", Address: "192.0.2.20", Port: 443, UUID: "00000000-0000-4000-8000-000000000002", Subscription: "0a1b2c3d"},
+					{Name: "third", Address: "192.0.2.30", Port: 443, UUID: "00000000-0000-4000-8000-000000000003", Subscription: "0a1b2c3d"},
+				}
+				subs := []vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Synthetic", Servers: servers}}
+				outbound := func(vpnconfig.Server) (json.RawMessage, error) {
+					return json.RawMessage(`{"protocol":"freedom"}`), nil
+				}
+				h.eps, _ = Build(subs, vpnconfig.NewActiveServer(servers[0]), outbound)
+				next, _ = Build(subs, vpnconfig.NewActiveServer(servers[2]), outbound)
+			}
+			before := append([]Endpoint(nil), h.eps...)
+			want := []Endpoint{before[2], before[0], before[1]}
+			if !reflect.DeepEqual(next, want) {
+				t.Fatal("active/order-only fixture changed endpoint keys, labels or outbounds")
+			}
+			gate, entered := make(chan struct{}), make(chan string, 3)
+			cleanGate(t, gate)
+			h.l.gate, h.l.entered = gate, entered
+			h.m.refresh(h.ctx, t0)
+			session := h.m.session
+			h.m.tick(h.ctx, t0)
+			enteredCheck(t, entered, before[0].Key)
+			h.eps = next
+			h.m.refresh(h.ctx, t0)
+			if h.m.session != session || exited(session) || h.l.startCount() != 1 || h.inFlight() != 1 {
+				t.Error("order-only refresh replaced the session or discarded its in-flight check")
+			}
+			if got := h.m.checkableSet(); !reflect.DeepEqual(got, want) {
+				t.Error("session identity comparison changed active-first order, labels or outbounds")
+			}
+			close(gate)
+			h.answer()
+			if st := h.state(before[0].Key); st.Status != watchdapi.StatusAlive || st.LatencyMS != 100 || st.CheckedAt != t0 {
+				t.Errorf("in-flight completion was discarded: %+v", st)
+			}
+			h.m.tick(h.ctx, t0)
+			enteredCheck(t, entered, before[2].Key)
+			h.answer()
+			if st := h.state(before[2].Key); st.Status != watchdapi.StatusAlive {
+				t.Errorf("updated active-first dispatch did not complete: %+v", st)
+			}
+		})
+	}
+}
+
+func TestMonitor_KeySetChangesReplaceSessionAndDropInflightCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		keys []string
+	}{
+		{"add", []string{"k1", "k2", "k3"}},
+		{"remove", []string{"k1"}},
+		{"rotated-key", []string{"k1", "rotated"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, "k1", "k2")
+			h.settings.Concurrency = 1
+			gate, entered := make(chan struct{}), make(chan string, 2)
+			cleanGate(t, gate)
+			h.l.gate, h.l.entered = gate, entered
+			h.m.refresh(h.ctx, t0)
+			old := h.m.session
+			h.m.tick(h.ctx, t0)
+			enteredCheck(t, entered, "k1")
+			h.eps = eps(tc.keys...)
+			h.m.refresh(h.ctx, t0)
+			if h.m.session == old || !exited(old) || h.l.startCount() != 2 {
+				t.Fatal("changed key set did not replace the session")
+			}
+			close(gate)
+			h.answer()
+			if st := h.state("k1"); st.Status != watchdapi.StatusUnknown || !st.CheckedAt.IsZero() {
+				t.Fatalf("replaced session's answer was accepted: %+v", st)
+			}
+			h.m.tick(h.ctx, t0)
+			enteredCheck(t, entered, "k1")
+			h.answer()
+			if st := h.state("k1"); st.Status != watchdapi.StatusAlive || st.CheckedAt != t0 {
+				t.Fatalf("new session's answer was discarded: %+v", st)
+			}
+		})
 	}
 }
 

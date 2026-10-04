@@ -459,6 +459,7 @@ func keysOf(eps []Endpoint) string {
 	for i, ep := range eps {
 		keys[i] = ep.Key
 	}
+	sort.Strings(keys)
 	return strings.Join(keys, ",")
 }
 

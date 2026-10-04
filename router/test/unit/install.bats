@@ -841,6 +841,126 @@ assert_watchd_preserved() {
     done
 }
 
+# Bats run suppresses errexit in shell functions; a fresh Bash keeps it active.
+watchd_install_failure_case() {
+    local failed_operation="$1" invocation="$2" old_identity protected_identity expected_events
+    watchd_download_sandbox
+    old_watchd_binary
+    old_identity="$(stat -c '%d:%i:%s:%a:%Y' "$VPD_DIR/vpn-director-watchd")"
+    cat > "$INIT_DIR/S98vpn-director-watchd" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] || exit 99
+printf 'init:%s\n' "$1" >> "$BATS_TEST_TMPDIR/watchd.events"
+case "$1" in
+    stop) rm -f "$BATS_TEST_TMPDIR/watchd.running" ;;
+    start|restart) touch "$BATS_TEST_TMPDIR/watchd.running" ;;
+    *) exit 99 ;;
+esac
+EOF
+    chmod +x "$INIT_DIR/S98vpn-director-watchd"
+    protected_identity="$(stat -c '%d:%i:%s:%a:%Y' "$INIT_DIR/S98vpn-director-watchd" \
+        "$VPD_DIR/"{telegram-bot,webui,vpn-director.json,watchd.unrelated.tmp})"
+
+    run bash -e -c '
+        source "$1" --source-only
+        VPD_DIR="$2"
+        INIT_DIR="$3"
+        RELEASE_ASSET_URL="$4"
+        failed_operation="$5"
+        mv() {
+            printf "%s\n" "$@" > "$BATS_TEST_TMPDIR/watchd.mv.calls"
+            printf "mv\n" >> "$BATS_TEST_TMPDIR/watchd.events"
+            [[ $# == 2 && $1 == "$VPD_DIR/vpn-director-watchd.tmp" &&
+                $2 == "$VPD_DIR/vpn-director-watchd" ]] || return 99
+            [[ $failed_operation != mv ]] || return 1
+            command mv "$@"
+        }
+        chmod() {
+            printf "%s\n" "$@" > "$BATS_TEST_TMPDIR/watchd.chmod.calls"
+            printf "chmod\n" >> "$BATS_TEST_TMPDIR/watchd.events"
+            [[ $# == 2 && $1 == +x && $2 == "$VPD_DIR/vpn-director-watchd" ]] || return 99
+            [[ $failed_operation != chmod ]] || return 1
+            command chmod "$@"
+        }
+        rm() {
+            local path
+            for path in "$@"; do
+                case "$path" in -*) continue ;; esac
+                printf "%s\n" "$path" >> "$BATS_TEST_TMPDIR/watchd.rm.calls"
+                [[ $path == "$BATS_TEST_TMPDIR/"* && $path != *"/../"* ]] || return 99
+            done
+            command rm "$@"
+        }
+        case "$6" in
+            errexit) download_watchd ;;
+            conditional)
+                if download_watchd; then
+                    :
+                else
+                    exit 90
+                fi
+                ;;
+            *) exit 99 ;;
+        esac
+        printf "installer continued\n"
+    ' bash "$PROJECT_ROOT/../install.sh" "$VPD_DIR" "$INIT_DIR" "$RELEASE_ASSET_URL" \
+        "$failed_operation" "$invocation"
+
+    assert_success
+    assert_output --partial "installer continued"
+    case "$failed_operation" in
+        mv)
+            assert_output --partial "Warning: Failed to move the server monitor binary (optional component)"
+            assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "old monitor"
+            assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$VPD_DIR/vpn-director-watchd")" "$old_identity"
+            [[ ! -e "$BATS_TEST_TMPDIR/watchd.chmod.calls" ]]
+            ;;
+        chmod)
+            assert_output --partial "Warning: Failed to make the server monitor executable (optional component)"
+            assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "new monitor"
+            [[ ! -x "$VPD_DIR/vpn-director-watchd" ]]
+            assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.chmod.calls")" $'+x\n'"$VPD_DIR/vpn-director-watchd"
+            ;;
+    esac
+    refute_output --partial "Installed the server monitor"
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+    [[ ! -f "$BATS_TEST_TMPDIR/watchd.running" ]]
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.mv.calls")" \
+        "$VPD_DIR/vpn-director-watchd.tmp"$'\n'"$VPD_DIR/vpn-director-watchd"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.rm.calls")" "$VPD_DIR/vpn-director-watchd.tmp"
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$INIT_DIR/S98vpn-director-watchd" \
+        "$VPD_DIR/"{telegram-bot,webui,vpn-director.json,watchd.unrelated.tmp})" "$protected_identity"
+    local file
+    for file in telegram-bot webui vpn-director.json watchd.unrelated.tmp; do
+        assert_equal "$(cat "$VPD_DIR/$file")" "unrelated $file"
+    done
+    expected_events=$'curl\npidof:alive\ninit:stop\nsleep:1\npidof:gone\nmv'
+    if [[ $failed_operation == chmod ]]; then
+        expected_events+=$'\nchmod'
+    fi
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.events")" "$expected_events"
+}
+
+@test "download_watchd: a failed mv is optional under real errexit and preserves the installed binary" {
+    load_installer
+    watchd_install_failure_case mv errexit
+}
+
+@test "download_watchd: a failed mv is optional for a conditional caller and preserves the installed binary" {
+    load_installer
+    watchd_install_failure_case mv conditional
+}
+
+@test "download_watchd: a failed chmod is optional under real errexit and keeps the moved binary" {
+    load_installer
+    watchd_install_failure_case chmod errexit
+}
+
+@test "download_watchd: a failed chmod is optional for a conditional caller and keeps the moved binary" {
+    load_installer
+    watchd_install_failure_case chmod conditional
+}
+
 @test "main: downloads the optional monitor and starts it only after the config exists" {
     load_installer
     local step

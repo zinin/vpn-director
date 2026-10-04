@@ -582,8 +582,16 @@ download_watchd() {
         return 0
     fi
 
-    mv "$tmp_path" "$watchd_path"
-    chmod +x "$watchd_path"
+    if ! mv "$tmp_path" "$watchd_path"; then
+        print_info "Warning: Failed to move the server monitor binary (optional component)"
+        rm -f "$tmp_path" 2>/dev/null || true
+        return 0
+    fi
+    if ! chmod +x "$watchd_path"; then
+        print_info "Warning: Failed to make the server monitor executable (optional component)"
+        rm -f "$tmp_path" 2>/dev/null || true
+        return 0
+    fi
     print_success "Installed the server monitor"
 }
 

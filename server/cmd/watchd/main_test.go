@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -213,6 +215,154 @@ func TestEndpointsReader_ConfigOnlySelectionRebuildsPriority(t *testing.T) {
 	}
 	if eps, _, err := read(); err != nil || len(eps) != 0 {
 		t.Fatal("deleted subscription remains in endpoint set:", err)
+	}
+}
+
+func TestEndpointsReader_RetriesFailedLoadWithoutStampChanges(t *testing.T) {
+	for _, warm := range []bool{false, true} {
+		t.Run(map[bool]string{false: "cold", true: "warm"}[warm], func(t *testing.T) {
+			store := testConfigService(t)
+			dir, err := store.SubscriptionsDir()
+			if err != nil {
+				t.Fatal(err)
+			}
+			stable := vpnconfig.Subscription{ID: "0a1b2c3d", Servers: []vpnconfig.Server{{Name: "stable", Address: "192.0.2.10", Port: 443, UUID: "00000000-0000-4000-8000-000000000001"}}}
+			if err := vpnconfig.SaveSubscription(dir, stable); err != nil {
+				t.Fatal(err)
+			}
+			cache := vpnconfig.NewSubscriptionCache()
+			calls, fail := 0, false
+			read := endpointsReaderWithLoader(store, func(dir string) ([]vpnconfig.Subscription, error) {
+				calls++
+				if fail {
+					fail = false
+					return []vpnconfig.Subscription{stable}, syscall.EIO
+				}
+				return cache.Load(dir)
+			})
+			if warm {
+				if eps, _, err := read(); err != nil || len(eps) != 1 {
+					t.Fatalf("initial set: count=%d err=%v", len(eps), err)
+				}
+			}
+			if err := vpnconfig.SaveSubscription(dir, vpnconfig.Subscription{ID: "1b2c3d4e", Servers: []vpnconfig.Server{{Name: "new", Address: "192.0.2.20", Port: 443, UUID: "00000000-0000-4000-8000-000000000002"}}}); err != nil {
+				t.Fatal(err)
+			}
+			stamp := monitor.Stamp(dir, store.ConfigPath())
+			raw, err := os.ReadFile(store.ConfigPath())
+			if err != nil || stamp == "" {
+				t.Fatal("could not capture unchanged files:", err)
+			}
+			fail = true
+			if eps, refused, err := read(); !errors.Is(err, syscall.EIO) || eps != nil || refused != nil {
+				t.Fatalf("load failure published a partial set: count=%d err=%v", len(eps), err)
+			}
+			failedCalls := calls
+			eps, refused, err := read()
+			if err != nil || len(eps) != 2 || len(refused) != 0 || calls != failedCalls+1 {
+				t.Fatalf("unchanged stamp prevented recovery: count=%d calls=%d err=%v", len(eps), calls, err)
+			}
+			if again, _, err := read(); err != nil || len(again) != 2 || calls != failedCalls+1 {
+				t.Fatal("successful unchanged set did not reuse the stamp shortcut:", err)
+			}
+			if after := monitor.Stamp(dir, store.ConfigPath()); after != stamp {
+				t.Fatal("retry changed subscription/config inode, size or mtime")
+			}
+			if after, err := os.ReadFile(store.ConfigPath()); err != nil || !bytes.Equal(raw, after) {
+				t.Fatal("retry changed config content")
+			}
+		})
+	}
+}
+
+type endpointsReadLauncher struct {
+	monitor.FakeLauncher
+	ready, started chan struct{}
+	starts         atomic.Int64
+}
+
+func (l *endpointsReadLauncher) Ready() error {
+	l.ready <- struct{}{}
+	return nil
+}
+
+func (l *endpointsReadLauncher) Start(ctx context.Context, eps []monitor.Endpoint) (monitor.Session, error) {
+	l.starts.Add(1)
+	sess, err := l.FakeLauncher.Start(ctx, eps)
+	l.started <- struct{}{}
+	return sess, err
+}
+
+func TestEndpointsReader_LoadFailureKeepsEngineEndpointSet(t *testing.T) {
+	store := testConfigService(t)
+	dir, err := store.SubscriptionsDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable := vpnconfig.Subscription{ID: "0a1b2c3d", Servers: []vpnconfig.Server{{Address: "192.0.2.10", Port: 443, UUID: "00000000-0000-4000-8000-000000000001"}}}
+	previous := vpnconfig.Subscription{ID: "2c3d4e5f", Servers: []vpnconfig.Server{{Address: "192.0.2.30", Port: 443, UUID: "00000000-0000-4000-8000-000000000003"}}}
+	for _, sub := range []vpnconfig.Subscription{stable, previous} {
+		if err := vpnconfig.SaveSubscription(dir, sub); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cache := vpnconfig.NewSubscriptionCache()
+	var fail atomic.Bool
+	read := endpointsReaderWithLoader(store, func(dir string) ([]vpnconfig.Subscription, error) {
+		if fail.Load() {
+			return []vpnconfig.Subscription{stable}, syscall.EIO
+		}
+		return cache.Load(dir)
+	})
+	var clock atomic.Int64
+	now := time.Now()
+	clock.Store(now.UnixNano())
+	launcher := &endpointsReadLauncher{ready: make(chan struct{}, 4), started: make(chan struct{}, 4)}
+	settings, _ := monitor.SettingsFrom(nil)
+	m := monitor.New(monitor.Deps{
+		Settings:  func() (monitor.Settings, error) { return settings, nil },
+		Endpoints: read,
+		Launcher:  launcher,
+		Stopped:   func() bool { return false },
+		WANUp:     func(context.Context) bool { return true },
+		Now:       func() time.Time { return time.Unix(0, clock.Load()) },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); await(t, done) })
+	await(t, launcher.ready)
+	await(t, launcher.started)
+	key := endpoint.Keys(stable.Servers[0])[0]
+	previousKey := endpoint.Keys(previous.Servers[0])[0]
+	if snap := m.Snapshot(); len(snap.Endpoints) != 2 {
+		t.Fatal("initial engine endpoint set is incomplete")
+	}
+	if err := vpnconfig.SaveSubscription(dir, vpnconfig.Subscription{ID: "1b2c3d4e", Servers: []vpnconfig.Server{{Address: "192.0.2.20", Port: 443, UUID: "00000000-0000-4000-8000-000000000002"}}}); err != nil {
+		t.Fatal(err)
+	}
+	stamp := monitor.Stamp(dir, store.ConfigPath())
+	fail.Store(true)
+	clock.Store(now.Add(2 * time.Minute).UnixNano())
+	if _, err := m.Request(nil); err != nil {
+		t.Fatal(err)
+	}
+	await(t, launcher.ready)
+	if snap := m.Snapshot(); len(snap.Endpoints) != 2 || snap.Endpoints[key].Status == "" || snap.Endpoints[previousKey].Status == "" || launcher.starts.Load() != 1 {
+		t.Fatal("failed load changed the last successful engine set or replaced its session")
+	}
+	fail.Store(false)
+	clock.Store(now.Add(4 * time.Minute).UnixNano())
+	if _, err := m.Request(nil); err != nil {
+		t.Fatal(err)
+	}
+	await(t, launcher.ready)
+	await(t, launcher.started)
+	if snap := m.Snapshot(); len(snap.Endpoints) != 3 || launcher.starts.Load() != 2 {
+		t.Fatal("engine did not publish the recovered set")
+	}
+	if monitor.Stamp(dir, store.ConfigPath()) != stamp {
+		t.Fatal("recovery changed files")
 	}
 }
 

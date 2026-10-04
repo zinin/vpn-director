@@ -256,6 +256,25 @@ func TestClient_AHungDaemonTimesOutWithinTheBound(t *testing.T) {
 	}
 }
 
+func TestHandler_CheckRejectsNullWithoutRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"null", `null`},
+		{"whitespace-null", " \n\tnull \r\n\t"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &fakeSource{snap: Snapshot{Endpoints: map[string]EndpointState{"a": {}}}}
+			rec := httptest.NewRecorder()
+			NewHandler(src).ServeHTTP(rec, httptest.NewRequest("POST", "/v1/monitor/check", strings.NewReader(tc.body)))
+			if rec.Code != http.StatusBadRequest || len(src.requests) != 0 {
+				t.Fatalf("status=%d requests=%d; want 400 without Request", rec.Code, len(src.requests))
+			}
+		})
+	}
+}
+
 func TestHandler_CheckRequiresTheWholeJSONDocument(t *testing.T) {
 	for _, body := range []string{`{} garbage`, `{} {}`, `{"keys":["a"]} null`, `{} ` + strings.Repeat(" ", 1<<20)} {
 		t.Run(body[:min(len(body), 24)], func(t *testing.T) {

@@ -41,7 +41,7 @@ func NewHandler(src Source) http.Handler {
 		writeJSON(w, http.StatusOK, src.Snapshot())
 	})
 	mux.HandleFunc("POST /v1/monitor/check", func(w http.ResponseWriter, r *http.Request) {
-		var req checkRequest
+		req := &checkRequest{}
 		body := http.MaxBytesReader(w, r.Body, 1<<20)
 		// An empty body is a check of every endpoint, like {}.
 		decoder := json.NewDecoder(body)
@@ -53,7 +53,7 @@ func NewHandler(src Source) http.Handler {
 				return
 			}
 		}
-		if err != nil && !errors.Is(err, io.EOF) {
+		if req == nil || (err != nil && !errors.Is(err, io.EOF)) {
 			writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid request body"})
 			return
 		}

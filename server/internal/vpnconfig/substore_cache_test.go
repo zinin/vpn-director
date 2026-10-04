@@ -1,11 +1,14 @@
 package vpnconfig
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -153,6 +156,77 @@ func TestSubscriptionCache_UsesSharedFilteringOrderingIDsAndWarnings(t *testing.
 	got, err := cache.Load(dir)
 	if err != nil || len(got) != 3 || reads["3d4e5f6a.json"] != 2 || parses["3d4e5f6a.json"] != 2 {
 		t.Fatal("a repaired broken file was not re-parsed")
+	}
+}
+
+func TestSubscriptionCache_RetriesOneShotReadFailureWithoutFileChanges(t *testing.T) {
+	for _, warm := range []bool{false, true} {
+		t.Run(map[bool]string{false: "cold", true: "warm"}[warm], func(t *testing.T) {
+			dir := t.TempDir()
+			stable := Subscription{ID: "0a1b2c3d", Name: "stable"}
+			flaky := Subscription{ID: "1b2c3d4e", Name: "recovering"}
+			if err := SaveSubscription(dir, stable); err != nil {
+				t.Fatal(err)
+			}
+			cache, reads, parses := countedSubscriptionCache()
+			if warm {
+				if subs, err := cache.Load(dir); err != nil || len(subs) != 1 {
+					t.Fatalf("prime cache: count=%d err=%v", len(subs), err)
+				}
+			}
+			if err := SaveSubscription(dir, flaky); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, flaky.ID+".json")
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config := filepath.Join(t.TempDir(), "vpn-director.json")
+			raw := []byte(`{"data_dir":"data","xray":{}}`)
+			if err := os.WriteFile(config, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			configBefore, err := os.Stat(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			read := cache.readFile
+			fail := true
+			cache.readFile = func(name string) ([]byte, error) {
+				if name == path && fail {
+					fail = false
+					reads[filepath.Base(name)]++
+					return nil, &os.PathError{Op: "read", Path: name, Err: syscall.EIO}
+				}
+				return read(name)
+			}
+			if subs, err := cache.Load(dir); !errors.Is(err, syscall.EIO) || subs != nil {
+				t.Fatalf("retryable read published a partial success: count=%d err=%v", len(subs), err)
+			}
+			for i := 0; i < 2; i++ {
+				subs, err := cache.Load(dir)
+				if err != nil || len(subs) != 2 || subs[1].ID != flaky.ID {
+					t.Fatalf("unchanged file did not recover: count=%d err=%v", len(subs), err)
+				}
+			}
+			after, err := os.Stat(path)
+			if err != nil || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+				t.Fatal("recovery changed subscription inode, size or mtime")
+			}
+			configAfter, err := os.Stat(config)
+			if err != nil || !os.SameFile(configBefore, configAfter) || configBefore.Size() != configAfter.Size() || !configBefore.ModTime().Equal(configAfter.ModTime()) {
+				t.Fatal("recovery changed config inode, size or mtime")
+			}
+			if data, err := os.ReadFile(config); err != nil || !bytes.Equal(data, raw) {
+				t.Fatal("recovery changed config content")
+			}
+			wantReads := map[string]int{"0a1b2c3d.json": 1, "1b2c3d4e.json": 2}
+			wantParses := map[string]int{"0a1b2c3d.json": 1, "1b2c3d4e.json": 1}
+			if !reflect.DeepEqual(reads, wantReads) || !reflect.DeepEqual(parses, wantParses) {
+				t.Fatalf("recovery reads=%v parses=%v, want reads=%v parses=%v", reads, parses, wantReads, wantParses)
+			}
+		})
 	}
 }
 

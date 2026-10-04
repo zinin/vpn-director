@@ -170,7 +170,10 @@ func settingsReader(configSvc *service.ConfigService) func() (monitor.Settings, 
 // endpointsReader rebuilds only when a subscription or config changed
 // (monitor.Stamp), reusing unchanged subscription files from the shared cache.
 func endpointsReader(configSvc *service.ConfigService) func() ([]monitor.Endpoint, map[string]string, error) {
-	cache := vpnconfig.NewSubscriptionCache()
+	return endpointsReaderWithLoader(configSvc, vpnconfig.NewSubscriptionCache().Load)
+}
+
+func endpointsReaderWithLoader(configSvc *service.ConfigService, load func(string) ([]vpnconfig.Subscription, error)) func() ([]monitor.Endpoint, map[string]string, error) {
 	var lastStamp string
 	var lastEps []monitor.Endpoint
 	var lastRefused map[string]string
@@ -183,7 +186,7 @@ func endpointsReader(configSvc *service.ConfigService) func() ([]monitor.Endpoin
 		if stamp != "" && stamp == lastStamp {
 			return lastEps, lastRefused, nil
 		}
-		subs, err := cache.Load(dir)
+		subs, err := load(dir)
 		if err != nil {
 			return nil, nil, err
 		}
