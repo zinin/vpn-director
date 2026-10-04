@@ -170,6 +170,172 @@ func TestRunDaemon_EarlyListenerFailureStopsTheProberAndSavesState(t *testing.T)
 	}
 }
 
+type ownershipMonitor struct {
+	runs atomic.Int64
+	snap watchdapi.Snapshot
+}
+
+func (m *ownershipMonitor) Snapshot() watchdapi.Snapshot { return m.snap }
+func (m *ownershipMonitor) Request(keys []string) (int, error) {
+	if len(keys) == 0 {
+		return len(m.snap.Endpoints), nil
+	}
+	return len(keys), nil
+}
+func (m *ownershipMonitor) Run(ctx context.Context) {
+	m.runs.Add(1)
+	<-ctx.Done()
+}
+
+func daemonSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "wd4m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "watchd.sock")
+}
+
+func awaitMonitorSocket(t *testing.T, path string) {
+	t.Helper()
+	for i := 0; i < 100; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, err := watchdapi.NewClient(path).Monitor(ctx)
+		cancel()
+		if err == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("owned monitor did not answer")
+}
+
+func TestRunMonitor_DuplicateCannotCleanOrStartAndKeepsPrimary(t *testing.T) {
+	path := daemonSocketPath(t)
+	var cleanupCalls atomic.Int64
+	primary := &ownershipMonitor{snap: watchdapi.Snapshot{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{"primary": {Status: watchdapi.StatusAlive}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- runMonitor(ctx, path, func() daemonMonitor {
+			cleanupCalls.Add(1)
+			return primary
+		})
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error("primary shutdown:", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("primary did not shut down")
+		}
+	})
+	awaitMonitorSocket(t, path)
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := &ownershipMonitor{snap: watchdapi.Snapshot{State: watchdapi.StateDisabled}}
+	duplicateCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer stop()
+	err = runMonitor(duplicateCtx, path, func() daemonMonitor {
+		cleanupCalls.Add(1)
+		return duplicate
+	})
+	if err == nil || cleanupCalls.Load() != 1 || duplicate.runs.Load() != 0 {
+		t.Errorf("duplicate performed cleanup/start: err=%v cleanup=%d runs=%d", err, cleanupCalls.Load(), duplicate.runs.Load())
+	}
+	if after, err := os.Lstat(path); err != nil || !os.SameFile(before, after) {
+		t.Error("duplicate changed the primary socket")
+	}
+	client := watchdapi.NewClient(path)
+	if snap, err := client.Monitor(context.Background()); err != nil || snap.State != watchdapi.StateOK || len(snap.Endpoints) != 1 {
+		t.Errorf("primary health was disturbed: state=%s err=%v", snap.State, err)
+	}
+	for _, keys := range [][]string{{"primary"}, nil} {
+		if n, err := client.Check(context.Background(), keys); err != nil || n != 1 {
+			t.Errorf("primary check failed after duplicate: n=%d err=%v", n, err)
+		}
+	}
+}
+
+func TestRunMonitor_CancellationKeepsOwnershipThroughStateShutdown(t *testing.T) {
+	path := daemonSocketPath(t)
+	m := &lifecycleMonitor{make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})}
+	var released sync.Once
+	finish := func() { released.Do(func() { close(m.finish) }) }
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runMonitor(ctx, path, func() daemonMonitor { return m }) }()
+	t.Cleanup(func() {
+		cancel()
+		finish()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Error("owner shutdown:", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("owner shutdown did not finish")
+		}
+	})
+	awaitMonitorSocket(t, path)
+	await(t, m.started)
+	cancel()
+	await(t, m.canceled)
+	initialized := false
+	duplicateCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer stop()
+	if err := runMonitor(duplicateCtx, path, func() daemonMonitor {
+		initialized = true
+		return &ownershipMonitor{}
+	}); err == nil || initialized {
+		t.Fatal("pending prober/state shutdown released instance ownership")
+	}
+	finish()
+	await(t, m.saved)
+}
+
+func TestRunMonitor_AcquisitionFailureIsSafeAndSkipsInitialization(t *testing.T) {
+	path := daemonSocketPath(t)
+	parent := filepath.Join(filepath.Dir(path), "SECRET_SENTINEL")
+	if err := os.WriteFile(parent, []byte("synthetic regular file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var initialized bool
+	m := &ownershipMonitor{}
+	err := runMonitor(context.Background(), filepath.Join(parent, "watchd.sock"), func() daemonMonitor {
+		initialized = true
+		return m
+	})
+	var cause *os.PathError
+	if err == nil || !errors.As(err, &cause) || strings.Contains(err.Error(), "SECRET_SENTINEL") {
+		t.Fatalf("acquisition did not return a safe wrapped cause: %v", err)
+	}
+	if initialized || m.runs.Load() != 0 {
+		t.Error("failed acquisition initialized/started the monitor")
+	}
+}
+
+func TestRunMonitor_CanceledStartupSkipsInitialization(t *testing.T) {
+	path := daemonSocketPath(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var initialized bool
+	m := &ownershipMonitor{}
+	err := runMonitor(ctx, path, func() daemonMonitor {
+		initialized = true
+		return m
+	})
+	if !errors.Is(err, context.Canceled) || initialized || m.runs.Load() != 0 {
+		t.Errorf("canceled acquisition initialized/started: err=%v initialized=%v runs=%d", err, initialized, m.runs.Load())
+	}
+}
+
 func testConfigService(t *testing.T) *service.ConfigService {
 	t.Helper()
 	dir := t.TempDir()

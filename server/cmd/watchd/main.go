@@ -81,34 +81,33 @@ func run() int {
 	scriptsDir := filepath.Dir(*configPath)
 	configSvc := service.NewConfigService(scriptsDir, filepath.Join(scriptsDir, "data"), *configPath)
 
-	var launcher monitor.Launcher
-	if *devFlag {
-		launcher = monitor.FakeLauncher{}
-	} else {
-		monitor.KillLeftovers(p.ProbeBinary)
-		launcher = &monitor.XrayLauncher{ProbeBinary: p.ProbeBinary, ConfigDir: p.ProbeDir}
-	}
-
-	m := monitor.New(monitor.Deps{
-		Settings:  settingsReader(configSvc),
-		Endpoints: endpointsReader(configSvc),
-		Launcher:  launcher,
-		Stopped: func() bool {
-			_, err := os.Stat(p.StoppedMarker)
-			return err == nil
-		},
-		WANUp: func(ctx context.Context) bool {
-			return monitor.WANUp(ctx, endpoint.WANControls, 3*time.Second)
-		},
-		StatePath:  p.WatchdState,
-		OnSettings: levelSetter(logger),
-	})
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	logger.StartRotation(ctx, p.RotatedLogs(), logging.DefaultMaxSize, time.Minute)
 
-	if err := runDaemon(ctx, p.WatchdSocket, m, watchdapi.Serve); err != nil {
+	if err := runMonitor(ctx, p.WatchdSocket, func() daemonMonitor {
+		logger.StartRotation(ctx, p.RotatedLogs(), logging.DefaultMaxSize, time.Minute)
+		var launcher monitor.Launcher
+		if *devFlag {
+			launcher = monitor.FakeLauncher{}
+		} else {
+			monitor.KillLeftovers(p.ProbeBinary)
+			launcher = &monitor.XrayLauncher{ProbeBinary: p.ProbeBinary, ConfigDir: p.ProbeDir}
+		}
+		return monitor.New(monitor.Deps{
+			Settings:  settingsReader(configSvc),
+			Endpoints: endpointsReader(configSvc),
+			Launcher:  launcher,
+			Stopped: func() bool {
+				_, err := os.Stat(p.StoppedMarker)
+				return err == nil
+			},
+			WANUp: func(ctx context.Context) bool {
+				return monitor.WANUp(ctx, endpoint.WANControls, 3*time.Second)
+			},
+			StatePath:  p.WatchdState,
+			OnSettings: levelSetter(logger),
+		})
+	}); err != nil {
 		slog.Error("the monitor's socket stopped", "path", p.WatchdSocket, "error", err)
 		return 1
 	}
@@ -119,6 +118,21 @@ func run() int {
 type daemonMonitor interface {
 	watchdapi.Source
 	Run(context.Context)
+}
+
+// Instance ownership precedes every prober side effect and outlives shutdown.
+func runMonitor(ctx context.Context, path string, build func() daemonMonitor) error {
+	listener, err := watchdapi.Listen(ctx, path)
+	if err != nil {
+		return &socketError{cause: err}
+	}
+	defer listener.Close()
+	if err := ctx.Err(); err != nil {
+		return &socketError{cause: err}
+	}
+	return runDaemon(ctx, path, build(), func(ctx context.Context, _ string, src watchdapi.Source) error {
+		return watchdapi.ServeListener(ctx, listener, src)
+	})
 }
 
 type socketError struct{ cause error }

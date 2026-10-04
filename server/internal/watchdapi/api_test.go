@@ -3,6 +3,7 @@ package watchdapi
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -146,7 +148,12 @@ func TestServe_ReplacesAStaleSocketFile(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "watchd.sock")
-	if err := os.WriteFile(path, nil, 0600); err != nil {
+	stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale.SetUnlinkOnClose(false)
+	if err := stale.Close(); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -293,6 +300,501 @@ func TestHandler_CheckRequiresTheWholeJSONDocument(t *testing.T) {
 		if rec.Code != http.StatusAccepted || len(src.requests) != 1 {
 			t.Fatalf("valid body status=%d requests=%d", rec.Code, len(src.requests))
 		}
+	}
+}
+
+func ownedSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "wd4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	return filepath.Join(dir, "watchd.sock")
+}
+
+func startOwnedServe(t *testing.T, path string, src Source) func() {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, path, src) }()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("owned Serve shutdown: %v", err)
+				}
+			case <-time.After(3 * time.Second):
+				t.Error("owned Serve did not stop")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	if _, err := waitForSocket(path); err != nil {
+		t.Fatal(err)
+	}
+	return stop
+}
+
+func attemptDuplicate(t *testing.T, path string) (error, bool) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- Serve(ctx, path, &fakeSource{snap: Snapshot{State: StateDisabled}}) }()
+	select {
+	case err := <-done:
+		return err, true
+	case <-time.After(500 * time.Millisecond):
+		cancel()
+		select {
+		case err := <-done:
+			return err, false
+		case <-time.After(3 * time.Second):
+			t.Fatal("duplicate Serve did not stop")
+			return nil, false
+		}
+	}
+}
+
+func TestServe_RefusesRunningInstanceAndKeepsItsSocket(t *testing.T) {
+	path := ownedSocketPath(t)
+	startOwnedServe(t, path, &fakeSource{snap: Snapshot{State: StateOK, Endpoints: map[string]EndpointState{"a": {}, "b": {}}}})
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err, early := attemptDuplicate(t, path); err == nil || !early {
+		t.Errorf("duplicate took over a running socket: err=%v early=%v", err, early)
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Error("duplicate changed the original socket inode")
+	}
+	client := NewClient(path)
+	if snap, err := client.Monitor(context.Background()); err != nil || snap.State != StateOK || len(snap.Endpoints) != 2 {
+		t.Errorf("original monitor no longer answers: state=%v err=%v", snap.State, err)
+	}
+	if n, err := client.Check(context.Background(), []string{"a"}); err != nil || n != 1 {
+		t.Errorf("original one check: n=%d err=%v", n, err)
+	}
+	if n, err := client.Check(context.Background(), nil); err != nil || n != 2 {
+		t.Errorf("original all check: n=%d err=%v", n, err)
+	}
+}
+
+func TestServe_RefusesAcceptingSocketWithoutWaitingForHTTP(t *testing.T) {
+	path := ownedSocketPath(t)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	t.Cleanup(func() { listener.Close() })
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err, early := attemptDuplicate(t, path); err == nil || !early {
+		t.Errorf("accepting socket without HTTP was replaced or awaited: err=%v early=%v", err, early)
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Error("accepting socket inode changed")
+	}
+	conn, err := net.DialTimeout("unix", path, 100*time.Millisecond)
+	if err != nil {
+		t.Error("original accepting socket is no longer reachable:", err)
+	} else {
+		conn.Close()
+	}
+}
+
+func TestServe_PreservesForeignRegularAndSymlinkPaths(t *testing.T) {
+	for _, symlink := range []bool{false, true} {
+		t.Run(map[bool]string{false: "regular", true: "symlink"}[symlink], func(t *testing.T) {
+			path := ownedSocketPath(t)
+			target := path
+			if symlink {
+				target = filepath.Join(filepath.Dir(path), "foreign")
+			}
+			data := []byte("foreign synthetic file\n")
+			if err := os.WriteFile(target, data, 0640); err != nil {
+				t.Fatal(err)
+			}
+			if symlink {
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err, early := attemptDuplicate(t, path); err == nil || !early {
+				t.Errorf("foreign path accepted: err=%v early=%v", err, early)
+			}
+			after, err := os.Lstat(path)
+			if err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+				t.Error("foreign file/symlink identity or mode changed")
+			}
+			if got, err := os.ReadFile(target); err != nil || string(got) != string(data) {
+				t.Error("foreign content changed:", err)
+			}
+			if symlink {
+				if got, err := os.Readlink(path); err != nil || got != target {
+					t.Error("foreign symlink target changed:", err)
+				}
+			}
+		})
+	}
+}
+
+func TestServe_ConcurrentStartsRefuseEveryDuplicate(t *testing.T) {
+	path := ownedSocketPath(t)
+	startOwnedServe(t, path, &fakeSource{snap: Snapshot{State: StateOK}})
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const count = 8
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gate := make(chan struct{})
+	done := make(chan error, count)
+	for range count {
+		go func() {
+			<-gate
+			done <- Serve(ctx, path, &fakeSource{snap: Snapshot{State: StateDisabled}})
+		}()
+	}
+	close(gate)
+	deadline := time.After(time.Second)
+	finished := 0
+collect:
+	for finished < count {
+		select {
+		case err := <-done:
+			finished++
+			if err == nil {
+				t.Error("a concurrent duplicate succeeded")
+			}
+		case <-deadline:
+			t.Error("a concurrent duplicate became a running server")
+			break collect
+		}
+	}
+	cancel()
+	for finished < count {
+		select {
+		case <-done:
+			finished++
+		case <-time.After(3 * time.Second):
+			t.Fatal("concurrent duplicate failed to stop")
+		}
+	}
+	if after, err := os.Lstat(path); err != nil || !os.SameFile(before, after) {
+		t.Error("concurrent starts changed the primary socket")
+	}
+	if snap, err := NewClient(path).Monitor(context.Background()); err != nil || snap.State != StateOK {
+		t.Error("concurrent starts disturbed the primary:", err)
+	}
+}
+
+func TestServe_ConcurrentFirstStartsHaveExactlyOneOwner(t *testing.T) {
+	path := ownedSocketPath(t)
+	const count = 8
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	gate, done := make(chan struct{}), make(chan error, count)
+	for range count {
+		go func() {
+			<-gate
+			done <- Serve(ctx, path, &fakeSource{snap: Snapshot{State: StateOK, Endpoints: map[string]EndpointState{"a": {}}}})
+		}()
+	}
+	close(gate)
+	finished := 0
+	t.Cleanup(func() {
+		cancel()
+		for finished < count {
+			select {
+			case <-done:
+				finished++
+			case <-time.After(3 * time.Second):
+				t.Error("concurrent first start did not finish")
+				return
+			}
+		}
+	})
+	deadline := time.After(time.Second)
+	for finished < count-1 {
+		select {
+		case err := <-done:
+			finished++
+			if err == nil {
+				t.Error("a first-start loser succeeded")
+			}
+		case <-deadline:
+			t.Fatal("more than one concurrent first start remained running")
+		}
+	}
+	if _, err := waitForSocket(path); err != nil {
+		t.Fatal("first-start winner did not serve:", err)
+	}
+	if n, err := NewClient(path).Check(context.Background(), nil); err != nil || n != 1 {
+		t.Fatalf("first-start winner check: n=%d err=%v", n, err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		finished++
+		if err != nil {
+			t.Fatal("first-start winner shutdown:", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("first-start winner did not stop")
+	}
+}
+
+func TestServe_LockInodeSurvivesCancellationAndRestart(t *testing.T) {
+	path := ownedSocketPath(t)
+	stop := startOwnedServe(t, path, &fakeSource{})
+	before, err := os.Lstat(path + ".lock")
+	if err != nil {
+		t.Fatal("lifetime lock was not created:", err)
+	}
+	stop()
+	if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(before, after) {
+		t.Fatal("normal cancellation removed/replaced the lock inode")
+	}
+	stopAgain := startOwnedServe(t, path, &fakeSource{})
+	if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(before, after) {
+		t.Error("restart did not reuse the stable lock inode")
+	}
+	stopAgain()
+}
+
+func assertLockReleased(t *testing.T, path string) {
+	t.Helper()
+	lock, err := os.OpenFile(path+".lock", os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal("instance lock was leaked:", err)
+	}
+}
+
+func TestListen_FailClosedOnAmbiguousSocketProbe(t *testing.T) {
+	for _, cause := range []error{context.DeadlineExceeded, os.ErrPermission, syscall.EIO} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			path := ownedSocketPath(t)
+			stale, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			stale.SetUnlinkOnClose(false)
+			stale.Close()
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			listener, err := listen(context.Background(), path, func(ctx context.Context, network, addr string) (net.Conn, error) {
+				calls++
+				if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > socketProbeTimeout || network != "unix" || addr != path {
+					t.Error("socket probe has no bound or targets another path")
+				}
+				return nil, cause
+			})
+			if listener != nil {
+				listener.Close()
+			}
+			if !errors.Is(err, cause) || listener != nil || calls != 1 {
+				t.Fatalf("ambiguous probe accepted: listener=%v calls=%d err=%v", listener != nil, calls, err)
+			}
+			if after, err := os.Lstat(path); err != nil || !os.SameFile(before, after) {
+				t.Error("ambiguous probe removed or replaced the socket")
+			}
+			assertLockReleased(t, path)
+			if listener, err := Listen(context.Background(), path); err != nil {
+				t.Fatal("failed probe prevented recovery:", err)
+			} else {
+				listener.Close()
+			}
+		})
+	}
+}
+
+func TestListen_FailedListenReleasesStableLockAndCanRestart(t *testing.T) {
+	base := filepath.Dir(ownedSocketPath(t))
+	dir := filepath.Join(base, strings.Repeat("d", 100))
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "watchd.sock")
+	if listener, err := Listen(context.Background(), path); err == nil {
+		listener.Close()
+		t.Fatal("overlong Unix socket address unexpectedly listened")
+	}
+	assertLockReleased(t, path)
+	before, err := os.Lstat(path + ".lock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fd, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fd.Close()
+	short := fmt.Sprintf("/proc/self/fd/%d/watchd.sock", fd.Fd())
+	listener, err := Listen(context.Background(), short)
+	if err != nil {
+		t.Fatal("restart on the same filesystem socket/lock via a bounded address failed:", err)
+	}
+	defer listener.Close()
+	if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(before, after) {
+		t.Error("failed listen/restart changed the lock inode")
+	}
+}
+
+func TestListen_CanceledContextDoesNotAcquire(t *testing.T) {
+	path := ownedSocketPath(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	listener, err := Listen(ctx, path)
+	if listener != nil {
+		listener.Close()
+	}
+	if !errors.Is(err, context.Canceled) || listener != nil {
+		t.Fatal("canceled Listen acquired resources:", err)
+	}
+	for _, name := range []string{path, path + ".lock"} {
+		if _, err := os.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+			t.Error("canceled startup created a socket or lock")
+		}
+	}
+	listener, err = Listen(context.Background(), path)
+	if err != nil {
+		t.Fatal("canceled startup prevented restart:", err)
+	}
+	listener.Close()
+}
+
+func TestListen_PreservesForeignLockPaths(t *testing.T) {
+	for _, kind := range []string{"symlink", "directory", "fifo"} {
+		t.Run(kind, func(t *testing.T) {
+			path := ownedSocketPath(t)
+			lockPath := path + ".lock"
+			target := filepath.Join(filepath.Dir(path), "foreign")
+			if err := os.WriteFile(target, []byte("synthetic foreign lock target"), 0640); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			switch kind {
+			case "symlink":
+				err = os.Symlink(target, lockPath)
+			case "directory":
+				err = os.Mkdir(lockPath, 0700)
+			case "fifo":
+				err = syscall.Mkfifo(lockPath, 0600)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.Lstat(lockPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if listener, err := Listen(context.Background(), path); err == nil {
+				listener.Close()
+				t.Error("foreign nonregular lock accepted")
+			}
+			if after, err := os.Lstat(lockPath); err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+				t.Error("foreign lock identity or mode changed")
+			}
+			if data, err := os.ReadFile(target); err != nil || string(data) != "synthetic foreign lock target" {
+				t.Error("foreign lock target changed:", err)
+			}
+		})
+	}
+}
+
+func TestListen_ClosePreservesAReplacementForeignPath(t *testing.T) {
+	for _, symlink := range []bool{false, true} {
+		t.Run(map[bool]string{false: "regular", true: "symlink"}[symlink], func(t *testing.T) {
+			path := ownedSocketPath(t)
+			listener, err := Listen(context.Background(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { listener.Close() })
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			target := path
+			if symlink {
+				target = filepath.Join(filepath.Dir(path), "replacement")
+			}
+			if err := os.WriteFile(target, []byte("foreign replacement"), 0640); err != nil {
+				t.Fatal(err)
+			}
+			if symlink {
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := os.Lstat(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			listener.Close()
+			if after, err := os.Lstat(path); err != nil || !os.SameFile(before, after) || before.Mode() != after.Mode() {
+				t.Error("listener Close removed/changed a foreign replacement")
+			}
+			if data, err := os.ReadFile(target); err != nil || string(data) != "foreign replacement" {
+				t.Error("foreign replacement content changed:", err)
+			}
+			assertLockReleased(t, path)
+		})
+	}
+}
+
+func TestServeListener_FatalFailureRetainsOwnershipUntilClosed(t *testing.T) {
+	path := ownedSocketPath(t)
+	listener, err := Listen(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	done := make(chan error, 1)
+	go func() { done <- ServeListener(context.Background(), listener, &fakeSource{}) }()
+	if _, err := waitForSocket(path); err != nil {
+		t.Fatal(err)
+	}
+	listener.(*instanceListener).Listener.Close()
+	select {
+	case err := <-done:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatal("fatal listener error lost:", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("failed ServeListener did not finish")
+	}
+	if next, err := Listen(context.Background(), path); err == nil {
+		next.Close()
+		t.Error("fatal HTTP serving released the lifetime lock before owner shutdown")
+	}
+	listener.Close()
+	if next, err := Listen(context.Background(), path); err != nil {
+		t.Fatal("owner shutdown did not release ownership:", err)
+	} else {
+		next.Close()
 	}
 }
 
