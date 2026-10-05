@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -111,33 +112,123 @@ func TestNewPathClient_ReportsTLSCloseAfterClientHello(t *testing.T) {
 	}
 }
 
-// WithClientTrace already composes with a previous ClientTrace. Copying those
-// hooks and chaining them ourselves makes TLSHandshakeStart run twice.
-// The test exercises the late TLS-handshake write and detects the race only
-// under -race, so it is intentionally assertion-free.
+// Hold the real peer, not a trace hook: hook barriers would synchronize the
+// late handshakeErr write with RoundTrip's read and hide the race under -race.
 func TestNewPathClient_HandshakeErrNoRace(t *testing.T) {
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ln.Close()
-	go func() {
-		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		time.Sleep(80 * time.Millisecond)
-		_ = c.Close()
-	}()
+	t.Cleanup(func() { _ = ln.Close() })
 	client := NewPathClient(&fakeSource{p: Path{Kind: netpath.KindDirect}})
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
-	defer cancel()
+	t.Cleanup(client.CloseIdleConnections)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	started := make(chan struct{})
+	handshakeDone := make(chan error, 1)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		TLSHandshakeStart: func() { close(started) },
+		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
+			handshakeDone <- err
+		},
+	})
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+ln.Addr().String()+"/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = client.Do(req)
-	time.Sleep(120 * time.Millisecond)
+
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	accepted := make(chan acceptResult, 1)
+	acceptDone := make(chan struct{})
+	requestDone := make(chan struct{})
+	var peer net.Conn
+	var acceptReceived bool
+	var resp *http.Response
+	var requestErr error
+	t.Cleanup(func() {
+		cancel()
+		_ = ln.Close()
+		if !acceptReceived {
+			peer = (<-accepted).conn
+		}
+		if peer != nil {
+			_ = peer.Close()
+		}
+		<-acceptDone
+		<-requestDone
+	})
+	go func() {
+		defer close(acceptDone)
+		c, err := ln.Accept()
+		accepted <- acceptResult{conn: c, err: err}
+	}()
+	go func() {
+		defer close(requestDone)
+		resp, requestErr = client.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("TLSHandshakeStart not called")
+	}
+	select {
+	case result := <-accepted:
+		acceptReceived = true
+		peer = result.conn
+		if result.err != nil {
+			t.Fatalf("accept TLS peer: %v", result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TLS peer did not accept the connection")
+	}
+	// Read a complete ClientHello record; the deadline is only a watchdog.
+	if err := peer.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var header [5]byte
+	if _, err := io.ReadFull(peer, header[:]); err != nil {
+		t.Fatalf("read ClientHello header: %v", err)
+	}
+	if header[0] != 22 {
+		t.Fatalf("TLS record type = %d, want handshake (22)", header[0])
+	}
+	recordLen := int64(header[3])<<8 | int64(header[4])
+	if _, err := io.CopyN(io.Discard, peer, recordLen); err != nil {
+		t.Fatalf("read ClientHello record: %v", err)
+	}
+
+	cancel()
+	select {
+	case <-requestDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("request did not return after cancellation")
+	}
+	if resp != nil || !errors.Is(requestErr, context.Canceled) {
+		t.Fatalf("canceled request: response=%v err=%v, want nil response and context.Canceled", resp, requestErr)
+	}
+	select {
+	case err := <-handshakeDone:
+		t.Fatalf("TLSHandshakeDone ran before peer release: %v", err)
+	default:
+	}
+	if err := peer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-handshakeDone:
+		if err == nil {
+			t.Fatal("TLSHandshakeDone reported success for the closed peer")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TLSHandshakeDone not called after canceled request and peer close")
+	}
 }
 
 func TestNewPathClient_ExistingTraceHooksRunOnce(t *testing.T) {
