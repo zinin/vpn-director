@@ -37,8 +37,8 @@ type errorResponse struct {
 	State State  `json:"state,omitempty"`
 }
 
-// NewHandler serves GET /v1/monitor and POST /v1/monitor/check for src.
-func NewHandler(src Source) http.Handler {
+// NewHandler serves the monitor and an optional watch/notification source.
+func NewHandler(src Source, automation ...AutomationSource) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/monitor", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, src.Snapshot())
@@ -71,6 +71,9 @@ func NewHandler(src Source) http.Handler {
 		}
 		writeJSON(w, http.StatusAccepted, checkResponse{Queued: n})
 	})
+	if len(automation) > 0 && automation[0] != nil {
+		addNotificationHandlers(mux, automation[0])
+	}
 	return mux
 }
 
@@ -326,11 +329,11 @@ func Serve(ctx context.Context, path string, src Source) error {
 
 // ServeListener serves an acquired listener. Its caller retains the lifetime
 // lock until both serving and the monitor's prober/state shutdown have ended.
-func ServeListener(ctx context.Context, l net.Listener, src Source) error {
+func ServeListener(ctx context.Context, l net.Listener, src Source, automation ...AutomationSource) error {
 	if owned, ok := l.(*instanceListener); ok {
 		l = owned.Listener
 	}
-	srv := &http.Server{Handler: NewHandler(src), ReadHeaderTimeout: 5 * time.Second}
+	srv := &http.Server{Handler: NewHandler(src, automation...), ReadHeaderTimeout: 5 * time.Second}
 	done, stopped := make(chan struct{}), make(chan struct{})
 	go func() {
 		defer close(stopped)

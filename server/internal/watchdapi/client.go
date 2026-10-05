@@ -21,6 +21,18 @@ type API interface {
 	Check(ctx context.Context, keys []string) (int, error)
 }
 
+// WatchAPI reads the subscription automation independently of the monitor API.
+type WatchAPI interface {
+	Watch(context.Context) (WatchSnapshot, error)
+}
+
+// NotificationAPI synchronizes recipients and durable delivery progress.
+type NotificationAPI interface {
+	SetRecipients(context.Context, []Recipient) error
+	Pending(context.Context, string) (NotificationPage, error)
+	Ack(context.Context, int64, EventID) error
+}
+
 // clientTimeout bounds every request, so a hung daemon cannot stall a page or
 // a command. A var so a test can shorten it.
 var clientTimeout = 2 * time.Second

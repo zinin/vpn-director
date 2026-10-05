@@ -1,9 +1,11 @@
 package notifications
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -385,6 +387,135 @@ func TestWatchTypes_SnakeCaseJSON(t *testing.T) {
 			var reopened watchdapi.WatchSnapshot
 			if err := json.Unmarshal(data, &reopened); err != nil || !reflect.DeepEqual(reopened, snapshot) {
 				t.Fatalf("watch snapshot round-trip = %+v, %v", reopened, err)
+			}
+		})
+	}
+}
+
+func TestPending_EncodedSizeBound(t *testing.T) {
+	at := notificationTestTime()
+	s := newNotificationStore(t, filepath.Join(t.TempDir(), "watchd-notifications.json"), func() time.Time { return at })
+	var recipients []watchdapi.Recipient
+	for _, chatID := range []int64{1000, 10, -2, 100, 2, -1000} {
+		recipients = append(recipients, watchdapi.Recipient{ChatID: chatID, FirstSeen: at})
+	}
+	replaceNotificationRecipients(t, s, recipients...)
+	text := strings.Repeat("<", 600<<10)
+	id := publishNotification(t, s, text)
+	var messages []watchdapi.Notification
+	cursor := ""
+	seen := make(map[string]bool)
+	for pages := 0; pages < 10; pages++ {
+		page, err := s.Pending(cursor)
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := json.Marshal(page)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The HTTP JSON encoder also writes a newline and escapes HTML characters.
+		if len(encoded)+1 >= 16<<20 || len(page.Messages) > 100 || len(page.NextCursor) > 256 {
+			t.Fatalf("page encoded=%d messages=%d cursor=%d", len(encoded)+1, len(page.Messages), len(page.NextCursor))
+		}
+		messages = append(messages, page.Messages...)
+		if page.NextCursor == "" {
+			break
+		}
+		if len(page.Messages) == 0 || seen[page.NextCursor] || page.NextCursor == cursor {
+			t.Fatal("size-bounded pagination did not advance")
+		}
+		seen[page.NextCursor] = true
+		cursor = page.NextCursor
+	}
+	if len(messages) != 6 || s.Status().Pending != 6 {
+		t.Fatalf("size-bounded messages=%d pending=%d, want 6 without consumption", len(messages), s.Status().Pending)
+	}
+	for i, chatID := range []int64{-1000, -2, 2, 10, 100, 1000} {
+		message := messages[i]
+		if message.ChatID != chatID || message.EventID != id || !message.At.Equal(at) || message.Text != text {
+			t.Fatalf("size-bounded message %d changed payload or numeric chat order", i)
+		}
+	}
+	if again := pendingNotifications(t, s); !reflect.DeepEqual(again, messages) {
+		t.Fatal("size-bounded read consumed or changed messages")
+	}
+}
+
+func TestPending_InvalidCursorIsAtomic(t *testing.T) {
+	at := notificationTestTime()
+	path := filepath.Join(t.TempDir(), "watchd-notifications.json")
+	s := newNotificationStore(t, path, func() time.Time { return at })
+	var recipients []watchdapi.Recipient
+	for chatID := int64(100); chatID < 106; chatID++ {
+		recipients = append(recipients, watchdapi.Recipient{ChatID: chatID, FirstSeen: at})
+	}
+	replaceNotificationRecipients(t, s, recipients...)
+	for i := 0; i < 20; i++ {
+		publishNotification(t, s, fmt.Sprintf("event %02d", i))
+	}
+	first, err := s.Pending("")
+	if err != nil || first.NextCursor == "" {
+		t.Fatalf("first page did not provide a cursor: %v", err)
+	}
+	before := pendingNotifications(t, s)
+	durable, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, cursor := range []string{"not-a-cursor", first.NextCursor + "!", strings.Repeat("x", 256), strings.Repeat("x", 257)} {
+		if _, err := s.Pending(cursor); err == nil {
+			t.Errorf("invalid %d-byte cursor was accepted", len(cursor))
+		}
+		if after := pendingNotifications(t, s); !reflect.DeepEqual(after, before) || s.Status().Pending != 120 {
+			t.Error("invalid cursor consumed or changed pending messages")
+		}
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, durable) {
+			t.Errorf("invalid cursor changed durable storage: %v", err)
+		}
+	}
+}
+
+func TestPending_AckValidationIsAtomic(t *testing.T) {
+	for _, name := range []string{"malformed", "zero-sequence", "leading-zero-sequence", "future-sequence", "maximum-future-sequence"} {
+		t.Run(name, func(t *testing.T) {
+			at := notificationTestTime()
+			path := filepath.Join(t.TempDir(), "watchd-notifications.json")
+			s := newNotificationStore(t, path, func() time.Time { return at })
+			replaceNotificationRecipients(t, s,
+				watchdapi.Recipient{ChatID: 100, FirstSeen: at},
+				watchdapi.Recipient{ChatID: 200, FirstSeen: at},
+			)
+			first := publishNotification(t, s, "first")
+			second := publishNotification(t, s, "second")
+			epoch, _ := splitNotificationID(t, first)
+			invalid := watchdapi.EventID(map[string]string{
+				"malformed":               "not-an-event",
+				"zero-sequence":           epoch + ":0",
+				"leading-zero-sequence":   epoch + ":03",
+				"future-sequence":         epoch + ":3",
+				"maximum-future-sequence": epoch + ":18446744073709551615",
+			}[name])
+			before := pendingNotifications(t, s)
+			durable, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := s.Ack(100, invalid); err == nil {
+				t.Errorf("Ack accepted %s", name)
+			}
+			if after := pendingNotifications(t, s); !reflect.DeepEqual(after, before) || s.Status().StorageError != "" {
+				t.Error("invalid Ack changed pending or storage health")
+			}
+			got, err := os.ReadFile(path)
+			if err != nil || !bytes.Equal(got, durable) {
+				t.Errorf("invalid Ack changed durable storage: %v", err)
+			}
+			third := publishNotification(t, s, "after rejected ack")
+			messages := pendingNotifications(t, s)
+			for _, chatID := range []int64{100, 200} {
+				assertNotificationIDs(t, notificationsForChat(messages, chatID), []watchdapi.EventID{first, second, third})
 			}
 		})
 	}

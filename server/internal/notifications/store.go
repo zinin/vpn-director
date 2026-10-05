@@ -22,6 +22,7 @@ const (
 	maxAge          = 12 * time.Hour
 	saveEvery       = 10 * time.Second
 	pageSize        = 100
+	maxPageBytes    = 16 << 20
 	maxCursorLength = 256
 	sequenceReserve = uint64(1 << 32)
 )
@@ -36,8 +37,9 @@ var (
 	errEncoding = errors.New("cannot encode notification storage")
 	errIdentity = errors.New("cannot create notification store identity")
 	errSequence = errors.New("notification sequence exhausted")
-	errCursor   = errors.New("invalid notification cursor")
-	errEventID  = errors.New("invalid notification event ID")
+	errCursor   = watchdapi.ErrInvalidCursor
+	errEventID  = watchdapi.ErrInvalidEventID
+	errPageSize = errors.New("notification exceeds page size")
 )
 
 type storedEvent struct {
@@ -137,7 +139,6 @@ func (s *Store) Pending(cursor string) (watchdapi.NotificationPage, error) {
 	at := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.pruneLocked(at)
 	var lastChat int64
 	var lastSequence uint64
 	if cursor != "" {
@@ -147,7 +148,7 @@ func (s *Store) Pending(cursor string) (watchdapi.NotificationPage, error) {
 		}
 		var err error
 		lastChat, err = strconv.ParseInt(parts[1], 10, 64)
-		if err != nil || strconv.FormatInt(lastChat, 10) != parts[1] {
+		if err != nil || lastChat == 0 || strconv.FormatInt(lastChat, 10) != parts[1] {
 			return page, errCursor
 		}
 		lastSequence, err = strconv.ParseUint(parts[2], 10, 64)
@@ -155,37 +156,73 @@ func (s *Store) Pending(cursor string) (watchdapi.NotificationPage, error) {
 			return page, errCursor
 		}
 	}
+	s.pruneLocked(at)
+	empty, err := json.Marshal(page)
+	if err != nil {
+		return page, errEncoding
+	}
+	// Count the envelope, commas, escaped message JSON, cursor and encoder newline.
+	encodedSize := len(empty) + 1
 	chats := make([]int64, 0, len(s.pending))
 	for chatID := range s.pending {
 		chats = append(chats, chatID)
 	}
 	sort.Slice(chats, func(i, j int) bool { return chats[i] < chats[j] })
-	for _, chatID := range chats {
-		for _, event := range s.pending[chatID] {
+	for chatIndex, chatID := range chats {
+		queue := s.pending[chatID]
+		for eventIndex, event := range queue {
 			sequence := eventSequence(event.EventID)
 			if cursor != "" && (chatID < lastChat || chatID == lastChat && sequence <= lastSequence) {
 				continue
 			}
 			if len(page.Messages) == pageSize {
 				last := page.Messages[len(page.Messages)-1]
-				page.NextCursor = s.epoch + ":" + strconv.FormatInt(last.ChatID, 10) + ":" + strconv.FormatUint(eventSequence(last.EventID), 10)
+				page.NextCursor = s.pageCursor(last.ChatID, eventSequence(last.EventID))
 				return page, nil
 			}
-			page.Messages = append(page.Messages, watchdapi.Notification{
-				ChatID: chatID, EventID: event.EventID, At: event.At, Text: event.Text,
-			})
+			message := watchdapi.Notification{ChatID: chatID, EventID: event.EventID, At: event.At, Text: event.Text}
+			encoded, err := json.Marshal(message)
+			if err != nil {
+				return page, errEncoding
+			}
+			delta := len(encoded)
+			if len(page.Messages) > 0 {
+				delta++
+			}
+			nextCursor := ""
+			if eventIndex+1 < len(queue) || chatIndex+1 < len(chats) {
+				nextCursor = s.pageCursor(chatID, sequence)
+			}
+			if encodedSize+delta+len(nextCursor) >= maxPageBytes {
+				if len(page.Messages) == 0 {
+					return page, errPageSize
+				}
+				last := page.Messages[len(page.Messages)-1]
+				page.NextCursor = s.pageCursor(last.ChatID, eventSequence(last.EventID))
+				return page, nil
+			}
+			page.Messages = append(page.Messages, message)
+			encodedSize += delta
 		}
 	}
 	return page, nil
 }
 
+func (s *Store) pageCursor(chatID int64, sequence uint64) string {
+	return s.epoch + ":" + strconv.FormatInt(chatID, 10) + ":" + strconv.FormatUint(sequence, 10)
+}
+
 func (s *Store) Ack(chatID int64, eventID watchdapi.EventID) error {
-	_, _, valid := parseEventID(eventID)
+	epoch, sequence, valid := parseEventID(eventID)
 	if !valid {
 		return errEventID
 	}
 	at := s.now()
 	s.mu.Lock()
+	if epoch == s.epoch && sequence > s.sequence {
+		s.mu.Unlock()
+		return errEventID
+	}
 	s.pruneLocked(at)
 	changed := false
 	queue := s.pending[chatID]
