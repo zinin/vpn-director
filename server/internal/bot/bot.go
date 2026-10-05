@@ -36,17 +36,19 @@ type Bot struct {
 	sender telegram.MessageSender
 	// outbox holds the watch's notifications until a path to Telegram carries
 	// them; pathLive says whether the path manager has one (nil: always).
-	outbox      outbox
-	pathLive    func() bool
-	devMode     bool
-	executor    service.ShellExecutor
-	updater     updater.Updater
-	chatStore   *chatstore.Store
-	pathManager *PathManager
-	subWatch    *subwatch.Watch
-	httpClient  *http.Client
-	endpoint    string
-	wire        func(*tgbotapi.BotAPI)
+	outbox          outbox
+	pathLive        func() bool
+	notificationAPI watchdapi.NotificationAPI
+	notifications   notificationReceiver
+	devMode         bool
+	executor        service.ShellExecutor
+	updater         updater.Updater
+	chatStore       *chatstore.Store
+	pathManager     *PathManager
+	subWatch        *subwatch.Watch
+	httpClient      *http.Client
+	endpoint        string
+	wire            func(*tgbotapi.BotAPI)
 	// apiBase is empty in production and set only by tests, where one local
 	// server answers both the path probe and the Telegram API, as one host
 	// does in production.
@@ -104,6 +106,13 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	logSvc := service.NewLogService(b.executor)
 
 	b.auth = NewAuth(cfg.AllowedUsers)
+	if b.notificationAPI == nil {
+		b.notificationAPI = watchdapi.NewClient(p.WatchdSocket)
+	}
+	if err := b.syncRecipients(ctx); err != nil && ctx.Err() == nil {
+		slog.Warn("Watch notification recipients will retry synchronization")
+	}
+	go b.receiveNotifications(ctx)
 
 	if b.devMode {
 		b.httpClient = &http.Client{}
@@ -116,7 +125,9 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		})
 		pm.SelectOnce(ctx)
 		b.pathManager = pm
+		b.mu.Lock()
 		b.pathLive = func() bool { return pm.Current().Kind != netpath.KindNone }
+		b.mu.Unlock()
 		b.httpClient = NewPathClient(pm)
 		go pm.Start(ctx)
 		readiness := netpath.Readiness{
@@ -205,9 +216,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	return b, nil
 }
 
-// Connect authorizes with Telegram and wires handlers. The subscription
-// watch (and PathManager) already run; a failed getMe must not tear them
-// down, or recovery waits on the connection it should repair.
+// Connect wires Telegram handlers without restarting background automation.
 func (b *Bot) Connect(cfg *config.Config) error {
 	if b.api != nil {
 		return nil
@@ -321,7 +330,7 @@ func (b *Bot) Run(ctx context.Context) {
 		store = b.chatStore
 	}
 	// Check for pending update notification before starting polling
-	if err := startup.CheckAndSendNotify(b.sender, store, startup.DefaultNotifyFile, startup.DefaultUpdateDir, b.version); err != nil {
+	if err := startup.CheckAndSendNotify(b.Sender(), store, startup.DefaultNotifyFile, startup.DefaultUpdateDir, b.version); err != nil {
 		slog.Warn("Failed to send update notification", "error", err)
 	}
 
@@ -348,14 +357,17 @@ func (b *Bot) Run(ctx context.Context) {
 					continue
 				}
 				username := msg.From.UserName
-				if !b.auth.IsAuthorized(username) {
+				if !b.Auth().IsAuthorized(username) {
 					slog.Warn("Unauthorized access attempt", "username", username)
-					b.sender.SendPlain(msg.Chat.ID, "Access denied")
+					b.Sender().SendPlain(msg.Chat.ID, "Access denied")
 					continue
 				}
 				// Record interaction for update notifications
 				if b.chatStore != nil {
 					_ = b.chatStore.RecordInteraction(username, msg.Chat.ID)
+					if err := b.syncRecipients(ctx); err != nil && ctx.Err() == nil {
+						slog.Warn("Watch notification recipients will retry synchronization")
+					}
 				}
 				// Log command without arguments for sensitive commands (import may contain tokens)
 				slog.Info("Command received", "username", username, "command", sanitizeLogMessage(msg))
@@ -367,9 +379,9 @@ func (b *Bot) Run(ctx context.Context) {
 					continue
 				}
 				// Acknowledge callback to prevent UI spinner hanging
-				b.sender.AckCallback(cb.ID)
+				b.Sender().AckCallback(cb.ID)
 				username := cb.From.UserName
-				if !b.auth.IsAuthorized(username) {
+				if !b.Auth().IsAuthorized(username) {
 					slog.Warn("Unauthorized callback", "username", username)
 					continue
 				}
@@ -377,6 +389,9 @@ func (b *Bot) Run(ctx context.Context) {
 				// Note: cb.Message can be nil for inline callbacks, so check before accessing
 				if b.chatStore != nil && cb.Message != nil {
 					_ = b.chatStore.RecordInteraction(username, cb.Message.Chat.ID)
+					if err := b.syncRecipients(ctx); err != nil && ctx.Err() == nil {
+						slog.Warn("Watch notification recipients will retry synchronization")
+					}
 				}
 				slog.Info("Callback received", "username", username, "data", cb.Data)
 				b.router.RouteCallback(cb)
@@ -401,6 +416,8 @@ func sanitizeLogMessage(msg *tgbotapi.Message) string {
 
 // Auth returns the authorization handler (for update checker).
 func (b *Bot) Auth() *Auth {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.auth
 }
 

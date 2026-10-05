@@ -12,8 +12,9 @@ import (
 
 // UserChat represents a user with their chat ID.
 type UserChat struct {
-	Username string
-	ChatID   int64
+	Username  string
+	ChatID    int64
+	FirstSeen time.Time
 }
 
 // userRecord is the stored data for each user.
@@ -124,8 +125,9 @@ func (s *Store) GetActiveUsers() ([]UserChat, error) {
 	for username, record := range s.users {
 		if record.Active {
 			users = append(users, UserChat{
-				Username: username,
-				ChatID:   record.ChatID,
+				Username:  username,
+				ChatID:    record.ChatID,
+				FirstSeen: record.FirstSeen,
 			})
 		}
 	}
@@ -179,6 +181,28 @@ func (s *Store) IsNotified(username string, version string) bool {
 		}
 	}
 	return false
+}
+
+// SetInactiveChat deactivates every username associated with a blocked chat.
+func (s *Store) SetInactiveChat(chatID int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	found := false
+	for _, record := range s.users {
+		if record.ChatID == chatID {
+			record.Active = false
+			found = true
+		}
+	}
+	if !found {
+		return nil
+	}
+	if err := s.save(); err != nil {
+		slog.Warn("Failed to save chat store", "error", err)
+		return err
+	}
+	return nil
 }
 
 // SetInactive marks user as inactive (e.g., bot blocked).

@@ -1,6 +1,7 @@
 package chatstore
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -188,5 +189,66 @@ func TestStore_UsernameNormalization(t *testing.T) {
 	_ = store.MarkNotified("JOHN_DOE", "v1.0.0")
 	if !store.IsNotified("john_doe", "v1.0.0") {
 		t.Error("expected case-insensitive notified check")
+	}
+}
+
+func TestRecipients_StoreFirstSeenSurvivesInteractionAndReload(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chats.json")
+	data := `{"alice":{"chat_id":100,"first_seen":"2026-01-02T15:04:00Z","last_seen":"2026-01-03T15:04:00Z","active":true,"notified_versions":["v1.0.0"]}}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := New(path)
+	want := time.Date(2026, 1, 2, 15, 4, 0, 0, time.UTC)
+	for _, current := range []*Store{store, New(path)} {
+		users, err := current.GetActiveUsers()
+		if err != nil || len(users) != 1 {
+			t.Fatalf("GetActiveUsers = %+v, %v", users, err)
+		}
+		if !users[0].FirstSeen.Equal(want) {
+			t.Fatalf("FirstSeen = %v, want %v", users[0].FirstSeen, want)
+		}
+	}
+	if err := store.SetInactiveChat(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordInteraction("ALICE", 100); err != nil {
+		t.Fatal(err)
+	}
+	users, err := New(path).GetActiveUsers()
+	if err != nil || len(users) != 1 || !users[0].FirstSeen.Equal(want) {
+		t.Fatalf("reactivated/reloaded users = %+v, %v; want original FirstSeen %v", users, err, want)
+	}
+	if !New(path).IsNotified("alice", "v1.0.0") {
+		t.Fatal("chat deactivation lost update notification history")
+	}
+}
+
+func TestRecipients_SetInactiveChatDeactivatesEveryAliasPersistently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chats.json")
+	store := New(path)
+	for _, record := range []UserChat{
+		{Username: "alice", ChatID: 100},
+		{Username: "alice_renamed", ChatID: 100},
+		{Username: "bob", ChatID: 200},
+	} {
+		if err := store.RecordInteraction(record.Username, record.ChatID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.SetInactiveChat(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetInactiveChat(100); err != nil {
+		t.Fatalf("repeated deactivation: %v", err)
+	}
+	if err := store.SetInactiveChat(999); err != nil {
+		t.Fatalf("unknown chat deactivation: %v", err)
+	}
+	for _, current := range []*Store{store, New(path)} {
+		users, err := current.GetActiveUsers()
+		if err != nil || len(users) != 1 || users[0].Username != "bob" || users[0].ChatID != 200 {
+			t.Fatalf("active users = %+v, %v; want only bob/200", users, err)
+		}
 	}
 }

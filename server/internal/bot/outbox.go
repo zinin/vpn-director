@@ -2,15 +2,12 @@ package bot
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
-	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/telegram"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 // The subscription watch's notifications wait in the outbox until a path to
@@ -21,16 +18,16 @@ import (
 const (
 	// outboxMaxPerChat is how many messages a chat keeps waiting; a long
 	// outage drops the oldest.
-	outboxMaxPerChat = 20
+	outboxMaxPerChat = notificationMaxPerChat
 	// outboxMaxAge is how long a message stays worth delivering.
-	outboxMaxAge = 12 * time.Hour
+	outboxMaxAge = notificationMaxAge
 	// outboxLateAfter is how late a message may arrive before it says when it
 	// happened.
-	outboxLateAfter = time.Minute
+	outboxLateAfter = notificationLateAfter
 	// outboxRetryEvery is how often the bot tries the waiting messages again.
 	// A path comes back on the path manager's own schedule (every 30 s, or at
 	// the next failure), so this bounds the delay after it.
-	outboxRetryEvery = 10 * time.Second
+	outboxRetryEvery = notificationPollEvery
 )
 
 type outboxNote struct {
@@ -155,43 +152,16 @@ func (o *outbox) pop(id int64, seq uint64) {
 // delayedText is the message as sent at now: a message a minute or more late
 // says when it happened, with the day when that was another day.
 func delayedText(n outboxNote, now time.Time) (string, bool) {
-	if now.Sub(n.at) < outboxLateAfter {
-		return n.text, false
-	}
-	layout := "15:04"
-	if y, m, d := n.at.Date(); !sameDay(y, m, d, now) {
-		layout = "Jan 2 15:04"
-	}
-	return fmt.Sprintf("(%s, delayed) %s", n.at.Format(layout), n.text), true
-}
-
-func sameDay(y int, m time.Month, d int, t time.Time) bool {
-	ty, tm, td := t.Date()
-	return y == ty && m == tm && d == td
-}
-
-// retryable reports whether a failed send may succeed later: anything that
-// failed on the way (no path, a timeout, a reset) and Telegram's own 429 and
-// 5xx. Any other answer from Telegram is final.
-func retryable(err error) bool {
-	var apiErr *tgbotapi.Error
-	if errors.As(err, &apiErr) {
-		return apiErr.Code == http.StatusTooManyRequests || apiErr.Code >= http.StatusInternalServerError
-	}
-	return true
+	text := notificationText(watchdapi.Notification{At: n.at, Text: n.text}, now)
+	return text, now.Sub(n.at) >= outboxLateAfter
 }
 
 // flushNotifications sends the waiting messages once Telegram is connected and
 // the path manager has a path to it; with no path every send would fail at
 // once and log an error.
 func (b *Bot) flushNotifications() {
-	b.mu.Lock()
-	sender := b.sender
-	b.mu.Unlock()
+	sender := b.notificationSender()
 	if sender == nil || !b.outbox.pending() {
-		return
-	}
-	if b.pathLive != nil && !b.pathLive() {
 		return
 	}
 	b.outbox.flush(sender)

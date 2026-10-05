@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/devmode"
 	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/paths"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 // newAPIServer answers getMe the way Telegram does and everything else with an
@@ -256,5 +258,78 @@ func TestNotifyActiveChats_AuthorizedOncePerChat(t *testing.T) {
 	want := []sentPlain{{chatID: 100, text: "Xray outbound is down"}}
 	if !reflect.DeepEqual(sender.snapshot(), want) {
 		t.Fatalf("sent %+v, want %+v", sender.snapshot(), want)
+	}
+}
+
+func TestReceiver_SyncBeforeGetMe(t *testing.T) {
+	for _, failGetMe := range []bool{false, true} {
+		name := "successful_getme"
+		if failGetMe {
+			name = "failed_getme_and_connect_retry"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := receiverChatStore(t, `{"tester":{"chat_id":100,"first_seen":"2026-01-02T15:04:00Z","last_seen":"2026-01-02T15:04:00Z","active":true,"notified_versions":[]}}`)
+			want := []watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Date(2026, 1, 2, 15, 4, 0, 0, time.UTC)}}
+			var synchronized, telegramBeforeSync atomic.Bool
+			var telegramAttempts, pendingCalls atomic.Int32
+			pendingStarted, release := make(chan struct{}), make(chan struct{})
+			api := &receiverAPI{
+				set: func(_ context.Context, recipients []watchdapi.Recipient) error {
+					if reflect.DeepEqual(recipients, want) {
+						synchronized.Store(true)
+					}
+					return nil
+				},
+				pending: func(ctx context.Context, _ string) (watchdapi.NotificationPage, error) {
+					if pendingCalls.Add(1) == 1 {
+						close(pendingStarted)
+					}
+					select {
+					case <-ctx.Done():
+						return watchdapi.NotificationPage{}, ctx.Err()
+					case <-release:
+						return watchdapi.NotificationPage{Messages: []watchdapi.Notification{}}, nil
+					}
+				},
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if strings.HasSuffix(r.URL.Path, "/getMe") {
+					telegramAttempts.Add(1)
+					if !synchronized.Load() {
+						telegramBeforeSync.Store(true)
+					}
+					if failGetMe {
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = io.WriteString(w, `{"ok":false,"error_code":500,"description":"synthetic outage"}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"ok":true,"result":{"id":1,"is_bot":true,"first_name":"test","username":"testbot"}}`)
+					return
+				}
+				_, _ = io.WriteString(w, `{"ok":true,"result":{}}`)
+			}))
+			t.Cleanup(srv.Close)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(func() {
+				cancel()
+				close(release)
+			})
+			b, err := New(ctx, testConfig(), testPaths(t), "v0.0.0", "v0.0.0-test", "deadbee", "2026-01-01",
+				WithChatStore(store), withNotifications(api), withAPIBase(srv.URL))
+			if b == nil || (err != nil) != failGetMe {
+				t.Fatalf("New returned bot=%v error=%v, failGetMe=%v", b != nil, err, failGetMe)
+			}
+			receiverWait(t, pendingStarted, "receiver started by New")
+			if telegramAttempts.Load() == 0 || telegramBeforeSync.Load() {
+				t.Fatalf("Telegram attempts=%d, attempted before recipient sync=%v", telegramAttempts.Load(), telegramBeforeSync.Load())
+			}
+			if err := b.Connect(testConfig()); (err != nil) != failGetMe {
+				t.Fatalf("Connect retry = %v, failGetMe=%v", err, failGetMe)
+			}
+			if pendingCalls.Load() != 1 {
+				t.Fatalf("receiver poll starts = %d, want one despite Connect retry", pendingCalls.Load())
+			}
+		})
 	}
 }
