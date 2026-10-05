@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -86,7 +87,7 @@ func NewPathManager(cfg PathManagerConfig) *PathManager {
 	}
 	if m.loadTunnelIdx == nil {
 		m.loadTunnelIdx = func() map[string]int {
-			return loadTunnelIdxFile(defaultTunnelTablesPath)
+			return netpath.LoadTunnelIndexes(defaultTunnelTablesPath)
 		}
 	}
 	return m
@@ -121,7 +122,7 @@ func (m *PathManager) RegisterIdleCloser(fn func(Path)) {
 // on a live direct is exactly one probe.
 func (m *PathManager) ReportFailure(p Path) {
 	m.mu.Lock()
-	skip := !p.same(m.current) || m.cycling
+	skip := !p.Same(m.current) || m.cycling
 	m.mu.Unlock()
 	if skip {
 		return
@@ -176,7 +177,7 @@ func (m *PathManager) SelectOnce(ctx context.Context) {
 	stored := current
 
 	var tried []string
-	direct := Path{kind: kindDirect}
+	direct := Path{Kind: netpath.KindDirect}
 	directLive := m.probeOne(ctx, direct, &tried)
 
 	// Discovery — the config read, the fork of "vpn-director.sh platform", the
@@ -207,13 +208,13 @@ func (m *PathManager) SelectOnce(ctx context.Context) {
 			}
 		}
 
-		port := socksPort(cfg)
+		port := netpath.SOCKSPort(cfg)
 		socksUp := m.listening(port)
 		idxByID := m.loadTunnelIdx()
-		cands := candidates(cfg, plat, socksUp, idxByID)
+		cands := netpath.Candidates(cfg, plat, socksUp, idxByID)
 
 		currentProbed := false
-		if current.kind == kindSOCKS || current.kind == kindTunnel {
+		if current.Kind == netpath.KindSOCKS || current.Kind == netpath.KindTunnel {
 			if fresh, ok := matchPath(cands, current); ok {
 				current = fresh
 				currentLive = m.probeOne(ctx, current, &tried)
@@ -221,12 +222,12 @@ func (m *PathManager) SelectOnce(ctx context.Context) {
 			}
 		}
 
-		if current.kind == kindNone || !currentLive {
+		if current.Kind == netpath.KindNone || !currentLive {
 			for _, p := range cands {
-				if p.kind == kindDirect {
+				if p.Kind == netpath.KindDirect {
 					continue
 				}
-				if currentProbed && p.same(current) {
+				if currentProbed && p.Same(current) {
 					continue
 				}
 				if m.probeOne(ctx, p, &tried) {
@@ -238,14 +239,14 @@ func (m *PathManager) SelectOnce(ctx context.Context) {
 	}
 
 	next := selectPath(current, directLive, currentLive, replacement)
-	changed := !next.same(stored)
+	changed := !next.Same(stored)
 	if changed {
 		slog.Info("Telegram API path selected", "from", stored.String(), "to", next.String())
-		if stored.kind == kindDirect && (next.kind == kindSOCKS || next.kind == kindTunnel) {
+		if stored.Kind == netpath.KindDirect && (next.Kind == netpath.KindSOCKS || next.Kind == netpath.KindTunnel) {
 			slog.Warn("Telegram API unreachable on WAN, using backup path")
 		}
 	}
-	if changed || !pathParamsEqual(next, stored) {
+	if changed || !next.ParamsEqual(stored) {
 		m.mu.Lock()
 		closers := slices.Clone(m.closers)
 		m.mu.Unlock()
@@ -256,7 +257,7 @@ func (m *PathManager) SelectOnce(ctx context.Context) {
 		m.current = next
 		m.mu.Unlock()
 	}
-	if next.kind == kindNone {
+	if next.Kind == netpath.KindNone {
 		key := strings.Join(tried, ",")
 		m.mu.Lock()
 		repeat := key == m.lastNoPath
@@ -288,7 +289,7 @@ func (m *PathManager) probeOne(ctx context.Context, p Path, tried *[]string) boo
 
 func matchPath(cands []Path, p Path) (Path, bool) {
 	for _, c := range cands {
-		if c.same(p) {
+		if c.Same(p) {
 			return c, true
 		}
 	}

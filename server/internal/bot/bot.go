@@ -14,6 +14,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/config"
 	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/handler"
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/paths"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/startup"
@@ -115,9 +116,15 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		})
 		pm.SelectOnce(ctx)
 		b.pathManager = pm
-		b.pathLive = func() bool { return pm.Current().kind != kindNone }
+		b.pathLive = func() bool { return pm.Current().Kind != netpath.KindNone }
 		b.httpClient = NewPathClient(pm)
 		go pm.Start(ctx)
+		readiness := netpath.Readiness{
+			TablesPath:   defaultTunnelTablesPath,
+			FailoverPath: defaultFailoverReadyPath,
+			TPROXYPath:   defaultTproxyReadyPath,
+			StoppedPath:  defaultStoppedPath,
+		}
 		sw := &subwatch.Watch{
 			LoadVPN:           configSvc.LoadVPNConfig,
 			LoadPlatform:      vpnSvc.Platform,
@@ -126,7 +133,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			RestartXray:       vpnSvc.RestartXrayProcessUnlessStopped,
 			LoadSubscriptions: configSvc.LoadSubscriptions,
 			SaveSubscription:  configSvc.SaveSubscription,
-			Reachable:         reachTCP4(nil),
+			Reachable:         netpath.ReachTCP4(nil),
 			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 				cfg, err := configSvc.LoadVPNConfig()
 				if err != nil {
@@ -140,9 +147,9 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
 			},
 			Notify:        b.notifyActiveChats,
-			FallbackReady: failoverTunnelReady,
-			TPROXYReady:   tproxyRulesReady,
-			Stopped:       vpnDirectorStopped,
+			FallbackReady: readiness.FallbackReady,
+			TPROXYReady:   readiness.TPROXYReady,
+			Stopped:       readiness.Stopped,
 		}
 		b.subWatch = sw
 		go sw.Start(ctx)

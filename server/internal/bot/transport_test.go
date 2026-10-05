@@ -10,11 +10,10 @@ import (
 	"net/http/httptrace"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
-	"golang.org/x/net/dns/dnsmessage"
+	"github.com/zinin/vpn-director/server/internal/netpath"
 )
 
 type fakeSource struct {
@@ -27,154 +26,8 @@ func (f *fakeSource) Current() Path                    { return f.p }
 func (f *fakeSource) ReportFailure(p Path)             { f.failed = append(f.failed, p) }
 func (f *fakeSource) RegisterIdleCloser(fn func(Path)) { f.idle = append(f.idle, fn) }
 
-func TestDialPath_None(t *testing.T) {
-	_, err := DialPath(context.Background(), Path{}, "tcp", "example.com:443")
-	if !errors.Is(err, errNoPath) {
-		t.Fatalf("got %v", err)
-	}
-}
-
-func TestDialPath_DirectTCP4(t *testing.T) {
-	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		c.Close()
-	}()
-	conn, err := DialPath(context.Background(), Path{kind: kindDirect}, "tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn.Close()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("accept timed out")
-	}
-}
-
-func TestPathDialer_SOCKSKeepsHostname(t *testing.T) {
-	var gotAddr string
-	d := pathDialer{
-		socksDial: func(ctx context.Context, port int, network, addr string) (net.Conn, error) {
-			gotAddr = addr
-			if port != 12346 || network != "tcp" {
-				t.Errorf("port=%d network=%s", port, network)
-			}
-			c1, c2 := net.Pipe()
-			c2.Close()
-			return c1, nil
-		},
-	}
-	p := Path{kind: kindSOCKS, socksPort: 12346}
-	conn, err := d.dial(context.Background(), p, "tcp", "api.telegram.org:443")
-	if err != nil {
-		t.Fatal(err)
-	}
-	conn.Close()
-	if gotAddr != "api.telegram.org:443" {
-		t.Fatalf("SOCKS target %q", gotAddr)
-	}
-}
-
-func TestDialDirect_LookupHasDeadline(t *testing.T) {
-	var had bool
-	d := pathDialer{
-		lookupIPv4: func(ctx context.Context, host string) ([]net.IP, error) {
-			_, had = ctx.Deadline()
-			return nil, errors.New("stop")
-		},
-	}
-	_, _ = d.dial(context.Background(), Path{kind: kindDirect}, "tcp", "api.telegram.org:443")
-	if !had {
-		t.Fatal("direct DNS lookup has no dial timeout")
-	}
-}
-
-func TestDialIPv4s_ReservesTimeForLaterAddresses(t *testing.T) {
-	var mu sync.Mutex
-	var secondRemain time.Duration
-	sawSecond := false
-	d := pathDialer{
-		tcpDial: func(ctx context.Context, network, addr string, control func(string, string, syscall.RawConn) error) (net.Conn, error) {
-			host, _, _ := net.SplitHostPort(addr)
-			if host == "5.6.7.8" {
-				mu.Lock()
-				sawSecond = true
-				if dl, ok := ctx.Deadline(); ok {
-					secondRemain = time.Until(dl)
-				}
-				mu.Unlock()
-				c1, c2 := net.Pipe()
-				c2.Close()
-				return c1, nil
-			}
-			<-ctx.Done()
-			return nil, ctx.Err()
-		},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	start := time.Now()
-	conn, err := d.dialIPv4s(ctx, []net.IP{net.IPv4(1, 2, 3, 4), net.IPv4(5, 6, 7, 8)}, "443", nil)
-	elapsed := time.Since(start)
-	if err != nil {
-		t.Fatalf("second address: %v", err)
-	}
-	conn.Close()
-	if elapsed > 4*time.Second {
-		t.Fatalf("first address consumed the budget: %s", elapsed)
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if !sawSecond {
-		t.Fatal("second address not tried")
-	}
-	if secondRemain < time.Second {
-		t.Fatalf("second address remaining %s", secondRemain)
-	}
-}
-
-func TestPathDialer_TunnelBindsIface(t *testing.T) {
-	var gotIface string
-	var gotMark uint32
-	d := pathDialer{
-		lookupIPv4: func(ctx context.Context, host string) ([]net.IP, error) {
-			return []net.IP{net.IPv4(1, 2, 3, 4)}, nil
-		},
-		bindControl: func(iface string, mark uint32) func(network, address string, c syscall.RawConn) error {
-			gotIface = iface
-			gotMark = mark
-			return func(network, address string, c syscall.RawConn) error { return nil }
-		},
-		// The connect is failed deliberately: the test asserts only the recorded iface and mark.
-		tcpDial: func(ctx context.Context, network, addr string, control func(string, string, syscall.RawConn) error) (net.Conn, error) {
-			if network != "tcp4" {
-				t.Errorf("network %s", network)
-			}
-			return nil, errors.New("dial skipped")
-		},
-	}
-	p := Path{kind: kindTunnel, id: "ovpnc2", iface: "tun12", mark: 0x10000}
-	_, _ = d.dial(context.Background(), p, "tcp", "api.telegram.org:443")
-	if gotIface != "tun12" {
-		t.Fatalf("iface %q", gotIface)
-	}
-	if gotMark != 0x10000 {
-		t.Fatalf("mark 0x%x", gotMark)
-	}
-}
-
 func TestNewPathClient_ReportsDialFailure(t *testing.T) {
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	// Nothing listens here; DialPath to this host:port fails.
 	req, _ := http.NewRequest(http.MethodGet, "http://127.0.0.1:1/", nil)
@@ -182,8 +35,47 @@ func TestNewPathClient_ReportsDialFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected dial error")
 	}
-	if len(src.failed) != 1 || !src.failed[0].same(src.p) {
+	if len(src.failed) != 1 || !src.failed[0].Same(src.p) {
 		t.Fatalf("failures %+v", src.failed)
+	}
+}
+
+func TestNewPathClientWith_DialInjectionIsPerClient(t *testing.T) {
+	paths := []Path{
+		{Kind: netpath.KindSOCKS, SOCKSPort: 23456},
+		{Kind: netpath.KindTunnel, ID: "ovpnc2", Iface: "tun12", Mark: 0x10000},
+	}
+	var mu sync.Mutex
+	dials := make([]int, len(paths))
+	sources := make([]*fakeSource, len(paths))
+	clients := make([]*http.Client, len(paths))
+	dialErrs := make([]*net.OpError, len(paths))
+	for i, p := range paths {
+		sources[i] = &fakeSource{p: p}
+		dialErrs[i] = &net.OpError{Op: "dial", Net: "tcp", Err: errors.New("injected " + p.String() + " failure")}
+		dial := func(ctx context.Context, got Path, network, addr string) (net.Conn, error) {
+			mu.Lock()
+			dials[i]++
+			mu.Unlock()
+			if !got.ParamsEqual(p) || network != "tcp" || addr != "api.example:80" {
+				t.Errorf("dial path=%+v network=%q addr=%q", got, network, addr)
+			}
+			return nil, dialErrs[i]
+		}
+		clients[i] = newPathClientWith(sources[i], dial)
+		defer clients[i].CloseIdleConnections()
+	}
+	for i, client := range clients {
+		if _, err := client.Get("http://api.example/botTOKEN/getMe"); !errors.Is(err, dialErrs[i]) {
+			t.Fatalf("client %d: err=%v, want its injected failure", i, err)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for i, p := range paths {
+		if dials[i] != 1 || len(sources[i].failed) != 1 || !sources[i].failed[0].ParamsEqual(p) {
+			t.Fatalf("client %d: dials=%d failures=%+v", i, dials[i], sources[i].failed)
+		}
 	}
 }
 
@@ -208,13 +100,13 @@ func TestNewPathClient_ReportsTLSCloseAfterClientHello(t *testing.T) {
 		}
 	}()
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	_, err = client.Get("https://" + ln.Addr().String() + "/")
 	if err == nil {
 		t.Fatal("expected TLS handshake error")
 	}
-	if len(src.failed) != 1 || !src.failed[0].same(src.p) {
+	if len(src.failed) != 1 || !src.failed[0].Same(src.p) {
 		t.Fatalf("ReportFailure skipped for %v; failures %+v", err, src.failed)
 	}
 }
@@ -237,7 +129,7 @@ func TestNewPathClient_HandshakeErrNoRace(t *testing.T) {
 		time.Sleep(80 * time.Millisecond)
 		_ = c.Close()
 	}()
-	client := NewPathClient(&fakeSource{p: Path{kind: kindDirect}})
+	client := NewPathClient(&fakeSource{p: Path{Kind: netpath.KindDirect}})
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://"+ln.Addr().String()+"/", nil)
@@ -272,7 +164,7 @@ func TestNewPathClient_ExistingTraceHooksRunOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client := NewPathClient(&fakeSource{p: Path{kind: kindDirect}})
+	client := NewPathClient(&fakeSource{p: Path{Kind: netpath.KindDirect}})
 	_, _ = client.Do(req)
 	select {
 	case <-start:
@@ -282,7 +174,7 @@ func TestNewPathClient_ExistingTraceHooksRunOnce(t *testing.T) {
 }
 
 func TestNewPathClient_RegistersIdleCloser(t *testing.T) {
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	_ = NewPathClient(src)
 	if len(src.idle) != 1 {
 		t.Fatalf("idle closers %d", len(src.idle))
@@ -303,7 +195,7 @@ func TestNewPathClient_PathChangeAbortsInFlight(t *testing.T) {
 	defer srv.Close()
 	defer close(hold)
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	if len(src.idle) != 1 {
 		t.Fatalf("idle closers %d", len(src.idle))
@@ -350,7 +242,7 @@ func TestNewPathClient_PathChangeDoesNotAbortSend(t *testing.T) {
 	defer srv.Close()
 	defer release()
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 
 	errc := make(chan error, 1)
@@ -430,7 +322,7 @@ func TestNewPathClient_SendOnReusedPollConnSurvivesPathChange(t *testing.T) {
 	defer srv.Close()
 	defer release()
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	resp, err := client.Get(srv.URL + "/botTOKEN/getUpdates")
 	if err != nil {
@@ -495,7 +387,7 @@ func TestNewPathClient_PollSeesRetireAcrossSnapshot(t *testing.T) {
 	defer releaseSend()
 	defer releasePoll()
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	pt := client.Transport.(*pathTransport)
 	pt.base.MaxConnsPerHost = 1
@@ -569,7 +461,7 @@ func TestNewPathClient_PathChangeAbortsPollAfterHeaders(t *testing.T) {
 	defer srv.Close()
 	defer release()
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	resp, err := client.Get(srv.URL + "/botTOKEN/getMe")
 	if err != nil {
@@ -606,26 +498,25 @@ func TestNewPathClient_PathChangeAbortsPollAfterHeaders(t *testing.T) {
 	}
 }
 
-// closeAll empties the generation's map but, without a retired flag, a dial
-// that started before retire can still add() and return an old-path socket.
+// A dial that started before retire must not return a socket on the retired path.
 func TestNewPathClient_RetireRejectsLateDial(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
-	var startOnce sync.Once
-	d := pathDialer{
-		tcpDial: func(ctx context.Context, network, addr string, control func(string, string, syscall.RawConn) error) (net.Conn, error) {
-			startOnce.Do(func() { close(started) })
-			<-release
-			return net.Dial(network, addr)
-		},
+	var startOnce, releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	dial := func(ctx context.Context, p Path, network, addr string) (net.Conn, error) {
+		startOnce.Do(func() { close(started) })
+		<-release
+		return net.Dial(network, addr)
 	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
-	client := newPathClientWith(src, &d)
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
+	client := newPathClientWith(src, dial)
 	if len(src.idle) != 1 {
 		t.Fatalf("idle closers %d", len(src.idle))
 	}
@@ -647,7 +538,7 @@ func TestNewPathClient_RetireRejectsLateDial(t *testing.T) {
 	}
 
 	src.idle[0](src.p)
-	close(release)
+	unblock()
 
 	select {
 	case err := <-errc:
@@ -674,7 +565,7 @@ func TestNewPathClient_PathChangeDoesNotReuseOldConn(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	if len(src.idle) != 1 {
 		t.Fatalf("idle closers %d", len(src.idle))
@@ -714,22 +605,21 @@ func TestNewPathClient_SwitchBindsNewPathBeforeCurrentUpdates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	socks := Path{kind: kindSOCKS, socksPort: 12346}
-	direct := Path{kind: kindDirect}
+	socks := Path{Kind: netpath.KindSOCKS, SOCKSPort: 12346}
+	direct := Path{Kind: netpath.KindDirect}
 	src := &fakeSource{p: socks}
 
 	var mu sync.Mutex
-	var dialed []string
-	d := pathDialer{
-		socksDial: func(ctx context.Context, port int, network, addr string) (net.Conn, error) {
-			mu.Lock()
-			dialed = append(dialed, "socks")
-			mu.Unlock()
-			return net.Dial(network, addr)
-		},
+	var dialed []Path
+	dial := func(ctx context.Context, p Path, network, addr string) (net.Conn, error) {
+		mu.Lock()
+		dialed = append(dialed, p)
+		mu.Unlock()
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
 	}
 
-	client := newPathClientWith(src, &d)
+	client := newPathClientWith(src, dial)
 	if len(src.idle) != 1 {
 		t.Fatalf("idle closers %d", len(src.idle))
 	}
@@ -743,8 +633,8 @@ func TestNewPathClient_SwitchBindsNewPathBeforeCurrentUpdates(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	if len(dialed) != 0 {
-		t.Fatalf("new pool dialed stale Current()=%s: %v", src.Current(), dialed)
+	if len(dialed) != 1 || !dialed[0].ParamsEqual(direct) {
+		t.Fatalf("new pool dialed stale Current()=%s: %+v", src.Current(), dialed)
 	}
 }
 
@@ -757,7 +647,7 @@ func TestNewPathClient_NonPollRequestTimesOut(t *testing.T) {
 	defer srv.Close()
 	defer close(hold)
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	client.Transport.(*pathTransport).nonPollTimeout = 50 * time.Millisecond
 
@@ -791,7 +681,7 @@ func TestNewPathClient_GetUpdatesIgnoresNonPollTimeout(t *testing.T) {
 	defer srv.Close()
 	defer close(hold)
 
-	src := &fakeSource{p: Path{kind: kindDirect}}
+	src := &fakeSource{p: Path{Kind: netpath.KindDirect}}
 	client := NewPathClient(src)
 	client.Transport.(*pathTransport).nonPollTimeout = 50 * time.Millisecond
 
@@ -818,114 +708,9 @@ func TestNewPathClient_GetUpdatesIgnoresNonPollTimeout(t *testing.T) {
 }
 
 func TestNewPathClient_NoClientTimeout(t *testing.T) {
-	c := NewPathClient(&fakeSource{p: Path{kind: kindDirect}})
+	c := NewPathClient(&fakeSource{p: Path{Kind: netpath.KindDirect}})
 	if c.Timeout != 0 {
 		t.Fatalf("Timeout=%s; getUpdates long-polls", c.Timeout)
-	}
-}
-
-func TestLookupTunnel_FallsBackAfterDNSTimeout(t *testing.T) {
-	silent, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer silent.Close()
-	go func() {
-		buf := make([]byte, 512)
-		for {
-			if _, _, err := silent.ReadFrom(buf); err != nil {
-				return
-			}
-		}
-	}()
-
-	good, err := net.ListenPacket("udp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer good.Close()
-	go serveDNSA(good, net.IPv4(1, 2, 3, 4))
-
-	d := pathDialer{
-		dnsDial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			switch network {
-			case "udp", "udp6":
-				network = "udp4"
-			case "tcp", "tcp6":
-				network = "tcp4"
-			}
-			target := silent.LocalAddr().String()
-			if address == "1.1.1.1:53" {
-				target = good.LocalAddr().String()
-			}
-			var nd net.Dialer
-			return nd.DialContext(ctx, network, target)
-		},
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	ips, err := d.lookupTunnel(ctx, "tun0", 0, "vpn-director-dns-test.example.")
-	if err != nil {
-		t.Fatalf("lookup: %v", err)
-	}
-	if len(ips) != 1 || !ips[0].Equal(net.IPv4(1, 2, 3, 4)) {
-		t.Fatalf("ips %v", ips)
-	}
-}
-
-func serveDNSA(pc net.PacketConn, ip net.IP) {
-	v4 := ip.To4()
-	if v4 == nil {
-		return
-	}
-	buf := make([]byte, 2048)
-	for {
-		n, addr, err := pc.ReadFrom(buf)
-		if err != nil {
-			return
-		}
-		var p dnsmessage.Parser
-		hdr, err := p.Start(buf[:n])
-		if err != nil {
-			continue
-		}
-		q, err := p.Question()
-		if err != nil {
-			continue
-		}
-		hdr.Response = true
-		hdr.RecursionAvailable = true
-		b := dnsmessage.NewBuilder(make([]byte, 0, 512), hdr)
-		b.EnableCompression()
-		if err := b.StartQuestions(); err != nil {
-			continue
-		}
-		if err := b.Question(q); err != nil {
-			continue
-		}
-		if err := b.StartAnswers(); err != nil {
-			continue
-		}
-		if err := b.AResource(dnsmessage.ResourceHeader{
-			Name:  q.Name,
-			Type:  dnsmessage.TypeA,
-			Class: dnsmessage.ClassINET,
-			TTL:   60,
-		}, dnsmessage.AResource{A: [4]byte{v4[0], v4[1], v4[2], v4[3]}}); err != nil {
-			continue
-		}
-		msg, err := b.Finish()
-		if err != nil {
-			continue
-		}
-		_, _ = pc.WriteTo(msg, addr)
-	}
-}
-
-func TestProductionDialer_Timeout(t *testing.T) {
-	d := newProductionDialer(nil)
-	if d.Timeout != 30*time.Second {
-		t.Fatalf("Timeout=%s; DefaultTransport uses 30s", d.Timeout)
 	}
 }
 

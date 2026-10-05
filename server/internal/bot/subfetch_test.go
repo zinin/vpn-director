@@ -164,8 +164,8 @@ func TestSubscriptionTunnel_DialsTheTunnelTheClientsWereMovedTo(t *testing.T) {
 	if client == nil {
 		t.Fatal("no tunnel client")
 	}
-	if p.id != "wgc1" || p.iface != "wgc1" {
-		t.Fatalf("path %s on %s, want wgc1, the tunnel the clients were moved to", p.id, p.iface)
+	if p.ID != "wgc1" || p.Iface != "wgc1" {
+		t.Fatalf("path %s on %s, want wgc1, the tunnel the clients were moved to", p.ID, p.Iface)
 	}
 }
 

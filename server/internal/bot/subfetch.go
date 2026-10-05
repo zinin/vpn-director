@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
 	"github.com/zinin/vpn-director/server/internal/subscription"
@@ -87,7 +88,7 @@ func lazyTunnel(ctx context.Context, cfgSvc service.ConfigStore, vpnSvc service.
 		if c == nil {
 			return nil, errNoTunnel
 		}
-		return lookupIPv4OnPath(ctx, p, host)
+		return netpath.LookupIPv4(ctx, p, host)
 	}
 	return client, lookup
 }
@@ -212,9 +213,9 @@ func subscriptionTunnel(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) 
 	if id == "" {
 		return Path{}, nil
 	}
-	p := subscriptionTunnelPath(cfg, plat, id)
+	p := netpath.TunnelPath(cfg, plat, id, defaultTunnelTablesPath)
 	return p, newTunnelHTTPClient(func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return refusePrivatePeer(DialPath(ctx, p, "tcp4", addr))
+		return refusePrivatePeer(netpath.DialPath(ctx, p, "tcp4", addr))
 	})
 }
 
@@ -250,18 +251,3 @@ func refusePrivatePeer(conn net.Conn, err error) (net.Conn, error) {
 	return conn, nil
 }
 
-func subscriptionTunnelPath(cfg *vpnconfig.VPNDirectorConfig, plat vpnconfig.PlatformInfo, id string) Path {
-	var iface string
-	for _, t := range plat.Tunnels {
-		if t.ID == id {
-			iface = t.Iface
-			break
-		}
-	}
-	idxByID := loadTunnelIdxFile(defaultTunnelTablesPath)
-	var mark uint32
-	if idx, ok := idxByID[id]; ok {
-		mark = tunnelMark(idx, markShift(cfg))
-	}
-	return Path{kind: kindTunnel, id: id, iface: iface, mark: mark}
-}

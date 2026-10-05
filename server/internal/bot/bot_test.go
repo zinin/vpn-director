@@ -16,6 +16,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/chatstore"
 	"github.com/zinin/vpn-director/server/internal/config"
 	"github.com/zinin/vpn-director/server/internal/devmode"
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/paths"
 )
 
@@ -127,7 +128,8 @@ func TestNew_ProductionUsesPathClientAndManager(t *testing.T) {
 	if b.pathManager == nil {
 		t.Fatal("production must build a PathManager")
 	}
-	if got := b.pathManager.Current().String(); got != "direct" {
+	var current netpath.Path = b.pathManager.Current()
+	if got := current.String(); got != "direct" {
 		t.Fatalf("path %q; the local server answers the probe, so direct is live", got)
 	}
 	c, ok := b.api.Client.(*http.Client)
@@ -137,8 +139,13 @@ func TestNew_ProductionUsesPathClientAndManager(t *testing.T) {
 	if _, isPath := c.Transport.(*pathTransport); !isPath {
 		t.Fatalf("transport is %T; production must dial through a pathTransport", c.Transport)
 	}
+	running := func() bool {
+		b.pathManager.mu.Lock()
+		defer b.pathManager.mu.Unlock()
+		return b.pathManager.running
+	}
 	deadline := time.Now().Add(time.Second)
-	for !b.pathManager.running {
+	for !running() {
 		if time.Now().After(deadline) {
 			t.Fatal("path monitor must start before getMe so a blackhole can fail over")
 		}
