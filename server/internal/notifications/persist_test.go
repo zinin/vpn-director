@@ -187,6 +187,67 @@ func TestStore_FailedPublishPreservesPreviousFileAndDirtyState(t *testing.T) {
 	}
 }
 
+func TestStore_LostDirtyPublishDoesNotReuseIDs(t *testing.T) {
+	for _, stage := range []string{"write", "file_sync", "rename"} {
+		t.Run(stage, func(t *testing.T) {
+			at := notificationTestTime()
+			now := func() time.Time { return at }
+			path := filepath.Join(t.TempDir(), "watchd-notifications.json")
+			s := newNotificationStore(t, path, now)
+			replaceNotificationRecipients(t, s, watchdapi.Recipient{ChatID: 100, FirstSeen: at})
+			first := publishNotification(t, s, "already durable")
+			before := readNotificationFile(t, path)
+			failNotificationIO(t, s, stage)
+			lost, err := s.Publish("lost dirty event")
+			if err == nil {
+				t.Fatalf("Publish succeeded despite %s failure", stage)
+			}
+			lostEpoch, lostSequence := splitNotificationID(t, lost)
+			if status := s.Status(); status.StorageError == "" || status.Pending != 2 {
+				t.Fatalf("failed Publish status = %+v", status)
+			}
+			assertNotificationIDs(t, pendingNotifications(t, s), []watchdapi.EventID{first, lost})
+			if after := readNotificationFile(t, path); !bytes.Equal(after, before) {
+				t.Fatal("failed publication changed the previous durable file")
+			}
+			assertNoNotificationTempFiles(t, path)
+
+			// A crash drops dirty RAM without retrying the failed save.
+			s = newNotificationStore(t, path, now)
+			assertNotificationIDs(t, pendingNotifications(t, s), []watchdapi.EventID{first})
+			if status := s.Status(); status.StorageError != "" || status.Pending != 1 {
+				t.Fatalf("restart retained lost dirty state: %+v", status)
+			}
+			next := publishNotification(t, s, "after dirty state loss")
+			if next == lost {
+				t.Fatalf("restart reused lost dirty event ID %q with the same injected clock", lost)
+			}
+			nextEpoch, nextSequence := splitNotificationID(t, next)
+			if nextEpoch != lostEpoch || nextSequence <= lostSequence {
+				t.Fatalf("valid restart reset epoch or dirty sequence: %q after %q", next, lost)
+			}
+			assertNotificationIDs(t, pendingNotifications(t, s), []watchdapi.EventID{first, next})
+			replaceNotificationRecipients(t, s,
+				watchdapi.Recipient{ChatID: 100, FirstSeen: at},
+				watchdapi.Recipient{ChatID: 200, FirstSeen: at},
+			)
+			if err := s.Flush(); err != nil {
+				t.Fatal(err)
+			}
+			s = newNotificationStore(t, path, now)
+			messages := pendingNotifications(t, s)
+			for _, chatID := range []int64{100, 200} {
+				queue := notificationsForChat(messages, chatID)
+				assertNotificationIDs(t, queue, []watchdapi.EventID{first, next})
+				if queue[0].Text != "already durable" || queue[1].Text != "after dirty state loss" {
+					t.Fatalf("durable queue for chat %d contains lost dirty data: %+v", chatID, queue)
+				}
+			}
+			assertNoNotificationTempFiles(t, path)
+		})
+	}
+}
+
 func TestStore_DirectorySyncFailureRetainsDirtyIntent(t *testing.T) {
 	at := notificationTestTime()
 	path := filepath.Join(t.TempDir(), "watchd-notifications.json")
@@ -511,18 +572,44 @@ func TestStore_AtomicHealthSchema(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("notification file mode = %v, %v, want 0600", info, err)
 	}
-	before := readNotificationFile(t, path)
 	document := notificationDocument(t, path)
 	health, ok := document["health"]
 	if !ok || !json.Valid(health) {
 		t.Fatal("version 1 schema has no valid subscription health section")
 	}
+	healthFixture := json.RawMessage(`{
+		"subscription-synthetic-alpha": {
+			"available": true,
+			"endpoint": "192.0.2.10:443",
+			"checked_at": "2026-10-05T10:00:00Z",
+			"samples": [3, 0, 7],
+			"metadata": {"host": "health.example.test", "note": null}
+		},
+		"subscription-synthetic-beta": {
+			"available": false,
+			"retry_count": 2,
+			"endpoints": ["198.51.100.20:8443"]
+		}
+	}`)
+	document["health"] = healthFixture
+	fixture, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, fixture, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s = newNotificationStore(t, path, now)
+	before := readNotificationFile(t, path)
 	oldFile, err := os.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer oldFile.Close()
 	third := publishNotification(t, s, "third recent event")
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	oldBytes, err := io.ReadAll(oldFile)
 	if err != nil || !bytes.Equal(oldBytes, before) {
 		t.Fatalf("successful publication overwrote the previous inode: %v", err)
@@ -555,13 +642,17 @@ func TestStore_AtomicHealthSchema(t *testing.T) {
 	if err := s.Flush(); err != nil {
 		t.Fatal(err)
 	}
+	s = newNotificationStore(t, path, now)
+	messages = pendingNotifications(t, s)
+	assertNotificationIDs(t, notificationsForChat(messages, 100), []watchdapi.EventID{second, third, fourth})
+	assertNotificationIDs(t, notificationsForChat(messages, 300), []watchdapi.EventID{first, second, third, fourth})
 	after := notificationDocument(t, path)
-	var beforeHealth, afterHealth any
-	if err := json.Unmarshal(health, &beforeHealth); err != nil {
+	var wantHealth, afterHealth any
+	if err := json.Unmarshal(healthFixture, &wantHealth); err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(after["health"], &afterHealth); err != nil || !reflect.DeepEqual(beforeHealth, afterHealth) {
-		t.Fatalf("health section did not survive round-trip: %s, %v", after["health"], err)
+	if err := json.Unmarshal(after["health"], &afterHealth); err != nil || !reflect.DeepEqual(wantHealth, afterHealth) {
+		t.Fatalf("health section did not survive round-trip: %s, %v, want %s", after["health"], err, healthFixture)
 	}
 	info, err = os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0600 {

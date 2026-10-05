@@ -42,8 +42,8 @@ var (
 
 type storedEvent struct {
 	EventID watchdapi.EventID `json:"event_id"`
-	At      time.Time        `json:"at"`
-	Text    string           `json:"text"`
+	At      time.Time         `json:"at"`
+	Text    string            `json:"text"`
 }
 
 // Store has one writer; saves serialize independently of RAM mutations.

@@ -22,12 +22,12 @@ func realStoreIO() storeIO {
 }
 
 type savedState struct {
-	Version         int                                      `json:"version"`
-	Epoch           string                                   `json:"epoch"`
-	Sequence        uint64                                   `json:"sequence"`
-	ReservedThrough uint64                                   `json:"reserved_through"`
-	Recent          []storedEvent                            `json:"recent"`
-	Recipients      map[int64]watchdapi.Recipient              `json:"recipients"`
+	Version         int                                       `json:"version"`
+	Epoch           string                                    `json:"epoch"`
+	Sequence        uint64                                    `json:"sequence"`
+	ReservedThrough uint64                                    `json:"reserved_through"`
+	Recent          []storedEvent                             `json:"recent"`
+	Recipients      map[int64]watchdapi.Recipient             `json:"recipients"`
 	Pending         map[int64][]storedEvent                   `json:"pending"`
 	Closed          map[int64]map[watchdapi.EventID]time.Time `json:"closed_progress"`
 	Health          map[string]json.RawMessage                `json:"health"`
