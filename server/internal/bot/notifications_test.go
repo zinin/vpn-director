@@ -732,3 +732,130 @@ func TestReceiver_PollsAndSyncsActivityEveryTenSeconds(t *testing.T) {
 		t.Fatalf("new activity missing from scheduled recipient sync: %+v", last)
 	}
 }
+
+func TestReceiver_SlowChatKeepsPeriodicPollAndSync(t *testing.T) {
+	first := receiverNote(100, "11111111111111111111111111111111:1", "outage")
+	follow := receiverNote(100, "11111111111111111111111111111111:2", "recovered")
+	var newNote watchdapi.Notification
+	var published, firstAcked, followAcked, newAcked atomic.Bool
+	reads := make(chan time.Time, 4)
+	firstStarted, release := make(chan struct{}), make(chan struct{})
+	newDelivered, slowDelivered := make(chan struct{}), make(chan struct{})
+	var firstOnce, releaseOnce, newOnce, slowOnce sync.Once
+	var inFirst, overlap atomic.Bool
+	api := &receiverAPI{
+		pending: func(ctx context.Context, _ string) (watchdapi.NotificationPage, error) {
+			messages := []watchdapi.Notification{}
+			if !firstAcked.Load() {
+				messages = append(messages, first)
+			}
+			if !followAcked.Load() {
+				messages = append(messages, follow)
+			}
+			if published.Load() && !newAcked.Load() {
+				messages = append(messages, newNote)
+			}
+			select {
+			case reads <- time.Now():
+			case <-ctx.Done():
+				return watchdapi.NotificationPage{}, ctx.Err()
+			}
+			return watchdapi.NotificationPage{Messages: messages}, nil
+		},
+		ack: func(_ context.Context, chatID int64, eventID watchdapi.EventID) error {
+			switch {
+			case chatID == 100 && eventID == first.EventID:
+				firstAcked.Store(true)
+			case chatID == 100 && eventID == follow.EventID:
+				followAcked.Store(true)
+				slowOnce.Do(func() { close(slowDelivered) })
+			case chatID == 300 && eventID == "11111111111111111111111111111111:3":
+				newAcked.Store(true)
+				newOnce.Do(func() { close(newDelivered) })
+			}
+			return nil
+		},
+	}
+	transport := &receiverTelegram{send: func(message tgbotapi.MessageConfig) error {
+		if message.ChatID == 100 && message.Text == first.Text {
+			if inFirst.Swap(true) {
+				overlap.Store(true)
+			}
+			firstOnce.Do(func() { close(firstStarted) })
+			<-release
+			inFirst.Store(false)
+		} else if message.ChatID == 100 && inFirst.Load() {
+			overlap.Store(true)
+		}
+		return nil
+	}}
+	b := receiverBot(t, api, telegram.NewSender(transport))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		b.receiveNotifications(ctx)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		releaseOnce.Do(func() { close(release) })
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("receiver did not stop after releasing the slow send")
+		}
+	})
+	var initialPoll time.Time
+	select {
+	case initialPoll = <-reads:
+	case <-time.After(2 * time.Second):
+		t.Fatal("receiver did not start its first poll")
+	}
+	receiverWait(t, firstStarted, "the blocked first chat send")
+	if err := b.chatStore.RecordInteraction("new_user", 300); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	b.auth = NewAuth([]string{"alice", "alice_renamed", "bob", "new_user"})
+	b.mu.Unlock()
+	newNote = receiverNote(300, "11111111111111111111111111111111:3", "new independent event")
+	published.Store(true)
+	select {
+	case nextPoll := <-reads:
+		if elapsed := nextPoll.Sub(initialPoll); elapsed < 9*time.Second || elapsed > 12*time.Second {
+			t.Fatalf("poll spacing during slow send = %v, want the 10-second schedule", elapsed)
+		}
+	case <-time.After(12 * time.Second):
+		t.Fatal("slow send prevented the next scheduled Pending and recipient sync")
+	}
+	recipients, cursors, _ := api.snapshot()
+	if len(recipients) < 2 || !reflect.DeepEqual(cursors, []string{"", ""}) {
+		t.Fatalf("polls while send is blocked: recipients=%+v cursors=%q", recipients, cursors)
+	}
+	last := recipients[len(recipients)-1]
+	if len(last) != 3 || last[0].ChatID != 100 || last[1].ChatID != 200 || last[2].ChatID != 300 {
+		t.Fatalf("recipient change was not synchronized during slow send: %+v", last)
+	}
+	receiverWait(t, newDelivered, "the new chat's delivery and ack before releasing the slow chat")
+	if got := transport.texts(300, false); !reflect.DeepEqual(got, []string{"new independent event"}) {
+		t.Fatalf("new chat delivery while slow send is blocked = %q", got)
+	}
+	if got := transport.texts(100, true); overlap.Load() || !reflect.DeepEqual(got, []string{"outage"}) {
+		t.Fatalf("same-chat jobs overlapped across polls: overlap=%v attempts=%q", overlap.Load(), got)
+	}
+	_, _, acks := api.snapshot()
+	if want := []receiverAck{{300, newNote.EventID}}; !reflect.DeepEqual(acks, want) {
+		t.Fatalf("acks before slow send release = %+v, want %+v", acks, want)
+	}
+	releaseOnce.Do(func() { close(release) })
+	receiverWait(t, slowDelivered, "the slow chat's FIFO delivery after release")
+	cancel()
+	receiverWait(t, done, "receiver cancellation")
+	if got := transport.texts(100, false); overlap.Load() || !reflect.DeepEqual(got, []string{"outage", "recovered"}) {
+		t.Fatalf("same-chat delivery after release: overlap=%v delivered=%q", overlap.Load(), got)
+	}
+	_, _, acks = api.snapshot()
+	if want := []receiverAck{{300, newNote.EventID}, {100, first.EventID}, {100, follow.EventID}}; !reflect.DeepEqual(acks, want) {
+		t.Fatalf("cross-poll delivery acks = %+v, want %+v", acks, want)
+	}
+}

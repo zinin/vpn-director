@@ -33,17 +33,24 @@ type notificationReceipt struct {
 }
 
 type notificationReceiver struct {
-	once    sync.Once
-	polling sync.Mutex
-	syncing sync.Mutex
-	mu      sync.Mutex
-	sent    map[int64][]notificationReceipt
+	once     sync.Once
+	polling  sync.Mutex
+	syncing  sync.Mutex
+	mu       sync.Mutex
+	sent     map[int64][]notificationReceipt
+	inFlight map[int64]*notificationChatJob
+	slots    chan struct{}
 }
 
 type notificationChatJob struct {
 	chatID   int64
 	receipts []notificationReceipt
 	messages []watchdapi.Notification
+}
+
+type notificationWork struct {
+	api watchdapi.NotificationAPI
+	job *notificationChatJob
 }
 
 func withNotifications(api watchdapi.NotificationAPI) Option {
@@ -166,12 +173,17 @@ func (r *notificationReceiver) forget(chatID int64, eventID watchdapi.EventID) {
 }
 
 func (b *Bot) pollNotifications(ctx context.Context) error {
+	api, jobs, err := b.readNotificationJobs(ctx)
+	return errors.Join(err, b.deliverNotificationJobs(ctx, api, jobs))
+}
+
+func (b *Bot) readNotificationJobs(ctx context.Context) (watchdapi.NotificationAPI, map[int64]*notificationChatJob, error) {
 	b.notifications.polling.Lock()
 	defer b.notifications.polling.Unlock()
 	syncErr := b.syncRecipients(ctx)
 	api := b.notificationSource()
 	if api == nil || ctx.Err() != nil {
-		return errors.Join(syncErr, ctx.Err())
+		return api, nil, errors.Join(syncErr, ctx.Err())
 	}
 	recipients := b.notificationRecipients()
 	allowed := make(map[int64]time.Time, len(recipients))
@@ -180,8 +192,15 @@ func (b *Bot) pollNotifications(ctx context.Context) error {
 	}
 	jobs := make(map[int64]*notificationChatJob, len(recipients))
 	b.notifications.mu.Lock()
+	// Exclude busy chats for the whole read, including jobs that finish mid-page.
+	busy := make(map[int64]bool, len(b.notifications.inFlight))
+	for chatID := range b.notifications.inFlight {
+		busy[chatID] = true
+	}
 	for chatID, receipts := range b.notifications.sent {
-		jobs[chatID] = &notificationChatJob{chatID: chatID, receipts: append([]notificationReceipt{}, receipts...)}
+		if !busy[chatID] {
+			jobs[chatID] = &notificationChatJob{chatID: chatID, receipts: append([]notificationReceipt{}, receipts...)}
+		}
 	}
 	b.notifications.mu.Unlock()
 
@@ -201,7 +220,7 @@ func (b *Bot) pollNotifications(ctx context.Context) error {
 		for _, n := range page.Messages {
 			firstSeen, authorized := allowed[n.ChatID]
 			key := notificationDeliveryKey{chatID: n.ChatID, eventID: n.EventID}
-			if !authorized || n.At.Before(firstSeen) || time.Since(n.At) > notificationMaxAge || seenEvents[key] {
+			if busy[n.ChatID] || !authorized || n.At.Before(firstSeen) || time.Since(n.At) > notificationMaxAge || seenEvents[key] {
 				continue
 			}
 			job := jobs[n.ChatID]
@@ -224,7 +243,23 @@ func (b *Bot) pollNotifications(ctx context.Context) error {
 		seenCursors[page.NextCursor] = true
 		cursor = page.NextCursor
 	}
-	return errors.Join(syncErr, pageErr, b.deliverNotificationJobs(ctx, api, jobs))
+	b.notifications.mu.Lock()
+	if b.notifications.inFlight == nil {
+		b.notifications.inFlight = make(map[int64]*notificationChatJob)
+	}
+	for chatID, job := range jobs {
+		b.notifications.inFlight[chatID] = job
+	}
+	b.notifications.mu.Unlock()
+	return api, jobs, errors.Join(syncErr, pageErr, ctx.Err())
+}
+
+func (r *notificationReceiver) finish(job *notificationChatJob) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inFlight[job.chatID] == job {
+		delete(r.inFlight, job.chatID)
+	}
 }
 
 type notificationDeliveryKey struct {
@@ -236,6 +271,11 @@ func (b *Bot) deliverNotificationJobs(ctx context.Context, api watchdapi.Notific
 	if len(jobs) == 0 {
 		return nil
 	}
+	defer func() {
+		for _, job := range jobs {
+			b.notifications.finish(job)
+		}
+	}()
 	chats := make([]int64, 0, len(jobs))
 	for chatID := range jobs {
 		chats = append(chats, chatID)
@@ -331,6 +371,19 @@ func (b *Bot) ackNotification(ctx context.Context, api watchdapi.NotificationAPI
 }
 
 func (b *Bot) deliverNotificationChat(ctx context.Context, api watchdapi.NotificationAPI, job *notificationChatJob) error {
+	defer b.notifications.finish(job)
+	b.notifications.mu.Lock()
+	if b.notifications.slots == nil {
+		b.notifications.slots = make(chan struct{}, notificationWorkers)
+	}
+	slots := b.notifications.slots
+	b.notifications.mu.Unlock()
+	select {
+	case slots <- struct{}{}:
+		defer func() { <-slots }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	closed := make(map[watchdapi.EventID]bool, len(job.receipts))
 	var result error
 	for _, receipt := range job.receipts {
@@ -385,17 +438,66 @@ func (b *Bot) receiveNotifications(ctx context.Context) {
 	b.notifications.once.Do(func() {
 		ticker := time.NewTicker(notificationPollEvery)
 		defer ticker.Stop()
+		work := make(chan notificationWork)
+		results := make(chan error, notificationWorkers)
+		var workers sync.WaitGroup
+		for i := 0; i < notificationWorkers; i++ {
+			workers.Add(1)
+			go func() {
+				defer workers.Done()
+				for task := range work {
+					err := b.deliverNotificationChat(ctx, task.api, task.job)
+					select {
+					case results <- err:
+					case <-ctx.Done():
+					}
+				}
+			}()
+		}
+		var queue []notificationWork
+		defer func() {
+			for _, task := range queue {
+				b.notifications.finish(task.job)
+			}
+			close(work)
+			workers.Wait()
+		}()
+		poll := func() {
+			api, jobs, err := b.readNotificationJobs(ctx)
+			if err != nil && ctx.Err() == nil {
+				slog.Warn("Watch notification delivery will retry")
+			}
+			chats := make([]int64, 0, len(jobs))
+			for chatID := range jobs {
+				chats = append(chats, chatID)
+			}
+			sort.Slice(chats, func(i, j int) bool { return chats[i] < chats[j] })
+			for _, chatID := range chats {
+				queue = append(queue, notificationWork{api: api, job: jobs[chatID]})
+			}
+		}
+		poll()
 		for {
-			if err := ctx.Err(); err != nil {
+			if ctx.Err() != nil {
 				return
 			}
-			if err := b.pollNotifications(ctx); err != nil && ctx.Err() == nil {
-				slog.Warn("Watch notification delivery will retry")
+			var dispatch chan<- notificationWork
+			var next notificationWork
+			if len(queue) > 0 {
+				dispatch, next = work, queue[0]
 			}
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				poll()
+			case dispatch <- next:
+				queue[0] = notificationWork{}
+				queue = queue[1:]
+			case err := <-results:
+				if err != nil && ctx.Err() == nil {
+					slog.Warn("Watch notification delivery will retry")
+				}
 			}
 		}
 	})

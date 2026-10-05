@@ -1,6 +1,12 @@
 package telegram
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -171,5 +177,80 @@ func TestSender_AckCallback(t *testing.T) {
 
 	if len(mock.SentMessages) != 1 {
 		t.Fatalf("expected 1 request, got %d", len(mock.SentMessages))
+	}
+}
+
+func TestSender_SendPlainSafeErrorLogging(t *testing.T) {
+	const token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+	const providerPayload = "synthetic provider payload: https://provider.example.test/subscription?secret=fixture-provider-secret"
+	transportError := &url.Error{
+		Op:  "Post",
+		URL: "https://api.example.test/bot" + token + "/sendMessage",
+		Err: errors.New("synthetic transport payload"),
+	}
+	forbidden := &tgbotapi.Error{Code: 403, Message: providerPayload}
+	rateLimit := &tgbotapi.Error{Code: 429, Message: providerPayload}
+	serverError := &tgbotapi.Error{Code: 502, Message: providerPayload}
+	for _, tc := range []struct {
+		name      string
+		err       error
+		transport *url.Error
+		provider  *tgbotapi.Error
+	}{
+		{"token_bearing_url", transportError, transportError, nil},
+		{"permanent_provider_payload", forbidden, nil, forbidden},
+		{"retryable_provider_payload", rateLimit, nil, rateLimit},
+		{"wrapped_provider_payload", fmt.Errorf("synthetic wrapper payload: %w", serverError), nil, serverError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var captured bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(&captured, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+			sender := NewSender(&MockBotAPI{LastError: tc.err})
+			err := sender.SendPlain(123, "safe notification")
+			if err != tc.err || !errors.Is(err, tc.err) {
+				t.Fatal("SendPlain changed the original returned error identity")
+			}
+			if tc.transport != nil {
+				var got *url.Error
+				if !errors.As(err, &got) || got != tc.transport || !errors.Is(err, tc.transport.Err) {
+					t.Error("SendPlain lost transport error matching or its cause")
+				}
+			}
+			if tc.provider != nil {
+				var got *tgbotapi.Error
+				if !errors.As(err, &got) || got != tc.provider || !errors.Is(err, tc.provider) {
+					t.Error("SendPlain changed Telegram error matching or retry/permanent classification")
+				}
+			}
+			var record struct {
+				Level   string `json:"level"`
+				Message string `json:"msg"`
+				ChatID  int64  `json:"chat_id"`
+			}
+			if err := json.Unmarshal(captured.Bytes(), &record); err != nil {
+				t.Fatal("SendPlain did not retain a structured error diagnostic")
+			}
+			if record.Level != "ERROR" || record.Message == "" || record.ChatID != 123 {
+				t.Fatalf("error diagnostic lost level/operation/chat metadata: %+v", record)
+			}
+			for _, private := range []struct {
+				name string
+				text string
+			}{
+				{"Telegram token", token},
+				{"token-bearing URL", transportError.URL},
+				{"transport payload", "synthetic transport payload"},
+				{"provider payload", providerPayload},
+				{"provider URL", "https://provider.example.test/subscription"},
+				{"provider credential", "fixture-provider-secret"},
+				{"wrapper payload", "synthetic wrapper payload"},
+			} {
+				if strings.Contains(captured.String(), private.text) {
+					t.Errorf("SendPlain error log exposes the synthetic %s", private.name)
+				}
+			}
+		})
 	}
 }
