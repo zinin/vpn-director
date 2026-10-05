@@ -125,6 +125,11 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			TPROXYPath:   defaultTproxyReadyPath,
 			StoppedPath:  defaultStoppedPath,
 		}
+		fetcher := service.SubscriptionFetcher{
+			Store:      configSvc,
+			VPN:        vpnSvc,
+			TablesPath: defaultTunnelTablesPath,
+		}
 		sw := &subwatch.Watch{
 			LoadVPN:           configSvc.LoadVPNConfig,
 			LoadPlatform:      vpnSvc.Platform,
@@ -143,9 +148,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
 				return service.GenerateAndRecordWalkedServer(configSvc, xraySvc, endpoint.ServerForDial(s), s, ports, guard)
 			},
-			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
-				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
-			},
+			Fetch:         fetcher.Fetch,
 			Notify:        b.notifyActiveChats,
 			FallbackReady: readiness.FallbackReady,
 			TPROXYReady:   readiness.TPROXYReady,
