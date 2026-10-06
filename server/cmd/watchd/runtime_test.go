@@ -868,3 +868,295 @@ func TestRuntime_NewWatchCancelsShellWithTickWhileParentLives(t *testing.T) {
 		t.Fatal("cancelled Tick changed durable recovery intent")
 	}
 }
+
+func TestRuntime_NewWatchPortSnapshotAcrossConfigLockWait(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		preferred bool
+		disabled  bool
+	}{
+		{name: "legacy_nil_health"},
+		{name: "legacy_disabled_monitor", disabled: true},
+		{name: "preferred_return_nil_health", preferred: true},
+		{name: "preferred_return_disabled_monitor", preferred: true, disabled: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			p := runtimePaths(t)
+			cfg := runtimeConfig(t, p, `{"data_dir":"resolved-data","paused_clients":["192.168.50.9"],"advanced":{"xray":{"tproxy_port":23456,"socks_port":23457}},"tunnel_director":{"tunnels":{"wgc1":{"clients":["192.168.50.20","192.168.50.8"],"exclude":["ru"]},"wgc2":{"clients":["192.168.50.30"],"exclude":[]}}},"xray":{"clients":["192.168.50.9"],"servers":["192.0.2.10","192.0.2.20"],"exclude_ips":["198.51.100.0/24"],"exclude_sets":["ru"],"active_server":{"name":"Oslo","address":"oslo.example","port":443,"subscription":"0a1b2c3d","seq":7},"failover":{"tunnel":"wgc1","clients":["192.168.50.8"],"added":["192.168.50.8"],"committed":true}}}`)
+			if err := cfg.UpdateVPNConfig(func(c *vpnconfig.VPNDirectorConfig) error {
+				enabled := !test.disabled
+				c.Monitor = &vpnconfig.MonitorConfig{Enabled: &enabled}
+				if test.preferred {
+					c.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Madrid", Address: "madrid.example", Port: 443, Subscription: "0a1b2c3d", Seq: 7}
+					c.Xray.PreferredServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Subscription: "0a1b2c3d"}
+					c.Xray.Failover = nil
+					c.Xray.Clients = []string{"192.168.50.9", "192.168.50.8"}
+					tunnel := c.TunnelDirector.Tunnels["wgc1"]
+					tunnel.Clients = []string{"192.168.50.20"}
+					c.TunnelDirector.Tunnels["wgc1"] = tunnel
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			servers := []vpnconfig.Server{{Name: "Oslo", Address: "oslo.example", Port: 443, IPs: []string{"192.0.2.10"}, UUID: "00000000-0000-0000-0000-000000000001", Security: "tls", SNI: "oslo.example"}}
+			if test.preferred {
+				servers = append(servers, vpnconfig.Server{Name: "Madrid", Address: "madrid.example", Port: 443, IPs: []string{"192.0.2.20"}, UUID: "00000000-0000-0000-0000-000000000002", Security: "tls", SNI: "madrid.example"})
+			}
+			if err := cfg.SaveSubscription(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "synthetic", Servers: servers}); err != nil {
+				t.Fatal(err)
+			}
+			subPath := filepath.Join(p.ScriptsDir, "resolved-data", "subscriptions", "0a1b2c3d.json")
+			subBefore, err := os.ReadFile(subPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for path, text := range map[string]string{
+				p.XrayTemplate: `{"inbounds":[{"tag":"tproxy-in","protocol":"dokodemo-door","port":12345},{"tag":"socks-in","protocol":"socks","port":12346}],"outbounds":[]}`,
+				p.XrayConfig:   "previous main Xray\n",
+				p.TunnelTables: "2 wgc1\n3 wgc2\n", p.FailoverReady: "wgc1\n", p.TPROXYReady: "ready\n",
+			} {
+				if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv("PATH", t.TempDir())
+			q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "resolved-data", "watchd-notifications.json"))
+			if err := q.ReplaceRecipients([]watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Now().Add(-time.Hour)}}); err != nil {
+				t.Fatal(err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			var emitted []service.InboundPorts
+			var dialed []string
+			var probes []int
+			var steps []string
+			applies := 0
+			executor := runtimeExecutor(func(_ context.Context, _ string, args ...string) (*shell.Result, error) {
+				switch {
+				case reflect.DeepEqual(args, []string{"platform"}):
+					return &shell.Result{Output: `{"platform":"merlin","tunnels":[{"id":"wgc1","iface":"wgc1","connected":true}]}`}, nil
+				case reflect.DeepEqual(args, []string{"--wait", "--unless-stopped", "apply"}):
+					applies++
+					return &shell.Result{}, nil
+				case reflect.DeepEqual(args, []string{"--wait", "--unless-stopped", "restart", "xray-process"}):
+					raw, err := os.ReadFile(p.XrayConfig)
+					if err != nil {
+						return nil, err
+					}
+					var doc struct {
+						Inbounds []struct {
+							Tag  string `json:"tag"`
+							Port int    `json:"port"`
+						} `json:"inbounds"`
+						Outbounds []struct {
+							Settings struct {
+								Vnext []struct {
+									Address string `json:"address"`
+								} `json:"vnext"`
+							} `json:"settings"`
+						} `json:"outbounds"`
+					}
+					if err := json.Unmarshal(raw, &doc); err != nil {
+						return nil, err
+					}
+					ports := service.InboundPorts{}
+					for _, inbound := range doc.Inbounds {
+						switch inbound.Tag {
+						case "tproxy-in":
+							ports.TProxy = inbound.Port
+						case "socks-in":
+							ports.Socks = inbound.Port
+						}
+					}
+					if ports.TProxy <= 0 || ports.Socks <= 0 || len(doc.Outbounds) != 1 || len(doc.Outbounds[0].Settings.Vnext) != 1 {
+						return nil, errors.New("generated config lacks the synthetic inbounds or outbound")
+					}
+					emitted = append(emitted, ports)
+					dialed = append(dialed, doc.Outbounds[0].Settings.Vnext[0].Address)
+					steps = append(steps, "restart")
+					return &shell.Result{}, nil
+				default:
+					return nil, fmt.Errorf("unexpected port-snapshot command: %q", args)
+				}
+			})
+			var health subwatch.HealthMonitor
+			if test.disabled {
+				health = monitor.New(monitor.Deps{Settings: settingsReader(cfg), Endpoints: endpointsReader(cfg), Launcher: monitor.FakeLauncher{}})
+			}
+			vpn := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(ctx, executor))
+			xray := service.NewXrayServiceForContext(ctx, p.XrayTemplate, p.XrayConfig)
+			w := newWatch(ctx, p, cfg, vpn, xray, q, runtimeGate(t, p), health, nil)
+			w.Now = func() time.Time { return time.Unix(1_700_000_000, 0) }
+			w.Reachable = func(_ context.Context, ip string, port int) bool { return ip == "192.0.2.10" && port == 443 }
+			w.AfterRestart = func(wait time.Duration) {
+				steps = append(steps, "settle:"+wait.String())
+			}
+			w.Probe = func(_ context.Context, port int) error {
+				probes = append(probes, port)
+				if len(emitted) == 0 {
+					if test.preferred {
+						return nil
+					}
+					return errors.New("synthetic dead main outbound")
+				}
+				steps = append(steps, "probe")
+				live := emitted[len(emitted)-1].Socks
+				if port != live {
+					return fmt.Errorf("SOCKS probe used %d, generated listener is %d", port, live)
+				}
+				return nil
+			}
+			var generations []struct {
+				generated bool
+				seq       int
+				err       error
+			}
+			generate := w.Generate
+			entered := make(chan struct{})
+			var enterOnce sync.Once
+			w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				enterOnce.Do(func() { close(entered) })
+				generated, seq, err := generate(s, guard)
+				generations = append(generations, struct {
+					generated bool
+					seq       int
+					err       error
+				}{generated, seq, err})
+				return generated, seq, err
+			}
+			writer := service.NewConfigService(p.ScriptsDir, p.DefaultDataDir, cfg.ConfigPath())
+			held, release, writerDone, tickDone := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})
+			writerErrors := make(chan error, 1)
+			var writerActive vpnconfig.ActiveServer
+			var releaseOnce sync.Once
+			unlock := func() { releaseOnce.Do(func() { close(release) }) }
+			tickStarted := false
+			t.Cleanup(func() {
+				unlock()
+				cancel()
+				await(t, writerDone)
+				if tickStarted {
+					await(t, tickDone)
+				}
+			})
+			go func() {
+				defer close(writerDone)
+				writerErrors <- writer.UpdateVPNConfig(func(c *vpnconfig.VPNDirectorConfig) error {
+					close(held)
+					<-release
+					c.Advanced["xray"].(map[string]interface{})["socks_port"] = float64(33457)
+					writerActive = *c.Xray.ActiveServer
+					return nil
+				})
+			}()
+			await(t, held)
+			tickStarted = true
+			go func() { defer close(tickDone); w.Tick(ctx) }()
+			await(t, entered)
+			runtimeAwaitConfigLockWait(t, cfg.LockPath(), tickDone)
+			if raw, err := os.ReadFile(p.XrayConfig); err != nil || string(raw) != "previous main Xray\n" {
+				t.Fatal("generation did not wait for the real config lock")
+			}
+			unlock()
+			await(t, writerDone)
+			await(t, tickDone)
+			if err := <-writerErrors; err != nil {
+				t.Fatal("Advanced-only writer failed:", err)
+			}
+			wantWriterActive := vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Subscription: "0a1b2c3d", Seq: 7}
+			if test.preferred {
+				wantWriterActive.Name, wantWriterActive.Address = "Madrid", "madrid.example"
+			}
+			if writerActive != wantWriterActive || ctx.Err() != nil {
+				t.Fatalf("lock-wait fixture changed selection or expired: active=%+v context=%v", writerActive, ctx.Err())
+			}
+			if len(generations) != 1 || !generations[0].generated || generations[0].seq != 8 || generations[0].err != nil {
+				t.Errorf("healthy consumer generated/rolled back unexpectedly: %+v", generations)
+			}
+			if len(emitted) != 1 || emitted[0].TProxy != 23456 || emitted[0].Socks != 23457 && emitted[0].Socks != 33457 || !reflect.DeepEqual(dialed, []string{"192.0.2.10"}) {
+				t.Errorf("healthy server was restarted on unexpected ports/endpoints: ports=%+v dialed=%v", emitted, dialed)
+			}
+			if len(probes) != 2 || probes[0] != 23457 || len(emitted) == 0 || probes[1] != emitted[0].Socks {
+				t.Errorf("generated/probed SOCKS snapshot diverged after config lock wait: emitted=%+v probes=%v", emitted, probes)
+			}
+			if !reflect.DeepEqual(steps, []string{"restart", "settle:3s", "probe"}) {
+				t.Errorf("healthy switch skipped settle/probe or rolled back: %v", steps)
+			}
+			wantApplies := 3
+			wantNotes := []string{"Xray outbound is down; LAN clients moved to tunnel:wgc1", "LAN clients back on Xray; server synthetic / Oslo"}
+			if test.preferred {
+				wantApplies = 0
+				wantNotes = []string{"Xray back on the preferred server synthetic / Oslo"}
+			}
+			if applies != wantApplies {
+				t.Errorf("routing applies=%d, want %d", applies, wantApplies)
+			}
+			current, err := cfg.LoadVPNConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantActive := vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Subscription: "0a1b2c3d", Seq: 8}
+			if current.Xray.ActiveServer == nil || *current.Xray.ActiveServer != wantActive || current.Xray.PreferredServer != nil || current.Xray.Failover != nil || current.Xray.PendingRestore != nil {
+				t.Errorf("healthy server was rejected or rollback/backoff retained: xray=%+v", current.Xray)
+			}
+			if !reflect.DeepEqual(current.Xray.Clients, []string{"192.168.50.9", "192.168.50.8"}) || !reflect.DeepEqual(current.PausedClients, []string{"192.168.50.9"}) || !reflect.DeepEqual(current.TunnelDirector.Tunnels, map[string]vpnconfig.TunnelConfig{
+				"wgc1": {Clients: []string{"192.168.50.20"}, Exclude: []string{"ru"}},
+				"wgc2": {Clients: []string{"192.168.50.30"}, Exclude: []string{}},
+			}) {
+				t.Errorf("healthy consumer left clients on fallback or changed unrelated assignments: xray=%v paused=%v tunnels=%+v", current.Xray.Clients, current.PausedClients, current.TunnelDirector.Tunnels)
+			}
+			if tproxy, socks := vpnconfig.XrayInboundPorts(current); tproxy != 23456 || socks != 33457 || current.Monitor == nil || current.Monitor.Enabled == nil || *current.Monitor.Enabled != !test.disabled || !reflect.DeepEqual(current.Xray.Servers, []string{"192.0.2.10", "192.0.2.20"}) || !reflect.DeepEqual(current.Xray.ExcludeIPs, []string{"198.51.100.0/24"}) || !reflect.DeepEqual(current.Xray.ExcludeSets, []string{"ru"}) {
+				t.Error("walk/return overwrote the writer's ports, monitor setting or TPROXY bypass inputs")
+			}
+			if after, err := os.ReadFile(subPath); err != nil || !bytes.Equal(subBefore, after) {
+				t.Error("port-snapshot handling changed the subscription")
+			}
+			page, err := q.Pending("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var notes []string
+			for _, message := range page.Messages {
+				notes = append(notes, message.Text)
+			}
+			if !reflect.DeepEqual(notes, wantNotes) {
+				t.Errorf("healthy server emitted false failure/rollback events: notes=%v want=%v", notes, wantNotes)
+			}
+			stages, err := filepath.Glob(filepath.Join(p.ScriptsDir, "config.json.*"))
+			if err != nil || len(stages) != 0 {
+				t.Errorf("generation leaked staged configs: stages=%v error=%v", stages, err)
+			}
+		})
+	}
+}
+
+func runtimeAwaitConfigLockWait(t *testing.T, lockPath string, done <-chan struct{}) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatal("observe real config lock waiter:", err)
+		}
+		opened := 0
+		for _, entry := range entries {
+			if target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name())); err == nil && target == lockPath {
+				opened++
+			}
+		}
+		// The writer holds one descriptor; Generate opens another before flock.
+		if opened >= 2 {
+			return
+		}
+		select {
+		case <-done:
+			t.Fatal("Tick ended before real Generate waited for the held config lock")
+		case <-deadline:
+			t.Fatal("real Generate did not open the held config lock")
+		case <-ticker.C:
+		}
+	}
+}

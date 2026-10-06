@@ -218,6 +218,15 @@ func (f *fastSelection) record(s vpnconfig.Server, seq int, err error) {
 	f.recorded = &copy
 }
 
+// BoundGenerationPorts supplies the fast snapshot to the Tick's Generate callback.
+// A bound attempt is read only with Tick ownership held.
+func (w *Watch) BoundGenerationPorts() (service.InboundPorts, bool) {
+	if w.fastOwned == nil || w.fastOwned.ports == nil {
+		return service.InboundPorts{}, false
+	}
+	return *w.fastOwned.ports, true
+}
+
 func (w *Watch) fastGuardNow(ctx context.Context, guard func(*vpnconfig.VPNDirectorConfig) error) (*vpnconfig.VPNDirectorConfig, error) {
 	if err := w.mutationAllowedContext(ctx); err != nil {
 		return nil, err
