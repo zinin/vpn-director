@@ -1014,10 +1014,10 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 	return failed, published > 0 || len(failed) == 0
 }
 
-// walk tries the servers of subs in walkOrder, each address once per outbound
-// (endpoint.DialKey), and brings the clients back to Xray on the first live one. With
-// none live it returns Xray to the server the user chose and backs the next
-// wave off.
+// walk prioritizes current monitor health within walkOrder, trying each address
+// once per outbound (endpoint.DialKey). A main probe decides when the clients
+// return to Xray. With none live it returns Xray to the chosen server and backs
+// the next wave off.
 func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription) {
 	var active, chosen *vpnconfig.ActiveServer
 	if cfg != nil {
@@ -1053,20 +1053,39 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 	lastSeq := startedSeq
 	gone := map[string]bool{}
 	seen := map[string]bool{}
-	for _, s := range endpoint.PerAddress(order) {
+	remaining := endpoint.PerAddress(order)
+	for len(remaining) > 0 {
 		if ctx.Err() != nil || w.mutationAllowed() != nil {
 			return
-		}
-		if gone[s.Subscription] {
-			continue
 		}
 		// A copy whose endpoint.DialKey the walk has written already is that server
 		// again. A copy the guard refused or that did not generate was not
 		// tried, and leaves its twins their turn.
-		key := endpoint.DialKey(s)
-		if key != "" && seen[key] {
-			continue
+		pending := remaining[:0]
+		for _, c := range remaining {
+			if gone[c.Subscription] {
+				continue
+			}
+			if key := endpoint.DialKey(c); key != "" && seen[key] {
+				continue
+			}
+			pending = append(pending, c)
 		}
+		remaining = pending
+		// Rejected entries stay pending so later evidence can admit them again.
+		ordered := w.healthWalkOrder(remaining, cfg)
+		if len(ordered) == 0 {
+			break
+		}
+		s := ordered[0]
+		id, healthKey := serverID(s), endpoint.Key(s)
+		for i, c := range remaining {
+			if serverID(c) == id && endpoint.Key(c) == healthKey {
+				remaining = append(remaining[:i], remaining[i+1:]...)
+				break
+			}
+		}
+		key := endpoint.DialKey(s)
 		generated, seq, err := w.generateWalked(s, w.walkGuard(s.Subscription, links[s.Subscription], started, lastRecorded, lastSeq, ctx))
 		if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
 			slog.Info("Walk skips a subscription deleted while it runs", "subscription", names[s.Subscription])

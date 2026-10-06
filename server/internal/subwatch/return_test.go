@@ -3,13 +3,16 @@ package subwatch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 const (
@@ -881,5 +884,234 @@ func TestTick_AReturnWhoseSubscriptionGoesMidAttemptRollsBack(t *testing.T) {
 	}
 	if r.w.returnRetry != ReturnRetry {
 		t.Fatalf("returnRetry %v, want %v: the attempt failed", r.w.returnRetry, ReturnRetry)
+	}
+}
+
+func TestReturn_HealthOrderingPreservesBackoffAndChoice(t *testing.T) {
+	newHealthReturn := func() *returnRig {
+		r := newReturnRig(returnServers())
+		servers := returnServers()
+		e := orderTestEvidence(r.f.now, map[string]watchdapi.Status{
+			endpoint.Key(servers[0]): watchdapi.StatusDead,
+			endpoint.Key(servers[1]): watchdapi.StatusAlive,
+		})
+		r.w.Health = &fastHealth{cached: e, fresh: copyFastEvidence(e, nil), invalid: make(map[string]bool)}
+		return r
+	}
+
+	t.Run("all failed main probes return to the original walk choice", func(t *testing.T) {
+		sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Unknown", "Alive1", "Alive2")
+		r := newHealthWalkFixture(t, sub)
+		r.setHealth(map[string]watchdapi.Status{"Alive1": watchdapi.StatusAlive, "Alive2": watchdapi.StatusAlive})
+
+		r.tick()
+
+		want := []string{
+			"Alive1@203.0.113.12", "Alive2@203.0.113.13", "Preferred@203.0.113.10",
+			"Unknown@203.0.113.11", "Preferred@203.0.113.10",
+		}
+		if got := healthLabels(r.generated); !reflect.DeepEqual(got, want) {
+			t.Fatalf("walk and fallback %v, want %v; preferred comes from the original walk order", got, want)
+		}
+		wantActive := &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "Preferred", Address: "preferred.example", Port: 443, Seq: 5}
+		if !reflect.DeepEqual(r.f.cfg.Xray.ActiveServer, wantActive) || r.f.cfg.Xray.PreferredServer != nil || r.f.cfg.Xray.Failover == nil {
+			t.Fatalf("active %+v, preferred %+v, failover %+v; an all-dead wave must leave the user's choice on the tunnel", r.f.cfg.Xray.ActiveServer, r.f.cfg.Xray.PreferredServer, r.f.cfg.Xray.Failover)
+		}
+		last := r.events[len(r.events)-2:]
+		if !reflect.DeepEqual(last, []string{"generate Preferred@203.0.113.10", "restart"}) ||
+			r.w.importRetry != 10*time.Minute || countNotes(r.f.notes, "No live server in any subscription") != 1 ||
+			countNotes(r.f.notes, "LAN clients back on Xray") != 0 {
+			t.Fatalf("fallback %v, retry %v, notes %v; the fallback is not another main probe or a restore", last, r.w.importRetry, r.f.notes)
+		}
+	})
+
+	t.Run("health-selected server keeps the original preferred and five minute delay", func(t *testing.T) {
+		sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Healthy")
+		r := newHealthWalkFixture(t, sub)
+		r.setHealth(map[string]watchdapi.Status{"Preferred": watchdapi.StatusDead, "Healthy": watchdapi.StatusAlive})
+		r.live["Healthy"] = true
+		r.live["Preferred"] = true
+		r.w.Reachable = func(_ context.Context, ip string, _ int) bool { return ip == "203.0.113.10" || controlUp(ip) }
+		start := r.f.now
+
+		r.tick()
+
+		if got := healthLabels(r.generated); !reflect.DeepEqual(got, []string{"Healthy@203.0.113.11"}) {
+			t.Fatalf("walk %v; the monitored healthy server must lead", got)
+		}
+		wantPreferred := &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "Preferred", Address: "preferred.example", Port: 443}
+		if !reflect.DeepEqual(r.f.cfg.Xray.PreferredServer, wantPreferred) || !r.w.returnNotBefore.Equal(start.Add(5*time.Minute)) || r.f.cfg.Xray.Failover != nil {
+			t.Fatalf("preferred %+v, next return %v, failover %+v", r.f.cfg.Xray.PreferredServer, r.w.returnNotBefore, r.f.cfg.Xray.Failover)
+		}
+		r.f.now = start.Add(5*time.Minute - time.Second)
+		r.tick()
+		if len(r.generated) != 1 {
+			t.Fatalf("early return %v; five minutes have not passed", healthLabels(r.generated))
+		}
+		r.f.now = start.Add(5 * time.Minute)
+		r.tick()
+		if got := healthLabels(r.generated); !reflect.DeepEqual(got, []string{"Healthy@203.0.113.11", "Preferred@203.0.113.10"}) {
+			t.Fatalf("scheduled return %v; cached dead must not replace the original preferred choice", got)
+		}
+		wantActive := &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "Preferred", Address: "preferred.example", Port: 443, Seq: 2}
+		if !reflect.DeepEqual(r.f.cfg.Xray.ActiveServer, wantActive) || r.f.cfg.Xray.PreferredServer != nil ||
+			countNotes(r.f.notes, "Xray back on the preferred server Alpha / Preferred") != 1 {
+			t.Fatalf("active %+v, preferred %+v, notes %v", r.f.cfg.Xray.ActiveServer, r.f.cfg.Xray.PreferredServer, r.f.notes)
+		}
+	})
+
+	t.Run("failed return rolls back with ten twenty thirty minute retry and four failure cap", func(t *testing.T) {
+		r := newHealthReturn()
+		r.up[osloIP] = true
+		r.live[madridIP] = true
+		start := r.f.now
+		r.tick()
+		want := []string{"Oslo@" + osloIP, "restart", "Madrid@" + madridIP, "restart"}
+		if !reflect.DeepEqual(r.events, want) {
+			t.Fatalf("events %v, want %v", r.events, want)
+		}
+		if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Madrid" {
+			t.Fatalf("active %+v, want Madrid back", a)
+		}
+		if p := r.f.cfg.Xray.PreferredServer; p == nil || p.Name != "Oslo" {
+			t.Fatalf("preferred %+v, want Oslo kept", p)
+		}
+		if len(r.f.notes) != 0 {
+			t.Fatalf("notes %v; a failed return tells nobody", r.f.notes)
+		}
+		for i, at := range []time.Duration{10 * time.Minute, 30 * time.Minute, 60 * time.Minute} {
+			r.f.now = start.Add(at - time.Second)
+			r.tick()
+			if n := r.attempts(); n != i+1 {
+				t.Fatalf("attempts %d at %v, want %d", n, at-time.Second, i+1)
+			}
+			r.f.now = start.Add(at)
+			r.tick()
+			if n := r.attempts(); n != i+2 || r.w.returnFails != i+2 {
+				t.Fatalf("attempts %d, failures %d at %v, want %d", n, r.w.returnFails, at, i+2)
+			}
+		}
+		for _, at := range []time.Duration{90 * time.Minute, 3 * time.Hour} {
+			r.f.now = start.Add(at)
+			r.tick()
+			if n := r.attempts(); n != 4 {
+				t.Fatalf("attempts %d at %v, want 4: the returns have stopped", n, at)
+			}
+		}
+		if r.w.returnRetry != 30*time.Minute || r.w.returnFails != 4 || len(r.f.notes) != 0 {
+			t.Fatalf("retry %v, failures %d, notes %v", r.w.returnRetry, r.w.returnFails, r.f.notes)
+		}
+	})
+
+	t.Run("a successful return keeps the backoff until it holds thirty minutes", func(t *testing.T) {
+		r := newHealthReturn()
+		r.up[osloIP] = true
+		r.live[madridIP] = true
+		r.tick()
+		if r.w.returnRetry != 10*time.Minute || r.w.returnFails != 1 {
+			t.Fatalf("failed return retry %v, failures %d", r.w.returnRetry, r.w.returnFails)
+		}
+		r.live[osloIP] = true
+		r.f.now = r.f.now.Add(10 * time.Minute)
+		r.tick()
+		if r.f.cfg.Xray.PreferredServer != nil || r.f.cfg.Xray.ActiveServer.Name != "Oslo" {
+			t.Fatalf("active %+v, preferred %+v; the scheduled preferred return must still probe Oslo", r.f.cfg.Xray.ActiveServer, r.f.cfg.Xray.PreferredServer)
+		}
+		returned := r.f.now
+		r.f.now = returned.Add(30*time.Minute - time.Second)
+		r.tick()
+		if r.w.returnRetry != 10*time.Minute || r.w.returnFails != 1 {
+			t.Fatalf("retry %v, failures %d before the thirty-minute hold", r.w.returnRetry, r.w.returnFails)
+		}
+		r.f.now = returned.Add(30 * time.Minute)
+		r.tick()
+		if r.w.returnRetry != 0 || r.w.returnFails != 0 || len(r.events) != 6 {
+			t.Fatalf("retry %v, failures %d, events %v after the return held", r.w.returnRetry, r.w.returnFails, r.events)
+		}
+	})
+
+	for _, choice := range []string{"same server", "another server"} {
+		for _, live := range []bool{false, true} {
+			t.Run(choice+" manually selected during preferred probe live="+fmt.Sprint(live), func(t *testing.T) {
+				r := newHealthReturn()
+				r.up[osloIP] = true
+				r.live[osloIP] = live
+				r.live[madridIP] = true
+				r.onProbe = func() {
+					if r.running == osloIP {
+						if choice == "same server" {
+							r.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(r.f.cfg.Xray.ActiveServer, returnServers()[0])
+						} else {
+							selectManual(r.f)
+						}
+						r.f.cfg.Xray.PreferredServer = nil
+					}
+				}
+
+				r.tick()
+
+				want := []string{"Oslo@" + osloIP, "restart"}
+				if !reflect.DeepEqual(r.events, want) || len(r.f.notes) != 0 {
+					t.Fatalf("events %v, notes %v; no rollback or announcement may overwrite a manual selection", r.events, r.f.notes)
+				}
+				name := "Oslo"
+				if choice == "another server" {
+					name = "Manual"
+				}
+				if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != name || a.Seq != 9 || r.f.cfg.Xray.PreferredServer != nil {
+					t.Fatalf("active %+v, preferred %+v; the manual seq must stand", a, r.f.cfg.Xray.PreferredServer)
+				}
+			})
+		}
+	}
+
+	for _, boundary := range []string{"settle loses gate", "probe loses gate", "local probe timeout"} {
+		t.Run(boundary, func(t *testing.T) {
+			r := newHealthReturn()
+			r.up[osloIP] = true
+			r.live[osloIP] = true
+			r.live[madridIP] = true
+			var incompatible atomic.Bool
+			r.w.CanMutate = mutationGate(&incompatible)
+			candidateProbes := 0
+			if boundary == "settle loses gate" {
+				r.w.AfterRestart = func(time.Duration) { incompatible.Store(true) }
+			}
+			probe := r.w.Probe
+			r.w.Probe = func(ctx context.Context, port int) error {
+				if r.running == osloIP {
+					candidateProbes++
+					if boundary == "probe loses gate" {
+						incompatible.Store(true)
+					}
+					if boundary == "local probe timeout" {
+						if ctx.Err() != nil {
+							t.Fatal("the attempt context expired, not the local main probe")
+						}
+						return context.DeadlineExceeded
+					}
+				}
+				return probe(ctx, port)
+			}
+
+			r.tick()
+
+			want := []string{"Oslo@" + osloIP, "restart"}
+			wantProbes := 1
+			if boundary == "settle loses gate" {
+				wantProbes = 0
+			}
+			if boundary == "local probe timeout" {
+				want = append(want, "Madrid@"+madridIP, "restart")
+				if r.w.returnFails != 1 || r.w.returnRetry != 10*time.Minute || !r.w.returnNotBefore.Equal(r.f.now.Add(10*time.Minute)) || r.f.cfg.Xray.ActiveServer.Name != "Madrid" {
+					t.Fatalf("local timeout failures %d, retry %v, next %v, active %+v; a live attempt still counts a server failure and rolls back", r.w.returnFails, r.w.returnRetry, r.w.returnNotBefore, r.f.cfg.Xray.ActiveServer)
+				}
+			} else if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+				t.Fatalf("failures %d, retry %v; late gate loss must end the return, not fail it", r.w.returnFails, r.w.returnRetry)
+			}
+			if !reflect.DeepEqual(r.events, want) || candidateProbes != wantProbes || len(r.f.notes) != 0 {
+				t.Fatalf("events %v, candidate probes %d, notes %v, want %v / %d without another attempt or notification", r.events, candidateProbes, r.f.notes, want, wantProbes)
+			}
+		})
 	}
 }
