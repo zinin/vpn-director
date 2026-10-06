@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -4139,5 +4140,69 @@ func TestTick_ANewEpisodeGivesItsFallbackTimeBeforeMovingOn(t *testing.T) {
 	tickFor(w, f, ImportRetry-time.Minute)
 	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" {
 		t.Fatalf("failover %+v; the new episode's fallback got no time", f.cfg.Xray.Failover)
+	}
+}
+
+func TestFast_PendingRestorePrecedesNewAttempt(t *testing.T) {
+	for _, state := range []string{"ready recovery", "unready recovery", "deleted tunnel while unarmed", "stopped recovery"} {
+		t.Run(state, func(t *testing.T) {
+			s := newRecoverySystem(t)
+			s.seedPending(t)
+			if state == "unready recovery" || state == "deleted tunnel while unarmed" {
+				s.setReady(t, false)
+			}
+			if state == "deleted tunnel while unarmed" {
+				if err := s.store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
+					delete(cfg.TunnelDirector.Tunnels, "ovpnc2")
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				s.probeErr = errProbe
+				s.subs = nil
+			} else {
+				active := fastServer("Oslo", "example.com", "203.0.113.10")
+				s.subs = []vpnconfig.Subscription{{ID: "alpha", Name: "Alpha", URL: "https://alpha.example/list", Servers: []vpnconfig.Server{active}}}
+			}
+			if state == "stopped recovery" {
+				if err := os.WriteFile(s.readiness.StoppedPath, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w := s.watch()
+			health := newFastFixture(t).h
+			w.Health = health
+			wan, generated, restarted := 0, 0, 0
+			w.WANUp = func(context.Context) bool { wan++; return true }
+			w.Generate = func(vpnconfig.Server, func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				generated++
+				return false, 7, errProbe
+			}
+			w.RestartXray = func() error { restarted++; return nil }
+			w.Tick(context.Background())
+			cfg, pending, _ := s.read(t)
+			if len(health.requests()) != 0 || wan != 0 || generated != 0 || restarted != 0 || s.probes != 0 {
+				t.Fatalf("recovery %s started a new fast attempt: checks %d, WAN %d, generate %d, restart %d, probe %d", state, len(health.requests()), wan, generated, restarted, s.probes)
+			}
+			if cfg.Xray.ActiveServer.Name != "Oslo" || cfg.Xray.ActiveServer.Seq != 7 {
+				t.Fatalf("recovery changed the selected identity/sequence: %+v", cfg.Xray.ActiveServer)
+			}
+			switch state {
+			case "ready recovery":
+				assertRecoveryFinished(t, s)
+			case "unready recovery":
+				if pending != nil || !vpnconfig.FailoverCommitted(cfg) || contains(cfg.Xray.Clients, "192.168.1.8") {
+					t.Fatalf("unready recovery lost the guarded fallback: failover %+v, pending %+v, clients %v", cfg.Xray.Failover, pending, cfg.Xray.Clients)
+				}
+			case "deleted tunnel while unarmed":
+				if pending == nil || cfg.Xray.Failover != nil || len(s.notes) != 0 {
+					t.Fatalf("deleted tunnel recovery must retain intent, not invent a fast fallback: pending %+v, failover %+v, notes %v", pending, cfg.Xray.Failover, s.notes)
+				}
+			case "stopped recovery":
+				if pending == nil || s.applies != 0 || len(s.notes) != 0 {
+					t.Fatalf("stopped recovery mutated intent: pending %+v, apply %d, notes %v", pending, s.applies, s.notes)
+				}
+			}
+		})
 	}
 }

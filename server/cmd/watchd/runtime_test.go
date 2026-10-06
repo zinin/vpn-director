@@ -73,7 +73,7 @@ func runtimeWatch(t *testing.T, ctx context.Context, p paths.Paths, cfg *service
 	t.Helper()
 	vpn := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(ctx, executor))
 	xray := service.NewXrayServiceForContext(ctx, p.XrayTemplate, p.XrayConfig)
-	return newWatch(ctx, p, cfg, vpn, xray, q, runtimeGate(t, p))
+	return newWatch(ctx, p, cfg, vpn, xray, q, runtimeGate(t, p), nil, nil)
 }
 
 func startRuntime(t *testing.T, ctx context.Context, cancel context.CancelFunc, path string, build func() (runtimeDeps, error), release ...func()) <-chan error {
@@ -562,6 +562,57 @@ func TestRuntime_NewWatchPreservesPersistedRecoveryAndNoReplay(t *testing.T) {
 	page, err := q.Pending("")
 	if err != nil || len(page.Messages) != 1 || applies.Load() != 3 {
 		t.Fatal("completed no-subscription restore replayed after another restart")
+	}
+}
+
+func TestRuntime_NewWatchUsesSoleMonitorAndCallerWANContext(t *testing.T) {
+	p := runtimePaths(t)
+	cfg := runtimeConfig(t, p, runtimePending)
+	q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "resolved-data", "watchd-notifications.json"))
+	root, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	before, err := os.ReadFile(cfg.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := monitor.New(monitor.Deps{})
+	calls := 0
+	var received context.Context
+	wan := func(ctx context.Context) bool {
+		calls++
+		received = ctx
+		return ctx.Err() == nil
+	}
+	shellCalls := 0
+	vpn := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(root, runtimeExecutor(func(context.Context, string, ...string) (*shell.Result, error) {
+		shellCalls++
+		return &shell.Result{}, nil
+	})))
+	xray := service.NewXrayServiceForContext(root, p.XrayTemplate, p.XrayConfig)
+	w := newWatch(root, p, cfg, vpn, xray, q, runtimeGate(t, p), m, wan)
+	if w.Health != m || w.WANUp == nil || calls != 0 || shellCalls != 0 {
+		t.Fatal("newWatch must share the runtime Monitor, without constructor checks or side effects")
+	}
+	caller, end := context.WithTimeout(root, 2*time.Second)
+	defer end()
+	if !w.WANUp(caller) || received != caller || calls != 1 {
+		t.Fatal("WAN injection replaced the caller's context or lost its result")
+	}
+	wantDeadline, _ := caller.Deadline()
+	gotDeadline, bounded := received.Deadline()
+	if !bounded || !gotDeadline.Equal(wantDeadline) {
+		t.Fatal("WAN control did not retain the caller's bounded deadline")
+	}
+	end()
+	if w.WANUp(caller) || received != caller || calls != 2 || root.Err() != nil {
+		t.Fatal("caller cancellation must stop its WAN look without canceling the runtime lifetime")
+	}
+	if _, err := w.Health.CheckEvidence(caller, []string{"synthetic-key"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("the shared Monitor did not retain the evidence API's caller cancellation: %v", err)
+	}
+	after, err := os.ReadFile(cfg.ConfigPath())
+	if err != nil || !bytes.Equal(before, after) || shellCalls != 0 || q.Status().Pending != 0 {
+		t.Fatal("health/WAN injection changed config, shell or notification ownership")
 	}
 }
 

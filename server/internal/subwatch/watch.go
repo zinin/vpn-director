@@ -82,6 +82,8 @@ type Watch struct {
 	SaveSubscription  func(vpnconfig.Subscription) error
 	Generate          func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error)
 	Probe             func(ctx context.Context, socksPort int) error
+	Health            HealthMonitor              // nil => legacy confirmation
+	WANUp             func(context.Context) bool // nil => legacy confirmation
 	Fetch             func(ctx context.Context, url string) ([]vpnconfig.Server, error)
 	Reachable         func(ctx context.Context, ip string, port int) bool // nil => no TCP checks: no fast death, no return
 	Notify            func(msg string)
@@ -99,6 +101,9 @@ type Watch struct {
 	mutationContext   context.Context
 	mutationCancel    context.CancelCauseFunc
 	mutationFailed    atomic.Bool
+	outboundGuard     func(*vpnconfig.VPNDirectorConfig) error
+	outboundRefused   error
+	fastOwned         *fastSelection
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
 	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
@@ -166,6 +171,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 		w.mutationContext = nil
 		w.mutationCancel = nil
+		w.outboundGuard, w.outboundRefused, w.fastOwned = nil, nil, nil
 		w.setContext(nil)
 		w.setStatusAction("")
 		w.mu.Unlock()
@@ -335,6 +341,18 @@ func (w *Watch) Tick(ctx context.Context) {
 	if w.failSince.IsZero() {
 		w.failSince = now
 	}
+	attempt := w.fastFailover(ctx, cfg)
+	switch attempt.Outcome {
+	case fastSwitched:
+		return
+	case fastCanceled:
+		w.resetFail()
+		return
+	case fastFallback:
+		w.failOutbound(ctx, attempt.Config, "monitor", attempt.Guard)
+		return
+	}
+	cfg = attempt.Config
 	// Past DeadAfter the outbound is dead whatever a look finds.
 	if now.Sub(w.failSince) < DeadAfter {
 		w.checkReach(ctx, cfg)
@@ -344,10 +362,18 @@ func (w *Watch) Tick(ctx context.Context) {
 		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, "error", err)
 		return
 	}
-	// A /stop can land while the probe waits; the move is a write it rules out.
-	if w.mutationAllowed() != nil {
+	w.failOutbound(ctx, cfg, reason, attempt.Guard)
+}
+
+func (w *Watch) failOutbound(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, reason string, guard func(*vpnconfig.VPNDirectorConfig) error) {
+	previousGuard, previousRefused := w.outboundGuard, w.outboundRefused
+	w.outboundGuard, w.outboundRefused = guard, nil
+	defer func() { w.outboundGuard, w.outboundRefused = previousGuard, previousRefused }()
+	w.setStatusAction("fallback")
+	if w.mutationAllowed() != nil || w.outboundAllowedNow() != nil {
 		return
 	}
+	now := w.Now()
 	if w.lastRouteKind == noteNoTunnel && !w.lastNoTunnelCheck.IsZero() && now.Sub(w.lastNoTunnelCheck) < ImportRetry {
 		w.maybeImportAndPick(ctx, cfg)
 		return
@@ -362,7 +388,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	// transition only until the user has been told there is no fallback.
 	announce := w.lastRouteKind != noteNoTunnel
 	if announce {
-		slog.Info("Xray outbound declared dead", "socks_port", socks, "reason", reason, "error", err)
+		slog.Info("Xray outbound declared dead", "socks_port", w.socksPort(cfg), "reason", reason)
 	}
 
 	var plat vpnconfig.PlatformInfo
@@ -377,7 +403,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	// LoadPlatform shells out and takes no lock: a /stop can finish while it
 	// runs, and neither the stage write nor the message below may follow one.
-	if w.mutationAllowed() != nil {
+	if w.mutationAllowed() != nil || w.outboundAllowedNow() != nil {
 		return
 	}
 	id := vpnconfig.FirstTDExit(cfg, plat)
@@ -448,7 +474,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	cfg, ok = w.applyFailover(cfg)
 	// The commit inside can wait for the config lock; a stop that finished
 	// meanwhile refused it, and nothing below may announce or retry it.
-	if w.mutationAllowed() != nil {
+	if w.mutationAllowed() != nil || w.outboundAllowedNow() != nil {
 		return
 	}
 	if !ok {
@@ -486,6 +512,15 @@ func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPND
 	}
 	if w.UpdateVPN != nil {
 		if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
+			if w.outboundGuard != nil {
+				if !w.fallbackReady(current) {
+					return errors.New("failover tunnel is not ready")
+				}
+				if err := w.outboundGuard(current); err != nil {
+					w.outboundRefused = err
+					return err
+				}
+			}
 			vpnconfig.CommitXrayFailover(current)
 			return nil
 		}); err != nil {
@@ -836,7 +871,7 @@ func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string, 
 // subscription with a link downloads at once, each list that arrives is
 // published, and the walk looks for a live server across every subscription.
 func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
-	if w.Fetch == nil || w.mutationAllowed() != nil {
+	if w.Fetch == nil || w.mutationAllowed() != nil || w.outboundAllowedNow() != nil {
 		return
 	}
 	subs, err := w.loadSubscriptions()
@@ -860,7 +895,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	// The downloads block for as long as the slowest host takes. A /stop that
 	// finished meanwhile ends the wave before anything more is written, and a
 	// wave that did not happen leaves its window to the next one.
-	if w.mutationAllowed() != nil || ctx.Err() != nil {
+	if w.mutationAllowed() != nil || ctx.Err() != nil || w.outboundAllowedNow() != nil {
 		w.lastImport = prevImport
 		return
 	}
@@ -927,6 +962,9 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 		}()
 	}
 	wg.Wait()
+	if w.outboundAllowedNow() != nil {
+		return nil, false
+	}
 	if links == 0 {
 		return nil, true
 	}
@@ -957,6 +995,12 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 		switch {
 		case err == nil:
 			published++
+			if w.outboundGuard != nil && w.fastOwned != nil {
+				// This publication replaces the inputs of the completed death proof.
+				w.fastOwned.proofRequired = false
+				w.fastOwned.refreshed = true
+				w.fastOwned.last, w.fastOwned.recorded, w.fastOwned.fallbackProofs = nil, nil, nil
+			}
 			slog.Info("Subscription refreshed", "subscription", s.Name, "servers", len(results[i].servers))
 		case mutationInterrupted(err):
 			return failed, false
@@ -1023,7 +1067,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		if key != "" && seen[key] {
 			continue
 		}
-		generated, seq, err := w.Generate(s, w.walkGuard(s.Subscription, links[s.Subscription], started, lastRecorded, lastSeq, ctx))
+		generated, seq, err := w.generateWalked(s, w.walkGuard(s.Subscription, links[s.Subscription], started, lastRecorded, lastSeq, ctx))
 		if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
 			slog.Info("Walk skips a subscription deleted while it runs", "subscription", names[s.Subscription])
 			gone[s.Subscription] = true
@@ -1132,7 +1176,7 @@ func (w *Watch) importInterval() time.Duration {
 // server whose subscription was deleted meanwhile is not written back: there
 // is nothing to return to.
 func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) error {
-	generated, _, err := w.Generate(s, guard)
+	generated, _, err := w.generateWalked(s, guard)
 	if endsWalk(err) {
 		return err
 	}
@@ -1180,6 +1224,15 @@ func (w *Watch) update(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 		if err := w.mutationAllowedContext(ctx); err != nil {
 			return err
 		}
+		if w.outboundGuard != nil {
+			if w.outboundRefused != nil {
+				return w.outboundRefused
+			}
+			if err := w.outboundGuard(cfg); err != nil {
+				w.outboundRefused = err
+				return err
+			}
+		}
 		if err := fn(cfg); err != nil {
 			return err
 		}
@@ -1200,12 +1253,18 @@ func (w *Watch) apply() error {
 	if err := w.mutationAllowed(); err != nil {
 		return err
 	}
+	if err := w.outboundAllowedNow(); err != nil {
+		return err
+	}
 	if w.Apply == nil {
 		return nil
 	}
 	err := w.Apply()
 	// A zero exit can be --unless-stopped skipping the script.
 	if refused := w.mutationAllowed(); refused != nil {
+		return refused
+	}
+	if refused := w.outboundAllowedNow(); refused != nil {
 		return refused
 	}
 	return err
@@ -1218,11 +1277,17 @@ func (w *Watch) restartXray() error {
 	if err := w.mutationAllowed(); err != nil {
 		return err
 	}
+	if err := w.outboundAllowedNow(); err != nil {
+		return err
+	}
 	if w.RestartXray == nil {
 		return nil
 	}
 	err := w.RestartXray()
 	if refused := w.mutationAllowed(); refused != nil {
+		return refused
+	}
+	if refused := w.outboundAllowedNow(); refused != nil {
 		return refused
 	}
 	return err
@@ -1643,7 +1708,7 @@ func (w *Watch) applyDefaults() {
 // that episode's import outcome is news again. A suppressed one leaves the
 // import channel alone: the no-tunnel branch notifies on every tick.
 func (w *Watch) notify(kind noteKind, msg string) {
-	if w.mutationAllowed() != nil {
+	if w.mutationAllowed() != nil || w.outboundAllowedNow() != nil {
 		return
 	}
 	if kind == noteRestored {

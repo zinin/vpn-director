@@ -14,7 +14,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/watchcompat"
 )
 
-func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vpn *service.VPNDirectorService, xray *service.XrayService, q *notifications.Store, gate *watchcompat.Gate) *subwatch.Watch {
+func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vpn *service.VPNDirectorService, xray *service.XrayService, q *notifications.Store, gate *watchcompat.Gate, health subwatch.HealthMonitor, wanUp func(context.Context) bool) *subwatch.Watch {
 	readiness := netpath.Readiness{
 		TablesPath:   p.TunnelTables,
 		FailoverPath: p.FailoverReady,
@@ -27,6 +27,8 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 		LoadSubscriptions: cfg.LoadSubscriptions,
 		SaveSubscription:  cfg.SaveSubscription,
 		Reachable:         netpath.ReachTCP4(nil),
+		Health:            health,
+		WANUp:             wanUp,
 		FallbackReady:     readiness.FallbackReady,
 		TPROXYReady:       readiness.TPROXYReady,
 		Stopped:           readiness.Stopped,

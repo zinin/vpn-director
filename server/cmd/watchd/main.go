@@ -131,7 +131,20 @@ func run() int {
 		}
 		vpnSvc := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(ctx, executor))
 		xraySvc := service.NewXrayServiceForContext(ctx, p.XrayTemplate, p.XrayConfig)
-		watch := newWatch(ctx, p, configSvc, vpnSvc, xraySvc, queue, gate)
+		readiness := netpath.Readiness{StoppedPath: p.StoppedMarker}
+		wanUp := func(ctx context.Context) bool {
+			return monitor.WANUp(ctx, endpoint.WANControls, 3*time.Second)
+		}
+		m := monitor.New(monitor.Deps{
+			Settings:   settingsReader(configSvc),
+			Endpoints:  endpointsReader(configSvc),
+			Launcher:   launcher,
+			Stopped:    readiness.Stopped,
+			WANUp:      wanUp,
+			StatePath:  p.WatchdState,
+			OnSettings: levelSetter(logger),
+		})
+		watch := newWatch(ctx, p, configSvc, vpnSvc, xraySvc, queue, gate, m, wanUp)
 		if *devFlag {
 			// Dev has no installed or running router bot to attest.
 			watch.CanMutate = func() error {
@@ -141,18 +154,6 @@ func run() int {
 				return ctx.Err()
 			}
 		}
-		readiness := netpath.Readiness{StoppedPath: p.StoppedMarker}
-		m := monitor.New(monitor.Deps{
-			Settings:  settingsReader(configSvc),
-			Endpoints: endpointsReader(configSvc),
-			Launcher:  launcher,
-			Stopped:   readiness.Stopped,
-			WANUp: func(ctx context.Context) bool {
-				return monitor.WANUp(ctx, endpoint.WANControls, 3*time.Second)
-			},
-			StatePath:  p.WatchdState,
-			OnSettings: levelSetter(logger),
-		})
 		return runtimeDeps{Monitor: m, Watch: watch, Queue: queue}, errors.Join(pathErr, storageErr)
 	}); err != nil {
 		slog.Error("the monitor's socket stopped", "path", p.WatchdSocket, "error", err)
