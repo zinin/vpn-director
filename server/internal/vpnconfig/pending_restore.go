@@ -33,12 +33,13 @@ func BeginXrayRestore(cfg *VPNDirectorConfig) *XrayPendingRestore {
 
 // FailoverSnapshot keeps only restored addresses whose current assignment still
 // belongs to this restore. A manual move, pause or deletion is never rolled back.
+// The caller checks tunnel availability before reinstatement.
 func (p *XrayPendingRestore) FailoverSnapshot(cfg *VPNDirectorConfig) *XrayFailover {
 	if cfg == nil || p == nil || p.Snapshot == nil {
 		return nil
 	}
 	original := p.Snapshot
-	if _, ok := cfg.TunnelDirector.Tunnels[original.Tunnel]; !ok || original.Tunnel == "" {
+	if original.Tunnel == "" {
 		return nil
 	}
 	snapshot := &XrayFailover{

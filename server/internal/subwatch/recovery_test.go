@@ -264,6 +264,101 @@ func TestRecovery_PendingRestoreAfterRestart(t *testing.T) {
 	}
 }
 
+func TestRecovery_MissingFallbackKeepsIntentAfterRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		applyErr error
+	}{
+		{"failed Apply", errApply},
+		{"successful Apply without readiness", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newRecoverySystem(t)
+			s.seedPending(t)
+			if err := s.store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
+				delete(cfg.TunnelDirector.Tunnels, "ovpnc2")
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			s.setReady(t, false)
+			want := &recoveryIntent{
+				Snapshot: &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8", "192.168.1.3"}, Added: []string{"192.168.1.8"}, Committed: true},
+				Restored: []string{"192.168.1.8", "192.168.1.3"},
+				Active:   &vpnconfig.ActiveServer{Name: "Oslo", Address: "example.com", Port: 443, Subscription: "alpha", Seq: 7},
+			}
+			assertAssignments := func() (*vpnconfig.VPNDirectorConfig, *recoveryIntent, []byte) {
+				t.Helper()
+				cfg, pending, raw := s.read(t)
+				if cfg.Xray.Failover != nil ||
+					!reflect.DeepEqual(cfg.Xray.Clients, []string{"192.168.1.9", "192.168.1.10", "192.168.1.8", "192.168.1.3"}) ||
+					!reflect.DeepEqual(cfg.TunnelDirector.Tunnels, map[string]vpnconfig.TunnelConfig{
+						"wgc1": {Clients: []string{"192.168.1.20"}, Exclude: []string{}},
+					}) || !reflect.DeepEqual(cfg.PausedClients, []string{"192.168.1.9"}) ||
+					!reflect.DeepEqual(cfg.Xray.ActiveServer, want.Active) {
+					t.Fatalf("missing fallback recovery changed manual assignments: xray %v, tunnels %v, paused %v, active %+v, failover %+v", cfg.Xray.Clients, cfg.TunnelDirector.Tunnels, cfg.PausedClients, cfg.Xray.ActiveServer, cfg.Xray.Failover)
+				}
+				return cfg, pending, raw
+			}
+			applyErr, makeReady := tc.applyErr, false
+			apply := func() error {
+				s.applies++
+				if makeReady {
+					s.setReady(t, true)
+				}
+				return applyErr
+			}
+			for attempt := 0; attempt < 3; attempt++ {
+				// Each restart must recover from the file without the previous Watch's RAM.
+				w := s.watch()
+				w.Apply = apply
+				applies := s.applies
+				w.Tick(context.Background())
+				cfg, pending, _ := assertAssignments()
+				if !reflect.DeepEqual(pending, want) || !vpnconfig.Armed(cfg, 0) {
+					t.Fatalf("restart %d lost unfinished restore with missing fallback/readiness: pending %+v, armed %v, applies %d", attempt, pending, vpnconfig.Armed(cfg, 0), s.applies)
+				}
+				if s.applies <= applies || s.probes != 0 || len(s.notes) != 0 {
+					t.Fatalf("restart %d did not retry the existing restore alone: applies %d after %d, probes %d, notes %v", attempt, s.applies, applies, s.probes, s.notes)
+				}
+				s.now = s.now.Add(ImportRetry)
+			}
+
+			_, _, beforeStop := assertAssignments()
+			if err := os.WriteFile(s.readiness.StoppedPath, nil, 0600); err != nil {
+				t.Fatal(err)
+			}
+			w := s.watch()
+			w.Apply = apply
+			applies := s.applies
+			w.Tick(context.Background())
+			_, _, afterStop := assertAssignments()
+			if string(afterStop) != string(beforeStop) || s.applies != applies || s.probes != 0 || len(s.notes) != 0 {
+				t.Fatal("missing fallback recovery continued while /stop was present")
+			}
+			if err := os.Remove(s.readiness.StoppedPath); err != nil {
+				t.Fatal(err)
+			}
+
+			applyErr, makeReady = nil, true
+			s.now = s.now.Add(ImportRetry)
+			w.Tick(context.Background())
+			cfg, pending, _ := assertAssignments()
+			if pending != nil || vpnconfig.Armed(cfg, 0) || s.applies <= applies || s.probes != 0 ||
+				len(s.notes) != 1 || countNotes(s.notes, "LAN clients back on Xray") != 1 {
+				t.Fatalf("successful Apply/readiness did not finish the missing fallback restore once: pending %+v, armed %v, applies %d after %d, probes %d, notes %v", pending, vpnconfig.Armed(cfg, 0), s.applies, applies, s.probes, s.notes)
+			}
+			applies = s.applies
+			w.Tick(context.Background())
+			s.watch().Tick(context.Background())
+			_, pending, _ = assertAssignments()
+			if pending != nil || s.applies != applies || len(s.notes) != 1 {
+				t.Fatalf("completed missing fallback restore replayed: pending %+v, applies %d after %d, notes %v", pending, s.applies, applies, s.notes)
+			}
+		})
+	}
+}
+
 func mustLoadRecovery(t *testing.T, s *recoverySystem) *vpnconfig.VPNDirectorConfig {
 	t.Helper()
 	cfg, _, _ := s.read(t)

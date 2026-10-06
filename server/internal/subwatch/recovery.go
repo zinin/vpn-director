@@ -109,6 +109,12 @@ func (w *Watch) finalizeRestore(expected *vpnconfig.XrayPendingRestore, applied 
 		pending := current.Xray.PendingRestore
 		snapshot := pending.FailoverSnapshot(current)
 		if !ready && snapshot != nil {
+			if _, ok := current.TunnelDirector.Tunnels[snapshot.Tunnel]; !ok {
+				if applied {
+					return errRestoreApply
+				}
+				return errRestoreNeedsApply
+			}
 			vpnconfig.ApplyFailoverSnapshot(current, snapshot)
 			reinstated = true
 		} else {
