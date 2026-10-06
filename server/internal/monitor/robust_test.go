@@ -673,16 +673,55 @@ func TestMonitor_IdleStartupReconcilesAndPreservesTheSavedState(t *testing.T) {
 				t.Fatalf("idle shutdown lost statuses/pauses: %+v, %v", saved, err)
 			}
 			h.stopped, h.settings.Enabled, h.l.ready = false, true, nil
-			h.m = New(h.deps(path))
+			reassessed := false
+			launcher := &launcherFaults{fakeLauncher: h.l}
+			launcher.onStart = func(ctx context.Context, set []Endpoint) (Session, error) {
+				for _, ep := range set {
+					if ep.Key == "rejected" {
+						reassessed = true
+					}
+				}
+				return h.l.Start(ctx, set)
+			}
+			d := h.deps(path)
+			d.Launcher = launcher
+			h.m = New(d)
 			h.m.restore()
-			h.at(40*time.Second, true)
+			h.now = t0.Add(40 * time.Second)
+			h.m.refresh(h.ctx, h.now)
 			for k, v := range want {
+				if k == "rejected" {
+					continue
+				}
 				if h.state(k) != v.State {
 					t.Fatalf("idle restart changed %s", k)
 				}
 			}
 			if h.l.checkCount("k1") != 0 || h.l.checkCount("k2") != 0 {
 				t.Fatal("idle restart checked before saved schedules")
+			}
+			if !reassessed || h.m.session == nil || h.state("rejected").Status != watchdapi.StatusUnknown {
+				t.Fatal("persisted crash rejection did not pass the current launcher and become checkable")
+			}
+			before := h.m.Evidence()
+			if _, ok := before.Endpoints["rejected"]; ok || h.m.ValidateEvidence(before, []string{"rejected"}) == nil {
+				t.Fatal("persisted crash rejection acquired proof before a live completion")
+			}
+			done := h.askEvidence([]string{"rejected"})
+			evidenceWaiting(t, done)
+			h.at(40*time.Second, false)
+			got := evidenceAnswered(t, done)
+			st := got.evidence.Endpoints["rejected"]
+			if got.err != nil || st.Status != watchdapi.StatusAlive || st.CheckedAt != t0.Add(40*time.Second) || st.LatencyMS != 100 || st.Fails != 0 || st.Error != "" || h.l.checkCount("rejected") != 1 {
+				t.Fatalf("accepted persisted crash rejection has no fresh live result: %+v, %v", got.evidence, got.err)
+			}
+			if err := h.m.ValidateEvidence(got.evidence, []string{"rejected"}); err != nil {
+				t.Fatalf("post-reassessment live result has no applicable proof: %v", err)
+			}
+			for _, key := range []string{"k1", "k2"} {
+				if h.state(key) != want[key].State || h.l.checkCount(key) != 0 {
+					t.Fatalf("reassessment changed the saved state or schedule of %s", key)
+				}
 			}
 		})
 	}

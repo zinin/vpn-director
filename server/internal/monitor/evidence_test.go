@@ -596,6 +596,180 @@ func TestEvidence_AllRejectedCurrentBuild(t *testing.T) {
 	})
 }
 
+func TestEvidence_RestoredXrayRejection(t *testing.T) {
+	captureEngineLogs(t)
+	restoreRefusal := func(t *testing.T) *harness {
+		t.Helper()
+		h := newHarness(t, "bad")
+		path := filepath.Join(t.TempDir(), "watchd-state.json")
+		h.m = New(h.deps(path))
+		h.l.refuse["bad"] = "persisted synthetic Xray refusal"
+		h.m.refresh(h.ctx, t0)
+		before := applicableEvidence(t, h.m, []string{"bad"})
+		if before.Endpoints["bad"].Status != watchdapi.StatusRejected || before.Endpoints["bad"].Error != "persisted synthetic Xray refusal" || h.m.session != nil {
+			t.Fatal("fixture did not obtain an all-rejected Xray build")
+		}
+		h.m.shutdown()
+		h.l = newFakeLauncher()
+		h.m = New(h.deps(path))
+		h.m.restore()
+		saved, ok := h.m.restored["bad"]
+		if !ok || !saved.Sticky || saved.State.Status != watchdapi.StatusRejected || saved.State.Error != "persisted synthetic Xray refusal" {
+			t.Fatal("save/restore did not retain the sticky Xray rejection")
+		}
+		t.Cleanup(func() { h.m.shutdown() })
+		return h
+	}
+
+	t.Run("current-refusal-has-new-proof", func(t *testing.T) {
+		h := restoreRefusal(t)
+		h.l.refuse["bad"] = "current synthetic Xray refusal"
+		h.m.refresh(h.ctx, t0)
+		h.m.refresh(h.ctx, t0)
+		ctx, cancel := context.WithTimeout(h.ctx, 150*time.Millisecond)
+		defer cancel()
+		got, err := h.m.CheckEvidence(ctx, []string{"bad"})
+		st := got.Endpoints["bad"]
+		if err != nil || got.State != watchdapi.StateOK || st.Status != watchdapi.StatusRejected || st.Error != "current synthetic Xray refusal" || st.Fails != 0 || !st.CheckedAt.IsZero() {
+			t.Fatalf("restored Xray refusal was not reassessed by the current build: %+v, %v", got, err)
+		}
+		if err := h.m.ValidateEvidence(got, []string{"bad"}); err != nil {
+			t.Fatalf("current Xray refusal has no applicable proof: %v", err)
+		}
+		current := applicableEvidence(t, h.m, []string{"bad"})
+		if current.Endpoints["bad"] != st || h.m.session != nil || h.l.checkCount("bad") != 0 {
+			t.Fatal("all-rejected current build lost its static proof or dispatched a live check")
+		}
+	})
+
+	t.Run("accepted-build-needs-live-check", func(t *testing.T) {
+		h := restoreRefusal(t)
+		h.m.refresh(h.ctx, t0)
+		if h.state("bad").Status != watchdapi.StatusUnknown {
+			t.Fatal("accepted current Xray build retained the persisted sticky rejection")
+		}
+		if _, ok := h.m.Evidence().Endpoints["bad"]; ok {
+			t.Fatal("accepted but unchecked outbound acquired proof from a persisted rejection")
+		}
+		done := h.askEvidence([]string{"bad"})
+		evidenceWaiting(t, done)
+		h.at(0, false)
+		got := evidenceAnswered(t, done)
+		st := got.evidence.Endpoints["bad"]
+		if got.err != nil || st.Status != watchdapi.StatusAlive || st.CheckedAt != t0 || st.LatencyMS != 100 || h.l.checkCount("bad") != 1 {
+			t.Fatalf("accepted restored outbound did not acquire fresh live proof: %+v, %v", got.evidence, got.err)
+		}
+		if err := h.m.ValidateEvidence(got.evidence, []string{"bad"}); err != nil {
+			t.Fatalf("post-restore live completion is not applicable: %v", err)
+		}
+	})
+
+	t.Run("reevaluation-does-not-block-ipc", func(t *testing.T) {
+		h := restoreRefusal(t)
+		h.l.refuse["bad"] = "current synthetic Xray refusal"
+		entered, release, refreshed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+		var once sync.Once
+		block := func(set []Endpoint) {
+			for _, ep := range set {
+				if ep.Key == "bad" {
+					once.Do(func() { close(entered) })
+					<-release
+				}
+			}
+		}
+		launcher := &launcherFaults{fakeLauncher: h.l}
+		launcher.onStart = func(ctx context.Context, set []Endpoint) (Session, error) {
+			block(set)
+			return h.l.Start(ctx, set)
+		}
+		launcher.onTest = func(ctx context.Context, set []Endpoint) error {
+			block(set)
+			return h.l.Test(ctx, set)
+		}
+		h.m.d.Launcher = launcher
+		t.Cleanup(func() {
+			select {
+			case <-release:
+			default:
+				close(release)
+			}
+			select {
+			case <-refreshed:
+			case <-time.After(5 * time.Second):
+				t.Error("gated restored-rejection refresh did not stop")
+			}
+		})
+		go func() {
+			h.m.refresh(h.ctx, t0)
+			close(refreshed)
+		}()
+		select {
+		case <-entered:
+		case <-refreshed:
+			t.Fatal("restored Xray rejection skipped current launcher reevaluation")
+		case <-time.After(5 * time.Second):
+			t.Fatal("restored Xray rejection did not reach launcher reevaluation")
+		}
+
+		path := filepath.Join(t.TempDir(), "w.sock")
+		listener, err := watchdapi.Listen(h.ctx, path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		serveCtx, cancel := context.WithCancel(h.ctx)
+		served := make(chan error, 1)
+		go func() { served <- watchdapi.ServeListener(serveCtx, listener, h.m) }()
+		t.Cleanup(func() {
+			cancel()
+			select {
+			case err := <-served:
+				if err != nil {
+					t.Errorf("IPC shutdown: %v", err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Error("IPC did not stop")
+			}
+			if err := listener.Close(); err != nil {
+				t.Errorf("listener close: %v", err)
+			}
+		})
+		cleanGate(t, release)
+		validated := make(chan evidenceAnswer, 1)
+		go func() {
+			current := h.m.Evidence()
+			validated <- evidenceAnswer{current, h.m.ValidateEvidence(current, []string{"bad"})}
+		}()
+		client := watchdapi.NewClient(path)
+		ipcCtx, stop := context.WithTimeout(h.ctx, time.Second)
+		defer stop()
+		snapshot, err := client.Monitor(ipcCtx)
+		if _, ok := snapshot.Endpoints["bad"]; err != nil || snapshot.State != watchdapi.StateOK || !ok {
+			t.Errorf("GET monitor blocked during restored-rejection reevaluation: %+v, %v", snapshot, err)
+		}
+		if queued, err := client.Check(ipcCtx, []string{"bad"}); err != nil || queued < 0 || queued > 1 {
+			t.Errorf("POST check blocked during restored-rejection reevaluation: queued %d, %v", queued, err)
+		}
+		select {
+		case got := <-validated:
+			if _, ok := got.evidence.Endpoints["bad"]; got.err == nil || ok {
+				t.Error("persisted rejection became applicable before launcher reevaluation finished")
+			}
+		case <-time.After(time.Second):
+			t.Error("evidence access waited for restored-rejection launcher reevaluation")
+		}
+		close(release)
+		select {
+		case <-refreshed:
+		case <-time.After(5 * time.Second):
+			t.Fatal("released restored-rejection refresh did not complete")
+		}
+		current := applicableEvidence(t, h.m, []string{"bad"})
+		if current.Endpoints["bad"].Status != watchdapi.StatusRejected || current.Endpoints["bad"].Error != "current synthetic Xray refusal" {
+			t.Fatalf("released launcher reevaluation retained the persisted refusal: %+v", current)
+		}
+	})
+}
+
 func TestEvidence_DoesNotBlockIPC(t *testing.T) {
 	captureEngineLogs(t)
 	for _, stage := range []string{"endpoint-build", "launcher-validation"} {

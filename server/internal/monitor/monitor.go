@@ -375,8 +375,35 @@ func (m *Monitor) resume(ctx context.Context, now time.Time) {
 		}
 		return
 	}
+	if ctx.Err() != nil {
+		return
+	}
+	m.reassessRejected(now)
 	if m.isolate(ctx, now) {
 		m.ensureSession(ctx, now)
+	}
+}
+
+// reassessRejected admits unproved Xray rejections to the current launcher.
+// It runs after readiness so persisted public statuses stay intact while idle.
+func (m *Monitor) reassessRejected(now time.Time) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := false
+	for _, key := range m.order {
+		e := m.entries[key]
+		if e == nil || e.st.Status != watchdapi.StatusRejected || e.rejectedCurrent {
+			continue
+		}
+		e.st = watchdapi.EndpointState{Status: watchdapi.StatusUnknown, NextAt: now, Since: now}
+		e.pause, e.sticky = 0, false
+		e.revision++
+		changed = true
+	}
+	if changed {
+		m.dirty = true
+		m.updated = now
+		m.invalidateEvidence()
 	}
 }
 
