@@ -115,20 +115,26 @@ func (s *Store) Publish(text string) (watchdapi.EventID, error) {
 			}
 			continue
 		}
-		s.sequence++
-		id := watchdapi.EventID(s.epoch + ":" + strconv.FormatUint(s.sequence, 10))
-		event := storedEvent{EventID: id, At: at, Text: text}
-		s.recent = append(s.recent, event)
-		for chatID, recipient := range s.recipients {
-			if !at.Before(recipient.FirstSeen) {
-				s.pending[chatID] = append(s.pending[chatID], event)
-			}
-		}
-		s.revision++
-		s.pruneLocked(at)
+		id := s.appendEventLocked(text, at)
 		s.mu.Unlock()
 		return id, s.Flush()
 	}
+}
+
+// Caller holds mu and has reserved enough event IDs.
+func (s *Store) appendEventLocked(text string, at time.Time) watchdapi.EventID {
+	s.sequence++
+	id := watchdapi.EventID(s.epoch + ":" + strconv.FormatUint(s.sequence, 10))
+	event := storedEvent{EventID: id, At: at, Text: text}
+	s.recent = append(s.recent, event)
+	for chatID, recipient := range s.recipients {
+		if !at.Before(recipient.FirstSeen) {
+			s.pending[chatID] = append(s.pending[chatID], event)
+		}
+	}
+	s.revision++
+	s.pruneLocked(at)
+	return id
 }
 
 func (s *Store) Pending(cursor string) (watchdapi.NotificationPage, error) {

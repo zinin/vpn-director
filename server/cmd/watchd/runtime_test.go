@@ -1160,3 +1160,177 @@ func runtimeAwaitConfigLockWait(t *testing.T, lockPath string, done <-chan struc
 		}
 	}
 }
+
+type runtimeHealthMonitor struct {
+	publisherHealthSource
+	stopped chan struct{}
+}
+
+func (m *runtimeHealthMonitor) Run(ctx context.Context) {
+	<-ctx.Done()
+	close(m.stopped)
+}
+
+func TestPublishSubscriptionHealth_RuntimeDrainsBeforeUnlock(t *testing.T) {
+	p := runtimePaths(t)
+	if err := os.WriteFile(p.XrayConfig, []byte("current main Xray\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	queuePath := filepath.Join(p.ScriptsDir, "watchd-notifications.json")
+	q := runtimeQueue(t, queuePath)
+	if err := q.ReplaceRecipients([]watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Now().Add(-time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	sub := publisherTestSubscription()
+	m := &runtimeHealthMonitor{
+		publisherHealthSource: publisherHealthSource{snapshot: publisherTestSnapshot(sub, watchdapi.StatusDead)},
+		stopped:               make(chan struct{}),
+	}
+	entered, gate := make(chan struct{}), make(chan struct{})
+	var enteredOnce, releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	var loads atomic.Int64
+	w := &subwatch.Watch{LoadSubscriptions: func() ([]vpnconfig.Subscription, error) {
+		loads.Add(1)
+		enteredOnce.Do(func() { close(entered) })
+		<-gate
+		return []vpnconfig.Subscription{sub}, nil
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startRuntime(t, ctx, cancel, p.WatchdSocket, func() (runtimeDeps, error) {
+		return runtimeDeps{Monitor: m, Watch: w, Queue: q}, nil
+	}, release)
+	await(t, entered)
+	before, err := os.Lstat(p.WatchdSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var duplicateBuilds atomic.Int64
+	tryDuplicate := func() {
+		t.Helper()
+		duplicateCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer stop()
+		err := runRuntime(duplicateCtx, p.WatchdSocket, func() (runtimeDeps, error) {
+			duplicateBuilds.Add(1)
+			return runtimeDeps{}, errors.New("duplicate must not initialize a health publisher")
+		})
+		if err == nil || duplicateBuilds.Load() != 0 || loads.Load() != 1 {
+			t.Fatalf("duplicate bypassed health ownership: error=%v builds=%d loads=%d", err, duplicateBuilds.Load(), loads.Load())
+		}
+	}
+	tryDuplicate()
+	if after, err := os.Lstat(p.WatchdSocket); err != nil || !os.SameFile(before, after) {
+		t.Fatal("duplicate replaced the health publisher owner's socket")
+	}
+	cancel()
+	await(t, m.stopped)
+	select {
+	case err := <-done:
+		t.Fatalf("runtime released ownership before its blocked publisher drained: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	tryDuplicate()
+	release()
+	runtimeResult(t, done)
+	reopened := runtimeQueue(t, queuePath)
+	page, err := reopened.Pending("")
+	if err != nil || len(page.Messages) != 0 || len(publisherHealthRecords(t, queuePath)) != 0 {
+		t.Fatalf("cancelled in-flight runtime load published late health: page=%+v error=%v", page, err)
+	}
+	if raw, err := os.ReadFile(p.XrayConfig); err != nil || string(raw) != "current main Xray\n" {
+		t.Fatal("health publisher shutdown changed the main Xray")
+	}
+	listener, err := watchdapi.Listen(context.Background(), p.WatchdSocket)
+	if err != nil {
+		t.Fatal("drained publisher retained runtime ownership:", err)
+	}
+	listener.Close()
+}
+
+func TestPublishSubscriptionHealth_RuntimeStoreErrorDoesNotStopWatch(t *testing.T) {
+	p := runtimePaths(t)
+	cfg := runtimeConfig(t, p, `{"xray":{"clients":["192.168.50.8"]}}`)
+	before, err := os.ReadFile(cfg.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p.XrayConfig, []byte("current main Xray\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	queueDir := filepath.Join(p.ScriptsDir, "queue")
+	q := runtimeQueue(t, filepath.Join(queueDir, "watchd-notifications.json"))
+	if err := q.ReplaceRecipients([]watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Now().Add(-time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(queueDir, queueDir+"-held"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queueDir, []byte("temporarily unavailable queue directory"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var logs runtimeLog
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+	sub := publisherTestSubscription()
+	sub.URL = ""
+	ticks := make(chan struct{}, 4)
+	var probes atomic.Int64
+	w := &subwatch.Watch{
+		LoadVPN:           cfg.LoadVPNConfig,
+		LoadSubscriptions: func() ([]vpnconfig.Subscription, error) { return []vpnconfig.Subscription{sub}, nil },
+		Probe: func(context.Context, int) error {
+			probes.Add(1)
+			select {
+			case ticks <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+	}
+	m := &ownershipMonitor{snap: publisherTestSnapshot(sub, watchdapi.StatusDead)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startRuntime(t, ctx, cancel, p.WatchdSocket, func() (runtimeDeps, error) {
+		return runtimeDeps{Monitor: m, Watch: w, Queue: q}, nil
+	})
+	await(t, ticks)
+	messages := awaitHealthMessages(t, q, 1, 2*time.Second)
+	if messages[0].Text != "Subscription North has no live servers" {
+		t.Fatalf("failed health save lost its safe RAM event: %+v", messages)
+	}
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for q.Status().StorageError == "" || !strings.Contains(strings.ToLower(logs.String()), "storage") {
+		select {
+		case <-deadline.C:
+			t.Fatal("health publisher did not diagnose its storage error while automation was running")
+		case <-ticker.C:
+		}
+	}
+	w.Tick(ctx)
+	if probes.Load() < 2 || ctx.Err() != nil {
+		t.Fatalf("health save failure stopped the watch: probes=%d context=%v", probes.Load(), ctx.Err())
+	}
+	client := watchdapi.NewClient(p.WatchdSocket)
+	if snapshot, err := client.Monitor(context.Background()); err != nil || snapshot.State != watchdapi.StateOK {
+		t.Fatalf("health save failure stopped monitor IPC: snapshot=%+v error=%v", snapshot, err)
+	}
+	if snapshot, err := client.Watch(context.Background()); err != nil || snapshot.State != watchdapi.WatchActive || snapshot.Notifications.Pending != 1 || snapshot.Notifications.StorageError == "" {
+		t.Fatalf("health save failure hid live automation or queue diagnostic: snapshot=%+v error=%v", snapshot, err)
+	}
+	cancel()
+	runtimeResult(t, done)
+	if after, err := os.ReadFile(cfg.ConfigPath()); err != nil || !bytes.Equal(before, after) {
+		t.Fatal("health save failure changed the current routing configuration")
+	}
+	if raw, err := os.ReadFile(p.XrayConfig); err != nil || string(raw) != "current main Xray\n" {
+		t.Fatal("health save failure changed the main Xray")
+	}
+	for _, secret := range []string{"SUBSCRIPTION_URL_SECRET", "RAW_MONITOR_ERROR_SECRET", "RAW_ENDPOINT_ERROR_SECRET", sub.Servers[0].UUID} {
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("runtime health diagnostic exposed %q", secret)
+		}
+	}
+}

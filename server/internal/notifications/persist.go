@@ -33,6 +33,23 @@ type savedState struct {
 	Health          map[string]json.RawMessage                `json:"health"`
 }
 
+func decodeSubscriptionHealth(raw json.RawMessage) (available, known bool) {
+	var record struct {
+		Available *bool `json:"available"`
+	}
+	if json.Unmarshal(raw, &record) != nil || record.Available == nil {
+		return false, false
+	}
+	return *record.Available, true
+}
+
+func encodeSubscriptionHealth(available bool) json.RawMessage {
+	if available {
+		return json.RawMessage(`{"available":true}`)
+	}
+	return json.RawMessage(`{"available":false}`)
+}
+
 func (s *Store) restore() error {
 	if s.path == "" {
 		return errRead
@@ -145,6 +162,11 @@ func validSavedState(state savedState) bool {
 }
 
 func (s *Store) Flush() error {
+	return s.flushForEvents(0)
+}
+
+// reserve is the minimum event-ID headroom for the next atomic mutation.
+func (s *Store) flushForEvents(reserve uint64) error {
 	s.saving.Lock()
 	defer s.saving.Unlock()
 	if err := s.ensureEpoch(); err != nil {
@@ -154,12 +176,20 @@ func (s *Store) Flush() error {
 	at := s.now()
 	s.mu.Lock()
 	s.pruneLocked(at)
+	if reserve > ^uint64(0)-s.sequence {
+		s.mu.Unlock()
+		return errSequence
+	}
 	reserveNeeded := s.sequence >= s.reservedThrough && s.sequence != ^uint64(0)
+	if reserve > 0 {
+		reserveNeeded = reserveNeeded || s.sequence >= s.reservedThrough || reserve > s.reservedThrough-s.sequence
+	}
 	if s.revision == s.savedRevision && !reserveNeeded && !s.needsBackup {
 		s.mu.Unlock()
 		return nil
 	}
 	state := s.snapshotLocked()
+	state.ReservedThrough = max(state.ReservedThrough, state.Sequence+reserve)
 	revision := s.revision
 	s.mu.Unlock()
 	data, err := json.Marshal(state)

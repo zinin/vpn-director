@@ -56,6 +56,9 @@ func runRuntime(ctx context.Context, socket string, build func() (runtimeDeps, e
 	start(deps.Monitor.Run)
 	start(deps.Watch.Start)
 	start(deps.Queue.Run)
+	start(func(ctx context.Context) {
+		publishSubscriptionHealth(ctx, deps.Watch.LoadSubscriptions, deps.Monitor, deps.Queue)
+	})
 	err = watchdapi.ServeListener(ctx, listener, source, source)
 	cancel()
 	// HTTP handlers may still be finishing a durable write after socket close.
