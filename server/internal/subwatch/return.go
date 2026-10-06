@@ -74,7 +74,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		return
 	}
 	if err != nil {
-		slog.Warn("Failed to read the subscriptions for the return to the preferred server", "error", err)
+		slog.Warn("Failed to read the subscriptions for the return to the preferred server", watchErrorAttr(err))
 		return
 	}
 	servers := vpnconfig.AllServers(subs)
@@ -124,6 +124,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		slog.Info("Return to the preferred server put off; no way back to the server that runs now", "server", before.Name)
 		return
 	}
+	w.setStatusAction("returning")
 	slog.Info("Returning to the preferred server", "server", candidates[0].Name, "from", before.Name)
 	for _, c := range candidates {
 		live, ended, gone := sw.to(ctx, c, true)
@@ -206,7 +207,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		return false, false, true
 	}
 	if !generated {
-		slog.Warn("Generating Xray config for server failed", "server", c.Name, "error", err)
+		slog.Warn("Generating Xray config for server failed", "server", c.Name, watchErrorAttr(err))
 		return false, false, false
 	}
 	s.wrote = true
@@ -221,7 +222,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		if endsWalk(err) || w.mutationEnded(ctx) {
 			return false, true, false
 		}
-		slog.Warn("Xray restart failed", "server", c.Name, "error", err)
+		slog.Warn("Xray restart failed", "server", c.Name, watchErrorAttr(err))
 		return false, false, false
 	}
 	w.AfterRestart(SettleAfterRestart)
@@ -233,7 +234,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		return false, true, false
 	}
 	if err != nil {
-		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, "error", err)
+		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, watchErrorAttr(err))
 		return false, false, false
 	}
 	return true, false, false

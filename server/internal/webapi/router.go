@@ -29,9 +29,10 @@ type Deps struct {
 	Xray         service.XrayGenerator
 	Network      service.NetworkInfo
 	Logs         service.LogReader
-	LogPaths     map[string]string // log source name -> file path, built by main from paths.Paths
-	Update       UpdateFlow        // self-update orchestration, shared with the bot
-	Monitor      watchdapi.API     // vpn-director-watchd's server monitor; nil reads as not running
+	LogPaths     map[string]string  // log source name -> file path, built by main from paths.Paths
+	Update       UpdateFlow         // self-update orchestration, shared with the bot
+	Monitor      watchdapi.API      // vpn-director-watchd's server monitor; nil reads as not running
+	Watch        watchdapi.WatchAPI // subscription automation; independent of the monitor
 	Shadow       *auth.ShadowAuth
 	JWT          *auth.JWTService
 	Version      string
@@ -96,7 +97,8 @@ func registerProtectedRoutes(mux *http.ServeMux, deps *Deps) {
 	mux.HandleFunc("POST /api/subscriptions/rename", handleRenameSubscription(deps))
 	mux.HandleFunc("DELETE /api/subscriptions", handleDeleteSubscription(deps))
 
-	// Server monitor (vpn-director-watchd)
+	// Server monitor and subscription automation (vpn-director-watchd)
+	mux.HandleFunc("GET /api/watch", handleWatch(deps))
 	mux.HandleFunc("GET /api/monitor", handleMonitor(deps))
 	mux.HandleFunc("POST /api/monitor/check", handleMonitorCheck(deps))
 

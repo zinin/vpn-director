@@ -3,6 +3,7 @@ package subwatch
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchcompat"
@@ -75,7 +76,40 @@ func (w *Watch) setStatusFlags(committed, pending bool) {
 }
 
 func (w *Watch) setStatusAction(action string) {
+	switch action {
+	case "probe", "confirm":
+		action = "checking"
+	case "switch":
+		action = "switching"
+	case "restore":
+		action = "restoring"
+	case "", "checking", "switching", "fallback", "refreshing", "walking", "returning", "restoring":
+	default:
+		action = ""
+	}
 	w.statusMu.Lock()
 	w.status.snapshot.Action = action
 	w.statusMu.Unlock()
+}
+
+// Provider and transport errors can embed subscription URLs or credentials.
+func watchErrorAttr(err error) slog.Attr {
+	kind := "operation"
+	switch {
+	case err == nil:
+		kind = "unavailable"
+	case errors.Is(err, context.Canceled):
+		kind = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		kind = "timeout"
+	case errors.Is(err, errStopped):
+		kind = "stopped"
+	case errors.Is(err, watchcompat.ErrIncompatible):
+		kind = "incompatible"
+	case errors.Is(err, errSuperseded):
+		kind = "superseded"
+	case errors.Is(err, vpnconfig.ErrSubscriptionGone):
+		kind = "subscription_gone"
+	}
+	return slog.Group("error", "kind", kind)
 }

@@ -188,6 +188,7 @@ func main() {
 	upd := updater.NewForDaemon(updater.DaemonWebUI)
 	upd.SetPlatform(plat.Name)
 	updateFlow := updateflow.New(upd, Version, *devFlag)
+	watchClient := watchdapi.NewClient(p.WatchdSocket)
 
 	deps := &webapi.Deps{
 		Config:  configSvc,
@@ -203,7 +204,8 @@ func main() {
 			"watchd": p.WatchdLogPath,
 		},
 		Update:  updateFlow,
-		Monitor: watchdapi.NewClient(p.WatchdSocket),
+		Monitor: watchClient,
+		Watch:   watchClient,
 		Shadow:  shadowAuth,
 		JWT:     jwtSvc,
 		Version: Version,

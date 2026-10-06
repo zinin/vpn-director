@@ -30,6 +30,8 @@ type Deps struct {
 	TelegramPath func() string
 	// Monitor is vpn-director-watchd's server monitor; nil means no marks.
 	Monitor watchdapi.API
+	// Watch is the daemon's independent subscription automation status.
+	Watch watchdapi.WatchAPI
 }
 
 // configUpdateError phrases an UpdateVPNConfig failure the way the bot has

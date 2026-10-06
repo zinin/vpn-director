@@ -193,7 +193,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	if err != nil {
 		w.setStatus(err)
-		slog.Warn("Failed to load VPN Director config for the subscription watch", "error", err)
+		slog.Warn("Failed to load VPN Director config for the subscription watch", watchErrorAttr(err))
 		return
 	}
 	w.setStatusConfig(cfg)
@@ -275,6 +275,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		if w.failSince.IsZero() {
 			w.failSince = w.Now()
 		}
+		w.setStatusAction("fallback")
 		cfg = w.extendFailover(cfg)
 		staged := vpnconfig.FailoverStaged(cfg)
 		wasPending := w.pendingApply || staged
@@ -308,7 +309,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	if w.pendingApply && cfg.Xray.PendingRestore == nil {
 		if err := w.apply(); err != nil {
-			slog.Warn("Apply retry after restoring Xray clients failed", "error", err)
+			slog.Warn("Apply retry after restoring Xray clients failed", watchErrorAttr(err))
 		} else {
 			w.pendingApply = false
 		}
@@ -359,7 +360,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	reason := w.deadReason(now)
 	if reason == "" {
-		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, "error", err)
+		slog.Debug("Xray SOCKS probe failed", "socks_port", socks, watchErrorAttr(err))
 		return
 	}
 	w.failOutbound(ctx, cfg, reason, attempt.Guard)
@@ -395,7 +396,7 @@ func (w *Watch) failOutbound(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	platErr := false
 	if w.LoadPlatform != nil {
 		if p, err := w.LoadPlatform(); err != nil {
-			slog.Warn("Failed to read platform info for the Xray failover", "error", err)
+			slog.Warn("Failed to read platform info for the Xray failover", watchErrorAttr(err))
 			platErr = true
 		} else {
 			plat = p
@@ -448,7 +449,7 @@ func (w *Watch) failOutbound(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		return nil
 	}); err != nil {
 		if !errors.Is(err, errStopped) {
-			slog.Warn("Failed to move Xray clients to Tunnel Director", "tunnel", id, "error", err)
+			slog.Warn("Failed to move Xray clients to Tunnel Director", "tunnel", id, watchErrorAttr(err))
 		}
 		return
 	}
@@ -459,7 +460,7 @@ func (w *Watch) failOutbound(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		slog.Warn("Xray clients Tunnel Director cannot carry stay on Xray", "clients", left)
 	}
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after moving Xray clients failed", "tunnel", id, "error", err)
+		slog.Warn("Apply after moving Xray clients failed", "tunnel", id, watchErrorAttr(err))
 		w.pendingApply = true
 		if reloaded, err := w.LoadVPN(); err == nil {
 			cfg = reloaded
@@ -495,7 +496,7 @@ func (w *Watch) failOutbound(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPNDirectorConfig, bool) {
 	if w.pendingApply {
 		if err := w.apply(); err != nil {
-			slog.Warn("Apply retry after moving Xray clients failed", "error", err)
+			slog.Warn("Apply retry after moving Xray clients failed", watchErrorAttr(err))
 			return cfg, false
 		}
 		w.pendingApply = false
@@ -525,7 +526,7 @@ func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPND
 			return nil
 		}); err != nil {
 			if !errors.Is(err, errStopped) {
-				slog.Warn("Failed to drop staged Xray clients after the tunnel apply", "error", err)
+				slog.Warn("Failed to drop staged Xray clients after the tunnel apply", watchErrorAttr(err))
 			}
 			return cfg, false
 		}
@@ -534,7 +535,7 @@ func (w *Watch) applyFailover(cfg *vpnconfig.VPNDirectorConfig) (*vpnconfig.VPND
 		cfg = reloaded
 	}
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after dropping staged Xray clients failed", "error", err)
+		slog.Warn("Apply after dropping staged Xray clients failed", watchErrorAttr(err))
 		w.pendingApply = true
 		return cfg, false
 	}
@@ -559,7 +560,7 @@ func (w *Watch) extendFailover(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPND
 		return nil
 	}); err != nil {
 		if !errors.Is(err, errStopped) {
-			slog.Warn("Failed to bring new Xray clients onto the failover tunnel", "error", err)
+			slog.Warn("Failed to bring new Xray clients onto the failover tunnel", watchErrorAttr(err))
 		}
 		return cfg
 	}
@@ -635,7 +636,7 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		return nil
 	}); err != nil {
 		if !errors.Is(err, errStopped) {
-			slog.Warn("Failed to move the Xray clients off a failover tunnel that is gone", "tunnel", id, "error", err)
+			slog.Warn("Failed to move the Xray clients off a failover tunnel that is gone", "tunnel", id, watchErrorAttr(err))
 		}
 		return cfg
 	}
@@ -652,7 +653,7 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 	}
 	w.resetFallbackState()
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after moving the Xray clients off the failover tunnel failed", "error", err)
+		slog.Warn("Apply after moving the Xray clients off the failover tunnel failed", watchErrorAttr(err))
 		w.pendingApply = true
 	}
 	if reloaded, err := w.LoadVPN(); err == nil {
@@ -672,7 +673,7 @@ func (w *Watch) fallbackCarries(cfg *vpnconfig.VPNDirectorConfig) bool {
 	}
 	if err := w.apply(); err != nil {
 		if !errors.Is(err, errStopped) {
-			slog.Warn("Apply retry while the failover tunnel does not carry the Xray clients failed", "error", err)
+			slog.Warn("Apply retry while the failover tunnel does not carry the Xray clients failed", watchErrorAttr(err))
 		}
 		return false
 	}
@@ -876,7 +877,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	}
 	subs, err := w.loadSubscriptions()
 	if err != nil {
-		slog.Warn("Failed to read the subscriptions for a refresh", "error", err)
+		slog.Warn("Failed to read the subscriptions for a refresh", watchErrorAttr(err))
 		return
 	}
 	if len(subs) == 0 {
@@ -917,7 +918,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	// while its servers work.
 	subs, err = w.loadSubscriptions()
 	if err != nil {
-		slog.Warn("Failed to read the subscriptions for the walk", "error", err)
+		slog.Warn("Failed to read the subscriptions for the walk", watchErrorAttr(err))
 		return
 	}
 	if len(subs) == 0 {
@@ -937,6 +938,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 // context returns at once, writing nothing more: the caller looks for both
 // before it reads either result.
 func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subscription) (failed []string, walk bool) {
+	w.setStatusAction("refreshing")
 	type download struct {
 		servers []vpnconfig.Server
 		err     error
@@ -983,11 +985,11 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 			if errors.As(err, &ue) {
 				err = ue.Err
 			}
-			slog.Warn("Subscription refresh failed", "subscription", s.Name, "error", err)
+			slog.Warn("Subscription refresh failed", "subscription", s.Name, watchErrorAttr(err))
 			failed = append(failed, s.Name)
 			rerr := vpnconfig.RecordSubscriptionError(update, w.files(ctx), s.ID, s.URL, s.Refreshed, err.Error())
 			if rerr != nil && !errors.Is(rerr, errStopped) && !errors.Is(rerr, vpnconfig.ErrSubscriptionGone) {
-				slog.Warn("Failed to record why the subscription did not refresh", "subscription", s.Name, "error", rerr)
+				slog.Warn("Failed to record why the subscription did not refresh", "subscription", s.Name, watchErrorAttr(rerr))
 			}
 			continue
 		}
@@ -1007,7 +1009,7 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 		case errors.Is(err, vpnconfig.ErrSubscriptionGone):
 			slog.Info("Subscription refresh dropped; the subscription was deleted while it downloaded", "subscription", s.Name)
 		default:
-			slog.Warn("Failed to publish the refreshed subscription", "subscription", s.Name, "error", err)
+			slog.Warn("Failed to publish the refreshed subscription", "subscription", s.Name, watchErrorAttr(err))
 			failed = append(failed, s.Name)
 		}
 	}
@@ -1019,6 +1021,7 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 // return to Xray. With none live it returns Xray to the chosen server and backs
 // the next wave off.
 func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription) {
+	w.setStatusAction("walking")
 	var active, chosen *vpnconfig.ActiveServer
 	if cfg != nil {
 		active = cfg.Xray.ActiveServer
@@ -1096,7 +1099,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 			return
 		}
 		if err != nil || !generated {
-			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, "error", err)
+			slog.Debug("Generating Xray config for server failed", "server", s.Name, "generated", generated, watchErrorAttr(err))
 		}
 		if !generated {
 			continue
@@ -1117,7 +1120,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 			if w.walkEnded(err) || w.mutationEnded(ctx) {
 				return
 			}
-			slog.Debug("Xray restart failed", "server", s.Name, "error", err)
+			slog.Debug("Xray restart failed", "server", s.Name, watchErrorAttr(err))
 			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
@@ -1129,7 +1132,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 			return
 		}
 		if probeErr != nil {
-			slog.Debug("Subscription server probe failed", "server", s.Name, "ips", s.IPs, "error", probeErr)
+			slog.Debug("Subscription server probe failed", "server", s.Name, "ips", s.IPs, watchErrorAttr(probeErr))
 			continue
 		}
 		name := label(names, s.Subscription, s.Name)
@@ -1195,6 +1198,7 @@ func (w *Watch) importInterval() time.Duration {
 // server whose subscription was deleted meanwhile is not written back: there
 // is nothing to return to.
 func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) error {
+	w.setStatusAction("returning")
 	generated, _, err := w.generateWalked(s, guard)
 	if endsWalk(err) {
 		return err
@@ -1204,7 +1208,7 @@ func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPND
 		return nil
 	}
 	if err != nil || !generated {
-		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, "error", err)
+		slog.Warn("Failed to return the Xray config to the preferred server", "server", s.Name, "generated", generated, watchErrorAttr(err))
 	}
 	if !generated {
 		return nil
@@ -1213,7 +1217,7 @@ func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPND
 		if endsWalk(rerr) {
 			return rerr
 		}
-		slog.Warn("Xray restart on the preferred server failed", "server", s.Name, "error", rerr)
+		slog.Warn("Xray restart on the preferred server failed", "server", s.Name, watchErrorAttr(rerr))
 		return nil
 	}
 	if err == nil {
@@ -1358,6 +1362,7 @@ func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) b
 	if w.Probe == nil || w.mutationEnded(ctx) {
 		return false
 	}
+	w.setStatusAction("checking")
 	err := w.Probe(ctx, w.socksPort(cfg))
 	return !w.mutationEnded(ctx) && err == nil
 }
@@ -1391,12 +1396,13 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 	}
 	if failoverTunnel(cfg) == "" {
 		if err := w.apply(); err != nil {
-			slog.Warn("Apply after picking an Xray server failed", "error", err)
+			slog.Warn("Apply after picking an Xray server failed", watchErrorAttr(err))
 			return false, false, nil
 		}
 		w.settled()
 		return true, false, nil
 	}
+	w.setStatusAction("restoring")
 	committed = vpnconfig.FailoverCommitted(cfg)
 	// Staging the snapshot back into xray.clients is what hands these clients to
 	// TPROXY, and the marker is the only thing that says TPROXY can carry them:
@@ -1411,7 +1417,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 			return false, committed, nil
 		}
 		if err := w.apply(); err != nil {
-			slog.Warn("Apply retry while TPROXY is not intercepting failed", "error", err)
+			slog.Warn("Apply retry while TPROXY is not intercepting failed", watchErrorAttr(err))
 			w.lastTPROXYFail = w.Now()
 			return false, committed, nil
 		}
@@ -1435,12 +1441,12 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 			if endsWalk(err) {
 				return false, committed, err
 			}
-			slog.Warn("Failed to stage Xray clients for restore", "error", err)
+			slog.Warn("Failed to stage Xray clients for restore", watchErrorAttr(err))
 			return false, committed, nil
 		}
 	}
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after staging Xray clients for restore failed", "error", err)
+		slog.Warn("Apply after staging Xray clients for restore failed", watchErrorAttr(err))
 		w.pendingApply = true
 		return false, committed, nil
 	}
@@ -1476,13 +1482,13 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 				}
 				return false, committed, err
 			}
-			slog.Warn("Failed to restore Xray clients from the failover", "error", err)
+			slog.Warn("Failed to restore Xray clients from the failover", watchErrorAttr(err))
 			return false, committed, nil
 		}
 	}
 	w.pendingRestore = attempt
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after dropping fallback membership failed", "error", err)
+		slog.Warn("Apply after dropping fallback membership failed", watchErrorAttr(err))
 		w.pendingApply = true
 		if endsWalk(err) {
 			return false, committed, err
@@ -1532,12 +1538,12 @@ func (w *Watch) unstageRestore() {
 		return nil
 	}); err != nil {
 		if !errors.Is(err, errStopped) {
-			slog.Warn("Failed to take the Xray clients off Xray again", "error", err)
+			slog.Warn("Failed to take the Xray clients off Xray again", watchErrorAttr(err))
 		}
 		return
 	}
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after taking the Xray clients off Xray again failed", "error", err)
+		slog.Warn("Apply after taking the Xray clients off Xray again failed", watchErrorAttr(err))
 		w.pendingApply = true
 	}
 }
@@ -1576,7 +1582,7 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 		if errors.Is(err, errStopped) {
 			return cfg
 		}
-		slog.Warn("Apply retry while the failover tunnel is not ready failed", "error", err)
+		slog.Warn("Apply retry while the failover tunnel is not ready failed", watchErrorAttr(err))
 	} else if w.fallbackReady(cfg) {
 		return cfg
 	}
@@ -1626,12 +1632,12 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 		return nil
 	}); err != nil {
 		if !errors.Is(err, errStopped) {
-			slog.Warn("Failed to retarget the Xray failover", "from", skip, "to", next, "error", err)
+			slog.Warn("Failed to retarget the Xray failover", "from", skip, "to", next, watchErrorAttr(err))
 		}
 		return cfg
 	}
 	if err := w.apply(); err != nil {
-		slog.Warn("Apply after retargeting the Xray failover failed", "tunnel", next, "error", err)
+		slog.Warn("Apply after retargeting the Xray failover failed", "tunnel", next, watchErrorAttr(err))
 		w.pendingApply = true
 	}
 	if reloaded, err := w.LoadVPN(); err == nil {
@@ -1788,7 +1794,7 @@ func (w *Watch) loadServers() ([]vpnconfig.Server, error) {
 func (w *Watch) subscriptionCount() int {
 	subs, err := w.loadSubscriptions()
 	if err != nil {
-		slog.Warn("Failed to read the subscriptions", "error", err)
+		slog.Warn("Failed to read the subscriptions", watchErrorAttr(err))
 		return 1
 	}
 	return len(subs)

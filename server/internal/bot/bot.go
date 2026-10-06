@@ -135,6 +135,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		sender := telegram.NewSender(api)
 		b.api = api
 		b.setSender(sender)
+		watchClient := watchdapi.NewClient(p.WatchdSocket)
 		deps := &handler.Deps{
 			Sender:      sender,
 			Config:      configSvc,
@@ -148,7 +149,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Commit:      commit,
 			BuildDate:   buildDate,
 			DevMode:     b.devMode,
-			Monitor:     watchdapi.NewClient(p.WatchdSocket),
+			Monitor:     watchClient,
+			Watch:       watchClient,
 		}
 		if pm := b.pathManager; pm != nil {
 			deps.TelegramPath = func() string { return pm.Current().String() }
