@@ -1,7 +1,9 @@
 package monitor
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -67,8 +69,8 @@ type Deps struct {
 }
 
 // Monitor checks every endpoint of every subscription through a prober. Run
-// drives it; Snapshot, Request and Check are safe to call from other
-// goroutines. Only Run's goroutine changes the session and the entries' set.
+// drives it; its public methods are safe to call from other goroutines.
+// Only Run's goroutine changes the session and the entries' set.
 type Monitor struct {
 	d Deps
 
@@ -80,9 +82,12 @@ type Monitor struct {
 	order        []string       // the endpoints' keys in Build order
 	pos          map[string]int // each key's place in order: the active server's first
 	session      Session
-	setKey       string                // the keys the session holds
+	setKey       string                // the keyed outbounds the session holds
 	restored     map[string]savedEntry // state read at startup, until the first refresh takes it
 	sequence     uint64                // completed checks, including unpublished failures
+	starts       uint64                // dispatch order, including checks still in flight
+	generation   uint64                // endpoint-set, session and activity epoch
+	closed       bool                  // Run's lifetime has ended
 	pending      map[string]outcome    // failures awaiting WAN evidence
 	recent       []outcome             // completed checks within GuardWindow
 	controlOK    time.Time             // when a control last answered
@@ -109,21 +114,25 @@ type Monitor struct {
 
 // result is a worker's answer for one endpoint.
 type result struct {
-	sess    Session
-	key     string
-	latency time.Duration
-	err     error
-	seq     uint64
-	at      time.Time
+	sess       Session
+	key        string
+	latency    time.Duration
+	err        error
+	seq        uint64
+	at         time.Time
+	generation uint64
+	started    uint64
 }
 
 // outcome is a completed check; failures stay private until WAN evidence.
 type outcome struct {
-	at     time.Time
-	ok     bool
-	key    string
-	reason string
-	seq    uint64
+	at         time.Time
+	ok         bool
+	key        string
+	reason     string
+	seq        uint64
+	generation uint64
+	started    uint64
 }
 
 // New returns a monitor over d; Run starts it.
@@ -136,15 +145,16 @@ func New(d Deps) *Monitor {
 	}
 	s, _ := SettingsFrom(nil)
 	return &Monitor{
-		d:        d,
-		settings: s,
-		state:    watchdapi.StateOK,
-		entries:  map[string]*entry{},
-		pending:  map[string]outcome{},
-		warned:   map[string]string{},
-		changed:  make(chan struct{}),
-		results:  make(chan result, MaxConcurrency),
-		wake:     make(chan struct{}, 1),
+		d:          d,
+		settings:   s,
+		state:      watchdapi.StateOK,
+		generation: 1,
+		entries:    map[string]*entry{},
+		pending:    map[string]outcome{},
+		warned:     map[string]string{},
+		changed:    make(chan struct{}),
+		results:    make(chan result, MaxConcurrency),
+		wake:       make(chan struct{}, 1),
 	}
 }
 
@@ -383,18 +393,26 @@ func (m *Monitor) merge(now time.Time, eps []Endpoint, refused map[string]string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	changed := len(m.restored) > 0
+	identityChanged := false
 	next := make(map[string]*entry, len(eps)+len(refused))
 	order := make([]string, 0, len(eps))
 	for _, ep := range eps {
 		e := m.entries[ep.Key]
 		if e == nil {
 			e = m.fromRestored(ep.Key, now)
+			identityChanged = true
+		}
+		if !bytes.Equal(e.ep.Outbound, ep.Outbound) {
+			identityChanged = true
+			e.rejectedCurrent = false
 		}
 		e.ep = ep
 		if e.st.Status == watchdapi.StatusRejected && !e.sticky {
 			// The generator refused it before and does no longer.
 			e.st = watchdapi.EndpointState{Status: watchdapi.StatusUnknown, NextAt: now, Since: now}
-			changed = true
+			e.revision++
+			e.rejectedCurrent = false
+			identityChanged, changed = true, true
 		}
 		next[ep.Key] = e
 		order = append(order, ep.Key)
@@ -403,6 +421,10 @@ func (m *Monitor) merge(now time.Time, eps []Endpoint, refused map[string]string
 		e := m.entries[key]
 		if e == nil {
 			e = m.fromRestored(key, now)
+			identityChanged = true
+		}
+		if e.checkable() || e.sticky || len(e.ep.Outbound) != 0 {
+			identityChanged = true
 		}
 		e.ep = Endpoint{Key: key}
 		before := e.st
@@ -410,7 +432,8 @@ func (m *Monitor) merge(now time.Time, eps []Endpoint, refused map[string]string
 		changed = changed || before != e.st
 		next[key] = e
 	}
-	if changed || len(next) != len(m.entries) || !sameKeys(next, m.entries) {
+	identityChanged = identityChanged || len(next) != len(m.entries) || !sameKeys(next, m.entries)
+	if changed || identityChanged {
 		m.dirty = true
 		m.updated = now
 	}
@@ -421,7 +444,11 @@ func (m *Monitor) merge(now time.Time, eps []Endpoint, refused map[string]string
 		m.pos[k] = i
 	}
 	m.restored = nil
-	m.notify()
+	if identityChanged {
+		m.invalidateEvidence()
+	} else {
+		m.notify()
+	}
 }
 
 func sameKeys(a, b map[string]*entry) bool {
@@ -454,10 +481,11 @@ func (m *Monitor) checkableSet() []Endpoint {
 	return set
 }
 
+// keysOf identifies keyed outbounds independently of labels and Build order.
 func keysOf(eps []Endpoint) string {
 	keys := make([]string, len(eps))
 	for i, ep := range eps {
-		keys[i] = ep.Key
+		keys[i] = ep.Key + ":" + fmt.Sprintf("%x", sha256.Sum256(ep.Outbound))
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ",")
@@ -497,8 +525,10 @@ func (m *Monitor) ensureSession(ctx context.Context, now time.Time) {
 			return
 		}
 		if err == nil {
+			setKey := keysOf(set)
 			m.mu.Lock()
-			m.session, m.setKey, m.sessionSince = sess, keysOf(set), m.d.Now()
+			m.session, m.setKey, m.sessionSince = sess, setKey, m.d.Now()
+			m.invalidateEvidence()
 			m.mu.Unlock()
 			m.proberFails, m.proberAt = 0, time.Time{}
 			m.setState(watchdapi.StateOK, "")
@@ -608,10 +638,15 @@ func (m *Monitor) rejectKey(now time.Time, key, reason string) {
 	if e == nil {
 		return
 	}
+	wasCheckable := e.checkable()
 	e.reject(now, reason, true)
 	m.dirty = true
 	m.updated = now
-	m.notify()
+	if wasCheckable {
+		m.invalidateEvidence()
+	} else {
+		m.notify()
+	}
 	slog.Warn("Monitor: Xray refused a server", "server", e.ep.Label, "reason", reason)
 }
 
@@ -640,6 +675,7 @@ func (m *Monitor) stopSession() {
 	}
 	m.discardPending()
 	m.recent = nil
+	m.invalidateEvidence()
 	m.mu.Unlock()
 	sess.Stop()
 }
@@ -659,9 +695,14 @@ func (m *Monitor) setState(state watchdapi.State, message string) {
 	if m.state == state && m.message == message {
 		return
 	}
+	stateChanged := m.state != state
 	m.state, m.message = state, message
 	m.updated = m.d.Now()
-	m.notify()
+	if stateChanged {
+		m.invalidateEvidence()
+	} else {
+		m.notify()
+	}
 	slog.Info("Monitor state", "state", state, "message", message)
 }
 
@@ -726,12 +767,13 @@ func (m *Monitor) dispatch(ctx context.Context, now time.Time) {
 		switch {
 		case e.inFlight:
 			busy++
-		case e.checkable() && !e.pending && (e.urgent || e.followUp || !e.st.NextAt.After(now)):
+		case e.checkable() && !e.pending && (e.urgent || e.followUp || e.evidenceFollowUp || !e.st.NextAt.After(now)):
 			due = append(due, e)
 		}
 	}
 	sort.Slice(due, func(i, j int) bool {
-		iUrgent, jUrgent := due[i].urgent || due[i].followUp, due[j].urgent || due[j].followUp
+		iUrgent := due[i].urgent || due[i].followUp || due[i].evidenceFollowUp
+		jUrgent := due[j].urgent || due[j].followUp || due[j].evidenceFollowUp
 		if iUrgent != jUrgent {
 			return iUrgent
 		}
@@ -744,10 +786,11 @@ func (m *Monitor) dispatch(ctx context.Context, now time.Time) {
 	n := min(free, len(due))
 	for _, e := range due[:n] {
 		e.inFlight, e.urgent = true, false
-		go m.check(ctx, m.session, e.ep.Key)
+		m.starts++
+		go m.check(ctx, m.session, e.ep.Key, m.generation, m.starts)
 	}
 	m.lag = 0
-	if waiting := due[n:]; len(waiting) > 0 && !waiting[0].urgent && !waiting[0].followUp {
+	if waiting := due[n:]; len(waiting) > 0 && !waiting[0].urgent && !waiting[0].followUp && !waiting[0].evidenceFollowUp {
 		m.lag = now.Sub(waiting[0].st.NextAt)
 	}
 	switch {
@@ -761,7 +804,7 @@ func (m *Monitor) dispatch(ctx context.Context, now time.Time) {
 
 // check is a worker: one attempt, and after a failure one retry retryAfter
 // later - unless the prober went meanwhile, a crash that is not the server's.
-func (m *Monitor) check(ctx context.Context, sess Session, key string) {
+func (m *Monitor) check(ctx context.Context, sess Session, key string, generation, started uint64) {
 	latency, err := sess.Check(ctx, key)
 	if err != nil && ctx.Err() == nil {
 		select {
@@ -771,7 +814,7 @@ func (m *Monitor) check(ctx context.Context, sess Session, key string) {
 			latency, err = sess.Check(ctx, key)
 		}
 	}
-	r := m.finish(result{sess: sess, key: key, latency: latency, err: err})
+	r := m.finish(result{sess: sess, key: key, latency: latency, err: err, generation: generation, started: started})
 	select {
 	case m.results <- r:
 	case <-ctx.Done():
@@ -808,12 +851,12 @@ func (m *Monitor) apply(ctx context.Context, r result) {
 		return
 	}
 	e.inFlight = false
-	if m.state != watchdapi.StateOK || ctx.Err() != nil {
+	if r.generation != m.generation || r.started == 0 || m.state != watchdapi.StateOK || ctx.Err() != nil {
 		m.mu.Unlock()
 		return
 	}
 	now := m.d.Now()
-	o := outcome{at: now, key: r.key, ok: r.err == nil, seq: r.seq}
+	o := outcome{at: now, key: r.key, ok: r.err == nil, seq: r.seq, generation: r.generation, started: r.started}
 	m.recent = append(m.recent, o)
 	m.pruneRecent(now)
 	trip := false
@@ -845,8 +888,12 @@ func (m *Monitor) apply(ctx context.Context, r result) {
 // completed publishes freshness only for a resolved completion, with mu held.
 func (m *Monitor) completed(e *entry, o outcome) {
 	e.completed, e.completedSession = o.seq, m.session
+	e.completedGeneration, e.completedStart = o.generation, o.started
 	if e.followUp && o.seq > e.after {
 		e.followUp = false
+	}
+	if e.evidenceFollowUp && o.generation == m.generation && o.started > e.evidenceAfter {
+		e.evidenceFollowUp = false
 	}
 	m.dirty = true
 	m.updated = m.d.Now()
@@ -992,6 +1039,7 @@ func (m *Monitor) crashed(ctx context.Context) {
 	m.session, m.setKey, m.sessionSince = nil, "", time.Time{}
 	m.discardPending()
 	m.recent = nil
+	m.invalidateEvidence()
 	kept := m.crashes[:0]
 	for _, t := range m.crashes {
 		if now.Sub(t) < CrashWindow {
@@ -1098,7 +1146,7 @@ func (m *Monitor) untilNext(now, nextRefresh time.Time) time.Duration {
 				if e.inFlight || e.pending || !e.checkable() {
 					continue
 				}
-				if e.urgent || e.followUp {
+				if e.urgent || e.followUp || e.evidenceFollowUp {
 					return 0
 				}
 				if e.st.NextAt.Before(next) {
@@ -1115,6 +1163,10 @@ func (m *Monitor) untilNext(now, nextRefresh time.Time) time.Duration {
 
 // shutdown stops the prober and saves the state.
 func (m *Monitor) shutdown() {
+	m.mu.Lock()
+	m.closed = true
+	m.invalidateEvidence()
+	m.mu.Unlock()
 	m.stopSession()
 	m.save(m.d.Now())
 }

@@ -284,9 +284,11 @@ func (h *harness) complete(key string, err error) {
 	h.m.mu.Lock()
 	e := h.m.entries[key]
 	e.inFlight, e.urgent = true, false
-	sess := h.m.session
+	sess, generation := h.m.session, h.m.generation
+	h.m.starts++
+	started := h.m.starts
 	h.m.mu.Unlock()
-	h.m.apply(h.ctx, h.m.finish(result{sess: sess, key: key, latency: 100 * time.Millisecond, err: err}))
+	h.m.apply(h.ctx, h.m.finish(result{sess: sess, key: key, latency: 100 * time.Millisecond, err: err, generation: generation, started: started}))
 }
 
 func (h *harness) answer() {
@@ -405,4 +407,69 @@ func cleanGate(t *testing.T, gate chan struct{}) {
 			close(gate)
 		}
 	})
+}
+
+type evidenceAnswer struct {
+	evidence Evidence
+	err      error
+}
+
+func (h *harness) askEvidence(keys []string) <-chan evidenceAnswer {
+	h.t.Helper()
+	ctx, cancel := context.WithTimeout(h.ctx, 5*time.Second)
+	h.t.Cleanup(cancel)
+	return h.askEvidenceContext(ctx, keys)
+}
+
+func (h *harness) askEvidenceContext(ctx context.Context, keys []string) <-chan evidenceAnswer {
+	h.t.Helper()
+	select {
+	case <-h.m.wake:
+	default:
+	}
+	done := make(chan evidenceAnswer, 1)
+	go func() {
+		evidence, err := h.m.CheckEvidence(ctx, keys)
+		done <- evidenceAnswer{evidence, err}
+	}()
+	select {
+	case <-h.m.wake:
+	case got := <-done:
+		done <- got
+	case <-time.After(5 * time.Second):
+		h.t.Fatal("CheckEvidence did not register its request")
+	}
+	return done
+}
+
+func evidenceWaiting(t *testing.T, done <-chan evidenceAnswer) {
+	t.Helper()
+	select {
+	case got := <-done:
+		t.Fatalf("CheckEvidence returned before fresh applicable answers: %+v, %v", got.evidence.Endpoints, got.err)
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func evidenceAnswered(t *testing.T, done <-chan evidenceAnswer) evidenceAnswer {
+	t.Helper()
+	select {
+	case got := <-done:
+		return got
+	case <-time.After(5 * time.Second):
+		t.Fatal("CheckEvidence did not finish")
+	}
+	return evidenceAnswer{}
+}
+
+func applicableEvidence(t *testing.T, m *Monitor, keys []string) Evidence {
+	t.Helper()
+	evidence := m.Evidence()
+	if evidence.State != watchdapi.StateOK {
+		t.Fatalf("Evidence state %s, want ok", evidence.State)
+	}
+	if err := m.ValidateEvidence(evidence, keys); err != nil {
+		t.Fatalf("current Evidence is not applicable to %v: %v", keys, err)
+	}
+	return evidence
 }

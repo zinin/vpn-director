@@ -25,12 +25,20 @@ type entry struct {
 	inFlight bool
 	// pending holds a failed completion until WAN evidence resolves it.
 	pending bool
+	// Revisions bind evidence to a record; restored rejections have no proof.
+	revision        uint64
+	rejectedCurrent bool
 	// completed identifies the last resolved check of completedSession.
-	completed        uint64
-	completedSession Session
+	completed           uint64
+	completedSession    Session
+	completedGeneration uint64
+	completedStart      uint64
 	// followUp keeps Check urgent until a completion newer than after resolves.
 	followUp bool
 	after    uint64
+	// Evidence also requires dispatch after its request, not just completion.
+	evidenceFollowUp bool
+	evidenceAfter    uint64
 	// urgent puts the endpoint ahead of the rest (Request).
 	urgent bool
 }
@@ -43,6 +51,7 @@ func (e *entry) checkable() bool {
 // succeed records a check that got its answer; jitter is in [-1, 1). It
 // reports whether the status changed.
 func (e *entry) succeed(now time.Time, latency time.Duration, s Settings, jitter float64) bool {
+	e.revision++
 	changed := e.st.Status != watchdapi.StatusAlive
 	if changed {
 		e.st.Since = now
@@ -66,6 +75,7 @@ func (e *entry) succeed(now time.Time, latency time.Duration, s Settings, jitter
 // waits 2 × Interval, then twice its last pause, up to DeadMax. It reports
 // whether the status changed. The latency of the last success stays.
 func (e *entry) fail(now time.Time, reason string, s Settings) bool {
+	e.revision++
 	changed := e.st.Status != watchdapi.StatusDead
 	if changed {
 		e.st.Since = now
@@ -89,6 +99,7 @@ func (e *entry) fail(now time.Time, reason string, s Settings) bool {
 // reject takes the endpoint out of the prober. A sticky rejection holds until
 // the outbound changes, which makes a new key.
 func (e *entry) reject(now time.Time, reason string, sticky bool) {
+	before, wasSticky := e.st, e.sticky
 	if e.st.Status != watchdapi.StatusRejected {
 		e.st.Since = now
 	}
@@ -101,4 +112,9 @@ func (e *entry) reject(now time.Time, reason string, sticky bool) {
 	e.pending = false
 	e.urgent = false
 	e.followUp = false
+	e.evidenceFollowUp = false
+	if before != e.st || wasSticky != sticky || !e.rejectedCurrent {
+		e.revision++
+	}
+	e.rejectedCurrent = true
 }
