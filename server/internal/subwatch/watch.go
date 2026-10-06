@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
@@ -89,7 +90,13 @@ type Watch struct {
 	FallbackReady     func(tunnel string) bool // nil => ready; false keeps Xray membership
 	TPROXYReady       func() bool              // nil => ready; false keeps fallback membership after restore
 	Stopped           func() bool              // nil => not stopped; true skips apply/restart after /stop
+	CanMutate         func() error             // nil => compatible; non-nil error pauses automation
 
+	// Tick ownership outlives the unlocked notification callback.
+	tickMu            sync.Mutex
+	mutationContext   context.Context
+	mutationCancel    context.CancelCauseFunc
+	mutationFailed    atomic.Bool
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
 	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
@@ -154,14 +161,31 @@ func (w *Watch) Start(ctx context.Context) {
 }
 
 func (w *Watch) Tick(ctx context.Context) {
+	w.tickMu.Lock()
+	defer w.tickMu.Unlock()
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	w.mutationContext = ctx
+	w.mutationFailed.Store(false)
+	defer func() {
+		if w.mutationFailed.Load() {
+			w.resetFail()
+		}
+		w.mutationContext = nil
+		w.mutationCancel = nil
+		w.mu.Unlock()
+	}()
 	w.applyDefaults()
+	if w.mutationAllowed() != nil {
+		return
+	}
 
 	if w.LoadVPN == nil {
 		return
 	}
 	cfg, err := w.LoadVPN()
+	if w.mutationAllowed() != nil {
+		return
+	}
 	if err != nil {
 		slog.Warn("Failed to load VPN Director config for the subscription watch", "error", err)
 		return
@@ -173,7 +197,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.resetFail()
 		return
 	}
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		// Nothing the outbound did while VPN Director is stopped counts: the
 		// three minutes start again once it runs.
 		w.resetFail()
@@ -182,7 +206,13 @@ func (w *Watch) Tick(ctx context.Context) {
 	// A download, the resolution behind it or a probe can hold the tick for
 	// minutes; a stop ends what it is waiting on rather than waiting with it.
 	ctx, endWatch := w.cancelOnStop(ctx)
-	defer endWatch()
+	w.mutationContext = ctx
+	defer func() {
+		if context.Cause(ctx) != nil {
+			w.mutationFailed.Store(true)
+		}
+		endWatch()
+	}()
 	if !w.reconciled {
 		w.reconciled = true
 		// The move is written before Apply, and a process that stopped in
@@ -207,7 +237,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 		// A /stop can land while the probe waits. What follows drops Xray
 		// membership and announces; a stopped tick does neither.
-		if w.stopped() {
+		if w.mutationAllowed() != nil {
 			return
 		}
 		// Xray is failing. Kept through the failover, so clients that go back
@@ -221,7 +251,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		wasPending := w.pendingApply || staged
 		var ok bool
 		cfg, ok = w.applyFailover(cfg)
-		if w.stopped() {
+		if w.mutationAllowed() != nil {
 			return
 		}
 		if ok && wasPending {
@@ -240,7 +270,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 		if ok {
 			cfg = w.watchFallback(cfg)
-			if w.stopped() {
+			if w.mutationAllowed() != nil {
 				return
 			}
 		}
@@ -289,6 +319,9 @@ func (w *Watch) Tick(ctx context.Context) {
 		socks = defaultSOCKSPort
 	}
 	err = w.Probe(ctx, socks)
+	if w.mutationEnded(ctx) {
+		return
+	}
 	if err == nil {
 		w.resetFail()
 		w.importRetry = 0
@@ -312,7 +345,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		return
 	}
 	// A /stop can land while the probe waits; the move is a write it rules out.
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		return
 	}
 	if w.lastRouteKind == noteNoTunnel && !w.lastNoTunnelCheck.IsZero() && now.Sub(w.lastNoTunnelCheck) < ImportRetry {
@@ -344,7 +377,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	// LoadPlatform shells out and takes no lock: a /stop can finish while it
 	// runs, and neither the stage write nor the message below may follow one.
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		return
 	}
 	id := vpnconfig.FirstTDExit(cfg, plat)
@@ -408,7 +441,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	cfg, ok = w.applyFailover(cfg)
 	// The commit inside can wait for the config lock; a stop that finished
 	// meanwhile refused it, and nothing below may announce or retry it.
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		return
 	}
 	if !ok {
@@ -524,7 +557,7 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		return cfg
 	}
 	// LoadPlatform shells out and takes no lock; a /stop may have finished.
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		return cfg
 	}
 	id := failoverTunnel(cfg)
@@ -541,7 +574,7 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		break
 	}
 	// The apply fallbackCarries runs can wait for the script lock.
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		return cfg
 	}
 	if w.fallbackDownSince.IsZero() {
@@ -699,10 +732,16 @@ func walkOwns(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string, ex
 // walkOwnsNow is walkOwns on a fresh read of the config, for the checks of
 // the walk that write nothing themselves.
 func (w *Watch) walkOwnsNow(started, lastRecorded string, expectedSeq int) error {
+	if err := w.mutationAllowed(); err != nil {
+		return err
+	}
 	if w.LoadVPN == nil {
 		return nil
 	}
 	cfg, err := w.LoadVPN()
+	if refused := w.mutationAllowed(); refused != nil {
+		return refused
+	}
 	if err != nil {
 		return nil
 	}
@@ -718,10 +757,14 @@ func (w *Watch) walkOwnsNow(started, lastRecorded string, expectedSeq int) error
 // server's subscription must still exist with link, the one the walk read: a
 // server of a subscription deleted meanwhile is not written
 // (vpnconfig.ErrSubscriptionGone).
-func (w *Watch) walkGuard(sub, link, started, lastRecorded string, expectedSeq int) func(*vpnconfig.VPNDirectorConfig) error {
+func (w *Watch) walkGuard(sub, link, started, lastRecorded string, expectedSeq int, contexts ...context.Context) func(*vpnconfig.VPNDirectorConfig) error {
+	ctx := w.mutationContext
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
 	return func(cfg *vpnconfig.VPNDirectorConfig) error {
-		if w.stopped() {
-			return errStopped
+		if err := w.mutationAllowedContext(ctx); err != nil {
+			return err
 		}
 		if err := walkOwns(cfg, started, lastRecorded, expectedSeq); err != nil {
 			return err
@@ -729,20 +772,22 @@ func (w *Watch) walkGuard(sub, link, started, lastRecorded string, expectedSeq i
 		if sub != "" && !w.subscriptionHolds(sub, link) {
 			return vpnconfig.ErrSubscriptionGone
 		}
-		return nil
+		return w.mutationAllowedContext(ctx)
 	}
 }
 
-// endsWalk is an error after which the walk writes nothing more: a stop or a
-// newer selection.
+// endsWalk identifies a refused or cancelled attempt, not a failed server.
 func endsWalk(err error) bool {
-	return errors.Is(err, errStopped) || errors.Is(err, errSuperseded)
+	return mutationInterrupted(err) || errors.Is(err, errSuperseded)
 }
 
 // walkEnded reports whether err ends the walk.
 func (w *Watch) walkEnded(err error) bool {
 	if !endsWalk(err) {
 		return false
+	}
+	if mutationInterrupted(err) {
+		w.mutationFailed.Store(true)
 	}
 	if errors.Is(err, errSuperseded) {
 		slog.Info("Subscription walk abandoned; a newer server was selected")
@@ -784,7 +829,7 @@ func superseded(cfg *vpnconfig.VPNDirectorConfig, started, lastRecorded string, 
 // subscription with a link downloads at once, each list that arrives is
 // published, and the walk looks for a live server across every subscription.
 func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
-	if w.Fetch == nil || w.stopped() {
+	if w.Fetch == nil || w.mutationAllowed() != nil {
 		return
 	}
 	subs, err := w.loadSubscriptions()
@@ -808,7 +853,7 @@ func (w *Watch) maybeImportAndPick(ctx context.Context, cfg *vpnconfig.VPNDirect
 	// The downloads block for as long as the slowest host takes. A /stop that
 	// finished meanwhile ends the wave before anything more is written, and a
 	// wave that did not happen leaves its window to the next one.
-	if w.stopped() || ctx.Err() != nil {
+	if w.mutationAllowed() != nil || ctx.Err() != nil {
 		w.lastImport = prevImport
 		return
 	}
@@ -879,11 +924,12 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 		return nil, true
 	}
 	published := 0
+	update := w.updateFor(ctx)
 	for i, s := range subs {
 		if s.Static() {
 			continue
 		}
-		if ctx.Err() != nil || w.stopped() {
+		if ctx.Err() != nil || w.mutationAllowed() != nil {
 			return failed, false
 		}
 		if err := results[i].err; err != nil {
@@ -894,18 +940,18 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 			}
 			slog.Warn("Subscription refresh failed", "subscription", s.Name, "error", err)
 			failed = append(failed, s.Name)
-			rerr := vpnconfig.RecordSubscriptionError(w.update, w.files(), s.ID, s.URL, s.Refreshed, err.Error())
+			rerr := vpnconfig.RecordSubscriptionError(update, w.files(ctx), s.ID, s.URL, s.Refreshed, err.Error())
 			if rerr != nil && !errors.Is(rerr, errStopped) && !errors.Is(rerr, vpnconfig.ErrSubscriptionGone) {
 				slog.Warn("Failed to record why the subscription did not refresh", "subscription", s.Name, "error", rerr)
 			}
 			continue
 		}
-		_, err := vpnconfig.RefreshSubscription(w.update, w.files(), s.ID, s.URL, results[i].servers, w.Now())
+		_, err := vpnconfig.RefreshSubscription(update, w.files(ctx), s.ID, s.URL, results[i].servers, w.Now())
 		switch {
 		case err == nil:
 			published++
 			slog.Info("Subscription refreshed", "subscription", s.Name, "servers", len(results[i].servers))
-		case errors.Is(err, errStopped):
+		case mutationInterrupted(err):
 			return failed, false
 		case errors.Is(err, vpnconfig.ErrSubscriptionGone):
 			slog.Info("Subscription refresh dropped; the subscription was deleted while it downloaded", "subscription", s.Name)
@@ -957,7 +1003,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 	gone := map[string]bool{}
 	seen := map[string]bool{}
 	for _, s := range endpoint.PerAddress(order) {
-		if ctx.Err() != nil || w.stopped() {
+		if ctx.Err() != nil || w.mutationAllowed() != nil {
 			return
 		}
 		if gone[s.Subscription] {
@@ -970,7 +1016,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		if key != "" && seen[key] {
 			continue
 		}
-		generated, seq, err := w.Generate(s, w.walkGuard(s.Subscription, links[s.Subscription], started, lastRecorded, lastSeq))
+		generated, seq, err := w.Generate(s, w.walkGuard(s.Subscription, links[s.Subscription], started, lastRecorded, lastSeq, ctx))
 		if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
 			slog.Info("Walk skips a subscription deleted while it runs", "subscription", names[s.Subscription])
 			gone[s.Subscription] = true
@@ -998,15 +1044,22 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 			return
 		}
 		if err := w.restartXray(); err != nil {
-			if errors.Is(err, errStopped) {
+			if w.walkEnded(err) || w.mutationEnded(ctx) {
 				return
 			}
 			slog.Debug("Xray restart failed", "server", s.Name, "error", err)
 			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
-		if err := w.Probe(ctx, socks); err != nil {
-			slog.Debug("Subscription server probe failed", "server", s.Name, "ips", s.IPs, "error", err)
+		if w.mutationEnded(ctx) {
+			return
+		}
+		probeErr := w.Probe(ctx, socks)
+		if w.mutationEnded(ctx) {
+			return
+		}
+		if probeErr != nil {
+			slog.Debug("Subscription server probe failed", "server", s.Name, "ips", s.IPs, "error", probeErr)
 			continue
 		}
 		name := label(names, s.Subscription, s.Name)
@@ -1018,7 +1071,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		// Only a committed failover left Xray. Staged clients never left, so
 		// "back on Xray" would be a false message. The restore does not look
 		// at the subscription (spec 5.4): the server runs and answers.
-		done, committed, refused := w.commitRestore(cfg, w.walkGuard("", "", started, lastRecorded, lastSeq))
+		done, committed, refused := w.commitRestore(cfg, w.walkGuard("", "", started, lastRecorded, lastSeq, ctx))
 		if w.walkEnded(refused) || !done {
 			return
 		}
@@ -1029,7 +1082,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		}
 		return
 	}
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		return
 	}
 	slog.Info("No live server in any subscription", "tried", tried)
@@ -1037,11 +1090,11 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		return
 	}
 	if preferred != nil && lastGenerated != "" && lastGenerated != serverID(*preferred) {
-		guard := w.walkGuard(preferred.Subscription, links[preferred.Subscription], started, lastRecorded, lastSeq)
+		guard := w.walkGuard(preferred.Subscription, links[preferred.Subscription], started, lastRecorded, lastSeq, ctx)
 		if w.walkEnded(w.returnToPreferred(*preferred, guard)) {
 			return
 		}
-		if w.stopped() {
+		if w.mutationAllowed() != nil {
 			return
 		}
 	}
@@ -1087,7 +1140,7 @@ func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPND
 		return nil
 	}
 	if rerr := w.restartXray(); rerr != nil {
-		if errors.Is(rerr, errStopped) {
+		if endsWalk(rerr) {
 			return rerr
 		}
 		slog.Warn("Xray restart on the preferred server failed", "server", s.Name, "error", rerr)
@@ -1111,15 +1164,13 @@ func (w *Watch) stopped() bool {
 	return w.Stopped != nil && w.Stopped()
 }
 
-// update is UpdateVPN with the stop marker checked inside the locked callback,
-// after whatever the wait for the config lock cost. The check made before that
-// wait says nothing about the router after it, and a write that lands on a
-// stopped router takes effect on its next manual apply. A watch without
-// UpdateVPN has no config to write: fn runs on none.
+// update rechecks mutation permission under the config lock, after its wait.
+// Without UpdateVPN, fn runs on no config.
 func (w *Watch) update(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	ctx := w.mutationContext
 	locked := func(cfg *vpnconfig.VPNDirectorConfig) error {
-		if w.stopped() {
-			return errStopped
+		if err := w.mutationAllowedContext(ctx); err != nil {
+			return err
 		}
 		return fn(cfg)
 	}
@@ -1130,52 +1181,47 @@ func (w *Watch) update(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 }
 
 func (w *Watch) apply() error {
+	if err := w.mutationAllowed(); err != nil {
+		return err
+	}
 	if w.Apply == nil {
 		return nil
 	}
-	if w.stopped() {
-		return errStopped
+	err := w.Apply()
+	// A zero exit can be --unless-stopped skipping the script.
+	if refused := w.mutationAllowed(); refused != nil {
+		return refused
 	}
-	if err := w.Apply(); err != nil {
-		return err
-	}
-	// Apply runs with --unless-stopped: the script skips it with exit 0 when a
-	// stop took the lock first, and the marker that stop left is how to tell.
-	if w.stopped() {
-		return errStopped
-	}
-	return nil
+	return err
 }
 
 // restartXray is RestartXray the way apply is Apply: the restart runs with
 // --unless-stopped too, and a probe after one the script skipped would try a
 // server that was never started.
 func (w *Watch) restartXray() error {
+	if err := w.mutationAllowed(); err != nil {
+		return err
+	}
 	if w.RestartXray == nil {
 		return nil
 	}
-	if w.stopped() {
-		return errStopped
+	err := w.RestartXray()
+	if refused := w.mutationAllowed(); refused != nil {
+		return refused
 	}
-	if err := w.RestartXray(); err != nil {
-		return err
-	}
-	if w.stopped() {
-		return errStopped
-	}
-	return nil
+	return err
 }
 
-// stopPoll is how often a tick looks for the stop marker while it waits.
+// stopPoll is how often a tick rechecks mutation permission while it waits.
 var stopPoll = time.Second
 
-// cancelOnStop is ctx cancelled once the stop marker appears, so whatever the
-// tick is waiting on ends with a /stop instead of running its course. end stops
-// the look and returns once it has ended: nothing of it outlives the tick.
+// cancelOnStop ends waits when stop or compatibility forbids mutation.
+// end joins the poller; it cannot outlive the tick.
 func (w *Watch) cancelOnStop(ctx context.Context) (context.Context, func()) {
-	ctx, cancel := context.WithCancel(ctx)
-	if w.Stopped == nil {
-		return ctx, cancel
+	ctx, cancel := context.WithCancelCause(ctx)
+	w.mutationCancel = cancel
+	if w.Stopped == nil && w.CanMutate == nil {
+		return ctx, func() { cancel(nil) }
 	}
 	ended := make(chan struct{})
 	go func() {
@@ -1187,15 +1233,15 @@ func (w *Watch) cancelOnStop(ctx context.Context) (context.Context, func()) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if w.Stopped() {
-					cancel()
+				if err := w.mutationAllowedContext(nil); err != nil {
+					cancel(err)
 					return
 				}
 			}
 		}
 	}()
 	return ctx, func() {
-		cancel()
+		cancel(nil)
 		<-ended
 	}
 }
@@ -1209,10 +1255,11 @@ func (w *Watch) socksPort(cfg *vpnconfig.VPNDirectorConfig) int {
 }
 
 func (w *Watch) probeOK(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
-	if w.Probe == nil {
+	if w.Probe == nil || w.mutationEnded(ctx) {
 		return false
 	}
-	return w.Probe(ctx, w.socksPort(cfg)) == nil
+	err := w.Probe(ctx, w.socksPort(cfg))
+	return !w.mutationEnded(ctx) && err == nil
 }
 
 func (w *Watch) tproxyReady() bool {
@@ -1239,8 +1286,8 @@ func (w *Watch) tproxyReady() bool {
 // dead. refused is the error with which the guard, or a stop, ended the
 // restore; a stage it ended after is taken back for clients that had left Xray.
 func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnconfig.VPNDirectorConfig) error) (done, committed bool, refused error) {
-	if w.stopped() {
-		return false, false, nil
+	if err := w.mutationAllowed(); err != nil {
+		return false, false, err
 	}
 	if failoverTunnel(cfg) == "" {
 		if err := w.apply(); err != nil {
@@ -1325,7 +1372,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 				// The stage handed the clients to a server that is no longer
 				// the one probed. Those that had left Xray leave it again, and
 				// the next probe is of the server running now.
-				if committed && !errors.Is(err, errStopped) {
+				if committed && errors.Is(err, errSuperseded) {
 					w.unstageRestore()
 				}
 				return false, committed, err
@@ -1502,7 +1549,7 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 		}
 	}
 	// The lookup blocks too; a /stop during it rules out moving the failover.
-	if w.stopped() {
+	if w.mutationAllowed() != nil {
 		return cfg
 	}
 	if w.fallbackTried == nil {
@@ -1619,7 +1666,7 @@ func (w *Watch) applyDefaults() {
 		w.Now = time.Now
 	}
 	if w.AfterRestart == nil {
-		w.AfterRestart = time.Sleep
+		w.AfterRestart = w.waitAfterRestart
 	}
 	if w.Probe == nil {
 		w.Probe = func(ctx context.Context, port int) error {
@@ -1636,6 +1683,9 @@ func (w *Watch) applyDefaults() {
 // that episode's import outcome is news again. A suppressed one leaves the
 // import channel alone: the no-tunnel branch notifies on every tick.
 func (w *Watch) notify(kind noteKind, msg string) {
+	if w.mutationAllowed() != nil {
+		return
+	}
 	if kind == noteRestored {
 		// The clients are back, or Xray works again: the next episode's moved
 		// or no-tunnel message is news even without a healthy probe between.
@@ -1701,10 +1751,17 @@ func (w *Watch) subscriptionCount() int {
 }
 
 // files is the subscription files, for vpnconfig's operations.
-func (w *Watch) files() vpnconfig.SubscriptionFiles {
+func (w *Watch) files(contexts ...context.Context) vpnconfig.SubscriptionFiles {
+	ctx := w.mutationContext
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
 	return vpnconfig.SubscriptionFiles{
 		Load: w.loadSubscriptions,
 		Save: func(s vpnconfig.Subscription) error {
+			if err := w.mutationAllowedContext(ctx); err != nil {
+				return err
+			}
 			if w.SaveSubscription == nil {
 				return nil
 			}

@@ -39,6 +39,9 @@ const (
 // ReturnCheck - after a failed return, ReturnRetry and longer. After
 // ReturnFailsMax failed attempts in a row the returns stop.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
+	if w.mutationEnded(ctx) {
+		return
+	}
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
 		// A return clears preferred_server too; its backoff ends once it has held.
 		if w.lastReturn.IsZero() || w.Now().Sub(w.lastReturn) >= ReturnHold {
@@ -67,6 +70,9 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	}
 	w.returnNotBefore = now.Add(ReturnCheck)
 	subs, err := w.loadSubscriptions()
+	if w.mutationEnded(ctx) {
+		return
+	}
 	if err != nil {
 		slog.Warn("Failed to read the subscriptions for the return to the preferred server", "error", err)
 		return
@@ -83,7 +89,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if tcpChecked(servers[i]) {
 		candidates = w.reachable(ctx, candidates)
 	}
-	if len(candidates) == 0 || ctx.Err() != nil || w.stopped() {
+	if len(candidates) == 0 || ctx.Err() != nil || w.mutationEnded(ctx) {
 		return
 	}
 	w.tryReturn(ctx, cfg, subs, servers, candidates)
@@ -131,7 +137,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		if live {
 			// A stop or a selection can land while the probe waits; the walk
 			// makes the same look before it announces.
-			if w.stopped() || endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
+			if w.mutationEnded(ctx) || endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
 				return
 			}
 			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
@@ -140,6 +146,9 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			w.notify(noteReturned, fmt.Sprintf(msgReturned, label(names, c.Subscription, c.Name)))
 			return
 		}
+	}
+	if w.mutationEnded(ctx) {
+		return
 	}
 	w.backOffReturn()
 	if !sw.wrote {
@@ -182,14 +191,14 @@ type switcher struct {
 // that ended the attempt, after which nothing more may be written.
 func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended, gone bool) {
 	w := s.w
-	if ctx.Err() != nil || w.stopped() {
+	if ctx.Err() != nil || w.mutationEnded(ctx) {
 		return false, true, false
 	}
 	sub, link := "", ""
 	if holds {
 		sub, link = c.Subscription, s.links[c.Subscription]
 	}
-	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq))
+	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq, ctx))
 	if endsWalk(err) {
 		return false, true, false
 	}
@@ -205,23 +214,25 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		s.lastRecorded = serverID(c)
 	}
 	s.seq = seq
-	if ctx.Err() != nil {
+	if w.mutationEnded(ctx) {
 		return false, true, false
 	}
 	if err := w.restartXray(); err != nil {
-		if errors.Is(err, errStopped) {
+		if endsWalk(err) || w.mutationEnded(ctx) {
 			return false, true, false
 		}
 		slog.Warn("Xray restart failed", "server", c.Name, "error", err)
 		return false, false, false
 	}
 	w.AfterRestart(SettleAfterRestart)
-	if err := w.Probe(ctx, s.socks); err != nil {
-		// A probe a cancelled context or a stop cut short says nothing about
-		// the server.
-		if ctx.Err() != nil || w.stopped() {
-			return false, true, false
-		}
+	if w.mutationEnded(ctx) {
+		return false, true, false
+	}
+	err = w.Probe(ctx, s.socks)
+	if w.mutationEnded(ctx) {
+		return false, true, false
+	}
+	if err != nil {
 		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, "error", err)
 		return false, false, false
 	}

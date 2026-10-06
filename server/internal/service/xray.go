@@ -476,6 +476,15 @@ func xrayRange(v interface{}) (from, to int64, ok bool) {
 // it replaces config.json. The optional ports keep the inbounds in step with
 // advanced.xray in vpn-director.json; without them the template's ports stand.
 func (s *XrayService) GenerateConfig(server vpnconfig.Server, ports ...InboundPorts) error {
+	return s.generateConfig(server, nil, ports...)
+}
+
+// GenerateConfigGuarded checks beforeCommit after validation, just before publication.
+func (s *XrayService) GenerateConfigGuarded(server vpnconfig.Server, ports InboundPorts, beforeCommit func() error) error {
+	return s.generateConfig(server, beforeCommit, ports)
+}
+
+func (s *XrayService) generateConfig(server vpnconfig.Server, beforeCommit func() error, ports ...InboundPorts) error {
 	outbound, err := serverOutbound(server)
 	if err != nil {
 		return err
@@ -516,6 +525,11 @@ func (s *XrayService) GenerateConfig(server vpnconfig.Server, ports ...InboundPo
 	}
 	if s.validate != nil {
 		if err := s.validate(tmpName); err != nil {
+			return err
+		}
+	}
+	if beforeCommit != nil {
+		if err := beforeCommit(); err != nil {
 			return err
 		}
 	}

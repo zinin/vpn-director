@@ -3,7 +3,10 @@ package service
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
@@ -351,5 +354,200 @@ func TestGenerateAndRecordActiveServer_ASelectionEndsWhatTheWalkRemembered(t *te
 	}
 	if store.cfg.Xray.PreferredServer != nil {
 		t.Fatalf("preferred_server %+v after the user selected Paris", store.cfg.Xray.PreferredServer)
+	}
+}
+
+func guardedActiveFixture(t *testing.T) (*ConfigService, *XrayService, string) {
+	t.Helper()
+	templatePath, outputPath := writeTemplate(t)
+	dir := filepath.Dir(outputPath)
+	store := NewConfigService(dir, filepath.Join(dir, "data"))
+	cfg := &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer: &vpnconfig.ActiveServer{Subscription: "sub", Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4},
+	}}
+	if err := vpnconfig.SaveVPNDirectorConfig(store.ConfigPath(), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	return store, newTestXrayService(templatePath, outputPath), outputPath
+}
+
+func assertConfigLockHeld(t *testing.T, store *ConfigService) {
+	t.Helper()
+	f, err := os.OpenFile(store.LockPath(), os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		t.Error("generation/guard ran without the exclusive config lock")
+	} else if !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("checking the config lock: %v", err)
+	}
+}
+
+func TestGenerateAndRecordGuardedWalkedServer_RecordsIdentityAndSequence(t *testing.T) {
+	store, xray, outputPath := guardedActiveFixture(t)
+	identity := vpnconfig.Server{Subscription: "sub", Name: "Backup", Address: "backup.example", Port: 443}
+	dial := vpnconfig.Server{Subscription: "sub", Name: "Backup", Address: "203.0.113.50", Port: 443, UUID: "synthetic-id", Security: "tls", SNI: "backup.example"}
+	guards, validations := 0, 0
+	xray.validate = func(string) error {
+		validations++
+		assertConfigLockHeld(t, store)
+		if guards == 0 {
+			t.Error("generation started before the initial locked guard")
+		}
+		return nil
+	}
+	generated, seq, err := GenerateAndRecordGuardedWalkedServer(store, xray, dial, identity,
+		InboundPorts{TProxy: 23456, Socks: 23457}, func(cfg *vpnconfig.VPNDirectorConfig) error {
+			guards++
+			assertConfigLockHeld(t, store)
+			if a := cfg.Xray.ActiveServer; a == nil || a.Seq != 4 || a.Name != "Oslo" {
+				t.Errorf("guard saw %+v, want the locked original selection", a)
+			}
+			return nil
+		})
+	if err != nil || !generated || seq != 5 {
+		t.Fatalf("generated %v, seq %d, error %v; want true/5/nil", generated, seq, err)
+	}
+	if guards < 2 || validations != 1 {
+		t.Errorf("guards %d, validations %d; want locked guards before and after one validation", guards, validations)
+	}
+	cfg, err := store.LoadVPNConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := cfg.Xray.ActiveServer; a == nil || a.Subscription != "sub" || a.Name != "Backup" || a.Address != "backup.example" || a.Port != 443 || a.Seq != 5 {
+		t.Errorf("recorded %+v, want the hostname identity at seq 5", a)
+	}
+	if p := cfg.Xray.PreferredServer; p == nil || p.Subscription != "sub" || p.Name != "Oslo" || p.Address != "oslo.example" || p.Port != 443 {
+		t.Errorf("preferred %+v, want the original manual choice preserved", p)
+	}
+	ports := readInboundPorts(t, outputPath)
+	if ports["tproxy-in"] != 23456 || ports["socks-in"] != 23457 {
+		t.Errorf("ports %v, want the supplied 23456/23457", ports)
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil || !strings.Contains(string(content), `"address": "203.0.113.50"`) {
+		t.Errorf("generated config %q, error %v; want the dial IP rather than the identity hostname", content, err)
+	}
+	assertNoXrayTemps(t, outputPath)
+}
+
+func TestGenerateAndRecordGuardedWalkedServer_RefusalWritesNothing(t *testing.T) {
+	for _, afterValidation := range []bool{false, true} {
+		name := "initial guard"
+		if afterValidation {
+			name = "final guard after injected validation"
+		}
+		t.Run(name, func(t *testing.T) {
+			store, xray, outputPath := guardedActiveFixture(t)
+			before, err := os.ReadFile(store.ConfigPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			validated, finalGuard := false, false
+			refused := errors.New("compatibility is unconfirmed")
+			xray.validate = func(string) error {
+				assertConfigLockHeld(t, store)
+				validated = true
+				return nil
+			}
+			s := vpnconfig.Server{Subscription: "sub", Name: "Backup", Address: "backup.example", Port: 443, Security: "tls"}
+			generated, _, err := GenerateAndRecordGuardedWalkedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+				assertConfigLockHeld(t, store)
+				if validated {
+					finalGuard = true
+				}
+				if !afterValidation || validated {
+					return refused
+				}
+				return nil
+			})
+			if generated || !errors.Is(err, refused) {
+				t.Errorf("generated %v, error %v; want false and the guard refusal", generated, err)
+			}
+			if validated != afterValidation || finalGuard != afterValidation {
+				t.Errorf("validated %v, final guard %v; want both %v", validated, finalGuard, afterValidation)
+			}
+			after, readErr := os.ReadFile(store.ConfigPath())
+			if readErr != nil || string(after) != string(before) {
+				t.Errorf("VPN config changed after refusal: error %v", readErr)
+			}
+			content, readErr := os.ReadFile(outputPath)
+			if readErr != nil || string(content) != "previous\n" {
+				t.Errorf("live config %q, error %v; refused generation must not publish", content, readErr)
+			}
+			assertNoXrayTemps(t, outputPath)
+		})
+	}
+}
+
+func TestGenerateAndRecordGuardedWalkedServer_SaveFailureIsGenerated(t *testing.T) {
+	xray, outputPath := testedService(t)
+	xray.validate = nil
+	saveErr := errors.New("synthetic config save failure")
+	store := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4},
+	}}, saveErr: saveErr}
+	s := vpnconfig.Server{Name: "Backup", Address: "backup.example", Port: 443, Security: "tls"}
+	guards := 0
+	generated, seq, err := GenerateAndRecordGuardedWalkedServer(store, xray, s, s, InboundPorts{}, func(*vpnconfig.VPNDirectorConfig) error {
+		guards++
+		if !store.inClosure {
+			t.Error("guard ran outside the config transaction")
+		}
+		return nil
+	})
+	if !generated || seq != 4 || !errors.Is(err, saveErr) {
+		t.Errorf("generated %v, seq %d, error %v; want true/4 and the bookkeeping failure", generated, seq, err)
+	}
+	if guards < 2 || !store.saved {
+		t.Errorf("guards %d, saved %v; the generated server must reach the guarded record/save", guards, store.saved)
+	}
+	if a := store.cfg.Xray.ActiveServer; a == nil || a.Name != "Backup" || a.Seq != 5 {
+		t.Errorf("in-transaction active %+v, want the attempted record at seq 5", a)
+	}
+	content, readErr := os.ReadFile(outputPath)
+	if readErr != nil || !strings.Contains(string(content), "backup.example") {
+		t.Errorf("live config %q, error %v; only the VPN record save failed", content, readErr)
+	}
+	assertNoXrayTemps(t, outputPath)
+}
+
+type afterGuardedStore struct {
+	*stubStore
+	after func()
+}
+
+func (s *afterGuardedStore) UpdateVPNConfig(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+	err := s.stubStore.UpdateVPNConfig(fn)
+	if err == nil {
+		s.after()
+	}
+	return err
+}
+
+func TestGenerateAndRecordGuardedWalkedServer_ReturnsTransactionSequence(t *testing.T) {
+	xray, _ := testedService(t)
+	xray.validate = nil
+	base := &stubStore{cfg: &vpnconfig.VPNDirectorConfig{Xray: vpnconfig.XrayConfig{
+		ActiveServer: &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443, Seq: 4},
+	}}}
+	store := &afterGuardedStore{stubStore: base, after: func() {
+		base.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Manual", Address: "manual.example", Port: 443, Seq: 99}
+	}}
+	s := vpnconfig.Server{Name: "Backup", Address: "backup.example", Port: 443, Security: "tls"}
+	generated, seq, err := GenerateAndRecordGuardedWalkedServer(store, xray, s, s, InboundPorts{}, nil)
+	if err != nil || !generated || seq != 5 {
+		t.Errorf("generated %v, seq %d, error %v; want the transaction's seq 5, not a later writer's 99", generated, seq, err)
+	}
+	if a := base.cfg.Xray.ActiveServer; a == nil || a.Seq != 99 {
+		t.Errorf("later writer fixture %+v did not execute", a)
 	}
 }

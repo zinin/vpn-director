@@ -3,6 +3,7 @@ package service
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -651,4 +652,126 @@ func TestOutboundJSON_PreservesNumericLiterals(t *testing.T) {
 			}
 		})
 	}
+}
+
+var _ GuardedXrayGenerator = (*XrayService)(nil)
+
+func assertNoXrayTemps(t *testing.T, outputPath string) {
+	t.Helper()
+	paths, err := filepath.Glob(outputPath + ".*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if path != outputPath+".template" {
+			t.Errorf("temporary Xray config left behind: %s", filepath.Base(path))
+		}
+	}
+}
+
+func TestGenerateConfigGuarded_RechecksAfterValidation(t *testing.T) {
+	svc, outputPath := testedService(t)
+	validated, checkedAfterValidation := false, false
+	refused := errors.New("automation lost permission during validation")
+	svc.validate = func(path string) error {
+		if path == outputPath {
+			t.Error("validation received the live path rather than the staged config")
+		}
+		content, err := os.ReadFile(outputPath)
+		if err != nil || string(content) != "previous\n" {
+			t.Errorf("live config during validation %q, error %v", content, err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Errorf("staged mode %o, want 0600", info.Mode().Perm())
+		}
+		validated = true
+		return nil
+	}
+
+	err := svc.GenerateConfigGuarded(storedVLESS, InboundPorts{}, func() error {
+		if validated {
+			checkedAfterValidation = true
+			return refused
+		}
+		return nil
+	})
+	if !errors.Is(err, refused) {
+		t.Errorf("guarded generation error %v, want the final guard refusal", err)
+	}
+	if !validated || !checkedAfterValidation {
+		t.Errorf("validated %v, checked after validation %v; validation must precede the final guard", validated, checkedAfterValidation)
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil || string(content) != "previous\n" {
+		t.Errorf("live config %q, error %v; a refused publication must leave it unchanged", content, err)
+	}
+	assertNoXrayTemps(t, outputPath)
+}
+
+func TestGenerateConfigGuarded_NilGuardKeepsGenerationSemantics(t *testing.T) {
+	templatePath, outputPath := writeTemplate(t)
+	svc := newTestXrayService(templatePath, outputPath)
+	validations := 0
+	svc.validate = func(path string) error {
+		validations++
+		if path == outputPath {
+			t.Error("the live config was used as the validation input")
+		}
+		return nil
+	}
+	server := vpnconfig.Server{Address: "203.0.113.50", Port: 443, UUID: "synthetic-id", Security: "tls", SNI: "oslo.example"}
+	if err := svc.GenerateConfigGuarded(server, InboundPorts{TProxy: 23456, Socks: 23457}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if validations != 1 {
+		t.Errorf("validations %d, want one before publication", validations)
+	}
+	ports := readInboundPorts(t, outputPath)
+	if ports["tproxy-in"] != 23456 || ports["socks-in"] != 23457 {
+		t.Errorf("ports %v, want the supplied 23456/23457", ports)
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(content, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := vnextAddress(t, cfg); got != "203.0.113.50" {
+		t.Errorf("dial address %q, want 203.0.113.50", got)
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("live config mode %o, want 0600", info.Mode().Perm())
+	}
+	assertNoXrayTemps(t, outputPath)
+}
+
+func TestGenerateConfigGuarded_ValidationFailureKeepsLiveConfig(t *testing.T) {
+	svc, outputPath := testedService(t)
+	rejected := errors.New("synthetic Xray validation refusal")
+	validations := 0
+	svc.validate = func(string) error {
+		validations++
+		return rejected
+	}
+	if err := svc.GenerateConfigGuarded(storedVLESS, InboundPorts{}, func() error { return nil }); !errors.Is(err, rejected) {
+		t.Errorf("generation error %v, want the validation failure", err)
+	}
+	if validations != 1 {
+		t.Errorf("validations %d, want the staged config to be tested", validations)
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil || string(content) != "previous\n" {
+		t.Errorf("live config %q, error %v; validation failure must not publish", content, err)
+	}
+	assertNoXrayTemps(t, outputPath)
 }

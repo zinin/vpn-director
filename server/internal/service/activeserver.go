@@ -56,22 +56,53 @@ func GenerateAndRecordActiveServer(store ConfigStore, xray XrayGenerator, s vpnc
 // selection committed in between would otherwise be adopted as the caller's own
 // write. It is meaningful only when generated is true.
 func GenerateAndRecordWalkedServer(store ConfigStore, xray XrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error) {
+	if guarded, ok := xray.(GuardedXrayGenerator); ok {
+		return GenerateAndRecordGuardedWalkedServer(store, guarded, generate, identity, ports, guard)
+	}
 	return generateAndRecord(store, xray, generate, ports, guard, func(cfg *vpnconfig.VPNDirectorConfig) {
 		vpnconfig.RecordWalkedServer(cfg, identity)
 	})
 }
 
-// generateAndRecord writes config.json from generate and, once that succeeded,
-// has record name it in the config, both under the config lock.
+// GuardedXrayGenerator checks permission immediately before the live rename.
+type GuardedXrayGenerator interface {
+	GenerateConfigGuarded(vpnconfig.Server, InboundPorts, func() error) error
+}
+
+// GenerateAndRecordGuardedWalkedServer keeps both guard checks under the config lock.
+func GenerateAndRecordGuardedWalkedServer(store ConfigStore, xray GuardedXrayGenerator, generate, identity vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error) (generated bool, seq int, err error) {
+	return recordGenerated(store, func(cfg *vpnconfig.VPNDirectorConfig) error {
+		check := func() error {
+			if guard == nil {
+				return nil
+			}
+			return guard(cfg)
+		}
+		if err := check(); err != nil {
+			return err
+		}
+		return xray.GenerateConfigGuarded(generate, ports, check)
+	}, func(cfg *vpnconfig.VPNDirectorConfig) {
+		vpnconfig.RecordWalkedServer(cfg, identity)
+	})
+}
+
 func generateAndRecord(store ConfigStore, xray XrayGenerator, generate vpnconfig.Server, ports InboundPorts, guard func(*vpnconfig.VPNDirectorConfig) error, record func(*vpnconfig.VPNDirectorConfig)) (generated bool, seq int, err error) {
-	var prev, written int
-	err = store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
+	return recordGenerated(store, func(cfg *vpnconfig.VPNDirectorConfig) error {
 		if guard != nil {
 			if err := guard(cfg); err != nil {
 				return err
 			}
 		}
-		if err := xray.GenerateConfig(generate, ports); err != nil {
+		return xray.GenerateConfig(generate, ports)
+	}, record)
+}
+
+// recordGenerated publishes and records one server in the same transaction.
+func recordGenerated(store ConfigStore, generate func(*vpnconfig.VPNDirectorConfig) error, record func(*vpnconfig.VPNDirectorConfig)) (generated bool, seq int, err error) {
+	var prev, written int
+	err = store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
+		if err := generate(cfg); err != nil {
 			return err
 		}
 		generated = true
