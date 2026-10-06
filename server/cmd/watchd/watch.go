@@ -64,13 +64,8 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 		if err := current.Err(); err != nil {
 			return false, 0, err
 		}
-		config, err := cfg.LoadVPNConfig()
-		if err != nil {
-			return false, 0, err
-		}
-		ports := service.InboundPorts{}
-		ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(config)
-		return service.GenerateAndRecordGuardedWalkedServer(cfg, xray.ForContext(current), endpoint.ServerForDial(s), s, ports, guard)
+		generator := watchXrayGenerator{GuardedXrayGenerator: xray.ForContext(current), config: cfg}
+		return service.GenerateAndRecordGuardedWalkedServer(cfg, generator, endpoint.ServerForDial(s), s, service.InboundPorts{}, guard)
 	}
 	w.Fetch = func(ctx context.Context, url string) ([]vpnconfig.Server, error) {
 		fetcher := service.SubscriptionFetcher{
@@ -89,6 +84,22 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 		}
 	}
 	return w
+}
+
+type watchXrayGenerator struct {
+	service.GuardedXrayGenerator
+	config *service.ConfigService
+}
+
+func (g watchXrayGenerator) GenerateConfigGuarded(s vpnconfig.Server, _ service.InboundPorts, guard func() error) error {
+	// The guarded transaction holds the config lock here.
+	config, err := g.config.LoadVPNConfig()
+	if err != nil {
+		return err
+	}
+	ports := service.InboundPorts{}
+	ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(config)
+	return g.GuardedXrayGenerator.GenerateConfigGuarded(s, ports, guard)
 }
 
 type watchOperationError struct {

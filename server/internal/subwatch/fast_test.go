@@ -1113,3 +1113,186 @@ func TestFast_GeneratedButRecordSaveFailed(t *testing.T) {
 		})
 	}
 }
+
+func TestFast_GuardedGenerationPortSnapshot(t *testing.T) {
+	cases := []struct {
+		name      string
+		at        string
+		changed   service.InboundPorts
+		generated service.InboundPorts
+		restarts  int
+		settles   int
+		probes    []int
+		switched  bool
+	}{
+		{"updated during checks", "checks", service.InboundPorts{TProxy: 22345, Socks: 22346}, service.InboundPorts{TProxy: 22345, Socks: 22346}, 1, 1, []int{12346, 22346}, true},
+		{"socks changed after generation", "generate", service.InboundPorts{TProxy: 12345, Socks: 22346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 0, 0, []int{12346}, false},
+		{"tproxy changed after generation", "generate", service.InboundPorts{TProxy: 22345, Socks: 12346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 0, 0, []int{12346}, false},
+		{"socks changed during restart", "restart", service.InboundPorts{TProxy: 12345, Socks: 22346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 1, 0, []int{12346}, false},
+		{"tproxy changed during restart", "restart", service.InboundPorts{TProxy: 22345, Socks: 12346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 1, 0, []int{12346}, false},
+		{"socks changed during settle", "settle", service.InboundPorts{TProxy: 12345, Socks: 22346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 1, 1, []int{12346}, false},
+		{"tproxy changed during settle", "settle", service.InboundPorts{TProxy: 22345, Socks: 12346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 1, 1, []int{12346}, false},
+		{"socks changed during probe", "probe", service.InboundPorts{TProxy: 12345, Socks: 22346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 1, 1, []int{12346, 12346}, false},
+		{"tproxy changed during probe", "probe", service.InboundPorts{TProxy: 22345, Socks: 12346}, service.InboundPorts{TProxy: 12345, Socks: 12346}, 1, 1, []int{12346, 12346}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("PATH", t.TempDir())
+			s, store, xray, output := newFastPersistedFixture(t)
+			template := `{"inbounds":[{"tag":"tproxy-in","protocol":"dokodemo-door","port":12345},{"tag":"socks-in","protocol":"socks","port":12346}],"outbounds":[]}`
+			if err := os.WriteFile(filepath.Join(filepath.Dir(output), "template.json"), []byte(template), 0600); err != nil {
+				t.Fatal(err)
+			}
+			setPorts := func(ports service.InboundPorts) error {
+				return store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
+					if cfg.Advanced == nil {
+						cfg.Advanced = make(map[string]interface{})
+					}
+					cfg.Advanced["xray"] = map[string]interface{}{"tproxy_port": float64(ports.TProxy), "socks_port": float64(ports.Socks)}
+					return nil
+				})
+			}
+			if err := setPorts(service.InboundPorts{TProxy: 12345, Socks: 12346}); err != nil {
+				t.Fatal(err)
+			}
+			var changes atomic.Int32
+			changePorts := func() error {
+				if err := setPorts(tc.changed); err != nil {
+					return err
+				}
+				changes.Add(1)
+				return nil
+			}
+			mustChange := func() {
+				if err := changePorts(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.at == "checks" {
+				var once sync.Once
+				var changeErr error
+				s.h.check = func(_ context.Context, keys []string) (monitor.Evidence, error) {
+					once.Do(func() { changeErr = changePorts() })
+					return copyFastEvidence(s.h.fresh, keys), changeErr
+				}
+			}
+			s.w.Generate = func(server vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				s.generateCalls++
+				cfg, err := store.LoadVPNConfig()
+				if err != nil {
+					return false, 0, err
+				}
+				ports := service.InboundPorts{}
+				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
+				generated, seq, err := service.GenerateAndRecordGuardedWalkedServer(store, xray, endpoint.ServerForDial(server), server, ports, guard)
+				if generated {
+					s.written = append(s.written, server)
+					if tc.at == "generate" {
+						mustChange()
+					}
+				}
+				return generated, seq, err
+			}
+			var running service.InboundPorts
+			s.w.RestartXray = func() error {
+				s.restarts++
+				running = fastReadInboundPorts(t, output)
+				if tc.at == "restart" {
+					mustChange()
+				}
+				return nil
+			}
+			settles := 0
+			s.w.AfterRestart = func(delay time.Duration) {
+				settles++
+				if delay != 3*time.Second {
+					t.Errorf("settle %v, want three seconds before the main probe", delay)
+				}
+				if tc.at == "settle" {
+					mustChange()
+				}
+			}
+			var probes []int
+			s.w.Probe = func(ctx context.Context, port int) error {
+				s.probes++
+				probes = append(probes, port)
+				if err := ctx.Err(); err != nil {
+					t.Errorf("unexpected main probe cancellation: %v", err)
+					return err
+				}
+				if s.probes == 1 {
+					return errProbe
+				}
+				if tc.at == "probe" {
+					mustChange()
+					return errProbe
+				}
+				if port != running.Socks {
+					return errProbe
+				}
+				return nil
+			}
+			s.w.Tick(context.Background())
+			cfg, err := store.LoadVPNConfig()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if changes.Load() != 1 {
+				t.Errorf("port mutations %d, want one advanced-only write without manual reselection", changes.Load())
+			}
+			if !reflect.DeepEqual(probes, tc.probes) || s.restarts != tc.restarts || settles != tc.settles {
+				t.Errorf("probed ports %v, restart %d, settle %d; want %v, %d, %d for the guarded generation snapshot", probes, s.restarts, settles, tc.probes, tc.restarts, tc.settles)
+			}
+			if s.generateCalls != 1 || len(s.written) != 1 || s.f.applies != 0 {
+				t.Errorf("generate %d, written %d, apply %d; a port change must not cause another candidate or immediate tunnel fallback", s.generateCalls, len(s.written), s.f.applies)
+			}
+			if got := fastReadInboundPorts(t, output); got != tc.generated {
+				t.Errorf("live generated ports %+v, want %+v", got, tc.generated)
+			}
+			tp, socks := vpnconfig.XrayInboundPorts(cfg)
+			if tp != tc.changed.TProxy || socks != tc.changed.Socks {
+				t.Errorf("persisted ports %d/%d, want %d/%d; automatic transition overwrote the settings change", tp, socks, tc.changed.TProxy, tc.changed.Socks)
+			}
+			assertFastAssignments(t, cfg)
+			wantActive := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8}
+			wantPreferred := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Oslo", Address: "oslo.example", Port: 443}
+			if !reflect.DeepEqual(cfg.Xray.ActiveServer, wantActive) || !reflect.DeepEqual(cfg.Xray.PreferredServer, wantPreferred) {
+				t.Errorf("active %+v, preferred %+v; preserve the own record and original choice", cfg.Xray.ActiveServer, cfg.Xray.PreferredServer)
+			}
+			if tc.switched {
+				if len(s.f.notes) != 1 || !strings.Contains(s.f.notes[0], "Backup") || strings.Contains(s.f.notes[0], "back on Xray") {
+					t.Errorf("notes %v; want one server-change event without a client restoration", s.f.notes)
+				}
+			} else if len(s.f.notes) != 0 {
+				t.Errorf("notes %v; a superseded port snapshot must not announce success or fallback", s.f.notes)
+			}
+		})
+	}
+}
+
+func fastReadInboundPorts(t *testing.T, path string) service.InboundPorts {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var config struct {
+		Inbounds []struct {
+			Tag  string `json:"tag"`
+			Port int    `json:"port"`
+		} `json:"inbounds"`
+	}
+	if err := json.Unmarshal(data, &config); err != nil {
+		t.Fatal(err)
+	}
+	ports := service.InboundPorts{}
+	for _, inbound := range config.Inbounds {
+		switch inbound.Tag {
+		case "tproxy-in":
+			ports.TProxy = inbound.Port
+		case "socks-in":
+			ports.Socks = inbound.Port
+		}
+	}
+	return ports
+}

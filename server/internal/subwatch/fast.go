@@ -56,6 +56,7 @@ type fastSelection struct {
 	active         vpnconfig.Server
 	activeKeys     []string
 	links          map[string]string
+	ports          *service.InboundPorts
 	evidence       monitor.Evidence
 	proofRequired  bool
 	refreshed      bool
@@ -117,6 +118,12 @@ func (f *fastSelection) ownership(w *Watch, ctx context.Context, cfg *vpnconfig.
 	}
 	if cfg == nil || cfg.Xray.ActiveServer == nil || *cfg.Xray.ActiveServer != f.expected {
 		return errSuperseded
+	}
+	if f.ports != nil {
+		tproxy, socks := vpnconfig.XrayInboundPorts(cfg)
+		if tproxy != f.ports.TProxy || socks != f.ports.Socks {
+			return errFastEvidence
+		}
 	}
 	subs, err := w.loadSubscriptions()
 	if err != nil {
@@ -381,8 +388,14 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			return finish(errFastEvidence)
 		}
 		candidateGuard := owner.choiceGuard(w, ctx, c)
-		if _, err := w.fastGuardNow(ctx, candidateGuard); err != nil {
+		current, err := w.fastGuardNow(ctx, candidateGuard)
+		if err != nil {
 			return finish(err)
+		}
+		if owner.ports == nil {
+			ports := service.InboundPorts{}
+			ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(current)
+			owner.ports = &ports
 		}
 		w.setStatusAction("switch")
 		generated, seq, err := w.Generate(c.server, candidateGuard)
@@ -411,11 +424,12 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
-		if _, err := w.fastGuardNow(ctx, guard); err != nil {
+		current, err = w.fastGuardNow(ctx, guard)
+		if err != nil {
 			return finish(err)
 		}
-		probeErr := w.Probe(ctx, w.socksPort(cfg))
-		current, err := w.fastGuardNow(ctx, guard)
+		probeErr := w.Probe(ctx, w.socksPort(current))
+		current, err = w.fastGuardNow(ctx, guard)
 		if err != nil {
 			return finish(err)
 		}
