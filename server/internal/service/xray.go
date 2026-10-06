@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
@@ -20,15 +21,29 @@ import (
 type XrayService struct {
 	templatePath string
 	outputPath   string
-	// validate tests a written config before it replaces the live one; nil
-	// skips the test. NewXrayService sets xrayTest.
-	validate func(path string) error
+	// validate overrides validateContext; both nil skip the config test.
+	validate        func(path string) error
+	validateContext func(context.Context, string) error
+	root            context.Context
+	operation       context.Context
 }
 
 var _ XrayGenerator = (*XrayService)(nil)
 
 func NewXrayService(templatePath, outputPath string) *XrayService {
 	return &XrayService{templatePath: templatePath, outputPath: outputPath, validate: xrayTest}
+}
+
+// NewXrayServiceForContext cancels validation and publication with the daemon.
+func NewXrayServiceForContext(ctx context.Context, templatePath, outputPath string) *XrayService {
+	return &XrayService{
+		templatePath: templatePath,
+		outputPath:   outputPath,
+		root:         ctx,
+		validateContext: func(ctx context.Context, path string) error {
+			return testXrayConfig(ctx, path, false)
+		},
+	}
 }
 
 // xrayTestTimeout bounds one "xray run -test"; a router needs a second or two.
@@ -48,19 +63,44 @@ var xrayTestTimeout = 15 * time.Second
 // names its format. Without an xray on PATH - the dev mode, a workstation -
 // there is nothing to test with.
 func xrayTest(path string) error {
+	return testXrayConfig(context.Background(), path, true)
+}
+
+func testXrayConfig(root context.Context, path string, details bool) error {
+	ctx, cancel := context.WithTimeout(root, xrayTestTimeout)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	bin, err := exec.LookPath("xray")
 	if err != nil {
 		slog.Debug("xray not found, config not tested", "path", path)
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), xrayTestTimeout)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, bin, "run", "-test", "-format", "json", "-c", path).CombinedOutput()
+	cmd := exec.CommandContext(ctx, bin, "run", "-test", "-format", "json", "-c", path)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			if err == syscall.ESRCH {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+	cmd.WaitDelay = time.Second
+	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
-		return fmt.Errorf("xray config test timed out after %s", xrayTestTimeout)
+		if ctx.Err() == context.Canceled {
+			return fmt.Errorf("xray config test canceled: %w", ctx.Err())
+		}
+		return fmt.Errorf("xray config test timed out after %s: %w", xrayTestTimeout, ctx.Err())
 	}
 	if err != nil {
-		return fmt.Errorf("xray rejected the config: %s", lastLines(string(out), 3))
+		if details {
+			return fmt.Errorf("xray rejected the config: %s", lastLines(string(out), 3))
+		}
+		return fmt.Errorf("xray rejected the generated config")
 	}
 	return nil
 }
@@ -484,7 +524,24 @@ func (s *XrayService) GenerateConfigGuarded(server vpnconfig.Server, ports Inbou
 	return s.generateConfig(server, beforeCommit, ports)
 }
 
+func (s *XrayService) generationContextError(joined context.Context) error {
+	// Cancellation hooks may still be waiting to propagate root shutdown.
+	for _, scope := range []context.Context{s.root, s.operation, joined} {
+		if scope != nil {
+			if err := scope.Err(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (s *XrayService) generateConfig(server vpnconfig.Server, beforeCommit func() error, ports ...InboundPorts) error {
+	ctx, cancel := joinOperationContext(s.root, s.operation)
+	defer cancel()
+	if err := s.generationContextError(ctx); err != nil {
+		return err
+	}
 	outbound, err := serverOutbound(server)
 	if err != nil {
 		return err
@@ -523,15 +580,28 @@ func (s *XrayService) generateConfig(server vpnconfig.Server, beforeCommit func(
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp config: %w", err)
 	}
+	if err := s.generationContextError(ctx); err != nil {
+		return err
+	}
 	if s.validate != nil {
 		if err := s.validate(tmpName); err != nil {
 			return err
 		}
+	} else if s.validateContext != nil {
+		if err := s.validateContext(ctx, tmpName); err != nil {
+			return err
+		}
+	}
+	if err := s.generationContextError(ctx); err != nil {
+		return err
 	}
 	if beforeCommit != nil {
 		if err := beforeCommit(); err != nil {
 			return err
 		}
+	}
+	if err := s.generationContextError(ctx); err != nil {
+		return err
 	}
 	if err := os.Rename(tmpName, s.outputPath); err != nil {
 		return fmt.Errorf("rename config: %w", err)

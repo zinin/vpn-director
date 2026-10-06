@@ -22,6 +22,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/platform"
 	"github.com/zinin/vpn-director/server/internal/updatechecker"
 	"github.com/zinin/vpn-director/server/internal/updater"
+	"github.com/zinin/vpn-director/server/internal/watchcompat"
 )
 
 var (
@@ -45,7 +46,15 @@ func main() {
 
 	devFlag := flag.Bool("dev", false, "Run in development mode (local testing)")
 	platformFlag := flag.String("platform", "", "platform this router runs (merlin|keenetic); detected when empty")
+	capabilitiesFlag := flag.Bool("watchd-capabilities", false, "print the read-only watchd ownership contract and exit")
 	flag.Parse()
+	if *capabilitiesFlag {
+		if err := watchcompat.WriteCapabilities(os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "Failed to write watchd capabilities")
+			os.Exit(1)
+		}
+		return
+	}
 
 	plat, err := platform.Resolve(*platformFlag, *devFlag)
 	if err != nil {

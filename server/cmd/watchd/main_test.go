@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -710,5 +711,125 @@ func TestEndpointsReader_AListingFailureDoesNotReuseAMissingDirectorySnapshot(t 
 	}
 	if eps, _, err := read(); err != nil || len(eps) != 1 {
 		t.Fatalf("repaired listing count=%d err=%v", len(eps), err)
+	}
+}
+
+func TestRuntime_WatchdStartupUsesResolvedDataDir(t *testing.T) {
+	if raw := os.Getenv("VPD_TASK8_WATCHD_MAIN"); raw != "" {
+		var args []string
+		if err := json.Unmarshal([]byte(raw), &args); err != nil {
+			panic(err)
+		}
+		os.Args = append([]string{"vpn-director-watchd"}, args...)
+		flag.CommandLine = flag.NewFlagSet("vpn-director-watchd", flag.ExitOnError)
+		main()
+		return
+	}
+
+	for _, failure := range []bool{false, true} {
+		name := "resolved_relative_data_dir"
+		if failure {
+			name = "unresolved_data_dir_keeps_ram_api"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := filepath.Dir(daemonSocketPath(t))
+			dev := filepath.Join(root, "testdata", "dev")
+			if err := os.MkdirAll(dev, 0700); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(dev, "vpn-director.json")
+			raw := []byte(`{"data_dir":"queues[1]","monitor":{"enabled":false},"xray":{}}`)
+			if failure {
+				raw = []byte("not a readable config")
+			}
+			if err := os.WriteFile(configPath, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dev, "telegram-bot.json"), []byte("no token; not a bot config"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			args, err := json.Marshal([]string{"--dev", "--config", configPath, "--platform", "keenetic"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			processCtx, kill := context.WithTimeout(context.Background(), 6*time.Second)
+			defer kill()
+			cmd := exec.CommandContext(processCtx, os.Args[0], "-test.run=^TestRuntime_WatchdStartupUsesResolvedDataDir$")
+			cmd.Dir = root
+			cmd.Env = append(os.Environ(), "VPD_TASK8_WATCHD_MAIN="+string(args), "VPD_PLATFORM=invalid-platform")
+			var output runtimeLog
+			cmd.Stdout, cmd.Stderr = &output, &output
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait(); close(done) }()
+			t.Cleanup(func() {
+				kill()
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Error("owned startup helper did not exit")
+				}
+			})
+			socket := filepath.Join(dev, "watchd.sock")
+			client := watchdapi.NewClient(socket)
+			var snap watchdapi.WatchSnapshot
+			deadline := time.Now().Add(3 * time.Second)
+			for {
+				request, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+				snap, err = client.Watch(request)
+				stop()
+				if err == nil {
+					break
+				}
+				select {
+				case exitErr := <-done:
+					t.Fatalf("watchd startup exited before its combined API: %v output=%s", exitErr, output.String())
+				default:
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("watchd did not expose automation/queue API: %v output=%s", err, output.String())
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if _, err := client.Monitor(context.Background()); err != nil {
+				t.Fatal("queue initialization disabled monitor API:", err)
+			}
+			queuePath := filepath.Join(dev, "queues[1]", "watchd-notifications.json")
+			if failure {
+				if snap.Notifications.StorageError == "" {
+					t.Fatal("failed DataDir resolution did not expose explicit RAM-only storage_error")
+				}
+			} else {
+				if err := client.SetRecipients(context.Background(), []watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Now().Add(-time.Minute)}}); err != nil {
+					t.Fatal("real startup did not wire the sole queue writer:", err)
+				}
+				info, err := os.Stat(queuePath)
+				if err != nil || info.Mode().Perm() != 0600 {
+					t.Fatal("queue was not published at resolved ConfigService.DataDir with mode 0600")
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dev, "data", "watchd-notifications.json")); !os.IsNotExist(err) {
+				t.Fatal("runtime silently used default data_dir rather than resolved config path")
+			}
+			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Fatalf("SIGTERM did not drain runtime cleanly: %v output=%s", err, output.String())
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("queue storage/path error blocked shutdown")
+			}
+			if after, err := os.ReadFile(configPath); err != nil || !bytes.Equal(after, raw) {
+				t.Fatal("startup or shutdown changed main routing/Xray config")
+			}
+			if _, err := os.Stat(filepath.Join(dev, "xray.json")); !os.IsNotExist(err) {
+				t.Fatal("unarmed watchd startup/shutdown generated main Xray config")
+			}
+		})
 	}
 }

@@ -246,3 +246,29 @@ func TestResolve(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntime_WatchReadinessPathsMatchProductionAndStayIsolatedInDev(t *testing.T) {
+	p := Default()
+	for _, tc := range []struct {
+		name, got, want string
+	}{
+		{"bot executable", p.BotBinary, "/opt/vpn-director/telegram-bot"},
+		{"tunnel tables", p.TunnelTables, "/tmp/tunnel_director/tun_dir_tables"},
+		{"failover readiness", p.FailoverReady, "/tmp/tunnel_director/failover_ready"},
+		{"TPROXY readiness", p.TPROXYReady, "/tmp/xray_tproxy/ready"},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s=%q, want the existing router path %q", tc.name, tc.got, tc.want)
+		}
+	}
+	dev := DevPaths()
+	for _, path := range []string{dev.BotBinary, dev.TunnelTables, dev.FailoverReady, dev.TPROXYReady, dev.StoppedMarker} {
+		if path == "" || filepath.IsAbs(path) {
+			t.Fatalf("dev automation would access a router path: %q", path)
+		}
+		rel, err := filepath.Rel("testdata/dev", filepath.Clean(path))
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			t.Errorf("dev readiness escaped testdata/dev: %q", path)
+		}
+	}
+}

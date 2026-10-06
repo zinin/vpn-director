@@ -12,17 +12,14 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/zinin/vpn-director/server/internal/chatstore"
 	"github.com/zinin/vpn-director/server/internal/config"
-	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/handler"
 	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/paths"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/startup"
-	"github.com/zinin/vpn-director/server/internal/subwatch"
 	"github.com/zinin/vpn-director/server/internal/telegram"
 	"github.com/zinin/vpn-director/server/internal/updateflow"
 	"github.com/zinin/vpn-director/server/internal/updater"
-	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 	"github.com/zinin/vpn-director/server/internal/wizard"
 )
@@ -34,9 +31,7 @@ type Bot struct {
 	router *Router
 	mu     sync.Mutex
 	sender telegram.MessageSender
-	// outbox holds the watch's notifications until a path to Telegram carries
-	// them; pathLive says whether the path manager has one (nil: always).
-	outbox          outbox
+	// pathLive reports whether the path manager can reach Telegram (nil: always).
 	pathLive        func() bool
 	notificationAPI watchdapi.NotificationAPI
 	notifications   notificationReceiver
@@ -45,7 +40,6 @@ type Bot struct {
 	updater         updater.Updater
 	chatStore       *chatstore.Store
 	pathManager     *PathManager
-	subWatch        *subwatch.Watch
 	httpClient      *http.Client
 	endpoint        string
 	wire            func(*tgbotapi.BotAPI)
@@ -130,43 +124,6 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		b.mu.Unlock()
 		b.httpClient = NewPathClient(pm)
 		go pm.Start(ctx)
-		readiness := netpath.Readiness{
-			TablesPath:   defaultTunnelTablesPath,
-			FailoverPath: defaultFailoverReadyPath,
-			TPROXYPath:   defaultTproxyReadyPath,
-			StoppedPath:  defaultStoppedPath,
-		}
-		fetcher := service.SubscriptionFetcher{
-			Store:      configSvc,
-			VPN:        vpnSvc,
-			TablesPath: defaultTunnelTablesPath,
-		}
-		sw := &subwatch.Watch{
-			LoadVPN:           configSvc.LoadVPNConfig,
-			LoadPlatform:      vpnSvc.Platform,
-			UpdateVPN:         configSvc.UpdateVPNConfig,
-			Apply:             vpnSvc.ApplyUnlessStopped,
-			RestartXray:       vpnSvc.RestartXrayProcessUnlessStopped,
-			LoadSubscriptions: configSvc.LoadSubscriptions,
-			SaveSubscription:  configSvc.SaveSubscription,
-			Reachable:         netpath.ReachTCP4(nil),
-			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
-				cfg, err := configSvc.LoadVPNConfig()
-				if err != nil {
-					return false, 0, err
-				}
-				ports := service.InboundPorts{}
-				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
-				return service.GenerateAndRecordWalkedServer(configSvc, xraySvc, endpoint.ServerForDial(s), s, ports, guard)
-			},
-			Fetch:         fetcher.Fetch,
-			Notify:        b.notifyActiveChats,
-			FallbackReady: readiness.FallbackReady,
-			TPROXYReady:   readiness.TPROXYReady,
-			Stopped:       readiness.Stopped,
-		}
-		b.subWatch = sw
-		go sw.Start(ctx)
 	}
 
 	b.endpoint = tgbotapi.APIEndpoint
@@ -236,52 +193,11 @@ func (b *Bot) Connect(cfg *config.Config) error {
 	return nil
 }
 
-// setSender publishes the sender and delivers what the watch said before
-// Telegram was connected.
+// setSender publishes the sender for the watchd notification receiver.
 func (b *Bot) setSender(s telegram.MessageSender) {
 	b.mu.Lock()
 	b.sender = s
 	b.mu.Unlock()
-	b.flushNotifications()
-}
-
-// notifyActiveChats sends msg to every active chat whose user is still in
-// allowed_users, once per ChatID: one person who renamed their handle is two
-// chatstore records with one ChatID. The message goes through the outbox: it
-// waits there while Telegram is not connected yet or no path reaches it, and
-// behind any older message of the same chat.
-func (b *Bot) notifyActiveChats(msg string) {
-	b.mu.Lock()
-	store := b.chatStore
-	auth := b.auth
-	b.mu.Unlock()
-	b.outbox.add(activeChats(store, auth), msg)
-	b.flushNotifications()
-}
-
-// activeChats is every active chat whose user is still in allowed_users, each
-// ChatID once.
-func activeChats(store *chatstore.Store, auth *Auth) []int64 {
-	if store == nil {
-		return nil
-	}
-	users, err := store.GetActiveUsers()
-	if err != nil {
-		return nil
-	}
-	var chats []int64
-	seen := make(map[int64]struct{}, len(users))
-	for _, u := range users {
-		if auth == nil || !auth.IsAuthorized(u.Username) {
-			continue
-		}
-		if _, dup := seen[u.ChatID]; dup {
-			continue
-		}
-		seen[u.ChatID] = struct{}{}
-		chats = append(chats, u.ChatID)
-	}
-	return chats
 }
 
 // RegisterCommands registers bot commands with Telegram
@@ -318,10 +234,6 @@ func (b *Bot) Run(ctx context.Context) {
 	if b.pathManager != nil {
 		go b.pathManager.Start(ctx)
 	}
-	if b.subWatch != nil {
-		go b.subWatch.Start(ctx)
-	}
-	go b.retryNotifications(ctx, outboxRetryEvery)
 	// b.chatStore is a typed nil in dev mode; assigning it straight into the
 	// interface would hand CheckAndSendNotify a non-nil interface over a nil
 	// pointer and panic on the first call.

@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -16,13 +17,18 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/devmode"
 	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/logging"
 	"github.com/zinin/vpn-director/server/internal/monitor"
+	"github.com/zinin/vpn-director/server/internal/netpath"
+	"github.com/zinin/vpn-director/server/internal/notifications"
 	"github.com/zinin/vpn-director/server/internal/paths"
+	"github.com/zinin/vpn-director/server/internal/platform"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/updater"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchcompat"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
@@ -45,7 +51,18 @@ func main() {
 func run() int {
 	configPath := flag.String("config", "/opt/vpn-director/vpn-director.json", "path to vpn-director.json")
 	devFlag := flag.Bool("dev", false, "run in development mode (testdata paths, a fake prober)")
+	platformFlag := flag.String("platform", "", "platform this router runs (merlin|keenetic); detected when empty")
 	flag.Parse()
+
+	plat, err := platform.Resolve(*platformFlag, *devFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
+	if err := plat.Export(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		return 1
+	}
 
 	var p paths.Paths
 	var detachErr error
@@ -78,35 +95,57 @@ func run() int {
 		slog.Warn("could not leave the directory this process was started in", "error", detachErr)
 	}
 
-	scriptsDir := filepath.Dir(*configPath)
-	configSvc := service.NewConfigService(scriptsDir, filepath.Join(scriptsDir, "data"), *configPath)
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := runMonitor(ctx, p.WatchdSocket, func() daemonMonitor {
+	if err := runRuntime(ctx, p.WatchdSocket, func() (runtimeDeps, error) {
 		logger.StartRotation(ctx, p.RotatedLogs(), logging.DefaultMaxSize, time.Minute)
+		scriptsDir := filepath.Dir(*configPath)
+		configSvc := service.NewConfigService(scriptsDir, filepath.Join(scriptsDir, "data"), *configPath)
+		queuePath := ""
+		dataDir, pathErr := configSvc.DataDir()
+		if pathErr == nil && dataDir != "" {
+			queuePath = filepath.Join(dataDir, "watchd-notifications.json")
+		} else {
+			pathErr = errors.New("notification data path is unavailable")
+		}
+		queue, storageErr := notifications.NewStore(queuePath, nil)
+		var executor service.ShellExecutor = service.DefaultExecutor()
 		var launcher monitor.Launcher
+		var gate *watchcompat.Gate
 		if *devFlag {
+			executor = devmode.NewExecutor()
 			launcher = monitor.FakeLauncher{}
 		} else {
+			gate = &watchcompat.Gate{BotPath: p.BotBinary}
 			monitor.KillLeftovers(p.ProbeBinary)
 			launcher = &monitor.XrayLauncher{ProbeBinary: p.ProbeBinary, ConfigDir: p.ProbeDir}
 		}
-		return monitor.New(monitor.Deps{
+		vpnSvc := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(ctx, executor))
+		xraySvc := service.NewXrayServiceForContext(ctx, p.XrayTemplate, p.XrayConfig)
+		watch := newWatch(ctx, p, configSvc, vpnSvc, xraySvc, queue, gate)
+		if *devFlag {
+			// Dev has no installed or running router bot to attest.
+			watch.CanMutate = func() error {
+				if current := watch.Context(); current != nil {
+					return current.Err()
+				}
+				return ctx.Err()
+			}
+		}
+		readiness := netpath.Readiness{StoppedPath: p.StoppedMarker}
+		m := monitor.New(monitor.Deps{
 			Settings:  settingsReader(configSvc),
 			Endpoints: endpointsReader(configSvc),
 			Launcher:  launcher,
-			Stopped: func() bool {
-				_, err := os.Stat(p.StoppedMarker)
-				return err == nil
-			},
+			Stopped:   readiness.Stopped,
 			WANUp: func(ctx context.Context) bool {
 				return monitor.WANUp(ctx, endpoint.WANControls, 3*time.Second)
 			},
 			StatePath:  p.WatchdState,
 			OnSettings: levelSetter(logger),
 		})
+		return runtimeDeps{Monitor: m, Watch: watch, Queue: queue}, errors.Join(pathErr, storageErr)
 	}); err != nil {
 		slog.Error("the monitor's socket stopped", "path", p.WatchdSocket, "error", err)
 		return 1

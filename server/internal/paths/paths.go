@@ -22,8 +22,12 @@ type Paths struct {
 	WatchdState    string // /tmp/vpn-director/watchd-state.json: the monitor's state across restarts
 	ProbeDir       string // /tmp/vpn-director/probe: the prober's config
 	ProbeBinary    string // /opt/vpn-director/vpn-director-probe: a hard link to xray
+	BotBinary      string // /opt/vpn-director/telegram-bot: capabilities checked before automation
+	TunnelTables   string // /tmp/tunnel_director/tun_dir_tables
+	FailoverReady  string // /tmp/tunnel_director/failover_ready
+	TPROXYReady    string // /tmp/xray_tproxy/ready
 	// StoppedMarker is the file vpn-director.sh stop writes and a full apply
-	// removes; bot/path.go reads the same file for the subscription watch.
+	// removes; it pauses monitoring and subscription automation.
 	StoppedMarker string // /tmp/vpn-director/stopped
 }
 
@@ -44,6 +48,10 @@ func Default() Paths {
 		WatchdState:    "/tmp/vpn-director/watchd-state.json",
 		ProbeDir:       "/tmp/vpn-director/probe",
 		ProbeBinary:    "/opt/vpn-director/vpn-director-probe",
+		BotBinary:      "/opt/vpn-director/telegram-bot",
+		TunnelTables:   "/tmp/tunnel_director/tun_dir_tables",
+		FailoverReady:  "/tmp/tunnel_director/failover_ready",
+		TPROXYReady:    "/tmp/xray_tproxy/ready",
 		StoppedMarker:  "/tmp/vpn-director/stopped",
 	}
 }
@@ -65,6 +73,10 @@ func DevPaths() Paths {
 		WatchdState:    "testdata/dev/watchd-state.json",
 		ProbeDir:       "testdata/dev/probe",
 		ProbeBinary:    "testdata/dev/vpn-director-probe",
+		BotBinary:      "testdata/dev/telegram-bot",
+		TunnelTables:   "testdata/dev/tun_dir_tables",
+		FailoverReady:  "testdata/dev/failover_ready",
+		TPROXYReady:    "testdata/dev/tproxy_ready",
 		StoppedMarker:  "testdata/dev/stopped",
 	}
 }

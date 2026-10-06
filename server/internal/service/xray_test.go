@@ -2,6 +2,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -774,4 +775,129 @@ func TestGenerateConfigGuarded_ValidationFailureKeepsLiveConfig(t *testing.T) {
 		t.Errorf("live config %q, error %v; validation failure must not publish", content, err)
 	}
 	assertNoXrayTemps(t, outputPath)
+}
+
+func waitForValidation(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			if !strings.HasPrefix(string(data), "run -test -format json -c ") {
+				t.Fatalf("unexpected Xray validation command: %s", data)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the staged Xray validation never started")
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestContextExecutor_ShutdownCancelsXrayValidation(t *testing.T) {
+	root, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	started := filepath.Join(dir, "validated")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$VALIDATION_STARTED\"\nexec /bin/sleep 60\n"
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("VALIDATION_STARTED", started)
+	template, output := writeTemplate(t)
+	if err := os.WriteFile(output, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	configDir := t.TempDir()
+	store := NewConfigService(configDir, filepath.Join(configDir, "data"))
+	before := []byte(`{"xray":{"active_server":{"name":"previous","address":"192.0.2.10","port":443,"subscription":"0a1b2c3d","seq":7}}}`)
+	if err := os.WriteFile(store.ConfigPath(), before, 0600); err != nil {
+		t.Fatal(err)
+	}
+	xray := NewXrayServiceForContext(root, template, output)
+	type generationResult struct {
+		generated bool
+		err       error
+	}
+	done := make(chan generationResult, 1)
+	go func() {
+		generated, _, err := GenerateAndRecordGuardedWalkedServer(store, xray, storedVLESS, storedVLESS, InboundPorts{}, nil)
+		done <- generationResult{generated, err}
+	}()
+	waitForValidation(t, started)
+	cancel()
+	select {
+	case result := <-done:
+		if result.generated || !errors.Is(result.err, context.Canceled) {
+			t.Errorf("canceled validation published a selection: generated=%v error=%v", result.generated, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon shutdown waited for the 15-second Xray validation timeout")
+	}
+	if raw, err := os.ReadFile(output); err != nil || string(raw) != "previous\n" {
+		t.Errorf("canceled validation replaced the live Xray config: %q, %v", raw, err)
+	}
+	if raw, err := os.ReadFile(store.ConfigPath()); err != nil || string(raw) != string(before) {
+		t.Errorf("canceled validation recorded a new active server: %q, %v", raw, err)
+	}
+	assertNoXrayTemps(t, output)
+	if err := store.UpdateVPNConfig(func(*vpnconfig.VPNDirectorConfig) error { return nil }); err != nil {
+		t.Fatal("shutdown retained the config lock:", err)
+	}
+}
+
+func TestContextExecutor_CancellationBeforeRenameKeepsLiveConfig(t *testing.T) {
+	for _, phase := range []string{"before_generation_without_xray", "after_validation"} {
+		t.Run(phase, func(t *testing.T) {
+			root, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			t.Setenv("PATH", t.TempDir())
+			template, output := writeTemplate(t)
+			if err := os.WriteFile(output, []byte("previous\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			xray := NewXrayServiceForContext(root, template, output)
+			if phase == "after_validation" {
+				xray.validate = func(string) error { cancel(); return nil }
+			} else {
+				cancel()
+			}
+			if err := xray.GenerateConfig(storedVLESS); !errors.Is(err, context.Canceled) {
+				t.Errorf("canceled generation error=%v, want context cancellation", err)
+			}
+			if raw, err := os.ReadFile(output); err != nil || string(raw) != "previous\n" {
+				t.Errorf("%s published despite root cancellation: %q, %v", phase, raw, err)
+			}
+			assertNoXrayTemps(t, output)
+		})
+	}
+}
+
+func TestContextExecutor_XrayValidationKeepsCommandTimeout(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte("#!/bin/sh\nexec /bin/sleep 60\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	previous := xrayTestTimeout
+	xrayTestTimeout = 80 * time.Millisecond
+	t.Cleanup(func() { xrayTestTimeout = previous })
+	root, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	template, output := writeTemplate(t)
+	if err := os.WriteFile(output, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := NewXrayServiceForContext(root, template, output).GenerateConfig(storedVLESS)
+	if err == nil || !strings.Contains(err.Error(), "timed out") || root.Err() != nil {
+		t.Fatalf("validation lost its per-command timeout: error=%v root=%v", err, root.Err())
+	}
+	if raw, err := os.ReadFile(output); err != nil || string(raw) != "previous\n" {
+		t.Fatal("validation timeout replaced the live config")
+	}
+	assertNoXrayTemps(t, output)
 }

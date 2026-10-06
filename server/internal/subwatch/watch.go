@@ -94,6 +94,8 @@ type Watch struct {
 
 	// Tick ownership outlives the unlocked notification callback.
 	tickMu            sync.Mutex
+	statusMu          sync.RWMutex
+	status            watchStatus
 	mutationContext   context.Context
 	mutationCancel    context.CancelCauseFunc
 	mutationFailed    atomic.Bool
@@ -156,6 +158,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	defer w.tickMu.Unlock()
 	w.mu.Lock()
 	w.mutationContext = ctx
+	w.setContext(ctx)
 	w.mutationFailed.Store(false)
 	defer func() {
 		if w.mutationFailed.Load() {
@@ -163,10 +166,14 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 		w.mutationContext = nil
 		w.mutationCancel = nil
+		w.setContext(nil)
+		w.setStatusAction("")
 		w.mu.Unlock()
 	}()
 	w.applyDefaults()
-	if w.mutationAllowed() != nil {
+	w.setStatus(nil)
+	if err := w.mutationAllowed(); err != nil {
+		w.setStatus(err)
 		return
 	}
 
@@ -174,13 +181,16 @@ func (w *Watch) Tick(ctx context.Context) {
 		return
 	}
 	cfg, err := w.LoadVPN()
-	if w.mutationAllowed() != nil {
+	if refused := w.mutationAllowed(); refused != nil {
+		w.setStatus(refused)
 		return
 	}
 	if err != nil {
+		w.setStatus(err)
 		slog.Warn("Failed to load VPN Director config for the subscription watch", "error", err)
 		return
 	}
+	w.setStatusConfig(cfg)
 	if cfg == nil {
 		w.resetFail()
 		return
@@ -193,9 +203,10 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.resetFail()
 		return
 	}
-	if w.mutationAllowed() != nil {
+	if err := w.mutationAllowed(); err != nil {
 		// Nothing the outbound did while VPN Director is stopped counts: the
 		// three minutes start again once it runs.
+		w.setStatus(err)
 		w.resetFail()
 		return
 	}
@@ -203,9 +214,11 @@ func (w *Watch) Tick(ctx context.Context) {
 	// minutes; a stop ends what it is waiting on rather than waiting with it.
 	ctx, endWatch := w.cancelOnStop(ctx)
 	w.mutationContext = ctx
+	w.setContext(ctx)
 	defer func() {
-		if context.Cause(ctx) != nil {
+		if cause := context.Cause(ctx); cause != nil {
 			w.mutationFailed.Store(true)
+			w.setStatus(cause)
 		}
 		endWatch()
 	}()
@@ -219,6 +232,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 	}
 	if cfg.Xray.PendingRestore != nil {
+		w.setStatusAction("restore")
 		if err := w.reconcileRestore(cfg); err != nil {
 			if w.walkEnded(err) {
 				return
@@ -303,6 +317,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	if socks == 0 {
 		socks = defaultSOCKSPort
 	}
+	w.setStatusAction("probe")
 	err = w.Probe(ctx, socks)
 	if w.mutationEnded(ctx) {
 		return
@@ -1160,16 +1175,25 @@ func (w *Watch) stopped() bool {
 // Without UpdateVPN, fn runs on no config.
 func (w *Watch) update(fn func(*vpnconfig.VPNDirectorConfig) error) error {
 	ctx := w.mutationContext
+	var committed, pending bool
 	locked := func(cfg *vpnconfig.VPNDirectorConfig) error {
 		if err := w.mutationAllowedContext(ctx); err != nil {
 			return err
 		}
-		return fn(cfg)
+		if err := fn(cfg); err != nil {
+			return err
+		}
+		committed, pending = statusFlags(cfg)
+		return nil
 	}
 	if w.UpdateVPN == nil {
 		return locked(nil)
 	}
-	return w.UpdateVPN(locked)
+	err := w.UpdateVPN(locked)
+	if err == nil {
+		w.setStatusFlags(committed, pending)
+	}
+	return err
 }
 
 func (w *Watch) apply() error {
