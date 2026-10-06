@@ -1306,6 +1306,86 @@ func TestTick_ARestoreLeftPendingIsFinishedWithoutASubscription(t *testing.T) {
 	}
 }
 
+func TestPendingRestore_WrittenWithFailoverRemoval(t *testing.T) {
+	s := newRecoverySystem(t)
+	s.subs = []vpnconfig.Subscription{{ID: "alpha", Name: "Alpha", URL: "https://example.org/sub/synthetic-subscription-link", Servers: []vpnconfig.Server{{
+		Subscription: "alpha", Name: "Oslo", Address: "example.com", Port: 443,
+		UUID: "synthetic-uuid", PublicKey: "synthetic-key", ShortID: "synthetic-short-id",
+		Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"synthetic-outbound-user"}]}]}}`),
+	}}}}
+	w := s.watch()
+	dropWrites, stageApplies, dropApplies := 0, 0, 0
+	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		return s.store.UpdateVPNConfig(func(current *vpnconfig.VPNDirectorConfig) error {
+			hadFailover := current.Xray.Failover != nil
+			if err := fn(current); err != nil {
+				return err
+			}
+			if hadFailover && current.Xray.Failover == nil {
+				dropWrites++
+				want := &recoveryIntent{
+					Snapshot: &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8", "192.168.1.3"}, Added: []string{"192.168.1.8"}, Committed: true},
+					Restored: []string{"192.168.1.8", "192.168.1.3"},
+					Active:   &vpnconfig.ActiveServer{Name: "Oslo", Address: "example.com", Port: 443, Subscription: "alpha", Seq: 7},
+				}
+				if got := recoveryIntentForConfig(t, current); !reflect.DeepEqual(got, want) {
+					t.Fatalf("pending restore inside failover-removal transaction = %+v, want %+v", got, want)
+				}
+				if stageApplies == 0 {
+					t.Fatal("fallback membership was removed before the staged Xray apply")
+				}
+				raw, err := json.Marshal(current)
+				if err != nil {
+					return err
+				}
+				var doc struct {
+					Xray struct {
+						PendingRestore json.RawMessage `json:"pending_restore"`
+					} `json:"xray"`
+				}
+				if err := json.Unmarshal(raw, &doc); err != nil {
+					return err
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(doc.Xray.PendingRestore, &fields); err != nil {
+					return err
+				}
+				if len(fields) != 3 {
+					t.Fatal("pending restore must contain only snapshot, restored and active metadata")
+				}
+				for _, secret := range []string{"synthetic-uuid", "synthetic-key", "synthetic-short-id", "synthetic-outbound-user", "https://example.org/sub/synthetic-subscription-link"} {
+					if strings.Contains(string(doc.Xray.PendingRestore), secret) {
+						t.Fatal("pending restore persisted server credentials instead of routing snapshot and active identity")
+					}
+				}
+			}
+			return nil
+		})
+	}
+	w.Apply = func() error {
+		s.applies++
+		cfg, pending, _ := s.read(t)
+		if cfg.Xray.Failover != nil {
+			stageApplies++
+			if !contains(cfg.Xray.Clients, "192.168.1.8") || !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+				t.Fatal("stage Apply must retain both Xray and fallback membership")
+			}
+			return nil
+		}
+		dropApplies++
+		if pending == nil || contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") || !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+			t.Fatal("final Apply must see durable intent, removed appended membership and preserved overlap")
+		}
+		return errApply
+	}
+
+	w.Tick(context.Background())
+	cfg, pending, _ := s.read(t)
+	if dropWrites != 1 || stageApplies == 0 || dropApplies != 1 || cfg.Xray.Failover != nil || pending == nil || len(s.notes) != 0 {
+		t.Fatalf("failed final Apply: drop writes %d, stage applies %d, drop applies %d, failover %+v, pending %+v, notes %v", dropWrites, stageApplies, dropApplies, cfg.Xray.Failover, pending, s.notes)
+	}
+}
+
 func TestTick_TunnelGoneAtMoveSkipsApplyAndNotify(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
@@ -3094,19 +3174,19 @@ func TestTick_RestoreApplyAndWriteBackFailureRetriesApplyBeforeProbe(t *testing.
 		probes++
 		return nil
 	}
-	// Fail only the write-back: the update right after the one that restored.
-	updates, restoredAt := 0, 0
+	// Fail routing reinstatement, not the metadata-only final clear.
 	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
-		updates++
-		if restoredAt != 0 && updates == restoredAt+1 {
-			return errors.New("config lock timeout")
-		}
-		if err := fn(f.cfg); err != nil {
+		current, err := cloneCfg(f.cfg)
+		if err != nil {
 			return err
 		}
-		if restoredAt == 0 && f.cfg.Xray.Failover == nil {
-			restoredAt = updates
+		if err := fn(current); err != nil {
+			return err
 		}
+		if f.cfg.Xray.Failover == nil && current.Xray.Failover != nil {
+			return errors.New("config lock timeout")
+		}
+		*f.cfg = *current
 		return nil
 	}
 

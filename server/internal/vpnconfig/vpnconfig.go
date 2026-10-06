@@ -150,12 +150,13 @@ type TunnelDirectorConfig struct {
 }
 
 type XrayConfig struct {
-	Clients      []string      `json:"clients"`
-	Servers      []string      `json:"servers"`
-	ExcludeIPs   []string      `json:"exclude_ips"`
-	ExcludeSets  []string      `json:"exclude_sets"`
-	ActiveServer *ActiveServer `json:"active_server,omitempty"`
-	Failover     *XrayFailover `json:"failover,omitempty"`
+	Clients        []string            `json:"clients"`
+	Servers        []string            `json:"servers"`
+	ExcludeIPs     []string            `json:"exclude_ips"`
+	ExcludeSets    []string            `json:"exclude_sets"`
+	ActiveServer   *ActiveServer       `json:"active_server,omitempty"`
+	Failover       *XrayFailover       `json:"failover,omitempty"`
+	PendingRestore *XrayPendingRestore `json:"pending_restore,omitempty"`
 	// PreferredServer is the server the user chose while the subscription walk
 	// has active_server on another one, and absent otherwise (RecordWalkedServer).
 	PreferredServer *ActiveServer `json:"preferred_server,omitempty"`

@@ -101,20 +101,20 @@ type Watch struct {
 	failSince         time.Time // zero => last probe succeeded
 	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
 	lastImport        time.Time
-	importRetry       time.Duration   // current wait between import waves; zero means ImportRetry
-	lastRouteKind     noteKind        // noteMoved, noteNoTunnel
-	lastImportKind    noteKind        // noteRefreshFailed, noteNoLive, noteRestored
-	pendingApply      bool            // JSON mutated; Apply has not yet succeeded
-	pendingRestore    *restoreAttempt // a restore whose last apply failed: what it removed, for the retry
-	reconciled        bool            // the first armed Tick has checked for a failover left by an earlier process
-	lastNoTunnelCheck time.Time       // last LoadPlatform while announcing no fallback
-	lastTPROXYFail    time.Time       // last apply that found TPROXY not intercepting
-	lastFallbackFail  time.Time       // last staged apply whose fallback was not ready
-	fallbackTried     map[string]bool // exits this round of retargets has tried
-	fallbackHold      time.Duration   // wait after a round that found no exit ready: 10, 20, then 30 minutes
-	fallbackHoldUntil time.Time       // no retarget before this
-	lastFallbackCheck time.Time       // last platform lookup for a committed failover's tunnel
-	fallbackDownSince time.Time       // since when that tunnel is no exit; zero while it is one
+	importRetry       time.Duration                 // current wait between import waves; zero means ImportRetry
+	lastRouteKind     noteKind                      // noteMoved, noteNoTunnel
+	lastImportKind    noteKind                      // noteRefreshFailed, noteNoLive, noteRestored
+	pendingApply      bool                          // JSON mutated; Apply has not yet succeeded
+	pendingRestore    *vpnconfig.XrayPendingRestore // mirror of config intent for the preferred-return guard
+	reconciled        bool                          // the first armed Tick has checked for a failover left by an earlier process
+	lastNoTunnelCheck time.Time                     // last LoadPlatform while announcing no fallback
+	lastTPROXYFail    time.Time                     // last apply that found TPROXY not intercepting
+	lastFallbackFail  time.Time                     // last staged apply whose fallback was not ready
+	fallbackTried     map[string]bool               // exits this round of retargets has tried
+	fallbackHold      time.Duration                 // wait after a round that found no exit ready: 10, 20, then 30 minutes
+	fallbackHoldUntil time.Time                     // no retarget before this
+	lastFallbackCheck time.Time                     // last platform lookup for a committed failover's tunnel
+	fallbackDownSince time.Time                     // since when that tunnel is no exit; zero while it is one
 	running           bool
 	returnNotBefore   time.Time         // no look for the preferred server before this
 	returnRetry       time.Duration     // wait after the last failed return; zero before any
@@ -122,15 +122,6 @@ type Watch struct {
 	lastReturn        time.Time         // when the last return proved live; zero once it held for ReturnHold or a death followed it
 	returnDeath       time.Time         // failSince of the last death the returns were settled at
 	lastPicked        *vpnconfig.Server // the copy the walk picked or a return proved, with the address it ran on
-}
-
-// restoreAttempt is a restore whose failover record is gone and whose last
-// apply has not succeeded yet: what the record said, so the retry can put it
-// back if that apply loses TPROXY, and whether its clients had left Xray.
-type restoreAttempt struct {
-	removed   *vpnconfig.XrayFailover
-	restored  []string
-	committed bool
 }
 
 func (w *Watch) Start(ctx context.Context) {
@@ -190,6 +181,11 @@ func (w *Watch) Tick(ctx context.Context) {
 		slog.Warn("Failed to load VPN Director config for the subscription watch", "error", err)
 		return
 	}
+	if cfg == nil {
+		w.resetFail()
+		return
+	}
+	w.pendingRestore = cfg.Xray.PendingRestore
 	subs := w.subscriptionCount()
 	// A restore whose last apply failed is work the watch has started, as a
 	// failover is: neither waits for a subscription or for Xray clients.
@@ -220,6 +216,19 @@ func (w *Watch) Tick(ctx context.Context) {
 		// idempotent and queues with --wait, so re-running it is safe.
 		if cfg.Xray.Failover != nil {
 			w.pendingApply = true
+		}
+	}
+	if cfg.Xray.PendingRestore != nil {
+		if err := w.reconcileRestore(cfg); err != nil {
+			if w.walkEnded(err) {
+				return
+			}
+			slog.Warn("Pending Xray restore could not finish")
+			if !errors.Is(err, errRestoreApply) {
+				return
+			}
+		} else {
+			return
 		}
 	}
 	if cfg.Xray.Failover != nil {
@@ -277,39 +286,15 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.maybeImportAndPick(ctx, cfg)
 		return
 	}
-	if w.pendingApply {
-		// The JSON says restored, but the restore Apply never succeeded (the
-		// write-back failed), so the kernel may still route the clients
-		// through the tunnel.
+	if w.pendingApply && cfg.Xray.PendingRestore == nil {
 		if err := w.apply(); err != nil {
 			slog.Warn("Apply retry after restoring Xray clients failed", "error", err)
-			// Keep probing: a dead outbound during a stuck restore-Apply
-			// must still be able to fail over again.
 		} else {
 			w.pendingApply = false
-			attempt := w.pendingRestore
-			w.pendingRestore = nil
-			if attempt != nil {
-				// This retry is the apply that drops the tunnel membership,
-				// the one that has to keep TPROXY up - checked here as after
-				// the first try, or a soft-failed retry would be announced
-				// with the clients on neither the proxy nor the tunnel.
-				if !w.tproxyReady() {
-					slog.Warn("TPROXY stopped intercepting during the restore; putting the clients back on the fallback tunnel")
-					w.lastTPROXYFail = w.Now()
-					w.reinstateFailover(attempt)
-					return
-				}
-				w.settled()
-				if attempt.committed {
-					w.announceRestored(w.activeLabel(cfg))
-				}
-			}
 		}
 	}
-	// A pending restore is all an unarmed watch finishes: a failover of its own
-	// needs a subscription to walk and Xray clients to move.
-	if !vpnconfig.Armed(cfg, subs) {
+	// Pending intent finishes an existing restore, not a failover of its own.
+	if subs == 0 || len(vpnconfig.EffectiveXrayClients(cfg)) == 0 {
 		w.resetFail()
 		return
 	}
@@ -408,10 +393,16 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	movedClients := 0
 	if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
+		if current.Xray.PendingRestore != nil || cfg.Xray.PendingRestore != nil {
+			if err := pendingRestoreGuard(current, cfg.Xray.PendingRestore); err != nil {
+				return err
+			}
+		}
 		vpnconfig.StageXrayClientsToTunnel(current, id)
 		if current.Xray.Failover == nil {
 			return fmt.Errorf("tunnel %s no longer configured, or no client it can carry", id)
 		}
+		current.Xray.PendingRestore = nil
 		movedClients = len(current.Xray.Failover.Clients)
 		return nil
 	}); err != nil {
@@ -420,6 +411,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 		return
 	}
+	w.pendingRestore = nil
 	// A new episode: the retry clock and the exits tried belong to the last one.
 	w.resetFallbackState()
 	if left := uncarried(cfg); len(left) > 0 {
@@ -1353,7 +1345,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 		return false, committed, nil
 	}
 	w.lastTPROXYFail = time.Time{}
-	attempt := &restoreAttempt{committed: committed}
+	var attempt *vpnconfig.XrayPendingRestore
 	if w.UpdateVPN != nil {
 		if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
 			if guard != nil {
@@ -1361,11 +1353,10 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 					return err
 				}
 			}
-			if current.Xray.Failover != nil {
-				fo := *current.Xray.Failover
-				attempt.removed = &fo
+			if current.Xray.PendingRestore != nil || current.Xray.Failover == nil {
+				return errSuperseded
 			}
-			attempt.restored = vpnconfig.RestoreXrayClientsFromFailover(current)
+			attempt = vpnconfig.BeginXrayRestore(current)
 			return nil
 		}); err != nil {
 			if endsWalk(err) {
@@ -1381,28 +1372,24 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 			return false, committed, nil
 		}
 	}
+	w.pendingRestore = attempt
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after dropping fallback membership failed", "error", err)
 		w.pendingApply = true
-		w.pendingRestore = attempt
+		if endsWalk(err) {
+			return false, committed, err
+		}
 		return false, committed, nil
 	}
-	if !w.tproxyReady() {
-		// The apply that dropped the fallback membership is also the one that
-		// had to keep TPROXY up. It soft-failed - exit 0, marker gone - so these
-		// clients have neither the proxy nor the tunnel, and a finished restore
-		// would leave nothing to try again. They go back to the failover they
-		// came from; the ready gate above restores them once the marker returns.
-		slog.Warn("TPROXY stopped intercepting during the restore; putting the clients back on the fallback tunnel")
-		w.lastTPROXYFail = w.Now()
-		w.reinstateFailover(attempt)
+	done, committed, err := w.finalizeRestore(attempt, true)
+	if err != nil {
+		if endsWalk(err) {
+			return false, committed, err
+		}
+		slog.Warn("Failed to finish the pending Xray restore")
 		return false, committed, nil
 	}
-	w.pendingApply = false
-	w.pendingRestore = nil
-	w.settled()
-	w.resetFallbackState()
-	return true, committed, nil
+	return done, committed, nil
 }
 
 // probedServer is the guard of a restore the tick's own probe decided. That
@@ -1445,57 +1432,6 @@ func (w *Watch) unstageRestore() {
 		slog.Warn("Apply after taking the Xray clients off Xray again failed", "error", err)
 		w.pendingApply = true
 	}
-}
-
-// reinstateFailover puts a restore that did not hold back the way it started:
-// committed - the restored addresses leave xray.clients, where a TPROXY that
-// cannot carry them would keep TUN_DIR from seeing them - or, for a stage that
-// was never committed, back on the tunnel with the clients still on Xray, as
-// they were all along. Only what the restore moved goes back, under the record
-// that was removed: an address the user took off the tunnel meanwhile stays off.
-func (w *Watch) reinstateFailover(attempt *restoreAttempt) {
-	if attempt == nil || attempt.removed == nil || len(attempt.restored) == 0 || w.UpdateVPN == nil {
-		return
-	}
-	removed, restored := attempt.removed, attempt.restored
-	snapshot := &vpnconfig.XrayFailover{
-		Tunnel:    removed.Tunnel,
-		Clients:   restored,
-		Added:     keepOnly(removed.Added, restored),
-		Committed: attempt.committed,
-	}
-	if err := w.update(func(current *vpnconfig.VPNDirectorConfig) error {
-		vpnconfig.ApplyFailoverSnapshot(current, snapshot)
-		return nil
-	}); err != nil {
-		if !errors.Is(err, errStopped) {
-			slog.Warn("Failed to put the Xray clients back on the fallback tunnel", "error", err)
-		}
-		return
-	}
-	if err := w.apply(); err != nil {
-		slog.Warn("Apply after putting the Xray clients back on the fallback tunnel failed", "error", err)
-		w.pendingApply = true
-	}
-}
-
-// keepOnly is list without the entries keep does not name. A nil list stays
-// nil: a failover record without Added is the older kind, whose restore drops
-// every snapshot address from the tunnel, and an empty one would drop none.
-func keepOnly(list, keep []string) []string {
-	if list == nil {
-		return nil
-	}
-	out := make([]string, 0, len(list))
-	for _, s := range list {
-		for _, k := range keep {
-			if s == k {
-				out = append(out, s)
-				break
-			}
-		}
-	}
-	return out
 }
 
 func committedFailover(cfg *vpnconfig.VPNDirectorConfig) bool {

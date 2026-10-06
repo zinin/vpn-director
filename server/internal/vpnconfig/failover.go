@@ -149,20 +149,29 @@ func ExtendXrayFailover(cfg *VPNDirectorConfig) bool {
 	return true
 }
 
-// DetachFailoverClient takes addr, in any spelling, out of the failover record:
-// an address the user has just deleted, or put on a route of their own, is no
+// DetachFailoverClient takes addr, in any spelling, out of failover and pending
+// restore records. An address deleted or put on a route of its own is no
 // longer one the restore brings back to Xray. The record stays, even empty, so
 // the restore that clears it still runs; Added stays a list, because nil is
 // the older kind of record, whose restore takes every restored address off the
 // tunnel.
 func DetachFailoverClient(cfg *VPNDirectorConfig, addr string) {
-	if cfg == nil || cfg.Xray.Failover == nil {
+	if cfg == nil {
 		return
 	}
-	fo := cfg.Xray.Failover
-	fo.Clients = withoutAddr(fo.Clients, addr)
-	if fo.Added != nil {
-		fo.Added = withoutAddr(fo.Added, addr)
+	detach := func(fo *XrayFailover) {
+		if fo == nil {
+			return
+		}
+		fo.Clients = withoutAddr(fo.Clients, addr)
+		if fo.Added != nil {
+			fo.Added = withoutAddr(fo.Added, addr)
+		}
+	}
+	detach(cfg.Xray.Failover)
+	if pending := cfg.Xray.PendingRestore; pending != nil {
+		detach(pending.Snapshot)
+		pending.Restored = withoutAddr(pending.Restored, addr)
 	}
 }
 
@@ -212,13 +221,13 @@ func EffectiveXrayClients(cfg *VPNDirectorConfig) []string {
 
 // Armed reports whether the subscription watch has work. Effective Xray
 // clients and at least one subscription - a static list included - arm it for
-// a failover of its own. A failover record arms it with or without either: the
-// clients the record took off Xray still have to come back.
+// a failover of its own. Failover and pending restore records arm it with or
+// without either: the clients' routing change still has to finish.
 func Armed(cfg *VPNDirectorConfig, subscriptions int) bool {
 	if cfg == nil {
 		return false
 	}
-	if cfg.Xray.Failover != nil {
+	if cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil {
 		return true
 	}
 	return subscriptions > 0 && len(EffectiveXrayClients(cfg)) > 0
