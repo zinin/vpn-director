@@ -102,6 +102,14 @@ func run() int {
 		logger.StartRotation(ctx, p.RotatedLogs(), logging.DefaultMaxSize, time.Minute)
 		scriptsDir := filepath.Dir(*configPath)
 		configSvc := service.NewConfigService(scriptsDir, filepath.Join(scriptsDir, "data"), *configPath)
+		// Shell mutations and Go guards must read the same configuration.
+		selectedConfig, err := filepath.Abs(configSvc.ConfigPath())
+		if err != nil {
+			return runtimeDeps{}, errors.New("could not resolve VPN Director configuration path")
+		}
+		if err := os.Setenv("VPD_CONFIG_FILE", selectedConfig); err != nil {
+			return runtimeDeps{}, errors.New("could not export VPN Director configuration path")
+		}
 		queuePath := ""
 		dataDir, pathErr := configSvc.DataDir()
 		if pathErr == nil && dataDir != "" {

@@ -214,7 +214,7 @@ func TestRuntime_OwnershipBeforeEverySideEffect(t *testing.T) {
 }
 
 func TestRuntime_BotIndependentAndStopped(t *testing.T) {
-	t.Run("absent_bot_then_bot_cancellation_keeps_scheduled_ticks", func(t *testing.T) {
+	t.Run("absent_bot_keeps_scheduled_ticks", func(t *testing.T) {
 		p := runtimePaths(t)
 		cfg := runtimeConfig(t, p, `{"data_dir":"resolved-data","xray":{"clients":["192.168.50.8"]}}`)
 		if err := cfg.SaveSubscription(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "static", Servers: []vpnconfig.Server{}}); err != nil {
@@ -233,18 +233,13 @@ func TestRuntime_BotIndependentAndStopped(t *testing.T) {
 			return runtimeDeps{Monitor: m, Watch: w, Queue: q}, nil
 		})
 		await(t, ticks)
-		botContext, stopBot := context.WithCancel(context.Background())
-		stopBot()
-		if botContext.Err() == nil {
-			t.Fatal("bot cancellation fixture did not cancel")
-		}
 		select {
 		case <-ticks:
 		case <-time.After(32 * time.Second):
 			t.Fatal("watchd did not run its next 30-second tick without a bot")
 		}
 		if watchTicks.Load() < 2 || ctx.Err() != nil {
-			t.Fatalf("bot cancellation stopped watchd: ticks=%d context=%v", watchTicks.Load(), ctx.Err())
+			t.Fatalf("absent bot stopped watchd: ticks=%d context=%v", watchTicks.Load(), ctx.Err())
 		}
 	})
 

@@ -23,8 +23,11 @@ import (
 	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/notifications"
 	"github.com/zinin/vpn-director/server/internal/paths"
+	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/shell"
+	"github.com/zinin/vpn-director/server/internal/subwatch"
 	"github.com/zinin/vpn-director/server/internal/telegram"
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
@@ -183,6 +186,108 @@ func TestNew_NoBotWatchWhenGetMeFailsAndReceiverLives(t *testing.T) {
 	}
 	cancel()
 	receiverWait(t, pendingCanceled, "receiver root cancellation")
+}
+
+func TestNew_BotReceiverCancellationKeepsWatchTicks(t *testing.T) {
+	p := testPaths(t)
+	cfg := service.NewConfigService(p.ScriptsDir, p.DefaultDataDir)
+	before := []byte(`{"data_dir":"data","xray":{"clients":["192.168.50.8"]}}`)
+	if err := os.WriteFile(cfg.ConfigPath(), before, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.SaveSubscription(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "static", Servers: []vpnconfig.Server{}}); err != nil {
+		t.Fatal(err)
+	}
+	watchCtx, stopWatch := context.WithCancel(context.Background())
+	ticks := make(chan struct{}, 4)
+	var watchTicks atomic.Int64
+	watch := &subwatch.Watch{
+		LoadVPN: cfg.LoadVPNConfig, UpdateVPN: cfg.UpdateVPNConfig,
+		LoadSubscriptions: cfg.LoadSubscriptions,
+		Probe: func(ctx context.Context, _ int) error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			watchTicks.Add(1)
+			select {
+			case ticks <- struct{}{}:
+			default:
+			}
+			return nil
+		},
+	}
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		watch.Start(watchCtx)
+	}()
+	t.Cleanup(func() {
+		stopWatch()
+		receiverWait(t, watchDone, "independently owned watch shutdown")
+	})
+	receiverWait(t, ticks, "initial independent watch tick")
+
+	botCtx, stopBot := context.WithCancel(context.Background())
+	defer stopBot()
+	pendingStarted := make(chan struct{})
+	pendingEnded := make(chan error, 1)
+	var first sync.Once
+	api := &receiverAPI{pending: func(ctx context.Context, _ string) (watchdapi.NotificationPage, error) {
+		first.Do(func() { close(pendingStarted) })
+		<-ctx.Done()
+		select {
+		case pendingEnded <- ctx.Err():
+		default:
+		}
+		return watchdapi.NotificationPage{}, ctx.Err()
+	}}
+	srv := newAPIServer(t)
+	b, err := New(botCtx, testConfig(), p, "v0.0.0", "v0.0.0-test", "deadbee", "2026-01-01",
+		WithDevMode(devmode.NewExecutor()), withNotifications(api), withAPIBase(srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receiverWait(t, pendingStarted, "constructor-owned bot receiver")
+	receiverDone := make(chan struct{})
+	go func() {
+		// Once waits for the constructor's receiver and all delivery workers to drain.
+		b.receiveNotifications(botCtx)
+		close(receiverDone)
+	}()
+	t.Cleanup(func() {
+		stopBot()
+		receiverWait(t, receiverDone, "bot receiver cleanup")
+	})
+	stopBot()
+	select {
+	case err := <-pendingEnded:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("receiver ended through its request deadline instead of bot cancellation: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("bot cancellation did not cancel the running receiver's IPC request")
+	}
+	receiverWait(t, receiverDone, "real bot receiver shutdown")
+	ticksAtShutdown := watchTicks.Load()
+	deadline := time.After(32 * time.Second)
+	for watchTicks.Load() <= ticksAtShutdown {
+		select {
+		case <-ticks:
+		case <-deadline:
+			t.Fatal("watch did not run its next 30-second tick after real bot receiver shutdown")
+		}
+	}
+	if watchTicks.Load() < 2 || watchCtx.Err() != nil {
+		t.Fatalf("bot receiver cancellation stopped independent watch: ticks=%d context=%v", watchTicks.Load(), watchCtx.Err())
+	}
+	select {
+	case <-watchDone:
+		t.Fatal("bot receiver shutdown ended the watch lifetime")
+	default:
+	}
+	if after, err := os.ReadFile(cfg.ConfigPath()); err != nil || string(after) != string(before) {
+		t.Fatal("bot receiver shutdown changed current routing configuration")
+	}
 }
 
 func TestNew_ProductionUsesPathClientAndManager(t *testing.T) {

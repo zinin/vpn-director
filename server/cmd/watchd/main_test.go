@@ -833,3 +833,145 @@ func TestRuntime_WatchdStartupUsesResolvedDataDir(t *testing.T) {
 		})
 	}
 }
+
+func TestRuntime_WatchdBindsSelectedShellConfig(t *testing.T) {
+	if raw := os.Getenv("VPD_TASK8_CONFIG_ARGS"); raw != "" {
+		var args []string
+		if err := json.Unmarshal([]byte(raw), &args); err != nil {
+			t.Fatal(err)
+		}
+		os.Args = append([]string{"vpn-director-watchd"}, args...)
+		flag.CommandLine = flag.NewFlagSet("vpn-director-watchd", flag.ExitOnError)
+		selected := os.Getenv("VPD_TASK8_SELECTED_CONFIG")
+		cfg := service.NewConfigService(filepath.Dir(selected), "", selected)
+		current, err := cfg.LoadVPNConfig()
+		if err != nil || current == nil || current.Xray.ActiveServer == nil || current.Xray.ActiveServer.Seq != 7 {
+			t.Fatalf("selected Go config must start with seq=7: config=%+v error=%v", current, err)
+		}
+		done := make(chan int, 1)
+		go func() { done <- run() }()
+		client := watchdapi.NewClient(filepath.Join("testdata", "dev", "watchd.sock"))
+		deadline := time.Now().Add(3 * time.Second)
+		for {
+			request, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+			_, err := client.Watch(request)
+			cancel()
+			if err == nil {
+				break
+			}
+			select {
+			case code := <-done:
+				t.Fatalf("watchd exited before shell configuration check: code=%d", code)
+			default:
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("watchd did not expose its API before shell configuration check:", err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		// Use the real executor in the running daemon's exported environment.
+		vpn := service.NewVPNDirectorService(os.Getenv("VPD_TASK8_SHELL_DIR"), service.DefaultExecutor())
+		if err := vpn.ApplyUnlessStopped(); err != nil {
+			t.Error("owned shell configuration recorder failed:", err)
+		} else {
+			trace := os.Getenv("VPD_TASK8_SHELL_TRACE")
+			path, pathErr := os.ReadFile(trace + ".path")
+			usedPath, absErr := filepath.Abs(strings.TrimSpace(string(path)))
+			raw, readErr := os.ReadFile(trace + ".json")
+			var used vpnconfig.VPNDirectorConfig
+			decodeErr := json.Unmarshal(raw, &used)
+			if pathErr != nil || absErr != nil || readErr != nil || decodeErr != nil {
+				t.Errorf("shell config trace unavailable: path=%v absolute=%v read=%v decode=%v", pathErr, absErr, readErr, decodeErr)
+			} else if usedPath != selected || used.Xray.ActiveServer == nil || used.Xray.ActiveServer.Seq != 7 {
+				t.Errorf("Go selected %s seq=7; shell Apply used %s active=%+v", selected, usedPath, used.Xray.ActiveServer)
+			}
+			if argv, err := os.ReadFile(trace + ".args"); err != nil || string(argv) != "--wait\n--unless-stopped\napply\n" {
+				t.Errorf("automatic Apply lost its wait/stop guards: argv=%q error=%v", argv, err)
+			}
+		}
+		if err := syscall.Kill(os.Getpid(), syscall.SIGTERM); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case code := <-done:
+			if code != 0 {
+				t.Errorf("watchd shutdown exit=%d", code)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("watchd did not drain after shell configuration check")
+		}
+		return
+	}
+
+	for _, tc := range []struct {
+		name      string
+		relative  bool
+		inherited bool
+	}{
+		{"absolute_config_with_inherited_mismatch", false, true},
+		{"relative_config_with_inherited_mismatch", true, true},
+		{"relative_config_without_inherited_override", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Dir(daemonSocketPath(t))
+			dev := filepath.Join(root, "testdata", "dev")
+			selected := filepath.Join(root, "custom configs", "selected.json")
+			live := filepath.Join(dev, "vpn-director.json")
+			for _, dir := range []string{dev, filepath.Dir(selected)} {
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			selectedRaw := []byte(`{"data_dir":"selected-data","monitor":{"enabled":false},"xray":{"active_server":{"name":"Oslo","address":"oslo.example","port":443,"seq":7}}}`)
+			liveRaw := []byte(`{"data_dir":"live-data","monitor":{"enabled":false},"xray":{"active_server":{"name":"Oslo","address":"oslo.example","port":443,"seq":41}}}`)
+			for path, raw := range map[string][]byte{selected: selectedRaw, live: liveRaw} {
+				if err := os.WriteFile(path, raw, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			trace := filepath.Join(dev, "shell-config")
+			// The installed default is replaced by an owned file for this recorder.
+			script := "#!/bin/sh\nset -eu\n" +
+				"config=\"${VPD_CONFIG_FILE:-$VPD_TASK8_DEFAULT_CONFIG}\"\n" +
+				"printf '%s\\n' \"$config\" > \"$VPD_TASK8_SHELL_TRACE.path\"\n" +
+				"cat \"$config\" > \"$VPD_TASK8_SHELL_TRACE.json\"\n" +
+				"printf '%s\\n' \"$@\" > \"$VPD_TASK8_SHELL_TRACE.args\"\n"
+			if err := os.WriteFile(filepath.Join(dev, "vpn-director.sh"), []byte(script), 0755); err != nil {
+				t.Fatal(err)
+			}
+			configArg := selected
+			if tc.relative {
+				configArg = filepath.Join("custom configs", "selected.json")
+			}
+			args, err := json.Marshal([]string{"--dev", "--config", configArg, "--platform", "keenetic"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			processCtx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(processCtx, os.Args[0], "-test.run=^TestRuntime_WatchdBindsSelectedShellConfig$")
+			cmd.Dir = root
+			for _, value := range os.Environ() {
+				if !strings.HasPrefix(value, "VPD_CONFIG_FILE=") {
+					cmd.Env = append(cmd.Env, value)
+				}
+			}
+			cmd.Env = append(cmd.Env, "VPD_TASK8_CONFIG_ARGS="+string(args), "VPD_TASK8_SELECTED_CONFIG="+selected,
+				"VPD_TASK8_SHELL_DIR="+dev, "VPD_TASK8_SHELL_TRACE="+trace, "VPD_TASK8_DEFAULT_CONFIG="+live)
+			if tc.inherited {
+				cmd.Env = append(cmd.Env, "VPD_CONFIG_FILE="+live)
+			}
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("non-default --config diverged from shell configuration: %v\n%s", err, output)
+			}
+			for path, before := range map[string][]byte{selected: selectedRaw, live: liveRaw} {
+				if after, err := os.ReadFile(path); err != nil || !bytes.Equal(before, after) {
+					t.Errorf("read-only configuration recorder changed %s: error=%v", path, err)
+				}
+			}
+			if _, err := os.Stat(filepath.Join(dev, "xray.json")); !os.IsNotExist(err) {
+				t.Fatal("unarmed configuration check generated main Xray config")
+			}
+		})
+	}
+}
