@@ -11,11 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
@@ -143,6 +146,38 @@ func TestSubscriptionTunnel_DialsTheTunnelTheClientsWereMovedTo(t *testing.T) {
 	}
 	if p.ID != "wgc1" || p.Iface != "wgc1" {
 		t.Fatalf("path %s on %s, want wgc1, the tunnel the clients were moved to", p.ID, p.Iface)
+	}
+}
+
+func TestSubscriptionTunnel_NonDefaultTablesPath(t *testing.T) {
+	tables := filepath.Join(t.TempDir(), "applied-tunnel-tables")
+	if err := os.WriteFile(tables, []byte("0 ovpnc2\n6 wgc1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &vpnconfig.VPNDirectorConfig{
+		TunnelDirector: vpnconfig.TunnelDirectorConfig{Tunnels: map[string]vpnconfig.TunnelConfig{
+			"ovpnc2": {Clients: []string{"192.168.1.3"}},
+			"wgc1":   {Clients: []string{"192.168.1.8"}},
+		}},
+		Xray: vpnconfig.XrayConfig{Failover: &vpnconfig.XrayFailover{
+			Tunnel: "wgc1", Clients: []string{"192.168.1.8"}, Added: []string{"192.168.1.8"},
+		}},
+	}
+	plat := vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "ovpnc2", Iface: "tun12", Connected: true},
+		{ID: "wgc1", Iface: "wg-return", Connected: true},
+	}}
+	fetcher := SubscriptionFetcher{Store: configOnly{cfg: cfg}, VPN: platformOnly{plat: plat}, TablesPath: tables}
+
+	path, client := subscriptionTunnel(fetcher.Store, fetcher.VPN, fetcher.TablesPath)
+
+	if client == nil {
+		t.Fatal("custom tables path produced no tunnel client")
+	}
+	t.Cleanup(client.CloseIdleConnections)
+	want := netpath.Path{Kind: netpath.KindTunnel, ID: "wgc1", Iface: "wg-return", Mark: 0x70000}
+	if path != want {
+		t.Fatalf("subscription tunnel path %+v, want %+v from the non-default applied tables", path, want)
 	}
 }
 

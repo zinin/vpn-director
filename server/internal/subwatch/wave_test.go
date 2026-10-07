@@ -531,6 +531,87 @@ func (r *healthWalkFixture) setHealth(statuses map[string]watchdapi.Status) {
 	r.h.fresh = copyFastEvidence(r.h.cached, nil)
 }
 
+func TestWalk_AllCurrentRejectedEndsWave(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		written    bool
+		wantEvents []string
+		wantWrites []string
+		wantSeq    int
+	}{
+		{
+			name:       "all rejected before generation",
+			wantEvents: []string{"probe Preferred"},
+		},
+		{
+			name:    "written failed candidate leaves only rejected remaining",
+			written: true,
+			wantEvents: []string{
+				"probe Preferred",
+				"generate Candidate@203.0.113.11", "restart", "settle", "probe Candidate",
+				"generate Preferred@203.0.113.10", "restart",
+			},
+			wantWrites: []string{"Candidate@203.0.113.11", "Preferred@203.0.113.10"},
+			wantSeq:    2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Candidate", "Last")
+			r := newHealthWalkFixture(t, sub)
+			statuses := map[string]watchdapi.Status{
+				"Preferred": watchdapi.StatusRejected, "Candidate": watchdapi.StatusRejected,
+				"Last": watchdapi.StatusRejected,
+			}
+			if tc.written {
+				statuses["Candidate"] = watchdapi.StatusAlive
+			}
+			r.setHealth(statuses)
+			before, err := cloneCfg(r.f.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			probe := r.w.Probe
+			failedWritten := false
+			r.w.Probe = func(ctx context.Context, port int) error {
+				err := probe(ctx, port)
+				if r.f.cfg.Xray.ActiveServer.Name == "Candidate" {
+					failedWritten = len(r.generated) == 1 && r.f.seq() == 1 && err != nil
+					r.setHealth(map[string]watchdapi.Status{
+						"Preferred": watchdapi.StatusRejected, "Candidate": watchdapi.StatusRejected,
+						"Last": watchdapi.StatusRejected,
+					})
+				}
+				return err
+			}
+
+			r.tick()
+
+			writes := healthLabels(r.generated)
+			if failedWritten != tc.written || !reflect.DeepEqual(r.events, tc.wantEvents) ||
+				len(writes) != len(tc.wantWrites) || len(writes) > 0 && !reflect.DeepEqual(writes, tc.wantWrites) {
+				t.Fatalf("written failed candidate=%t, events %v, writes %v; want %t / %v / %v", failedWritten, r.events, writes, tc.written, tc.wantEvents, tc.wantWrites)
+			}
+			if r.f.applies != 0 || r.f.cfg.Xray.PendingRestore != nil || r.w.lastPicked != nil ||
+				!reflect.DeepEqual(r.f.cfg.Xray.Failover, before.Xray.Failover) ||
+				!reflect.DeepEqual(r.f.cfg.Xray.Clients, before.Xray.Clients) ||
+				!reflect.DeepEqual(r.f.cfg.PausedClients, before.PausedClients) ||
+				!reflect.DeepEqual(r.f.cfg.TunnelDirector, before.TunnelDirector) {
+				t.Fatalf("empty rejected wave changed client/recovery intent: config=%+v applies=%d picked=%+v", r.f.cfg, r.f.applies, r.w.lastPicked)
+			}
+			wantActive := &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "Preferred", Address: "preferred.example", Port: 443, Seq: tc.wantSeq}
+			wantConfig := before
+			wantConfig.Xray.ActiveServer = wantActive
+			if !reflect.DeepEqual(r.f.cfg, wantConfig) {
+				t.Fatalf("empty wave config %+v, want original choice and unchanged client intent %+v", r.f.cfg, wantConfig)
+			}
+			if countNotes(r.f.notes, "LAN clients back on Xray") != 0 || countNotes(r.f.notes, "selected server") != 0 ||
+				countNotes(r.f.notes, "Xray back on the preferred server") != 0 {
+				t.Fatalf("empty wave announced a successful main probe or restore: %v", r.f.notes)
+			}
+		})
+	}
+}
+
 func TestWalk_HealthyFirstStillProbesMain(t *testing.T) {
 	t.Run("cached alive still needs each main HTTPS probe", func(t *testing.T) {
 		sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Unknown", "Dead", "Alive1", "Alive2", "Rejected")

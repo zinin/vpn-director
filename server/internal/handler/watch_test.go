@@ -280,6 +280,140 @@ func TestStatus_MonitorAndWatchShareParallelDeadline(t *testing.T) {
 	}
 }
 
+func TestStatus_PreservesSuccessfulPeerWhenOtherTimesOut(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		monitorAlive bool
+		wantMonitor  string
+		wantWatch    string
+		wantLines    []string
+	}{
+		{
+			name: "monitor succeeds while watch times out", monitorAlive: true,
+			wantMonitor: "disabled", wantWatch: "not_running",
+			wantLines: []string{"Committed failover: false", "Pending restore: false", "Notifications pending: 0"},
+		},
+		{
+			name:        "watch succeeds while monitor times out",
+			wantMonitor: "not_running", wantWatch: "active",
+			wantLines: []string{
+				"Committed failover: true", "Pending restore: true", "Notifications pending: 7",
+				"Action: walking", "Watch message: Subscription automation continues",
+				"Storage error: cannot sync notification storage",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			type read struct {
+				component string
+				ctx       context.Context
+				deadline  time.Time
+				bounded   bool
+			}
+			reads := make(chan read, 2)
+			releaseSuccess, release := make(chan struct{}), make(chan struct{})
+			var successOnce, releaseOnce sync.Once
+			unblockSuccess := func() { successOnce.Do(func() { close(releaseSuccess) }) }
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			monitorDone, watchDone, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+			done := make(chan string, 1)
+			t.Cleanup(func() {
+				unblockSuccess()
+				unblock()
+				for _, drained := range []<-chan struct{}{monitorDone, watchDone, finished} {
+					select {
+					case <-drained:
+					case <-time.After(5 * time.Second):
+						t.Error("asymmetric automation status did not drain")
+					}
+				}
+			})
+			wait := func(component string, ctx context.Context, success bool) error {
+				deadline, bounded := ctx.Deadline()
+				reads <- read{component, ctx, deadline, bounded}
+				if success {
+					select {
+					case <-releaseSuccess:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-release:
+						return errors.New("fixture released")
+					}
+				}
+				select {
+				case <-ctx.Done():
+					return errors.New("IPC timeout: " + automationSecret)
+				case <-release:
+					return errors.New("fixture released: " + automationSecret)
+				}
+			}
+			monitor := automationMonitorRead(func(ctx context.Context) (watchdapi.Snapshot, error) {
+				defer close(monitorDone)
+				err := wait("monitor", ctx, tc.monitorAlive)
+				return watchdapi.Snapshot{State: watchdapi.StateDisabled, IntervalSeconds: 60}, err
+			})
+			watch := automationWatchRead(func(ctx context.Context) (watchdapi.WatchSnapshot, error) {
+				defer close(watchDone)
+				err := wait("watch", ctx, !tc.monitorAlive)
+				return watchdapi.WatchSnapshot{
+					State: watchdapi.WatchActive, UpdatedAt: time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC),
+					Message: "Subscription automation continues", Action: "walking",
+					CommittedFailover: true, PendingRestore: true,
+					Notifications: watchdapi.NotificationsStatus{Pending: 7, StorageError: "cannot sync notification storage"},
+				}, err
+			})
+			started := time.Now()
+			go func() {
+				defer close(finished)
+				done <- automationStatus(monitor, watch)
+			}()
+			var observed []read
+			for len(observed) < 2 {
+				select {
+				case value := <-reads:
+					observed = append(observed, value)
+				case <-time.After(time.Second):
+					t.Fatal("the second IPC read did not start in parallel")
+				}
+			}
+			first, second := observed[0], observed[1]
+			if first.component == second.component || !first.bounded || !second.bounded || first.ctx != second.ctx || !first.deadline.Equal(second.deadline) {
+				t.Fatalf("asymmetric reads lack a shared context/deadline: %+v %+v", first, second)
+			}
+			if budget := first.deadline.Sub(started); budget < 1900*time.Millisecond || budget > 2100*time.Millisecond {
+				t.Fatalf("asymmetric IPC budget=%s, want 2 seconds", budget)
+			}
+			unblockSuccess()
+			select {
+			case text := <-done:
+				if elapsed := time.Since(started); elapsed < 1500*time.Millisecond || elapsed > 3*time.Second {
+					t.Errorf("asymmetric reads took %s, want one 2-second budget", elapsed)
+				}
+				assertIndependentAutomationStates(t, text, tc.wantMonitor, tc.wantWatch)
+				lines := strings.Split(text, "\n")
+				for _, want := range tc.wantLines {
+					found := false
+					for _, line := range lines {
+						found = found || line == want
+					}
+					if !found {
+						t.Errorf("completed peer field %q was lost: %q", want, text)
+					}
+				}
+				if tc.monitorAlive && (strings.Contains(text, "Action:") || strings.Contains(text, "Storage error:") || strings.Contains(text, "Subscription automation continues")) {
+					t.Errorf("failed Watch leaked the snapshot returned with an IPC error: %q", text)
+				}
+			case <-time.After(3 * time.Second):
+				t.Fatal("asymmetric IPC reads exceeded the shared deadline")
+			}
+			if first.ctx.Err() == nil || second.ctx.Err() == nil {
+				t.Fatal("completed automation status left the shared context live")
+			}
+		})
+	}
+}
+
 func TestStatus_MonitorAndWatchHungReadsUseOneTwoSecondBudget(t *testing.T) {
 	release := make(chan struct{})
 	var once sync.Once

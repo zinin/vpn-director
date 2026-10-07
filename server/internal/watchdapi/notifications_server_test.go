@@ -1,10 +1,14 @@
 package watchdapi_test
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -312,6 +317,121 @@ func TestNotificationsAPI_ValidationIsAtomic(t *testing.T) {
 			t.Fatal("negative chat acknowledgement left pending messages")
 		}
 	})
+}
+
+type unfinishedNotificationSource struct {
+	*notificationSource
+	recipientsCalls atomic.Int64
+	ackCalls        atomic.Int64
+}
+
+func (s *unfinishedNotificationSource) ReplaceRecipients(recipients []watchdapi.Recipient) error {
+	s.recipientsCalls.Add(1)
+	return s.Store.ReplaceRecipients(recipients)
+}
+
+func (s *unfinishedNotificationSource) Ack(chatID int64, eventID watchdapi.EventID) error {
+	s.ackCalls.Add(1)
+	return s.Store.Ack(chatID, eventID)
+}
+
+func TestNotificationsAPI_UnfinishedPOSTDeadlineIsAtomic(t *testing.T) {
+	for _, name := range []string{"recipients", "ack"} {
+		t.Run(name, func(t *testing.T) {
+			s := newNotificationSource(t, 100, 200)
+			id := publishAPIEvent(t, s, "before unfinished POST")
+			before, err := s.Pending("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			statusBefore := s.Status()
+			durableBefore, err := os.ReadFile(s.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			src := &unfinishedNotificationSource{notificationSource: s}
+			path := notificationSocketPath(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			listener, err := watchdapi.Listen(ctx, path)
+			if err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			served := make(chan error, 1)
+			go func() {
+				served <- watchdapi.ServeListener(ctx, listener, &notificationMonitor{snapshot: watchdapi.Snapshot{State: watchdapi.StateOK}}, src)
+			}()
+			t.Cleanup(func() {
+				cancel()
+				select {
+				case err := <-served:
+					if err != nil {
+						t.Errorf("ServeListener: %v", err)
+					}
+				case <-time.After(3 * time.Second):
+					t.Error("unfinished POST server did not drain")
+				}
+				_ = listener.Close()
+			})
+			conn, err := net.DialTimeout("unix", path, time.Second)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+			body := `{"recipients":[]}`
+			if name == "ack" {
+				body = fmt.Sprintf(`{"chat_id":100,"event_id":%q}`, id)
+			}
+			if err := conn.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			started := time.Now()
+			// The JSON is complete, but one declared body byte never arrives.
+			if _, err := fmt.Fprintf(conn, "POST /v1/notifications/%s HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", name, len(body)+1, body); err != nil {
+				t.Fatal(err)
+			}
+			response, readErr := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+					t.Fatalf("unfinished POST did not receive a server response/close before the client deadline: %v", readErr)
+				}
+			} else {
+				data, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
+				_ = response.Body.Close()
+				var failure struct {
+					Error string `json:"error"`
+				}
+				if err != nil || response.StatusCode != http.StatusBadRequest || json.Unmarshal(data, &failure) != nil || failure.Error != "invalid request body" {
+					t.Fatalf("unfinished POST response=%d/%q error=%v, want safe 400", response.StatusCode, data, err)
+				}
+			}
+			if elapsed := time.Since(started); elapsed < 1500*time.Millisecond || elapsed > 3*time.Second {
+				t.Fatalf("unfinished POST ended after %s, want the server's 2-second body deadline", elapsed)
+			}
+			if src.recipientsCalls.Load() != 0 || src.ackCalls.Load() != 0 {
+				t.Fatalf("unfinished body reached a source mutation: recipients=%d ack=%d", src.recipientsCalls.Load(), src.ackCalls.Load())
+			}
+			after, err := s.Pending("")
+			if err != nil || !reflect.DeepEqual(after, before) || s.Status() != statusBefore {
+				t.Fatalf("unfinished body changed RAM pending/status: %+v, %v", after, err)
+			}
+			durableAfter, err := os.ReadFile(s.path)
+			if err != nil || !bytes.Equal(durableAfter, durableBefore) {
+				t.Fatalf("unfinished body changed durable recipients/ack progress: %v", err)
+			}
+			next := publishAPIEvent(t, s, "after unfinished POST")
+			var want []watchdapi.Notification
+			for _, chatID := range []int64{100, 200} {
+				want = append(want,
+					watchdapi.Notification{ChatID: chatID, EventID: id, At: s.at, Text: "before unfinished POST"},
+					watchdapi.Notification{ChatID: chatID, EventID: next, At: s.at, Text: "after unfinished POST"},
+				)
+			}
+			if got := readAPIPages(t, notificationHandler(s), ""); !reflect.DeepEqual(got, want) {
+				t.Fatalf("unfinished POST altered recipient eligibility or per-chat progress: %+v", got)
+			}
+		})
+	}
 }
 
 func TestPending_PaginationUnderMutation(t *testing.T) {

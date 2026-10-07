@@ -360,6 +360,24 @@ with_mock() {
     [ "${#lines[@]}" -eq 2 ]
 }
 
+@test "platform_vpn_endpoints: preserves every Wireguard peer in a multi-peer array" {
+    load_platform
+    mkdir -p "$BATS_TEST_TMPDIR/rci/show"
+    jq '.Wireguard1.wireguard.peer[0] as $peer |
+        .Wireguard1.wireguard.peer = [
+            ($peer + {"public-key":"PEER_ONE", "remote":"wg-one.example.test"}),
+            ($peer + {"public-key":"PEER_TWO", "remote":"wg-two.example.test"}),
+            ($peer + {"public-key":"PEER_THREE", "remote":"wg-three.example.test"})
+        ]' "$TEST_ROOT/fixtures/keenetic/rci/show/interface.json" \
+        > "$BATS_TEST_TMPDIR/rci/show/interface.json"
+
+    BATS_RCI_FIXTURES="$BATS_TEST_TMPDIR/rci" run platform_vpn_endpoints
+
+    assert_success
+    assert_output $'203.0.113.7\nwg-one.example.test\nwg-two.example.test\nwg-three.example.test'
+    assert_equal "${#lines[@]}" 4
+}
+
 # RCI hands a single Wireguard peer back as an object where several come as an
 # array; the fixture has the array, this is the other shape.
 @test "platform_vpn_endpoints: a lone Wireguard peer arrives as an object" {

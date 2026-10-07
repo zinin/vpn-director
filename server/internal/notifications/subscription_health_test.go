@@ -307,6 +307,167 @@ func TestSubscriptionHealth_UnknownAndInfrastructureFreeze(t *testing.T) {
 	}
 }
 
+func TestSubscriptionHealth_WholeBatchLeaseBoundary(t *testing.T) {
+	for _, stage := range []string{"success", "write", "file_sync", "rename", "directory_sync"} {
+		t.Run(stage, func(t *testing.T) {
+			at := notificationTestTime()
+			now := func() time.Time { return at }
+			path := filepath.Join(t.TempDir(), "watchd-notifications.json")
+			s := newNotificationStore(t, path, now)
+			replaceNotificationRecipients(t, s, watchdapi.Recipient{ChatID: 100, FirstSeen: at})
+			north := healthTestSubscription()
+			south := north
+			south.ID, south.Name = "1b2c3d4e", "South"
+			south.Servers = append([]vpnconfig.Server(nil), north.Servers...)
+			for i := range south.Servers {
+				south.Servers[i].Subscription = south.ID
+			}
+			subs := []vpnconfig.Subscription{north, south}
+			observeSubscriptionHealth(t, s, subs, healthTestSnapshot(north, watchdapi.StatusAlive))
+			var initial savedState
+			if err := json.Unmarshal(readNotificationFile(t, path), &initial); err != nil {
+				t.Fatal(err)
+			}
+			// The private store fixture has one leased ID for a two-event batch.
+			initial.ReservedThrough = initial.Sequence + 1
+			data, err := json.Marshal(initial)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			s.mu.Lock()
+			s.reservedThrough = initial.ReservedThrough
+			beforeRevision, beforeSaved := s.revision, s.savedRevision
+			s.mu.Unlock()
+			before := captureSubscriptionHealth(t, s)
+			durableBefore := readNotificationFile(t, path)
+			if before.sequence != 0 || len(before.health) != 2 || len(before.recent) != 0 || beforeRevision != beforeSaved {
+				t.Fatalf("lease boundary fixture is not a clean, event-free pair of live subscriptions: %+v", before)
+			}
+			assertReservation := func(state savedState) {
+				t.Helper()
+				if state.Version != 1 || state.Epoch != initial.Epoch || state.Sequence != initial.Sequence ||
+					state.ReservedThrough < initial.Sequence+2 || len(state.Recent) != 0 || len(state.Pending) != 0 ||
+					!reflect.DeepEqual(state.Health, initial.Health) || !reflect.DeepEqual(state.Recipients, initial.Recipients) ||
+					!reflect.DeepEqual(state.Closed, initial.Closed) {
+					t.Fatalf("preliminary lease save contains partial health/event intent: %+v", state)
+				}
+			}
+			originalIO := s.io
+			t.Cleanup(func() { s.io = originalIO })
+			var writes []savedState
+			recordWrites := func() {
+				write := s.io.write
+				s.io.write = func(file *os.File, data []byte) (int, error) {
+					var state savedState
+					if err := json.Unmarshal(data, &state); err != nil {
+						t.Errorf("invalid staged lease/batch document: %v", err)
+					}
+					writes = append(writes, state)
+					return write(file, data)
+				}
+			}
+			restore := func() {}
+			if stage != "success" {
+				restore = failNotificationIO(t, s, stage)
+			}
+			recordWrites()
+			dead := healthTestSnapshot(north, watchdapi.StatusDead)
+
+			err = s.ObserveSubscriptions(subs, dead)
+
+			if stage != "success" {
+				if err == nil || len(writes) != 1 {
+					t.Fatalf("reservation %s failure error=%v saves=%d, want an error and only one reservation attempt", stage, err, len(writes))
+				}
+				assertReservation(writes[0])
+				if after := captureSubscriptionHealth(t, s); !reflect.DeepEqual(after, before) {
+					t.Fatalf("failed reservation composed partial RAM health/event/sequence: before=%+v after=%+v", before, after)
+				}
+				s.mu.Lock()
+				reserved, revision, saved := s.reservedThrough, s.revision, s.savedRevision
+				s.mu.Unlock()
+				if reserved != initial.ReservedThrough || revision != beforeRevision || saved != beforeSaved {
+					t.Fatalf("failed reservation committed a RAM lease/revision: lease=%d revision=%d saved=%d", reserved, revision, saved)
+				}
+				if status := s.Status(); status.Pending != 0 || status.StorageError == "" || len(pendingNotifications(t, s)) != 0 {
+					t.Fatalf("failed reservation lost its diagnostic or queued a partial batch: %+v", status)
+				}
+				if stage != "directory_sync" {
+					if !bytes.Equal(readNotificationFile(t, path), durableBefore) {
+						t.Fatal("pre-rename reservation failure changed durable bytes")
+					}
+				} else {
+					var reservedOnly savedState
+					if err := json.Unmarshal(readNotificationFile(t, path), &reservedOnly); err != nil {
+						t.Fatal(err)
+					}
+					assertReservation(reservedOnly)
+					if !reflect.DeepEqual(reservedOnly, writes[0]) {
+						t.Fatal("post-rename sync failure exposed something other than the complete reservation-only document")
+					}
+				}
+				assertNoNotificationTempFiles(t, path)
+				restore()
+				recordWrites()
+				err = s.ObserveSubscriptions(subs, dead)
+			}
+			if err != nil {
+				t.Fatal("whole-batch lease/retry:", err)
+			}
+			offset := 0
+			if stage != "success" {
+				offset = 1
+			}
+			if len(writes) != offset+2 {
+				t.Fatalf("successful boundary/retry wrote %d documents, want reservation-only followed by one full batch after %d failed attempt", len(writes), offset)
+			}
+			assertReservation(writes[offset])
+			full := writes[offset+1]
+			wantHealth := map[string]json.RawMessage{
+				north.ID: json.RawMessage(`{"available":false}`), south.ID: json.RawMessage(`{"available":false}`),
+			}
+			if full.Sequence != initial.Sequence+2 || full.ReservedThrough < full.Sequence || len(full.Recent) != 2 ||
+				len(full.Pending) != 1 || len(full.Pending[100]) != 2 || !reflect.DeepEqual(full.Health, wantHealth) ||
+				!reflect.DeepEqual(full.Recipients, initial.Recipients) || !reflect.DeepEqual(full.Closed, initial.Closed) {
+				t.Fatalf("full save did not atomically compose both health transitions and deliveries: %+v", full)
+			}
+			messages := assertSubscriptionHealthMessages(t, s, []string{
+				"Subscription North has no live servers", "Subscription South has no live servers",
+			})
+			var ids []watchdapi.EventID
+			for i, message := range messages {
+				epoch, sequence := splitNotificationID(t, message.EventID)
+				if epoch != initial.Epoch || sequence != initial.Sequence+uint64(i)+1 || full.Recent[i].EventID != message.EventID ||
+					full.Recent[i].Text != message.Text || !full.Recent[i].At.Equal(at) || !reflect.DeepEqual(full.Pending[100][i], full.Recent[i]) {
+					t.Fatalf("full batch event %d lost its unique sequence, timestamp or per-chat delivery: %+v", i, message)
+				}
+				ids = append(ids, message.EventID)
+			}
+			if ids[0] == ids[1] || s.Status().StorageError != "" {
+				t.Fatal("recovered batch reused an ID or retained a failed-save diagnostic")
+			}
+			var durable savedState
+			if err := json.Unmarshal(readNotificationFile(t, path), &durable); err != nil || !reflect.DeepEqual(durable, full) {
+				t.Fatalf("durable store does not contain the whole final batch: %v", err)
+			}
+			observeSubscriptionHealth(t, s, subs, dead)
+			if len(writes) != offset+2 {
+				t.Fatal("repeated successful observation rewrote or duplicated the confirmed batch")
+			}
+			assertNoNotificationTempFiles(t, path)
+			reopened := newNotificationStore(t, path, now)
+			observeSubscriptionHealth(t, reopened, subs, dead)
+			assertNotificationIDs(t, pendingNotifications(t, reopened), ids)
+			if after := captureSubscriptionHealth(t, reopened); !reflect.DeepEqual(after.health, captureSubscriptionHealth(t, s).health) || reopened.Status().StorageError != "" {
+				t.Fatalf("restart lost confirmed batch health or revived the diagnostic: %+v", after)
+			}
+		})
+	}
+}
+
 func TestSubscriptionHealth_AtomicFailureAndDelete(t *testing.T) {
 	for _, stage := range []string{"write", "file_sync", "rename", "directory_sync"} {
 		t.Run(stage, func(t *testing.T) {
