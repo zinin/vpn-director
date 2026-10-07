@@ -825,3 +825,188 @@ applied_then_moved_by_hand() {
     run ipset test XRAY_CLIENTS 192.168.1.101
     assert_success
 }
+
+# Only path declarations are rehomed; init control flow remains production code.
+watchd_init_sandbox() {
+    export WATCHD_TEST_BIN="$BATS_TEST_TMPDIR/watchd-bin"
+    export WATCHD_TEST_PATH="$BATS_TEST_TMPDIR/vpn-director-watchd"
+    export WATCHD_TEST_CONFIG="$BATS_TEST_TMPDIR/vpn-director.json"
+    export WATCHD_INIT_SURVIVES=0 WATCHD_INIT_FORCE_SURVIVES=0
+    mkdir -p "$WATCHD_TEST_BIN"
+    printf '{}\n' > "$WATCHD_TEST_CONFIG"
+    chmod 600 "$WATCHD_TEST_CONFIG"
+    cat > "$WATCHD_TEST_PATH" <<'EOF'
+#!/bin/sh
+[ "$#" = 2 ] && [ "$1" = --config ] && [ "$2" = "$WATCHD_TEST_CONFIG" ] || exit 99
+printf 'first-owner-4242\n' > "$BATS_TEST_TMPDIR/watchd.running"
+EOF
+    chmod 700 "$WATCHD_TEST_PATH"
+    cat > "$WATCHD_TEST_BIN/pidof" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = vpn-director-watchd ] || exit 99
+[ -f "$BATS_TEST_TMPDIR/watchd.running" ] || exit 1
+printf '4242\n'
+EOF
+    cat > "$WATCHD_TEST_BIN/killall" <<'EOF'
+#!/bin/sh
+printf 'killall %s\n' "$*" >> "$BATS_TEST_TMPDIR/watchd-init.events"
+case "$*" in
+    vpn-director-watchd) survives="$WATCHD_INIT_SURVIVES" ;;
+    '-9 vpn-director-watchd') survives="$WATCHD_INIT_FORCE_SURVIVES" ;;
+    *) exit 99 ;;
+esac
+[ "$survives" = 1 ] || /bin/rm -f "$BATS_TEST_TMPDIR/watchd.running"
+EOF
+    cat > "$WATCHD_TEST_BIN/nohup" <<'EOF'
+#!/bin/sh
+[ "$#" = 3 ] && [ "$1" = "$WATCHD_TEST_PATH" ] && [ "$2" = --config ] && [ "$3" = "$WATCHD_TEST_CONFIG" ] || exit 99
+printf 'nohup %s\n' "$*" >> "$BATS_TEST_TMPDIR/watchd-init.events"
+exec "$@"
+EOF
+    cat > "$WATCHD_TEST_BIN/sleep" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] || exit 99
+printf 'sleep %s\n' "$1" >> "$BATS_TEST_TMPDIR/watchd-init.events"
+case "$1" in
+    1) exit 0 ;;
+    2)
+        count=0
+        while [ ! -f "$BATS_TEST_TMPDIR/watchd.running" ] && [ "$count" -lt 100 ]; do
+            /bin/sleep 0.01
+            count=$((count + 1))
+        done
+        [ -f "$BATS_TEST_TMPDIR/watchd.running" ]
+        ;;
+    *) exit 99 ;;
+esac
+EOF
+    cat > "$WATCHD_TEST_BIN/logger" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/watchd-init.syslog"
+EOF
+    chmod +x "$WATCHD_TEST_BIN/"{pidof,killall,nohup,sleep,logger}
+    sed -e "s#^PATH=.*#PATH=$WATCHD_TEST_BIN:/usr/bin:/bin#" \
+        -e "s#^WATCHD_PATH=.*#WATCHD_PATH=\"$WATCHD_TEST_PATH\"#" \
+        -e "s#^WATCHD_CONFIG=.*#WATCHD_CONFIG=\"$WATCHD_TEST_CONFIG\"#" \
+        "$PROJECT_ROOT/opt/etc/init.d/S98vpn-director-watchd" > "$BATS_TEST_TMPDIR/watchd-init.sh"
+    local file
+    for file in xray.running xray.ready stopped failover_ready; do
+        printf 'preserve %s\n' "$file" > "$BATS_TEST_TMPDIR/$file"
+        chmod 600 "$BATS_TEST_TMPDIR/$file"
+    done
+    WATCHD_PROTECTED_IDENTITY="$(stat -c '%d:%i:%s:%a:%Y' "$WATCHD_TEST_CONFIG" \
+        "$BATS_TEST_TMPDIR/"{xray.running,xray.ready,stopped,failover_ready})"
+}
+
+assert_watchd_init_preserves_routing() {
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$WATCHD_TEST_CONFIG" \
+        "$BATS_TEST_TMPDIR/"{xray.running,xray.ready,stopped,failover_ready})" "$WATCHD_PROTECTED_IDENTITY"
+    local file
+    for file in xray.running xray.ready stopped failover_ready; do
+        assert_equal "$(cat "$BATS_TEST_TMPDIR/$file")" "preserve $file"
+    done
+    assert_equal "$(cat "$WATCHD_TEST_CONFIG")" '{}'
+}
+
+@test "watchd init: shutdown keeps main Xray and routing markers" {
+    watchd_init_sandbox
+    printf 'first-owner-4242\n' > "$BATS_TEST_TMPDIR/watchd.running"
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" stop
+
+    assert_success
+    assert_output --partial "stopped"
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd-init.events")" "killall vpn-director-watchd"
+    assert_watchd_init_preserves_routing
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" check
+    assert_failure
+    assert_output --partial "not running"
+}
+
+@test "watchd init: second start preserves the first instance without spawning another" {
+    watchd_init_sandbox
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" start
+    assert_success
+    assert_output --partial "started"
+    local first_identity first_events
+    first_identity="$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/watchd.running")"
+    first_events="$(cat "$BATS_TEST_TMPDIR/watchd-init.events")"
+    [[ $first_events == *"nohup $WATCHD_TEST_PATH --config $WATCHD_TEST_CONFIG"* ]]
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" start
+
+    assert_success
+    assert_output --partial "already running"
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/watchd.running")" "$first_identity"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.running")" "first-owner-4242"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd-init.events")" "$first_events"
+    assert_watchd_init_preserves_routing
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" check
+    assert_success
+    assert_output --partial "is running"
+}
+
+@test "watchd init: force cleanup is bounded and targets only watchd" {
+    watchd_init_sandbox
+    export WATCHD_INIT_SURVIVES=1
+    printf 'first-owner-4242\n' > "$BATS_TEST_TMPDIR/watchd.running"
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" stop
+
+    assert_success
+    assert_output --partial "Force killing"
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
+    assert_equal "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" 11
+    assert_equal "$(grep '^killall ' "$BATS_TEST_TMPDIR/watchd-init.events")" \
+        $'killall vpn-director-watchd\nkillall -9 vpn-director-watchd'
+    assert_watchd_init_preserves_routing
+}
+
+@test "watchd init: surviving force cleanup refuses restart and preserves the owner" {
+    watchd_init_sandbox
+    export WATCHD_INIT_SURVIVES=1 WATCHD_INIT_FORCE_SURVIVES=1
+    printf 'first-owner-4242\n' > "$BATS_TEST_TMPDIR/watchd.running"
+    local first_identity
+    first_identity="$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/watchd.running")"
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" restart
+
+    assert_failure
+    assert_output --partial "Failed to stop"
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/watchd.running")" "$first_identity"
+    assert_equal "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" 11
+    run cat "$BATS_TEST_TMPDIR/watchd-init.events"
+    refute_output --partial "nohup"
+    assert_watchd_init_preserves_routing
+}
+
+@test "watchd init: partial installation names unavailable automation and recovery" {
+    watchd_init_sandbox
+    chmod -x "$WATCHD_TEST_PATH"
+    local state
+    for state in non-executable missing; do
+        if [[ $state == missing ]]; then
+            rm "$WATCHD_TEST_PATH"
+        fi
+        : > "$BATS_TEST_TMPDIR/watchd-init.syslog"
+
+        run bash -c '
+            /bin/sh "$1" start
+            code=$?
+            [[ ! -e "$BATS_TEST_TMPDIR/watchd-init.syslog" ]] || cat "$BATS_TEST_TMPDIR/watchd-init.syslog"
+            exit "$code"
+        ' bash "$BATS_TEST_TMPDIR/watchd-init.sh"
+
+        assert_success
+        assert_output --partial "$WATCHD_TEST_PATH"
+        assert_output --partial "automatic failover"
+        assert_output --regexp '[Uu]navailable'
+        assert_output --regexp '[Rr]einstall|[Rr]epair|[Rr]estore'
+        [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
+        [[ ! -e "$BATS_TEST_TMPDIR/watchd-init.events" ]]
+        assert_watchd_init_preserves_routing
+    done
+}

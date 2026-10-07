@@ -17,22 +17,24 @@ LOGTAG="S98vpn-director-watchd"
 start() {
     [ "$ENABLED" != "yes" ] && return 0
     if [ ! -x "$WATCHD_PATH" ]; then
-        logger -t "$LOGTAG" "vpn-director-watchd not found at $WATCHD_PATH"
+        echo "Monitoring and automatic failover are unavailable: $WATCHD_PATH is missing or not executable. Reinstall VPN Director to restore it, then run $0 start."
+        logger -t "$LOGTAG" "vpn-director-watchd not found at $WATCHD_PATH; monitoring and automatic failover are unavailable; reinstall VPN Director"
         return 0
     fi
     echo "Starting $DESC..."
     if pidof "$WATCHD_NAME" >/dev/null 2>&1; then
-        echo "$DESC is already running"
+        echo "$DESC is already running; watchd owns monitoring and automatic failover"
         return 0
     fi
     nohup "$WATCHD_PATH" --config "$WATCHD_CONFIG" </dev/null >/dev/null 2>&1 &
     sleep 2
     if pidof "$WATCHD_NAME" >/dev/null 2>&1; then
-        echo "$DESC started"
-        logger -t "$LOGTAG" "Started $DESC"
+        echo "$DESC started; watchd owns monitoring and automatic failover (automation waits for bot compatibility)"
+        logger -t "$LOGTAG" "Started $DESC; watchd owns monitoring and automatic failover"
     else
         echo "Failed to start $DESC"
-        logger -t "$LOGTAG" "Failed to start $DESC"
+        echo "Monitoring and automatic failover are unavailable. Repair the error in /tmp/vpn-director-watchd.log for $WATCHD_PATH and $WATCHD_CONFIG, then run $0 start."
+        logger -t "$LOGTAG" "Failed to start $DESC; monitoring and automatic failover are unavailable; repair using /tmp/vpn-director-watchd.log"
         return 1
     fi
 }

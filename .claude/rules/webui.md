@@ -4,9 +4,11 @@ paths: "server/internal/webapi/**/*, server/internal/auth/**/*, server/cmd/webui
 
 # Web UI
 
-HTTPS interface for VPN Director, served by the `webui` daemon. Shares the
-`internal/service` layer with the Telegram bot; both write `vpn-director.json`
-only through `ConfigService.UpdateVPNConfig`, which holds a `flock`.
+HTTPS interface for VPN Director, served by the `webui` daemon. It shares the
+`internal/service` layer with the Telegram bot and watchd; all three write
+`vpn-director.json` through `ConfigService.UpdateVPNConfig`, which holds a `flock`.
+Watchd owns subscription automation; the Web UI manages it through shared configuration and
+reads monitor/watch status over unix IPC. Bot availability is not an automation prerequisite.
 `configure.sh` and `import_server_list.sh` write that file too and take the
 same lock (`.vpn-director.json.lock`, through `substore_lock` of
 `lib/substore.sh`) around their read-modify-writes. `configure.sh` rebuilds the
@@ -63,20 +65,53 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET/POST/DELETE | `/api/excludes/ips` | Excluded IPs and CIDRs |
 | GET | `/api/monitor` | The server monitor (`watchd.md`): `state` (`not_running` when `vpn-director-watchd` does not answer), `message`, `interval_seconds`, `lag_seconds`, and per subscription `id`, `alive`, `total` and its servers in list order: `index`, `fingerprint`, `status`, `latency_ms`, `checked_at`, `since`, `next_at`, `error` |
 | POST | `/api/monitor/check` | Check one server now - `{subscription, index, fingerprint}`, every address of it - or `{}` for every server; 409 "server list changed" when the fingerprint at that index is another server's, 409 while the monitor is stopped or disabled, 503 when the daemon does not answer |
+| GET | `/api/watch` | Independent subscription automation: `state`, `updated_at`, `message`, `action`, `committed_failover`, `pending_restore`, `notifications.pending` and `notifications.storage_error`; `not_running` when watch IPC is missing/unavailable |
 | GET | `/api/logs` | One source (`?source=`: `bot`, `vpn`, `xray`, `webui`, `watchd`) or every source at once |
 | GET | `/api/config` | `vpn-director.json` with `jwt_secret` blanked — subscription links live in their own files |
 | GET | `/api/update/check` | Latest release; `?force=1` pierces the 30-minute cache |
 | POST | `/api/update` | Starts the unified update, answers 202 |
 | GET | `/api/update/status` | Whether an update is running |
 
-`xray.active_server` is the only record of which server is running.
-`config.json` carries just the outbound, and a subscription routinely puts many
+## Independent monitoring and automation status
+
+`GET /api/monitor` reports endpoint checks; `GET /api/watch` reports watch availability and
+recovery intent. Both are authenticated read-only routes. Watch states are `starting`, `active`,
+`stopped`, `incompatible`, `error`, `not_running`; they are not aliases for monitor states.
+Disabling `monitor.enabled` disables the monitor/prober, not watchd's legacy failover. Old
+installed/running/deleted bot executables keep watch `incompatible` without suppressing monitor
+marks. Missing watch IPC, including an older daemon that serves only monitoring, is
+`not_running` for automation; do not infer watch health from a successful monitor response.
+
+`ServersTab.vue` polls watch state independently of the server list and monitor marks, and
+`WatchStatus.vue` shows action, committed failover, pending restore and queue pending/storage
+error. Unavailable or failed watch reads clear stale status rather than implying healthy
+failover. `active` describes an available worker, not proof that it is armed or that every
+notification is durable. Committed failover and pending restore are separate booleans; a restore
+can remain pending across watchd restart until readiness/apply succeeds. Logs use source `watchd`
+(`/tmp/vpn-director-watchd.log`) independently of bot/webui logs.
+
+Watchd alone owns the durable 20-per-chat/12-hour notification queue (`watchd.md`); the Web UI
+reads its health, not pending messages or ack progress. Telegram recipient sync, delivery and
+ack are bot-to-watchd IPC, not browser endpoints. `storage_error` indicates persistence is
+degraded while monitoring/failover can continue; it must not be hidden behind an `active` label.
+
+Manual selection increments `active_server.seq`, even for the same server, fencing a stale
+walk/return. `/api/stop` writes the stopped marker before teardown, and watch guards recheck it
+after waits and under the config lock. Automatic apply/restart uses `--unless-stopped`; a daemon
+shutdown alone leaves main Xray/routes intact. See `watchd.md` for pending restore and
+make-before-break rules, rather than clearing those records from the UI to force recovery.
+
+## Active server and configuration writes
+
+`xray.active_server` is the recorded selection used by the UI, not proof of process or route
+health. `config.json` carries just the outbound, and a subscription routinely puts many
 names behind one `address:port` - the router this was written on has 62 servers
 across 9 endpoints and one UUID - so the name cannot be recovered from it
 afterwards. Every path that generates `config.json` writes the record, and
 writes it **under the same config lock as the generation**: the three Go paths
-— the Web UI, the bot's `/xray`, the wizard — through
-`service.GenerateAndRecordActiveServer`, and `configure.sh` by holding its
+for manual selection — the Web UI, the bot's `/xray`, the wizard — through
+`service.GenerateAndRecordActiveServer`; watchd uses
+`service.GenerateAndRecordGuardedWalkedServer`, and `configure.sh` holds its
 `flock` across both steps. Without one lock a switch from the other daemon can
 land between this one's `config.json` and its record, and the two then name
 different servers with both switches reporting success.
@@ -100,7 +135,7 @@ material stay out. It is absent, and `active` is `null`, until something
 selects a server.
 
 `xray.preferred_server`, in the same fields, is the server the user chose
-while the bot's subscription walk has `active_server` on another one (see
+while watchd's subscription walk has `active_server` on another one (see
 `telegram-bot.md`). A selection is a new choice, so all three Go paths clear it
 and `configure.sh` deletes it; the delete of its subscription clears it too,
 from the daemons and from `import_server_list.sh` alike.
@@ -159,7 +194,7 @@ longer than the deadline", 502 for an add — and publishes nothing: the servers
 resolved by then are not the subscription.
 
 `POST /api/servers/active` names the subscription and the server as well as
-the index, counted within that subscription. The bot's subscription watch or a
+the index, counted within that subscription. Watchd's subscription watch or a
 refresh in another tab can replace a list between the page load and the click,
 and the index then names another server; a subscription deleted meanwhile is
 gone altogether. Either way the route answers 409 "server list changed" and
@@ -211,7 +246,12 @@ Plain HTTP instead of TLS, `server/testdata/dev/` for config, shadow and logs,
 `devmode.Executor` instead of real shell commands, and an `admin`/`admin`
 shadow file created on first run. `testdata/dev/vpn-director.json` is
 gitignored, and so is `testdata/dev/data/`, the dev `data_dir`: a subscription
-added in dev mode is written there, link and all.
+added in dev mode is written there, link and all. Run a separate `watchd --dev` with the same
+dev paths to see independent automation status; without watch IPC, the page reports
+`not_running`. Watchd uses fake endpoint health, mock shell and bypassed router bot attestation,
+but still writes dev configuration and queue files. Use synthetic data and RFC1918 LAN-client
+examples. These observations do not prove real Xray/Telegram/router behavior or authorize
+hardware changes; dev mode is not an OS/network sandbox.
 
 ## Build with embed
 
@@ -274,8 +314,11 @@ installs and starts anyway, so the trust does not change.
 ## Known limits
 
 - The update script is a **restart** net, not a **rollback** net: its `EXIT`
-  trap brings back the daemons that were running, but a failure part-way
-  through the copy step leaves a mixed set of files.
+  trap restores originally running daemons, leaves originally stopped ones stopped and removes
+  owned attempted first-copy daemons. A partial copy can still leave mixed versions. First
+  watchd/new bot introduction runs non-bot daemons before terminal status and bot startup;
+  old installed/running/deleted bot bytes can keep watchd automation incompatible while its
+  monitoring remains available. Repair the installation, not the capability gate; see `watchd.md`.
 - Three GitHub consumers share the unauthenticated 60-requests-per-hour budget:
   the bot's `Flow`, the Web UI's `Flow` (separate processes, separate caches)
   and `updatechecker`'s own ticker. Nothing coordinates them.

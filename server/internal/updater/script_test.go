@@ -1453,6 +1453,8 @@ type firstInstallSandbox struct {
 	s               *Service
 	originalRunning []string
 	newDaemons      []string
+	binaryPayload   map[string]string
+	env             []string
 }
 
 type firstInstallResult struct{ calls, out, log string }
@@ -1604,7 +1606,11 @@ func (s *firstInstallSandbox) run(failure, mode string) firstInstallResult {
 		s.write(filepath.Join(s.s.getFilesDir(), src), body, 0644)
 	}
 	for _, d := range Daemons {
-		s.write(filepath.Join(s.s.getFilesDir(), d.Name), "new "+d.Name+"\n", 0644)
+		body := "new " + d.Name + "\n"
+		if payload, ok := s.binaryPayload[d.Name]; ok {
+			body = payload
+		}
+		s.write(filepath.Join(s.s.getFilesDir(), d.Name), body, 0644)
 	}
 	if err := os.Remove(filepath.Join(s.state, "fault")); err != nil && !os.IsNotExist(err) {
 		s.t.Fatal(err)
@@ -1627,6 +1633,7 @@ func (s *firstInstallSandbox) run(failure, mode string) firstInstallResult {
 	cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+s.root, "SANDBOX_ROOT_PATTERN="+regexp.QuoteMeta(s.root), "STATE_DIR="+s.state,
 		"FILES_DIR="+s.s.getFilesDir(), "LOCK_FILE="+filepath.Join(s.s.getUpdateDir(), "lock"),
 		"CALLS_FILE="+s.calls, "FAIL_AT="+failure, "STOP_NEW_FAIL=0", "CLEANUP_MODE="+mode)
+	cmd.Env = append(cmd.Env, s.env...)
 	cmd.WaitDelay = time.Second
 	out, runErr := cmd.CombinedOutput()
 	if ctx.Err() != nil {

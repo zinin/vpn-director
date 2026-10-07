@@ -922,6 +922,7 @@ EOF
             assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.chmod.calls")" $'+x\n'"$VPD_DIR/vpn-director-watchd"
             ;;
     esac
+    assert_watchd_repair_hint
     refute_output --partial "Installed the server monitor"
     [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
     [[ ! -f "$BATS_TEST_TMPDIR/watchd.running" ]]
@@ -959,6 +960,140 @@ EOF
 @test "download_watchd: a failed chmod is optional for a conditional caller and keeps the moved binary" {
     load_installer
     watchd_install_failure_case chmod conditional
+}
+
+# Missing automation must name both the lost function and a recovery action.
+assert_watchd_repair_hint() {
+    assert_output --partial "automatic failover"
+    assert_output --regexp '[Uu]navailable'
+    assert_output --regexp '[Rr]einstall|[Rr]epair|[Rr]estore'
+}
+
+@test "watchd install: independent startup and visible partial installation" {
+    load_installer
+    fake_watchd_init 0
+    printf '{}\n' > "$VPD_DIR/vpn-director.json"
+    touch "$VPD_DIR/vpn-director-watchd"
+    chmod +x "$VPD_DIR/vpn-director-watchd"
+
+    run start_watchd
+
+    assert_success
+    assert_output --partial "Server monitor started"
+    assert_output --partial "automatic failover"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.calls")" "start"
+    [[ ! -e "$VPD_DIR/telegram-bot" ]]
+    [[ ! -e "$VPD_DIR/telegram-bot.json" ]]
+
+    printf '%s\n' '{"bot_token":"","allowed_users":[],"log_level":"info","update_check_interval":"1h"}' > "$VPD_DIR/telegram-bot.json"
+    run start_watchd
+
+    assert_success
+    assert_output --partial "Server monitor started"
+    assert_output --partial "automatic failover"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.calls")" $'start\nstart'
+    assert_equal "$(cat "$VPD_DIR/telegram-bot.json")" '{"bot_token":"","allowed_users":[],"log_level":"info","update_check_interval":"1h"}'
+}
+
+@test "watchd install: missing or non-executable binary explains unavailable automation" {
+    load_installer
+    fake_watchd_init 0
+    local state
+    for state in missing non-executable; do
+        if [[ $state == non-executable ]]; then
+            printf 'partial monitor\n' > "$VPD_DIR/vpn-director-watchd"
+            chmod 600 "$VPD_DIR/vpn-director-watchd"
+        fi
+
+        run start_watchd
+
+        assert_success
+        assert_watchd_repair_hint
+        assert_output --partial "$VPD_DIR/vpn-director-watchd"
+        refute_output --partial "Server monitor started"
+        [[ ! -e "$BATS_TEST_TMPDIR/watchd.calls" ]]
+    done
+    assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "partial monitor"
+    [[ ! -x "$VPD_DIR/vpn-director-watchd" ]]
+}
+
+@test "watchd install: missing or non-executable init explains unavailable automation" {
+    load_installer
+    touch "$VPD_DIR/vpn-director-watchd"
+    chmod +x "$VPD_DIR/vpn-director-watchd"
+    local state
+    for state in missing non-executable; do
+        if [[ $state == non-executable ]]; then
+            fake_watchd_init 0
+            chmod -x "$INIT_DIR/S98vpn-director-watchd"
+        fi
+
+        run start_watchd
+
+        assert_success
+        assert_output --partial "Server monitor init script not found, skipping start"
+        assert_watchd_repair_hint
+        assert_output --partial "$INIT_DIR/S98vpn-director-watchd"
+        refute_output --partial "Server monitor started"
+        [[ ! -e "$BATS_TEST_TMPDIR/watchd.calls" ]]
+    done
+}
+
+@test "watchd install: failed start explains unavailable automation without stopping Web UI" {
+    load_installer
+    touch "$VPD_DIR/"{webui,vpn-director-watchd}
+    chmod +x "$VPD_DIR/"{webui,vpn-director-watchd}
+    fake_init 0
+    fake_watchd_init 1
+
+    run bash -c '
+        source "$1" --source-only
+        VPD_DIR="$2" INIT_DIR="$3"
+        lan_ip() { printf "192.0.2.1\n"; }
+        start_watchd
+        start_webui
+        printf "installer continued\n"
+    ' bash "$PROJECT_ROOT/../install.sh" "$VPD_DIR" "$INIT_DIR"
+
+    assert_success
+    assert_output --partial "Failed to start the server monitor"
+    assert_watchd_repair_hint
+    assert_output --partial "/tmp/vpn-director-watchd.log"
+    assert_output --partial "Web UI started: https://192.0.2.1:8444"
+    assert_output --partial "installer continued"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.calls")" "start"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/init.calls")" "start"
+}
+
+@test "watchd install: failed first download is visible and main still starts Web UI" {
+    load_installer
+    watchd_download_sandbox
+    export WATCHD_DOWNLOAD_EXIT=22
+    touch "$VPD_DIR/webui"
+    chmod +x "$VPD_DIR/webui"
+    fake_init 0
+    fake_watchd_init 0
+    local step
+    for step in print_header detect_platform check_environment resolve_release_tag create_directories \
+        download_scripts load_platform_lib download_telegram_bot download_webui generate_tls_cert print_next_steps; do
+        eval "$step() { printf '%s\\n' '$step' >> \"\$BATS_TEST_TMPDIR/main.calls\"; }"
+    done
+    setup_webui_config() {
+        printf '{}\n' > "$VPD_DIR/vpn-director.json"
+    }
+
+    run main
+
+    assert_success
+    assert_output --partial "Warning: Failed to download the server monitor (optional component)"
+    assert_watchd_repair_hint
+    assert_output --partial "Web UI started"
+    refute_output --partial "Server monitor started"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/init.calls")" "start"
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.calls" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd" ]]
+    [[ ! -e "$VPD_DIR/vpn-director-watchd.tmp" ]]
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.events")" "curl"
 }
 
 @test "main: downloads the optional monitor and starts it only after the config exists" {

@@ -554,6 +554,7 @@ download_watchd() {
     local arch_suffix
     if ! arch_suffix="$(release_arch)"; then
         print_info "Architecture $(uname -m) not supported for the server monitor (optional component)"
+        print_info "Monitoring and automatic failover are unavailable without $VPD_DIR/vpn-director-watchd. Restore a supported build at that path, then run $INIT_DIR/S98vpn-director-watchd start."
         return 0
     fi
     local watchd_path="$VPD_DIR/vpn-director-watchd"
@@ -561,6 +562,7 @@ download_watchd() {
 
     if ! curl -fsSL "$RELEASE_ASSET_URL/vpn-director-watchd-$arch_suffix" -o "$tmp_path"; then
         print_info "Warning: Failed to download the server monitor (optional component)"
+        print_info "Monitoring and automatic failover are unavailable without an executable $watchd_path. Reinstall VPN Director to restore the missing binary; any previously running daemon has not been stopped."
         rm -f "$tmp_path" 2>/dev/null || true
         return 0
     fi
@@ -578,17 +580,20 @@ download_watchd() {
     fi
     if pidof vpn-director-watchd >/dev/null 2>&1; then
         print_info "Warning: Failed to stop the server monitor; keeping the installed binary"
+        print_info "The upgrade of monitoring and automatic failover is unavailable while the old daemon is running. Repair the stop failure using $INIT_DIR/S98vpn-director-watchd and /tmp/vpn-director-watchd.log, then reinstall $watchd_path."
         rm -f "$tmp_path" 2>/dev/null || true
         return 0
     fi
 
     if ! mv "$tmp_path" "$watchd_path"; then
         print_info "Warning: Failed to move the server monitor binary (optional component)"
+        print_info "Monitoring and automatic failover are unavailable while watchd is stopped. Reinstall VPN Director to repair the replacement of $watchd_path, then run $INIT_DIR/S98vpn-director-watchd start."
         rm -f "$tmp_path" 2>/dev/null || true
         return 0
     fi
     if ! chmod +x "$watchd_path"; then
         print_info "Warning: Failed to make the server monitor executable (optional component)"
+        print_info "Monitoring and automatic failover are unavailable: $watchd_path is not executable. Reinstall VPN Director to restore it, then run $INIT_DIR/S98vpn-director-watchd start."
         rm -f "$tmp_path" 2>/dev/null || true
         return 0
     fi
@@ -645,18 +650,21 @@ start_watchd() {
     # download_watchd skips unsupported architectures and tolerates a failed
     # download, so there is not always something to start.
     if [[ ! -x "$watchd_path" ]]; then
+        print_info "Monitoring and automatic failover are unavailable: $watchd_path is missing or not executable. Reinstall VPN Director to restore the daemon, then run $init_script start."
         return 0
     fi
     if [[ ! -x "$init_script" ]]; then
         print_info "Server monitor init script not found, skipping start"
+        print_info "Monitoring and automatic failover are unavailable: $init_script is missing or not executable. Reinstall VPN Director to restore the init script, then run $init_script start."
         return 0
     fi
     # The init script's start is a no-op when the monitor is up.
     if ! "$init_script" start >/dev/null 2>&1; then
         print_error "Failed to start the server monitor - see /tmp/vpn-director-watchd.log"
+        print_info "Monitoring and automatic failover are unavailable. Repair the error reported in /tmp/vpn-director-watchd.log for $watchd_path and $VPD_DIR/vpn-director.json, then run $init_script start."
         return 0
     fi
-    print_success "Server monitor started"
+    print_success "Server monitor started; watchd owns monitoring and automatic failover (automation waits for bot compatibility)"
 }
 
 ###############################################################################
