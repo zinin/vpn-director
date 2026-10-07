@@ -21,6 +21,7 @@ import type {
   UpdateStartResponse,
   UpdateStatusResponse,
   VersionResponse,
+  WatchResponse,
 } from './types'
 
 const api = axios.create({
@@ -107,6 +108,10 @@ export default {
     api.post<{ queued: number }>('/api/monitor/check', { subscription, index, fingerprint }, { timeout: 8000 }),
   checkAllServers: () =>
     api.post<{ queued: number }>('/api/monitor/check', {}, { timeout: 8000 }),
+
+  // Subscription automation
+  getWatch: () =>
+    api.get<WatchResponse>('/api/watch', { timeout: 8000 }),
 
   // Clients
   getClients: () =>

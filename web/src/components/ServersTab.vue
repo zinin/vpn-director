@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import api from '../api'
+import WatchStatus from './WatchStatus.vue'
 import type {
   ActiveServer,
   MonitorResponse,
@@ -8,6 +9,7 @@ import type {
   ServerHealth,
   Subscription,
   SubscriptionServers,
+  WatchResponse,
 } from '../types'
 
 const subscriptions = ref<Subscription[]>([])
@@ -27,6 +29,8 @@ const summaries = ref<string[]>([])
 // The server monitor's answer, polled while the tab is open.
 const monitor = ref<MonitorResponse | null>(null)
 const monitorUnavailable = ref(false)
+const watch = ref<WatchResponse | null>(null)
+const watchUnavailable = ref(false)
 // The check being sent: 'all' or '<subscription>:<index>'.
 const checking = ref('')
 const checkNotice = ref('')
@@ -35,23 +39,49 @@ let poll: ReturnType<typeof setInterval> | undefined
 let recheck: ReturnType<typeof setTimeout> | undefined
 let unmounted = false
 let monitorRequest = 0
+let watchRequest = 0
+let listRequest = 0
+let listLoaded = false
+let checkRequest = 0
 
 function errorText(e: any): string {
   return e?.response?.data?.error || e?.message || 'unknown error'
 }
 
 async function load() {
+  if (unmounted) return
+  const request = ++listRequest
   loading.value = true
   error.value = ''
+  const watchRead = loadWatch()
   try {
     const [subsRes, serversRes] = await Promise.all([api.getSubscriptions(), api.getServers()])
+    if (unmounted || request !== listRequest) return
     subscriptions.value = subsRes.data.subscriptions ?? []
     groups.value = serversRes.data.subscriptions ?? []
     active.value = serversRes.data.active ?? null
+    listLoaded = true
   } catch (e: any) {
+    if (unmounted || request !== listRequest) return
     error.value = errorText(e)
   } finally {
-    loading.value = false
+    if (!unmounted && request === listRequest) loading.value = false
+  }
+  await watchRead
+}
+
+async function loadWatch() {
+  if (unmounted) return
+  const request = ++watchRequest
+  try {
+    const resp = await api.getWatch()
+    if (unmounted || request !== watchRequest) return
+    watch.value = resp.data
+    watchUnavailable.value = false
+  } catch {
+    if (unmounted || request !== watchRequest) return
+    watch.value = null
+    watchUnavailable.value = true
   }
 }
 
@@ -107,7 +137,8 @@ async function loadMonitor() {
     monitorUnavailable.value = false
     monitor.value = resp.data
     if (monitor.value?.state !== 'wan_down') clearCheckNotice()
-    if (listChanged()) await load()
+    // The first monitor reply can precede the initial server list.
+    if (listLoaded && listChanged()) await load()
   } catch {
     if (unmounted || request !== monitorRequest) return
     monitorUnavailable.value = true
@@ -207,6 +238,8 @@ function clearCheckNotice() {
 
 // A check answers within seconds: the page looks again before the next poll.
 async function sendCheck(what: string, fn: () => Promise<{ data: { queued: number } }>) {
+  if (unmounted) return
+  const request = ++checkRequest
   const noticeGeneration = clearCheckNotice()
   checking.value = what
   try {
@@ -219,13 +252,14 @@ async function sendCheck(what: string, fn: () => Promise<{ data: { queued: numbe
       recheck = setTimeout(loadMonitor, 3000)
     }
   } catch (e: any) {
+    if (unmounted || request !== checkRequest) return
     if (e.response?.status === 409 && e.response?.data?.error === 'server list changed') {
       await load()
     } else {
       alert('Error: ' + errorText(e))
     }
   } finally {
-    checking.value = ''
+    if (!unmounted && request === checkRequest) checking.value = ''
   }
 }
 
@@ -238,16 +272,19 @@ function checkAll() {
 }
 
 async function run(what: string, fn: () => Promise<void>) {
+  if (unmounted || busy.value) return
   busy.value = what
   try {
     await fn()
   } catch (e: any) {
+    if (unmounted) return
     alert('Error: ' + errorText(e))
     // A failure can still have changed the list: "saved, but" and "deleted,
     // but" answers, or a 404 for a subscription deleted meanwhile.
     await load()
+    await loadMonitor()
   } finally {
-    busy.value = ''
+    if (!unmounted) busy.value = ''
   }
 }
 
@@ -256,12 +293,14 @@ function addSubscription() {
   return run('add', async () => {
     summaries.value = []
     const resp = await api.addSubscription(addUrl.value.trim(), addName.value.trim())
+    if (unmounted) return
     summaries.value = resp.data.existed
       ? [resp.data.summary, 'The link was saved already; its list was refreshed.']
       : [resp.data.summary]
     addUrl.value = ''
     addName.value = ''
     await load()
+    await loadMonitor()
   })
 }
 
@@ -269,70 +308,94 @@ function refresh(id?: string) {
   return run(id ? 'refresh:' + id : 'refresh-all', async () => {
     summaries.value = []
     const resp = await api.refreshSubscription(id)
+    if (unmounted) return
     summaries.value = (resp.data.results ?? []).map((r) => r.summary)
     await load()
+    await loadMonitor()
   })
 }
 
 function startRename(sub: Subscription) {
+  if (unmounted || busy.value) return
   renaming.value = sub.id
   renameText.value = sub.name
 }
 
 function saveRename(sub: Subscription) {
   // Enter reaches here while the ✓ button is disabled.
-  if (busy.value) return
+  if (unmounted || busy.value) return
   return run('rename:' + sub.id, async () => {
     await api.renameSubscription(sub.id, renameText.value.trim())
+    if (unmounted) return
     renaming.value = ''
     await load()
+    await loadMonitor()
   })
 }
 
 function remove(sub: Subscription) {
+  if (unmounted || busy.value) return
   const warn = runsFrom(sub.id)
     ? '\n\nThe running Xray server comes from it. Xray keeps running it until you select another.'
     : ''
   if (!confirm(`Delete the subscription ${sub.name} and its ${sub.servers} servers?${warn}`)) return
   return run('delete:' + sub.id, async () => {
     const resp = await api.deleteSubscription(sub.id)
+    if (unmounted) return
     if (resp.data.active_removed) {
       alert('The running server is no longer in any subscription. Select another server.')
     }
     await load()
+    await loadMonitor()
   })
 }
 
 async function selectServer(group: SubscriptionServers, index: number) {
+  if (unmounted || busy.value) return
   const server = group.servers?.[index]
   if (!server) return
   busy.value = `select:${group.id}:${index}`
   try {
     await api.selectServer(group.id, index, server)
+    if (unmounted) return
     alert(`Server selected: ${group.name} / ${server.name}`)
     await load()
+    await loadMonitor()
   } catch (e: any) {
+    if (unmounted) return
     if (e.response?.status === 409) {
       // A refresh on the router - the bot's subscription watch, an import in
       // another tab - moved the list since it was shown.
       alert('The server list changed; it has been reloaded. Select the server again.')
       await load()
+      await loadMonitor()
     } else {
       alert('Error: ' + errorText(e))
+      await load()
+      await loadMonitor()
     }
   } finally {
-    busy.value = ''
+    if (!unmounted) busy.value = ''
   }
+}
+
+async function pollStatus() {
+  if (unmounted) return
+  await Promise.all([loadMonitor(), loadWatch()])
 }
 
 onMounted(() => {
   load()
   loadMonitor()
-  poll = setInterval(loadMonitor, 15000)
+  poll = setInterval(pollStatus, 15000)
 })
 
 onUnmounted(() => {
   unmounted = true
+  listRequest++
+  monitorRequest++
+  watchRequest++
+  checkRequest++
   clearCheckNotice()
   clearInterval(poll)
   clearTimeout(recheck)
@@ -438,6 +501,7 @@ onUnmounted(() => {
       </button>
     </p>
     <p v-if="checkNotice" class="kv-label" style="margin: 0 0 0.75rem;" role="status">{{ checkNotice }}</p>
+    <WatchStatus :snapshot="watch" :unavailable="watchUnavailable" style="margin-bottom: 0.75rem;" />
     <details
       v-for="group in groups"
       :key="group.id"

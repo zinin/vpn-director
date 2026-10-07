@@ -30,12 +30,16 @@ function setup() {
     getMonitor: () => { const d = deferred(); pending.push(d); return d.promise },
     getSubscriptions: async () => ({ data: { subscriptions: [] } }),
     getServers: async () => ({ data: { subscriptions: groups, active: null } }),
+    getWatch: async () => ({ data: { state: 'active', updated_at: '2026-10-07T12:00:00Z', committed_failover: false, pending_restore: false, notifications: { pending: 0 } } }),
     checkServer: (...args) => { checks.push({ kind: 'one', args }); return checkResult() },
     checkAllServers: () => { checks.push({ kind: 'all', args: [] }); return checkResult() },
   }
   let timer = 0
   const vue = { ref: value => ({ value }), computed: fn => ({ get value() { return fn() } }), onMounted: () => {}, onUnmounted: fn => unmount.push(fn) }
-  const context = { exports: {}, require: name => name === 'vue' ? vue : { default: api }, Date, AbortController,
+  const context = { exports: {}, require: name => name === 'vue' ? vue
+    : name === '../watch' ? require('./watch-status.cjs').loadWatchModule()
+    : name === './WatchStatus.vue' ? { default: { filename: path.join(sourceRoot, 'components/WatchStatus.vue') } }
+    : { default: api }, Date, AbortController,
     alert: message => alerts.push(message), confirm: () => true,
     setTimeout: (fn, ms) => { timers.set(++timer, { fn, ms }); return timer }, clearTimeout: id => timers.delete(id),
     setInterval: (fn, ms) => { timers.set(++timer, { fn, ms }); return timer }, clearInterval: id => timers.delete(id) }
@@ -337,6 +341,373 @@ async function showWANNotice(c) {
       assert.equal([...c.timers.values()][0].ms, 3000)
     })
   }
+  const watchVM = require('./watch-status.cjs')
+  await test('Task14 watch outage and storage recovery preserve WAN notice and real health', async () => {
+    const http = watchVM.makeHTTP()
+    http.set('/api/monitor', watchVM.wanHealth)
+    const c = watchVM.setupPage('Servers', http)
+    await c.mount()
+    const check = watchVM.click(c, 'Check all now')
+    const post = http.pending('/api/monitor/check')[0]
+    assert.equal(JSON.stringify(post.body), '{}')
+    assert.equal(post.options.timeout, 8000)
+    assert.equal(c.x.checking.value, 'all')
+    assert.equal(c.x.checkNotice.value, '')
+    http.answer(post, { queued: 1 }); await check
+    assert.equal(c.x.checkNotice.value, queuedNotice)
+    assert.equal(c.x.checking.value, '')
+    http.fail('/api/watch')
+    await c.x.load(); await watchVM.flush()
+    assert.equal(watchVM.watchProps(c).unavailable, true)
+    assert.equal(c.x.checkNotice.value, queuedNotice)
+    assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+    assert.equal(c.x.canCheck.value, true)
+    assert.equal(c.x.aliveText('0a1b2c3d'), '2/2 alive')
+    assert.equal(c.x.healthOf(watchVM.group, 0, watchVM.primary).status, 'alive')
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.primary), true)
+    http.recover('/api/watch')
+    http.set('/api/watch', { ...watchVM.watch, notifications: { pending: 2, storage_error: 'Notification storage is unavailable' } })
+    await c.x.load(); await watchVM.flush()
+    assert.equal(watchVM.watchProps(c).unavailable, false)
+    assert.equal(watchVM.watchProps(c).snapshot.state, 'active')
+    assert.match(watchVM.watchDisplay(c), /Notification storage is unavailable/)
+    assert.equal(c.x.checkNotice.value, queuedNotice)
+    assert.equal(c.x.healthOf(watchVM.group, 0, watchVM.primary).latency_ms, 142)
+    assert.equal(http.calls('/api/monitor/check', 'POST').length, 1)
+    const recheck = [...c.timers.entries()].find(([, t]) => t.kind === 'timeout')
+    assert.equal(recheck[1].ms, 3000)
+    await c.fire(recheck[0])
+    assert.equal(c.x.checkNotice.value, queuedNotice)
+    assert.equal(c.x.canCheck.value, true)
+    c.unmount()
+    assert.equal(c.timers.size, 0)
+  })
+  await test('Task14 monitor failure alone clears WAN notice without hiding active watch', async () => {
+    const http = watchVM.makeHTTP()
+    http.set('/api/monitor', watchVM.wanHealth)
+    const c = watchVM.setupPage('Servers', http)
+    await c.mount()
+    const check = watchVM.click(c, 'Check all now')
+    http.answer(http.pending('/api/monitor/check')[0], { queued: 1 }); await check
+    assert.equal(c.x.checkNotice.value, queuedNotice)
+    http.fail('/api/monitor')
+    await c.x.loadMonitor(); await watchVM.flush()
+    assert.equal(c.x.checkNotice.value, '')
+    assert.equal(c.x.monitorLine.value, 'Monitoring: unavailable')
+    assert.equal(c.x.canCheck.value, false)
+    assert.equal(c.x.aliveText('0a1b2c3d'), '')
+    assert.equal(c.x.healthOf(watchVM.group, 0, watchVM.primary), null)
+    assert.equal(watchVM.watchProps(c).snapshot.state, 'active')
+    assert.equal(watchVM.watchProps(c).unavailable, false)
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.primary), true)
+    http.recover('/api/monitor')
+    http.set('/api/watch', { ...watchVM.watch, state: 'incompatible', message: 'Bot compatibility is unconfirmed' })
+    await c.x.load(); await c.x.loadMonitor(); await watchVM.flush()
+    assert.equal(c.x.checkNotice.value, '')
+    assert.equal(c.x.canCheck.value, true)
+    assert.equal(c.x.aliveText('0a1b2c3d'), '2/2 alive')
+    assert.equal(watchVM.watchProps(c).snapshot.state, 'incompatible')
+    assert.match(watchVM.watchDisplay(c), /Bot compatibility is unconfirmed/)
+    assert.equal(http.calls('/api/monitor/check', 'POST').length, 1)
+    c.unmount()
+  })
+  await test('Task14 the shared poll keeps watch and monitor request generations separate', async () => {
+    const http = watchVM.makeHTTP()
+    http.set('/api/monitor', watchVM.wanHealth)
+    const c = watchVM.setupPage('Servers', http)
+    await c.mount()
+    const check = watchVM.click(c, 'Check all now')
+    http.answer(http.pending('/api/monitor/check')[0], { queued: 1 }); await check
+    assert.equal(c.x.checkNotice.value, queuedNotice)
+    http.hold('/api/monitor'); http.hold('/api/watch')
+    const polls = [...c.timers.values()].filter(t => t.kind === 'interval')
+    assert.equal(polls.length, 1)
+    polls[0].fn(); await watchVM.flush()
+    polls[0].fn(); await watchVM.flush()
+    assert.equal(http.pending('/api/watch').length, 2)
+    assert.equal(http.pending('/api/monitor').length, 2)
+    const [oldWatch, newWatch] = http.pending('/api/watch')
+    const [oldMonitor, newMonitor] = http.pending('/api/monitor')
+    http.reject(newWatch); http.answer(newMonitor, watchVM.wanHealth)
+    await watchVM.flush()
+    http.answer(oldWatch, watchVM.watch); http.reject(oldMonitor)
+    await watchVM.flush()
+    assert.equal(watchVM.watchProps(c).unavailable, true)
+    assert.equal(c.x.checkNotice.value, queuedNotice)
+    assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+    assert.equal(c.x.canCheck.value, true)
+    assert.equal(c.x.aliveText('0a1b2c3d'), '2/2 alive')
+    assert.equal(c.x.healthOf(watchVM.group, 0, watchVM.primary).fingerprint, 'abcdef01')
+    assert.equal(http.calls('/api/monitor/check', 'POST').length, 1)
+    const callbacks = [...c.timers.values()].map(t => t.fn)
+    c.unmount()
+    const requests = http.requests.length
+    callbacks.forEach(fn => fn()); await watchVM.flush()
+    assert.equal(c.x.checkNotice.value, '')
+    assert.equal(c.timers.size, 0)
+    assert.equal(http.requests.length, requests)
+  })
+  await test('Task14 selection and check 409 reloads remain usable during watch outage', async () => {
+    const http = watchVM.makeHTTP()
+    http.fail('/api/watch')
+    const c = watchVM.setupPage('Servers', http)
+    await c.mount()
+    const select = watchVM.click(c, 'Select')
+    const selectPost = http.pending('/api/servers/active')[0]
+    assert.equal(JSON.stringify(selectPost.body), JSON.stringify({ subscription: '0a1b2c3d', index: 0, name: 'Primary', address: '192.0.2.1', port: 443 }))
+    http.set('/api/servers', { subscriptions: [{ ...watchVM.group, name: 'Reloaded synthetic' }], active: { subscription: '0a1b2c3d', name: 'Primary', address: '192.0.2.1', port: 443 } })
+    http.reject(selectPost, { response: { status: 409, data: { error: 'server list changed' } } }); await select
+    await watchVM.flush()
+    assert.deepEqual(c.alerts, ['The server list changed; it has been reloaded. Select the server again.'])
+    assert.equal(c.x.groups.value[0].name, 'Reloaded synthetic')
+    assert.equal(c.x.busy.value, '')
+    assert.equal(watchVM.watchProps(c).unavailable, true)
+    assert.equal(c.x.canCheck.value, true)
+    const check = c.x.checkServer(c.x.groups.value[0], 0, c.x.groups.value[0].servers[0])
+    const checkPost = http.pending('/api/monitor/check')[0]
+    assert.equal(JSON.stringify(checkPost.body), '{"subscription":"0a1b2c3d","index":0,"fingerprint":"abcdef01"}')
+    http.set('/api/servers', { subscriptions: [{ ...watchVM.group, name: 'Checked reload' }], active: null })
+    http.reject(checkPost, { response: { status: 409, data: { error: 'server list changed' } } }); await check
+    await watchVM.flush()
+    assert.deepEqual(c.alerts, ['The server list changed; it has been reloaded. Select the server again.'])
+    assert.equal(c.x.groups.value[0].name, 'Checked reload')
+    assert.equal(c.x.checking.value, '')
+    assert.equal(c.x.checkNotice.value, '')
+    assert.equal(watchVM.watchProps(c).unavailable, true)
+    assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+    assert.equal(http.calls('/api/monitor/check', 'POST').length, 1)
+    c.unmount()
+    assert.equal(c.timers.size, 0)
+  })
+  await test('Task14 I1 mounted selection 500 reconciles committed active B with unchanged fingerprints', async () => {
+    const http = watchVM.makeHTTP()
+    http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Primary', address: '192.0.2.1', port: 443, seq: 1 } })
+    const c = watchVM.setupPage('Servers', http)
+    await c.mount()
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.primary), true)
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.group.servers[1]), false)
+    assert.equal(c.x.active.value.seq, 1)
+    assert.match(watchVM.text(c.render()), /Primary Active/)
+    const start = http.requests.length
+    const action = watchVM.click(c, 'Select', 1)
+    const post = http.pending('/api/servers/active')[0]
+    assert.equal(JSON.stringify(post.body), '{"subscription":"0a1b2c3d","index":1,"name":"Secondary","address":"198.51.100.2","port":8443}')
+    assert.equal(c.x.busy.value, 'select:0a1b2c3d:1')
+    const duplicate = c.x.selectServer(c.x.groups.value[0], 1)
+    assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+    await duplicate
+    assert.equal(http.requests.slice(start).filter(r => r.method === 'GET').length, 0)
+    http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Secondary', address: '198.51.100.2', port: 8443, seq: 2 } })
+    http.set('/api/watch', { ...watchVM.watch, updated_at: '2026-10-07T12:00:01Z', notifications: { pending: 2 } })
+    http.set('/api/monitor', { ...watchVM.health, subscriptions: [{ id: '0a1b2c3d', alive: 2, total: 2, servers: watchVM.health.subscriptions[0].servers.map((h, index) => ({ ...h, latency_ms: index === 1 ? 82 : 142 })) }] })
+    http.reject(post, { response: { status: 500, data: { error: 'failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure' } } })
+    await action
+    await watchVM.flush()
+    assert.deepEqual(c.alerts, ['Error: failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure'])
+    for (const url of ['/api/subscriptions', '/api/servers', '/api/watch', '/api/monitor']) {
+      assert.equal(http.requests.slice(start).filter(r => r.method === 'GET' && r.url === url).length, 1, 'Mounted selection 500 must reread ' + url)
+    }
+    assert.equal(http.requests.slice(start).filter(r => r.method !== 'GET').length, 1)
+    assert.equal(c.x.active.value.subscription, '0a1b2c3d')
+    assert.equal(c.x.active.value.name, 'Secondary')
+    assert.equal(c.x.active.value.address, '198.51.100.2')
+    assert.equal(c.x.active.value.port, 8443)
+    assert.equal(c.x.active.value.seq, 2)
+    assert.equal(c.x.groups.value.length, 1)
+    assert.equal(c.x.groups.value[0].servers.length, 2)
+    assert.equal(c.x.groups.value[0].servers.map(s => s.fingerprint).join(','), 'abcdef01,abcdef02')
+    assert.equal(c.x.groups.value[0].servers.map(s => s.protocol).join(','), 'trojan,trojan')
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.primary), false)
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.group.servers[1]), true)
+    assert.match(watchVM.text(c.render()), /Secondary Active/)
+    assert.doesNotMatch(watchVM.text(c.render()), /Primary Active/)
+    assert.equal(watchVM.watchProps(c).snapshot.updated_at, '2026-10-07T12:00:01Z')
+    assert.equal(watchVM.watchProps(c).snapshot.state, 'active')
+    assert.equal(watchVM.watchProps(c).snapshot.notifications.pending, 2)
+    assert.equal(watchVM.watchProps(c).unavailable, false)
+    assert.equal(c.x.healthOf(c.x.groups.value[0], 1, c.x.groups.value[0].servers[1]).latency_ms, 82)
+    assert.equal(c.x.aliveText('0a1b2c3d'), '2/2 alive')
+    assert.equal(c.x.checkNotice.value, '')
+    assert.equal(c.x.busy.value, '')
+    assert.equal(c.x.loading.value, false)
+    assert.equal(c.x.error.value, '')
+    assert.equal(c.timers.size, 1)
+    assert.equal([...c.timers.values()][0].kind, 'interval')
+    assert.equal([...c.timers.values()][0].ms, 15000)
+    c.unmount()
+    assert.equal(c.timers.size, 0)
+    const status = watchVM.setupPage('Status', http)
+    await status.mount()
+    assert.equal(status.x.activeLabel.value, 'Synthetic / Secondary')
+    assert.equal(status.x.activeServer.value.seq, 2)
+    assert.equal(watchVM.watchProps(status).snapshot.updated_at, '2026-10-07T12:00:01Z')
+    assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+    status.unmount()
+  })
+  await test('Task14 I1 selection 500 reread preserves queued WAN notice and 15s/3s timers', async () => {
+    const http = watchVM.makeHTTP()
+    http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Primary', address: '192.0.2.1', port: 443, seq: 1 } })
+    http.set('/api/monitor', watchVM.wanHealth)
+    const c = watchVM.setupPage('Servers', http)
+    await c.mount()
+    const check = watchVM.click(c, 'Check all now')
+    http.answer(http.pending('/api/monitor/check')[0], { queued: 1 }); await check
+    assert.equal(c.x.checkNotice.value, 'Check queued; waiting for WAN recovery.')
+    const start = http.requests.length
+    const action = watchVM.click(c, 'Select', 1)
+    http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Secondary', address: '198.51.100.2', port: 8443, seq: 2 } })
+    http.reject(http.pending('/api/servers/active')[0], { response: { status: 500, data: { error: 'failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure' } } })
+    await action
+    await watchVM.flush()
+    for (const url of ['/api/subscriptions', '/api/servers', '/api/watch', '/api/monitor']) {
+      assert.equal(http.requests.slice(start).filter(r => r.method === 'GET' && r.url === url).length, 1)
+    }
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.group.servers[1]), true)
+    assert.equal(c.x.checkNotice.value, 'Check queued; waiting for WAN recovery.')
+    assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+    assert.equal(c.x.canCheck.value, true)
+    assert.equal(c.x.healthOf(c.x.groups.value[0], 1, c.x.groups.value[0].servers[1]).fingerprint, 'abcdef02')
+    assert.equal(c.x.healthOf(c.x.groups.value[0], 1, c.x.groups.value[0].servers[1]).latency_ms, 81)
+    assert.equal(watchVM.watchProps(c).snapshot.state, 'active')
+    assert.deepEqual(c.alerts, ['Error: failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure'])
+    assert.equal(http.calls('/api/monitor/check', 'POST').length, 1)
+    assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+    assert.equal(http.requests.slice(start).filter(r => r.method !== 'GET').length, 1)
+    assert.equal(c.timers.size, 2)
+    assert.equal([...c.timers.values()].find(t => t.kind === 'interval').ms, 15000)
+    const recheck = [...c.timers.entries()].find(([, t]) => t.kind === 'timeout')
+    assert.equal(recheck[1].ms, 3000)
+    await c.fire(recheck[0])
+    assert.equal(c.x.checkNotice.value, 'Check queued; waiting for WAN recovery.')
+    assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+    c.unmount()
+    assert.equal(c.timers.size, 0)
+  })
+  for (const departure of ['unmount', 'logout']) {
+    await test(`Task14 I1 late selection 500 after ${departure} starts no reads alerts timers or auth`, async () => {
+      const http = watchVM.makeHTTP()
+      http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Primary', address: '192.0.2.1', port: 443, seq: 1 } })
+      const c = watchVM.setupPage('Servers', http)
+      await c.mount()
+      const callbacks = [...c.timers.values()].map(t => t.fn)
+      const action = watchVM.click(c, 'Select', 1)
+      const post = http.pending('/api/servers/active')[0]
+      assert.equal(JSON.stringify(post.body), '{"subscription":"0a1b2c3d","index":1,"name":"Secondary","address":"198.51.100.2","port":8443}')
+      http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Secondary', address: '198.51.100.2', port: 8443, seq: 2 } })
+      if (departure === 'logout') {
+        const logout = c.x.api.logout()
+        assert.equal(http.pending('/api/logout').length, 1)
+        http.answer(http.pending('/api/logout')[0], { ok: true }); await logout
+      }
+      c.unmount()
+      const start = http.requests.length
+      http.reject(post, { response: { status: 500, data: { error: 'failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure' } } })
+      await action
+      callbacks.forEach(fn => fn())
+      await c.x.load(); await c.x.loadMonitor(); await c.x.pollStatus()
+      const selection = c.x.selectServer(c.x.groups.value[0], 1)
+      assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+      await selection
+      await watchVM.flush()
+      assert.equal(http.requests.length, start)
+      assert.deepEqual(c.alerts, [])
+      assert.equal(c.timers.size, 0)
+      assert.equal(c.x.active.value.name, 'Primary')
+      assert.equal(c.x.active.value.seq, 1)
+      assert.equal(c.x.busy.value, 'select:0a1b2c3d:1')
+      assert.equal(c.x.checkNotice.value, '')
+      assert.equal(watchVM.watchProps(c).snapshot.updated_at, '2026-10-07T12:00:00Z')
+      assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+      assert.equal(http.calls('/api/logout', 'POST').length, departure === 'logout' ? 1 : 0)
+      assert.equal(http.calls('/api/version').length, 0)
+      assert.equal(http.calls('/api/login', 'POST').length, 0)
+    })
+    await test(`Task14 I1 selection 500 reread cannot publish or continue after ${departure}`, async () => {
+      const http = watchVM.makeHTTP()
+      http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Primary', address: '192.0.2.1', port: 443, seq: 1 } })
+      const c = watchVM.setupPage('Servers', http)
+      await c.mount()
+      for (const url of ['/api/subscriptions', '/api/servers', '/api/watch', '/api/monitor']) http.hold(url)
+      const action = watchVM.click(c, 'Select', 1)
+      try {
+        http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Secondary', address: '198.51.100.2', port: 8443, seq: 2 } })
+        http.reject(http.pending('/api/servers/active')[0], { response: { status: 500, data: { error: 'failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure' } } })
+        await watchVM.flush()
+        for (const url of ['/api/subscriptions', '/api/servers', '/api/watch']) assert.equal(http.pending(url).length, 1, 'Mounted failed selection must start its guarded reread')
+        assert.deepEqual(c.alerts, ['Error: failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure'])
+        if (departure === 'logout') {
+          const logout = c.x.api.logout()
+          http.answer(http.pending('/api/logout')[0], { ok: true }); await logout
+        }
+        const callbacks = [...c.timers.values()].map(t => t.fn)
+        c.unmount()
+        const start = http.requests.length
+        for (const r of http.requests.filter(r => r.method === 'GET' && !r.settled)) {
+          http.answer(r, {
+            '/api/subscriptions': { subscriptions: [ { id: '0a1b2c3d', name: 'Synthetic', host: 'subscription.example.test', static: false, servers: 2, added: '2026-10-07T12:00:00Z', refreshed: '2026-10-07T12:00:00Z' } ] },
+            '/api/servers': { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Secondary', address: '198.51.100.2', port: 8443, seq: 2 } },
+            '/api/watch': { ...watchVM.watch, updated_at: '2026-10-07T12:00:01Z', pending_restore: true },
+            '/api/monitor': { ...watchVM.health, state: 'stopped' },
+          }[r.url])
+        }
+        await action
+        callbacks.forEach(fn => fn())
+        await c.x.pollStatus()
+        await watchVM.flush()
+        assert.equal(http.requests.length, start, 'Unmounted error reread must not dispatch its next read')
+        assert.equal(c.x.active.value.name, 'Primary')
+        assert.equal(c.x.active.value.seq, 1)
+        assert.equal(c.x.groups.value[0].servers.map(s => s.fingerprint).join(','), 'abcdef01,abcdef02')
+        assert.equal(watchVM.watchProps(c).snapshot.updated_at, '2026-10-07T12:00:00Z')
+        assert.equal(watchVM.watchProps(c).snapshot.pending_restore, false)
+        assert.equal(c.x.monitorLine.value, 'Monitoring every 1 min')
+        assert.equal(c.x.busy.value, 'select:0a1b2c3d:1')
+        assert.deepEqual(c.alerts, ['Error: failed to restart xray: restart xray failed (exit 7): Synthetic browser control failure'])
+        assert.equal(c.timers.size, 0)
+        assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+        assert.equal(http.calls('/api/logout', 'POST').length, departure === 'logout' ? 1 : 0)
+        assert.equal(http.calls('/api/version').length, 0)
+        assert.equal(http.calls('/api/login', 'POST').length, 0)
+      } finally {
+        c.unmount()
+        for (const r of http.requests.filter(r => !r.settled)) http.reject(r, Error('Synthetic test cleanup'))
+        await action
+        await watchVM.flush()
+      }
+    })
+  }
+  await test('Task14 I1 selection 409 retains changed-list alert and does not advance the active seq', async () => {
+    const http = watchVM.makeHTTP()
+    http.set('/api/servers', { subscriptions: [watchVM.group], active: { subscription: '0a1b2c3d', name: 'Primary', address: '192.0.2.1', port: 443, seq: 1 } })
+    const c = watchVM.setupPage('Servers', http)
+    await c.mount()
+    const start = http.requests.length
+    const action = watchVM.click(c, 'Select', 1)
+    const post = http.pending('/api/servers/active')[0]
+    assert.equal(JSON.stringify(post.body), '{"subscription":"0a1b2c3d","index":1,"name":"Secondary","address":"198.51.100.2","port":8443}')
+    http.set('/api/watch', { ...watchVM.watch, state: 'incompatible', message: 'Bot compatibility is unconfirmed' })
+    http.reject(post, { response: { status: 409, data: { error: 'server list changed' } } })
+    await action
+    await watchVM.flush()
+    assert.deepEqual(c.alerts, ['The server list changed; it has been reloaded. Select the server again.'])
+    for (const url of ['/api/subscriptions', '/api/servers', '/api/watch', '/api/monitor']) {
+      assert.equal(http.requests.slice(start).filter(r => r.method === 'GET' && r.url === url).length, 1)
+    }
+    assert.equal(http.requests.slice(start).filter(r => r.method !== 'GET').length, 1)
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.primary), true)
+    assert.equal(c.x.isActive('0a1b2c3d', watchVM.group.servers[1]), false)
+    assert.equal(c.x.active.value.seq, 1)
+    assert.equal(c.x.groups.value[0].servers.map(s => s.fingerprint).join(','), 'abcdef01,abcdef02')
+    assert.equal(watchVM.watchProps(c).snapshot.state, 'incompatible')
+    assert.equal(c.x.healthOf(c.x.groups.value[0], 1, c.x.groups.value[0].servers[1]).latency_ms, 81)
+    assert.equal(c.x.checkNotice.value, '')
+    assert.equal(c.x.busy.value, '')
+    assert.equal(c.x.error.value, '')
+    assert.equal(c.timers.size, 1)
+    assert.equal([...c.timers.values()][0].ms, 15000)
+    c.unmount()
+    assert.equal(c.timers.size, 0)
+  })
   console.log(`RESULT ${passes} PASS / ${failures} FAIL`)
   process.exitCode = failures ? 1 : 0
 })()

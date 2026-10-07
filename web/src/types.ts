@@ -51,6 +51,29 @@ export interface MonitorResponse {
   subscriptions: MonitorSubscription[] | null
 }
 
+/** The subscription automation's availability, independent of the monitor. */
+export type WatchState =
+  | 'starting'
+  | 'active'
+  | 'stopped'
+  | 'incompatible'
+  | 'error'
+  | 'not_running'
+
+/** GET /api/watch: cached automation, recovery intent and notification health. */
+export interface WatchResponse {
+  state: WatchState
+  updated_at: string
+  message?: string
+  action?: string
+  committed_failover: boolean
+  pending_restore: boolean
+  notifications: {
+    pending: number
+    storage_error?: string
+  }
+}
+
 export interface ClientInfo {
   ip: string
   route: string
