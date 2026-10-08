@@ -340,16 +340,18 @@ func TestGenerateScript_CoversEveryDaemon(t *testing.T) {
 		}
 	}
 
-	// The tables drive every loop, and both reach an init script only through
+	// The tables drive every loop, and they reach an init script only through
 	// parameter expansion - ${entry##*|} in the daemon loops, $dst in the copy
-	// loop. So an init script spelled out in a line the shell executes is a
-	// hardcoded call, and a hardcoded call silently skips the other daemon.
-	// The two table lines are where the names belong; comments, as elsewhere
-	// in this file, are free to name what they explain.
+	// loop, $listed in step 1's look at START_WHEN_NEW. So an init script
+	// spelled out in a line the shell executes is a hardcoded call, and a
+	// hardcoded call silently skips the other daemon. The table lines are
+	// where the names belong; comments, as elsewhere in this file, are free to
+	// name what they explain.
 	for i, line := range strings.Split(script, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "#") ||
-			strings.HasPrefix(trimmed, `DAEMONS="`) || strings.HasPrefix(trimmed, `FILES="`) {
+			strings.HasPrefix(trimmed, `DAEMONS="`) || strings.HasPrefix(trimmed, `FILES="`) ||
+			strings.HasPrefix(trimmed, `START_WHEN_NEW="`) {
 			continue
 		}
 		for _, d := range Daemons {
@@ -936,15 +938,25 @@ func TestGenerateScript_LogSurvivesTheDirectoryTheBotDeletes(t *testing.T) {
 
 // A daemon a release adds is not running before its first update - nothing
 // ran it - and restarting only the daemons that ran would leave it stopped.
-// Step 1 notes every daemon whose binary is absent, and once the copy has
-// succeeded those join the success-start list: step 6 starts them before the
-// bot. A daemon whose binary is there but stopped stays stopped.
+// Step 1 notes a daemon whose binary is absent and that the release
+// introduces (START_WHEN_NEW), and once the copy has succeeded it joins the
+// success-start list: step 6 starts it before the bot. A daemon whose binary
+// is there but stopped stays stopped, and so does any other absent daemon.
 func TestGenerateScript_StartsADaemonNewWithTheRelease(t *testing.T) {
 	s := &Service{updateDir: t.TempDir()}
 	writeTestManifest(t, s)
 	script, err := s.generateScript(validOpts())
 	if err != nil {
 		t.Fatalf("generateScript() error = %v", err)
+	}
+	var introduced []string
+	for _, d := range Daemons {
+		if d.StartWhenNew {
+			introduced = append(introduced, d.InitScript)
+		}
+	}
+	if want := `START_WHEN_NEW="` + strings.Join(introduced, " ") + `"`; !strings.Contains(script, "\n"+want+"\n") {
+		t.Errorf("the script does not render %s", want)
 	}
 	steps := afterOnExit(t, script)
 
@@ -971,6 +983,7 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 	tests := []struct {
 		name        string
 		failure     string
+		unreached   string // a fault armed where the update must not reach
 		missing     []string
 		running     []string
 		starts      []string
@@ -980,20 +993,20 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 		{name: "new daemon starts before the bot", missing: []string{watchd}, running: []string{bot, webui}, starts: []string{webui, watchd, bot}},
 		{name: "existing stopped webui stays stopped", missing: []string{watchd}, running: []string{bot}, starts: []string{watchd, bot}},
 		{name: "existing stopped watchd stays stopped", running: []string{bot}, starts: []string{bot}},
-		{name: "all daemons are new", missing: []string{bot, watchd, webui}, starts: []string{watchd, webui, bot}},
+		{name: "absent bot and webui are installed and stay stopped", missing: []string{bot, watchd, webui}, starts: []string{watchd}},
+		{name: "absent bot whose start would fail does not fail the update", unreached: "telegram-bot-start", missing: []string{bot, watchd, webui}, starts: []string{watchd}},
 		{name: "before copying", failure: "before-copy", missing: []string{watchd}, running: []string{bot, webui}},
 		{name: "partial binary copy", failure: "copy-new", missing: []string{watchd}, running: []string{bot, webui}},
 		{name: "binary permissions", failure: "permissions", missing: []string{watchd}, running: []string{bot, webui}},
 		{name: "after successful copy", failure: "after-copy", missing: []string{watchd}, running: []string{bot, webui}},
 		{name: "new start fails after spawning", failure: "vpn-director-watchd-start", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
 		{name: "existing start fails before new start", failure: "webui-start", missing: []string{watchd}, running: []string{bot, webui}},
-		{name: "webui start fails after new start", failure: "webui-start", missing: []string{watchd, webui}, running: []string{bot}, afterStart: true},
+		{name: "bot start fails after new start with webui absent", failure: "telegram-bot-start", missing: []string{watchd, webui}, running: []string{bot}, afterStart: true},
 		{name: "notify write fails after new start", failure: "notify", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
 		{name: "bot start fails after new start", failure: "telegram-bot-start", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
 		{name: "lock removal fails after remonitoring", failure: "late-lock", missing: []string{watchd}, running: []string{bot, webui}, afterStart: true},
-		{name: "failed new stop needs kill", failure: "webui-start", missing: []string{watchd, webui}, running: []string{bot}, afterStart: true, stopFailure: true},
-		{name: "no original daemons and webui start fails", failure: "webui-start", missing: []string{bot, watchd, webui}, afterStart: true},
-		{name: "no original daemons and bot start fails", failure: "telegram-bot-start", missing: []string{bot, watchd, webui}, afterStart: true},
+		{name: "failed new stop needs kill", failure: "telegram-bot-start", missing: []string{watchd, webui}, running: []string{bot}, afterStart: true, stopFailure: true},
+		{name: "no original daemons and notify fails after new start", failure: "notify", missing: []string{bot, watchd, webui}, afterStart: true},
 		{name: "failure leaves existing stopped daemons alone", failure: "telegram-bot-start", running: []string{bot}},
 	}
 	for _, tt := range tests {
@@ -1078,7 +1091,7 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 			cmd.Dir = root
 			cmd.Env = append(os.Environ(), "SANDBOX_ROOT="+root, "SANDBOX_ROOT_PATTERN="+regexp.QuoteMeta(root), "STATE_DIR="+state,
 				"FILES_DIR="+s.getFilesDir(), "LOCK_FILE="+filepath.Join(s.getUpdateDir(), "lock"),
-				"CALLS_FILE="+callsPath, "FAIL_AT="+tt.failure,
+				"CALLS_FILE="+callsPath, "FAIL_AT="+tt.failure+tt.unreached,
 				"STOP_NEW_FAIL="+map[bool]string{false: "0", true: "1"}[tt.stopFailure])
 			cmd.WaitDelay = time.Second
 			out, runErr := cmd.CombinedOutput()
@@ -1109,10 +1122,11 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 				t.Errorf("update lock remains: %v", err)
 			}
 			for _, name := range []string{bot, watchd, webui} {
-				wantRunning := contains(tt.running, name) || (tt.failure == "" && contains(tt.missing, name))
-				if !contains(tt.running, name) && !contains(tt.missing, name) {
+				isNew := contains(tt.missing, name) && startsWhenNew(name)
+				wantRunning := contains(tt.running, name) || (tt.failure == "" && isNew)
+				if !contains(tt.running, name) && !isNew {
 					if strings.Contains(string(calls), name+" start\n") || strings.Contains(string(calls), "monit monitor "+name+"\n") {
-						t.Errorf("existing stopped daemon %s was started or remonitored", name)
+						t.Errorf("stopped or absent daemon %s was started or remonitored", name)
 					}
 				}
 				for _, suffix := range []string{".running", ".monitored"} {
@@ -1134,6 +1148,9 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 				}
 				if strings.Join(starts, " ") != strings.Join(tt.starts, " ") {
 					t.Errorf("start order = %v, want %v", starts, tt.starts)
+				}
+				if tt.unreached != "" && strings.Contains(string(calls), "FAIL "+tt.unreached+"\n") {
+					t.Errorf("the update reached the armed fault %s", tt.unreached)
 				}
 				for _, name := range []string{bot, watchd, webui} {
 					path := filepath.Join(root, "opt/vpn-director", name)
@@ -1271,7 +1288,7 @@ func TestGenerateScript_FirstInstallationSurvivesAFailedAttempt(t *testing.T) {
 		{name: "notify after new start", failure: "notify"},
 		{name: "bot start after new start", failure: "telegram-bot-start"},
 		{name: "late failure after remonitor", failure: "late-lock"},
-		{name: "all new and webui start fails", failure: "webui-start", options: firstInstallOptions{allNew: true}},
+		{name: "all absent and notify fails after new start", failure: "notify", options: firstInstallOptions{allAbsent: true}},
 		{name: "exit observed after kill", failure: "vpn-director-watchd-start", mode: "delayed-exit"},
 		{name: "existing stopped watchd", failure: "permissions", options: firstInstallOptions{watchdExists: true}},
 		{name: "another existing stopped daemon", failure: "after-copy", options: firstInstallOptions{webuiStopped: true}},
@@ -1305,7 +1322,9 @@ func TestGenerateScript_FirstInstallationSurvivesAFailedAttempt(t *testing.T) {
 				wantRunning := s.contains(s.originalRunning, name) || (tt.failure == "" && s.contains(s.newDaemons, name))
 				s.assertState(name, wantRunning)
 				if !s.contains(s.newDaemons, name) {
-					if _, err := os.Lstat(s.binary(name)); err != nil {
+					// An absent daemon the release does not introduce has no
+					// first-copy cleanup: whatever its copy reached stays.
+					if _, err := os.Lstat(s.binary(name)); err != nil && !s.contains(s.absentDaemons, name) {
 						t.Errorf("pre-existing or original-running binary %s disappeared: %v", name, err)
 					}
 					if strings.Contains(first.calls, "unlink "+name+"\n") {
@@ -1353,6 +1372,9 @@ func TestGenerateScript_FirstInstallationSurvivesAFailedAttempt(t *testing.T) {
 			if watchdNew {
 				start := strings.Index(retry.calls, DaemonWatchd+" start\n")
 				bot := strings.Index(retry.calls, DaemonBot+" start\n")
+				if !s.contains(s.originalRunning, DaemonBot) {
+					bot = start // a bot that did not run is not started
+				}
 				monitor := strings.Index(retry.calls, "monit monitor "+DaemonWatchd+"\n")
 				if start < 0 || bot < start || monitor < bot {
 					t.Errorf("retry must start watchd once before bot, then remonitor: %s", retry.calls)
@@ -1439,7 +1461,7 @@ type firstInstallOptions struct {
 	watchdExists      bool
 	webuiStopped      bool
 	danglingWatchd    bool
-	allNew            bool
+	allAbsent         bool
 	missingRunningBot bool
 }
 
@@ -1452,9 +1474,21 @@ type firstInstallSandbox struct {
 	calls           string
 	s               *Service
 	originalRunning []string
-	newDaemons      []string
+	newDaemons      []string // absent and introduced by the release: started after the update
+	absentDaemons   []string // absent and not introduced: installed, stay stopped
 	binaryPayload   map[string]string
 	env             []string
+}
+
+// startsWhenNew reports whether the update starts the daemon when its binary
+// was absent: the release introduces it.
+func startsWhenNew(name string) bool {
+	for _, d := range Daemons {
+		if d.Name == name {
+			return d.StartWhenNew
+		}
+	}
+	return false
 }
 
 type firstInstallResult struct{ calls, out, log string }
@@ -1472,7 +1506,7 @@ func newFirstInstallSandbox(t *testing.T, opts firstInstallOptions) *firstInstal
 	for _, name := range []string{DaemonBot, DaemonWatchd, DaemonWebUI} {
 		exists := name != DaemonWatchd || opts.watchdExists || opts.danglingWatchd
 		running := name != DaemonWatchd && !(name == DaemonWebUI && opts.webuiStopped)
-		if opts.allNew {
+		if opts.allAbsent {
 			exists, running = false, false
 		}
 		if name == DaemonBot && opts.missingRunningBot {
@@ -1485,8 +1519,10 @@ func newFirstInstallSandbox(t *testing.T, opts firstInstallOptions) *firstInstal
 			s.write(filepath.Join(s.state, name+".running"), "", 0644)
 			s.write(filepath.Join(s.state, name+".monitored"), "", 0644)
 			s.originalRunning = append(s.originalRunning, name)
-		} else if !exists {
+		} else if !exists && startsWhenNew(name) {
 			s.newDaemons = append(s.newDaemons, name)
+		} else if !exists {
+			s.absentDaemons = append(s.absentDaemons, name)
 		}
 	}
 	s.write(filepath.Join(s.root, "independent", "keep"), "do not delete\n", 0644)

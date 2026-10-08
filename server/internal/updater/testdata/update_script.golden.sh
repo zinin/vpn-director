@@ -23,6 +23,10 @@ INIT_DIR="/opt/etc/init.d"
 # loops below rely on word splitting, so no field may contain a space.
 DAEMONS="telegram-bot|/opt/vpn-director/telegram-bot|S98telegram-bot vpn-director-watchd|/opt/vpn-director/vpn-director-watchd|S98vpn-director-watchd webui|/opt/vpn-director/webui|S98vpn-director-webui"
 
+# Init scripts of the daemons the release introduces (Daemon.StartWhenNew),
+# separated by spaces as in DAEMONS: step 1 starts one whose binary is absent.
+START_WHEN_NEW="S98vpn-director-watchd"
+
 # File table: "src|dst|mode" entries separated by spaces, src relative to
 # FILES_DIR, mode "x" for executable or "-" for data. Word splitting again, so
 # no field may contain a space; the manifest parser guarantees that.
@@ -299,8 +303,10 @@ log "Starting update from $OLD_VERSION to $NEW_VERSION (initiator: $INITIATOR)"
 
 # 1. Remember which daemons are running. Matching the full binary path keeps
 #    pgrep off unrelated processes. A daemon whose binary is not there at all
-#    is new with this release: nothing ran it, and nobody stopped it either,
-#    so it starts once the copy has succeeded.
+#    and that this release introduces (START_WHEN_NEW) is new: nothing ran it,
+#    and nobody stopped it either, so it starts once the copy has succeeded.
+#    Any other absent daemon - an optional download that failed, a binary the
+#    owner removed - is installed like every daemon and stays stopped.
 NEW_INITS=""
 for entry in $DAEMONS; do
     name="${entry%%|*}"
@@ -314,9 +320,20 @@ for entry in $DAEMONS; do
         log "ERROR: cannot determine whether $name is running"
         exit 1
     elif [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
-        NEW_INITS="$NEW_INITS $init"
-        NEW_BINARIES="$NEW_BINARIES $bin"
-        log "$name is new, it starts after the update"
+        introduced=0
+        for listed in $START_WHEN_NEW; do
+            if [ "$listed" = "$init" ]; then
+                introduced=1
+                break
+            fi
+        done
+        if [ "$introduced" = "1" ]; then
+            NEW_INITS="$NEW_INITS $init"
+            NEW_BINARIES="$NEW_BINARIES $bin"
+            log "$name is new, it starts after the update"
+        else
+            log "$name is not installed, it stays stopped after the update"
+        fi
     else
         log "$name is not running, it stays stopped after the update"
     fi

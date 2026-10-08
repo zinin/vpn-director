@@ -69,6 +69,9 @@ type Daemon struct {
 	Name       string
 	Binary     string
 	InitScript string
+	// StartWhenNew: the release introduces this daemon, so the update script starts it once its copy
+	// succeeds when its binary was absent; any other absent daemon is installed and stays stopped.
+	StartWhenNew bool
 }
 
 // Daemon names, as the release assets and the files/ payload spell them.
@@ -82,12 +85,13 @@ const (
 
 // Daemons lists every daemon a release ships. DownloadRelease fetches one
 // binary per entry and the update script restarts the entries that were
-// running before the update or are new with the release. This table is the
-// single source of truth: the downloader, the script template and install.sh
-// must not drift apart.
+// running before the update; of the entries whose binary was absent, only
+// those marked StartWhenNew start, and the others are installed and stay
+// stopped. This table is the single source of truth: the downloader, the
+// script template and install.sh must not drift apart.
 var Daemons = []Daemon{
 	{Name: DaemonBot, Binary: "/opt/vpn-director/telegram-bot", InitScript: "S98telegram-bot"},
-	{Name: DaemonWatchd, Binary: "/opt/vpn-director/vpn-director-watchd", InitScript: "S98vpn-director-watchd"},
+	{Name: DaemonWatchd, Binary: "/opt/vpn-director/vpn-director-watchd", InitScript: "S98vpn-director-watchd", StartWhenNew: true},
 	{Name: DaemonWebUI, Binary: "/opt/vpn-director/webui", InitScript: "S98vpn-director-webui"},
 }
 

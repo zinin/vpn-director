@@ -215,7 +215,7 @@ is reported separately from automation state. `/logs watchd` reads `/tmp/vpn-dir
 
 ## Self-Update (`/update`)
 
-Every daemon of the table — `telegram-bot`, `vpn-director-watchd` and `webui`, in that order — is updated together, from the bot or the Web UI; watchd starts no update of its own. The orchestration lives in `internal/updateflow`; the bot command and Web UI handlers are adapters over it. The script restarts originally running daemons and starts a first introduction once its copy succeeds; an existing daemon the owner stopped stays stopped. The Web UI remains last in the table, but bot is last in successful startup so terminal status exists before it can notify the user.
+Every daemon of the table — `telegram-bot`, `vpn-director-watchd` and `webui`, in that order — is updated together, from the bot or the Web UI; watchd starts no update of its own. The orchestration lives in `internal/updateflow`; the bot command and Web UI handlers are adapters over it. The script restarts originally running daemons and starts a first introduction of a daemon the release introduces (watchd) once its copy succeeds, while any other daemon whose binary was absent is installed and stays stopped; an existing daemon the owner stopped stays stopped. The Web UI remains last in the table, but bot is last in successful startup so terminal status exists before it can notify the user.
 
 1. `Flow.Check` asks the GitHub API for the latest release (result cached for 30 minutes; a forced check pierces the cache at most once a minute)
 2. `Flow.Start` creates the lock file (`/tmp/vpn-director-update/lock`)

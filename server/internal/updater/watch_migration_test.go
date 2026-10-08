@@ -247,7 +247,7 @@ func newMigrationSandbox(t *testing.T, botMode string, opts firstInstallOptions)
 			t.Fatal(err)
 		}
 		if botMode == "absent" {
-			s.newDaemons = append(s.newDaemons, DaemonBot)
+			s.absentDaemons = append(s.absentDaemons, DaemonBot)
 		}
 	}
 	if botMode == "no-token" {
@@ -427,9 +427,9 @@ func TestWatchMigration_MissingStoppedAndNoTokenBot(t *testing.T) {
 			assertMigrationObservation(t, observeMigrationRuntime(t, s.gate), watchdapi.WatchActive)
 			s.assertState(DaemonWatchd, true)
 			s.assertState(DaemonWebUI, true)
-			s.assertState(DaemonBot, bot == "absent")
-			if bot != "absent" && (strings.Contains(result.calls, DaemonBot+" start\n") || strings.Contains(result.calls, "monit monitor "+DaemonBot+"\n")) {
-				t.Fatal("compatible stopped/no-token bot was started by migration")
+			s.assertState(DaemonBot, false)
+			if strings.Contains(result.calls, DaemonBot+" start\n") || strings.Contains(result.calls, "monit monitor "+DaemonBot+"\n") {
+				t.Fatal("absent/compatible stopped/no-token bot was started by migration")
 			}
 			if bot == "no-token" {
 				data, err := os.ReadFile(filepath.Join(s.root, "opt/vpn-director/telegram-bot.json"))
