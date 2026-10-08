@@ -45,7 +45,10 @@ server/internal/watchdapi/         # the socket contract: types, Health, Serve, 
 Before any watch mutation, `watchcompat.Gate` checks the installed
 `/opt/vpn-director/telegram-bot` **and every running bot executable** through `/proc/PID/exe`.
 Only processes running as root count as running bot copies; same-named processes of other
-users are neither executed nor considered.
+users are neither executed nor considered. Any root process whose executable or argv0 is named
+`telegram-bot` counts, wherever it runs - a path test is not reliable where `/opt` is a
+symlink - and when its reply keeps the gate closed, the watchd log names its PID and executable
+path once.
 It recognizes an old executable that was replaced or deleted; checking only the new installed
 path cannot attest the old running process. PID/starttime and executable identity changes
 invalidate cached results. Unreadable or uncertain identities fail closed for automation.

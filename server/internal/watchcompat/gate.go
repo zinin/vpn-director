@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,7 @@ type Gate struct {
 	mu       sync.Mutex
 	verified []executableTarget
 	cache    map[executableTarget]struct{}
+	refused  executableTarget // the last refusal logged; zero once a Check succeeds
 	proc     func(context.Context, string, string) ([]executableTarget, error)
 	exec     func(context.Context, string) ([]byte, error)
 }
@@ -87,6 +89,13 @@ func (g *Gate) Check(ctx context.Context) error {
 				if ctx.Err() != nil {
 					return ErrIncompatible
 				}
+				// Once per target while it keeps the gate closed: the owner
+				// needs to know which executable does.
+				if target != g.refused {
+					g.refused = target
+					slog.Warn("Bot compatibility refused; automation stays incompatible while this executable runs",
+						"pid", target.pid, "path", executablePath(target))
+				}
 				return deny()
 			}
 		}
@@ -110,7 +119,19 @@ func (g *Gate) Check(ctx context.Context) error {
 	}
 	g.cache = cache
 	g.verified = after
+	g.refused = executableTarget{}
 	return nil
+}
+
+// executablePath names a target in the log: a running process by what its
+// /proc/<pid>/exe link points to, the installed bot by its path.
+func executablePath(target executableTarget) string {
+	if target.pid != 0 {
+		if link, err := os.Readlink(target.path); err == nil {
+			return link
+		}
+	}
+	return target.path
 }
 
 func (g *Gate) targets(ctx context.Context) ([]executableTarget, error) {

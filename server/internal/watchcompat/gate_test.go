@@ -5,8 +5,10 @@ package watchcompat
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -353,6 +355,94 @@ func TestGate_DiagnosticsDoNotExposeExecutableOutput(t *testing.T) {
 			t.Errorf("capability diagnostics expose synthetic provider data: %q", secret)
 		}
 	}
+}
+
+// gateWarnings records the log for the rest of the test and returns, when
+// called, every Warn record in it.
+func gateWarnings(t *testing.T) func() []map[string]any {
+	t.Helper()
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return func() []map[string]any {
+		t.Helper()
+		var warnings []map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+		for {
+			var record map[string]any
+			if err := decoder.Decode(&record); errors.Is(err, io.EOF) {
+				return warnings
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if record["level"] == "WARN" {
+				warnings = append(warnings, record)
+			}
+		}
+	}
+}
+
+// A root process named like the bot counts wherever it runs, so one whose
+// reply keeps the gate closed is named in the log - once while it does.
+func TestGate_RefusalNamesTheExecutable(t *testing.T) {
+	t.Run("once per refusing target", func(t *testing.T) {
+		g := gateFixture(t)
+		warnings := gateWarnings(t)
+		writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+		answer := filepath.Join(t.TempDir(), "answer")
+		if err := os.WriteFile(answer, []byte(`{"protocol_version":1,"watch_owner":"bot"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		running := filepath.Join(t.TempDir(), "vpn-director-bot")
+		writeCapabilityExecutable(t, running, fmt.Sprintf("exec /bin/cat %q", answer))
+		writeBotProcess(t, g.ProcRoot, 91, 501, running, g.BotPath)
+		assertWarned := func(want int) {
+			t.Helper()
+			got := warnings()
+			if len(got) != want {
+				t.Fatalf("Warn records %d, want %d: %v", len(got), want, got)
+			}
+			if last := got[len(got)-1]; last["pid"] != float64(91) || last["path"] != running {
+				t.Fatalf("refusal names pid %v and path %v, want 91 and %s", last["pid"], last["path"], running)
+			}
+		}
+
+		checkGate(t, g, false)
+		assertWarned(1)
+		checkGate(t, g, false)
+		assertWarned(1)
+
+		if err := os.WriteFile(answer, []byte(compatibleJSON), 0600); err != nil {
+			t.Fatal(err)
+		}
+		checkGate(t, g, true)
+		if err := os.WriteFile(answer, []byte(`{}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		// Another compatible copy changes the set, so the same refusing
+		// target runs again.
+		writeBotProcess(t, g.ProcRoot, 92, 502, g.BotPath, g.BotPath)
+		checkGate(t, g, false)
+		assertWarned(2)
+	})
+	t.Run("cancelled check", func(t *testing.T) {
+		g := gateFixture(t)
+		warnings := gateWarnings(t)
+		writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		g.exec = func(ctx context.Context, path string) ([]byte, error) {
+			cancel()
+			return nil, ctx.Err()
+		}
+		if err := g.Check(ctx); !errors.Is(err, ErrIncompatible) {
+			t.Fatalf("cancelled check %v, want ErrIncompatible", err)
+		}
+		if got := warnings(); len(got) != 0 {
+			t.Fatalf("Warn records %v; a cancelled check is no refusal", got)
+		}
+	})
 }
 
 func TestGate_CacheInvalidation(t *testing.T) {
