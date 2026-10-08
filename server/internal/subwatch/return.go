@@ -138,7 +138,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		if live {
 			// A stop or a selection can land while the probe waits; the walk
 			// makes the same look before it announces.
-			if w.mutationEnded(ctx) || endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
+			if w.mutationEnded(ctx) || w.endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
 				return
 			}
 			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
@@ -188,8 +188,9 @@ type switcher struct {
 // Nothing was written for it, and nobody else wrote either, so the way back
 // stays open - and is not held to that check itself: it is the server that
 // ran. live is a probe that passed; ended is a write the guard refused for a
-// stop or a newer selection, a restart a stop skipped, or a context or stop
-// that ended the attempt, after which nothing more may be written.
+// stop or a newer selection, a restart a stop skipped, or a stop or a cancelled
+// tick that ended the attempt, after which nothing more may be written. A
+// timeout of the switch's own while the tick runs is a failed switch.
 func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended, gone bool) {
 	w := s.w
 	if ctx.Err() != nil || w.mutationEnded(ctx) {
@@ -200,7 +201,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		sub, link = c.Subscription, s.links[c.Subscription]
 	}
 	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq, ctx))
-	if endsWalk(err) {
+	if w.endsWalk(err) {
 		return false, true, false
 	}
 	if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
@@ -219,7 +220,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		return false, true, false
 	}
 	if err := w.restartXray(); err != nil {
-		if endsWalk(err) || w.mutationEnded(ctx) {
+		if w.endsWalk(err) || w.mutationEnded(ctx) {
 			return false, true, false
 		}
 		slog.Warn("Xray restart failed", "server", c.Name, watchErrorAttr(err))

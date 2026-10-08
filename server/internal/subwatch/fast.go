@@ -328,7 +328,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		}
 		out.Err = err
 		if w.mutationEnded(ctx) || fastTerminal(err) {
-			if mutationInterrupted(err) {
+			if w.mutationInterrupted(err) {
 				w.mutationFailed.Store(true)
 				w.setStatus(err)
 			}

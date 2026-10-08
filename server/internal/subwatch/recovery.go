@@ -64,7 +64,7 @@ func (w *Watch) reconcileRestore(cfg *vpnconfig.VPNDirectorConfig) error {
 	}
 	if err := w.apply(); err != nil {
 		w.pendingApply = true
-		if endsWalk(err) {
+		if w.endsWalk(err) {
 			return err
 		}
 		// A failed apply must not prevent a fresh, normally armed death check.

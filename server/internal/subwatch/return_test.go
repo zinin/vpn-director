@@ -270,6 +270,54 @@ func TestTick_AReturnWhoseConfigWasNotWrittenBacksOff(t *testing.T) {
 	}
 }
 
+// A step of the switch to the preferred server that times out on its own
+// deadline while the tick runs - Xray's config test of one address, an Xray
+// restart - fails that address and ends nothing: the return tries the next
+// address and, with none live, goes back to the server that ran before.
+func TestTick_AReturnStepThatTimesOutFailsOnlyThatAddress(t *testing.T) {
+	for _, step := range []string{"config test", "restart"} {
+		t.Run(step, func(t *testing.T) {
+			servers := returnServers()
+			servers[0].IPs = []string{osloIP, osloIP2}
+			r := newReturnRig(servers)
+			r.up[osloIP] = true
+			r.up[osloIP2] = true
+			r.live[madridIP] = true
+			generate, restart := r.w.Generate, r.w.RestartXray
+			r.w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				if step == "config test" && dialIP(s) == osloIP {
+					return false, r.f.seq(), fmt.Errorf("xray config test timed out after 15s: %w", context.DeadlineExceeded)
+				}
+				return generate(s, guard)
+			}
+			r.w.RestartXray = func() error {
+				err := restart()
+				if step == "restart" && r.running == osloIP {
+					return fmt.Errorf("command timed out after 5m0s: %w", context.DeadlineExceeded)
+				}
+				return err
+			}
+			r.tick()
+			want := []string{"Oslo@" + osloIP2, "restart", "Madrid@" + madridIP, "restart"}
+			if step == "restart" {
+				want = append([]string{"Oslo@" + osloIP, "restart"}, want...)
+			}
+			if !reflect.DeepEqual(r.events, want) {
+				t.Fatalf("events %v, want %v", r.events, want)
+			}
+			if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Madrid" {
+				t.Fatalf("active %+v, want Madrid back", a)
+			}
+			if p := r.f.cfg.Xray.PreferredServer; p == nil || p.Name != "Oslo" {
+				t.Fatalf("preferred %+v, want Oslo kept", p)
+			}
+			if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry || len(r.f.notes) != 0 {
+				t.Fatalf("returnFails %d, returnRetry %v, notes %v; want one failed return that tells nobody", r.w.returnFails, r.w.returnRetry, r.f.notes)
+			}
+		})
+	}
+}
+
 func TestTick_ReturnWaitsForThePreferredServerToAcceptTCP(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.live[osloIP] = true

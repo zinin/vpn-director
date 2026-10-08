@@ -836,16 +836,16 @@ func (w *Watch) walkGuard(sub, link, started, lastRecorded string, expectedSeq i
 }
 
 // endsWalk identifies a refused or cancelled attempt, not a failed server.
-func endsWalk(err error) bool {
-	return mutationInterrupted(err) || errors.Is(err, errSuperseded)
+func (w *Watch) endsWalk(err error) bool {
+	return w.mutationInterrupted(err) || errors.Is(err, errSuperseded)
 }
 
 // walkEnded reports whether err ends the walk.
 func (w *Watch) walkEnded(err error) bool {
-	if !endsWalk(err) {
+	if !w.endsWalk(err) {
 		return false
 	}
-	if mutationInterrupted(err) {
+	if w.mutationInterrupted(err) {
 		w.mutationFailed.Store(true)
 	}
 	if errors.Is(err, errSuperseded) {
@@ -1020,7 +1020,7 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 				w.fastOwned.last, w.fastOwned.recorded, w.fastOwned.fallbackProofs = nil, nil, nil
 			}
 			slog.Info("Subscription refreshed", "subscription", s.Name, "servers", len(results[i].servers))
-		case mutationInterrupted(err):
+		case w.mutationInterrupted(err):
 			return failed, false
 		case errors.Is(err, vpnconfig.ErrSubscriptionGone):
 			slog.Info("Subscription refresh dropped; the subscription was deleted while it downloaded", "subscription", s.Name)
@@ -1216,7 +1216,7 @@ func (w *Watch) importInterval() time.Duration {
 func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) error {
 	w.setStatusAction("returning")
 	generated, _, err := w.generateWalked(s, guard)
-	if endsWalk(err) {
+	if w.endsWalk(err) {
 		return err
 	}
 	if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
@@ -1230,7 +1230,7 @@ func (w *Watch) returnToPreferred(s vpnconfig.Server, guard func(*vpnconfig.VPND
 		return nil
 	}
 	if rerr := w.restartXray(); rerr != nil {
-		if endsWalk(rerr) {
+		if w.endsWalk(rerr) {
 			return rerr
 		}
 		slog.Warn("Xray restart on the preferred server failed", "server", s.Name, watchErrorAttr(rerr))
@@ -1466,7 +1466,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 			vpnconfig.EnsureFailoverStaged(current)
 			return nil
 		}); err != nil {
-			if endsWalk(err) {
+			if w.endsWalk(err) {
 				return false, committed, err
 			}
 			slog.Warn("Failed to stage Xray clients for restore", watchErrorAttr(err))
@@ -1501,7 +1501,7 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 			attempt = vpnconfig.BeginXrayRestore(current)
 			return nil
 		}); err != nil {
-			if endsWalk(err) {
+			if w.endsWalk(err) {
 				// The stage handed the clients to a server that is no longer
 				// the one probed. Those that had left Xray leave it again, and
 				// the next probe is of the server running now.
@@ -1518,14 +1518,14 @@ func (w *Watch) commitRestore(cfg *vpnconfig.VPNDirectorConfig, guard func(*vpnc
 	if err := w.apply(); err != nil {
 		slog.Warn("Apply after dropping fallback membership failed", watchErrorAttr(err))
 		w.pendingApply = true
-		if endsWalk(err) {
+		if w.endsWalk(err) {
 			return false, committed, err
 		}
 		return false, committed, nil
 	}
 	done, committed, err := w.finalizeRestore(attempt, true)
 	if err != nil {
-		if endsWalk(err) {
+		if w.endsWalk(err) {
 			return false, committed, err
 		}
 		slog.Warn("Failed to finish the pending Xray restore")

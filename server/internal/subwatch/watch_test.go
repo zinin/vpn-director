@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -1964,6 +1965,87 @@ func TestTick_WalkContinuesPastACandidateWhoseRecordWasNotSaved(t *testing.T) {
 	}
 	if f.cfg.Xray.Failover != nil {
 		t.Fatal("the live Extra must restore the clients")
+	}
+}
+
+// Xray's config test of a candidate can time out on its own deadline, and its
+// error then wraps context.DeadlineExceeded. While the tick runs that is the
+// candidate's failure, and the walk goes on to the next one; the same error
+// once a stop has cancelled the tick ends the walk.
+func TestTick_WalkContextErrorEndsTheWalkOnlyWithTheTick(t *testing.T) {
+	defer func(poll time.Duration) { stopPoll = poll }(stopPoll)
+	stopPoll = time.Millisecond
+	for _, tc := range []struct {
+		name string
+		stop bool
+		want []string
+	}{
+		{"live tick", false, []string{"Backup", "Extra"}},
+		{"stopped tick", true, []string{"Backup"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fake{
+				cfg:  failedOverCfg(),
+				plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+				now:  time.Unix(1_700_000_000, 0),
+			}
+			f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+			var stopped atomic.Bool
+			generated, restarts := []string{}, 0
+			w := runningWatch(f.watch())
+			w.Stopped = stopped.Load
+			w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+				return []vpnconfig.Server{
+					{Name: "Backup", Address: "backup.example", Port: 443},
+					{Name: "Extra", Address: "extra.example", Port: 443},
+				}, nil
+			}
+			w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				if err := f.checkGuard(guard); err != nil {
+					return false, f.seq(), err
+				}
+				generated = append(generated, s.Name)
+				if s.Name != "Backup" {
+					f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+					return true, f.seq(), nil
+				}
+				if tc.stop {
+					stopped.Store(true)
+					select {
+					case <-w.mutationContext.Done():
+					case <-time.After(5 * time.Second):
+						t.Error("the stop did not cancel the tick")
+					}
+				}
+				return false, f.seq(), fmt.Errorf("xray config test timed out after 15s: %w", context.DeadlineExceeded)
+			}
+			w.RestartXray = func() error {
+				restarts++
+				return nil
+			}
+			w.AfterRestart = func(time.Duration) {}
+			w.Probe = func(context.Context, int) error {
+				if len(generated) > 0 && generated[len(generated)-1] == "Extra" {
+					return nil
+				}
+				return errProbe
+			}
+
+			w.Tick(context.Background())
+
+			if !reflect.DeepEqual(generated, tc.want) {
+				t.Fatalf("generated %v, want %v", generated, tc.want)
+			}
+			if tc.stop {
+				if restarts != 0 || f.cfg.Xray.Failover == nil {
+					t.Fatalf("restarts %d, failover %+v; a stopped walk restarts and restores nothing", restarts, f.cfg.Xray.Failover)
+				}
+				return
+			}
+			if f.cfg.Xray.Failover != nil {
+				t.Fatal("the live Extra must restore the clients")
+			}
+		})
 	}
 }
 

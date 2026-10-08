@@ -54,9 +54,16 @@ func (w *Watch) updateFor(ctx context.Context) func(func(*vpnconfig.VPNDirectorC
 	}
 }
 
-func mutationInterrupted(err error) bool {
-	return errors.Is(err, errStopped) || errors.Is(err, watchcompat.ErrIncompatible) ||
-		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+// mutationInterrupted: a stop or an incompatibility, or a context error once the tick itself
+// was cancelled or no tick runs; while the tick lives, a context error is the operation's own failure.
+func (w *Watch) mutationInterrupted(err error) bool {
+	if errors.Is(err, errStopped) || errors.Is(err, watchcompat.ErrIncompatible) {
+		return true
+	}
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return w.mutationContext == nil || context.Cause(w.mutationContext) != nil
 }
 
 func (w *Watch) waitAfterRestart(delay time.Duration) {

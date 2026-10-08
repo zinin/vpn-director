@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -739,6 +740,30 @@ func TestRecovery_PendingMutationWriteFailure(t *testing.T) {
 			}
 			assertRecoveryFinished(t, s)
 		})
+	}
+}
+
+// An apply that times out on its own deadline while the tick runs is a failed
+// restore apply, not a stop: the intent stays pending for the retry, and the
+// tick goes on to the death check as after any failed apply.
+func TestRecovery_ApplyTimeoutIsAFailedApply(t *testing.T) {
+	s := newRecoverySystem(t)
+	s.seedPending(t)
+	s.subs = []vpnconfig.Subscription{{ID: "static", Name: "Synthetic"}}
+	s.probeErr = errProbe
+	w := s.watch()
+	w.Apply = func() error {
+		s.applies++
+		return fmt.Errorf("command timed out after 5m0s: %w", context.DeadlineExceeded)
+	}
+
+	w.Tick(context.Background())
+
+	if _, pending, _ := s.read(t); pending == nil || !w.pendingApply {
+		t.Fatalf("pending %+v, pendingApply %v; the timed-out apply must stay pending for a retry", pending, w.pendingApply)
+	}
+	if s.applies != 1 || s.probes != 1 || w.failSince.IsZero() {
+		t.Fatalf("applies %d, probes %d, failSince %v; a failed restore apply must leave the death check armed", s.applies, s.probes, w.failSince)
 	}
 }
 
