@@ -281,6 +281,7 @@ func newMigrationSandbox(t *testing.T, botMode string, opts firstInstallOptions)
         /bin/mkdir -p "$STATE_DIR/proc/41"
         printf '41 (telegram-bot) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 202 0\n' > "$STATE_DIR/proc/41/stat"
         printf '%s\000' "$SANDBOX_ROOT/opt/vpn-director/telegram-bot" > "$STATE_DIR/proc/41/cmdline"
+        printf 'Name:\ttelegram-bot\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n' > "$STATE_DIR/proc/41/status"
         /bin/ln -sf "$SANDBOX_ROOT/opt/vpn-director/telegram-bot" "$STATE_DIR/proc/41/exe"`, 1)
 	botInit = strings.Replace(botInit, `        /bin/rm -f "$STATE_DIR/$name.running"`, `        /bin/rm -f "$STATE_DIR/$name.running"
         /bin/rm -rf "$STATE_DIR/proc/41"`, 1)
@@ -297,6 +298,7 @@ func writeMigrationProcess(t *testing.T, s *firstInstallSandbox, pid, executable
 	dir := filepath.Join(s.state, "proc", pid)
 	s.write(filepath.Join(dir, "stat"), fmt.Sprintf("%s (telegram-bot) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 101 0\n", pid), 0600)
 	s.write(filepath.Join(dir, "cmdline"), s.binary(DaemonBot)+"\x00", 0600)
+	s.write(filepath.Join(dir, "status"), "Name:\ttelegram-bot\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n", 0600)
 	if err := os.Symlink(executable, filepath.Join(dir, "exe")); err != nil {
 		t.Fatal(err)
 	}
