@@ -67,6 +67,7 @@ func writeBotProcess(t *testing.T, root string, pid int, start int64, executable
 		"stat":    stat,
 		"cmdline": strings.Join(argv, "\x00") + "\x00",
 		"comm":    comm + "\n",
+		"status":  "Name:\t" + comm + "\nUid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\n",
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
 			t.Fatal(err)
@@ -76,6 +77,16 @@ func writeBotProcess(t *testing.T, root string, pid int, start int64, executable
 		t.Fatal(err)
 	}
 	return dir
+}
+
+// setProcessUID gives a fake process uid as its real, effective, saved and
+// filesystem UID.
+func setProcessUID(t *testing.T, dir, uid string) {
+	t.Helper()
+	status := fmt.Sprintf("Uid:\t%[1]s\t%[1]s\t%[1]s\t%[1]s\n", uid)
+	if err := os.WriteFile(filepath.Join(dir, "status"), []byte(status), 0600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func checkGate(t *testing.T, g *Gate, compatible bool) {
@@ -247,6 +258,79 @@ func TestGate_InstalledAndRunningExecutables(t *testing.T) {
 				payload := compatibleJSON + strings.Repeat(" ", size-len(compatibleJSON)-1)
 				writeCapabilityExecutable(t, g.BotPath, capabilityReply(payload))
 				checkGate(t, g, size == 4096)
+			})
+		}
+	})
+}
+
+// Only root runs the bot: another user's process named like it - by its
+// executable or a spoofed argv0 - is neither executed nor able to close the gate.
+func TestGate_OnlyRootProcessesAreRunningBots(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		exe      string // the process's executable, by base name
+		argv0Bot bool   // argv0 names the installed bot
+		uid      string
+		executed bool
+	}{
+		{"another user's executable named like the bot", "vpn-director-bot", false, "1000", false},
+		{"another user's process with a spoofed argv0", "utility", true, "1000", false},
+		{"root's executable named like the bot", "vpn-director-bot", false, "0", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := gateFixture(t)
+			writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+			marker := filepath.Join(t.TempDir(), "executed")
+			running := filepath.Join(t.TempDir(), tc.exe)
+			writeCapabilityExecutable(t, running, ": > "+shellQuote(marker)+"\n"+capabilityReply(`{"protocol_version":1,"watch_owner":"bot"}`))
+			argv0 := running
+			if tc.argv0Bot {
+				argv0 = g.BotPath
+			}
+			setProcessUID(t, writeBotProcess(t, g.ProcRoot, 81, 401, running, argv0, "--daemon"), tc.uid)
+			checkGate(t, g, !tc.executed)
+			if _, err := os.Stat(marker); (err == nil) != tc.executed {
+				t.Fatalf("executed %v (%v), want %v", err == nil, err, tc.executed)
+			}
+		})
+	}
+	t.Run("named like the bot with no command line", func(t *testing.T) {
+		for _, tc := range []struct {
+			uid        string
+			compatible bool
+		}{{"1000", true}, {"0", false}} {
+			t.Run("uid "+tc.uid, func(t *testing.T) {
+				g := gateFixture(t)
+				writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+				dir := writeBotProcess(t, g.ProcRoot, 82, 402, g.BotPath)
+				if err := os.WriteFile(filepath.Join(dir, "cmdline"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(filepath.Join(dir, "exe")); err != nil {
+					t.Fatal(err)
+				}
+				setProcessUID(t, dir, tc.uid)
+				checkGate(t, g, tc.compatible)
+			})
+		}
+	})
+	t.Run("bot process whose owner cannot be read", func(t *testing.T) {
+		for _, status := range []string{"missing", "no Uid line"} {
+			t.Run(status, func(t *testing.T) {
+				g := gateFixture(t)
+				writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+				dir := writeBotProcess(t, g.ProcRoot, 83, 403, g.BotPath, g.BotPath)
+				path := filepath.Join(dir, "status")
+				var err error
+				if status == "missing" {
+					err = os.Remove(path)
+				} else {
+					err = os.WriteFile(path, []byte("Name:\tvpn-director-bo\nGid:\t0\t0\t0\t0\n"), 0600)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				checkGate(t, g, false)
 			})
 		}
 	})

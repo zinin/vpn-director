@@ -55,7 +55,11 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 		isBot := botExecutableName(link, botPath) || botExecutableName(argv0, botPath)
 		if cmdErr != nil || exeErr != nil {
 			if isBot {
-				if exited(dir, cmdErr) || exited(dir, exeErr) {
+				asRoot, err := runsAsRoot(dir)
+				if err != nil {
+					return nil, ErrIncompatible
+				}
+				if !asRoot || exited(dir, cmdErr) || exited(dir, exeErr) {
 					continue
 				}
 				return nil, ErrIncompatible
@@ -69,8 +73,13 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 					return nil, ErrIncompatible
 				}
 				comm, state, _, err := parseProcessStat(stat, pid)
-				if err != nil || (state != "Z" && state != "X" && botComm(comm, botPath)) {
+				if err != nil {
 					return nil, ErrIncompatible
+				}
+				if state != "Z" && state != "X" && botComm(comm, botPath) {
+					if asRoot, err := runsAsRoot(dir); err != nil || asRoot {
+						return nil, ErrIncompatible
+					}
 				}
 				continue
 			}
@@ -95,6 +104,15 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 			return nil, ErrIncompatible
 		}
 		if state == "Z" || state == "X" {
+			continue
+		}
+		// Read between the two stat reads, so the owner is the process the
+		// start time names and not a reused PID.
+		asRoot, err := runsAsRoot(dir)
+		if err != nil {
+			return nil, ErrIncompatible
+		}
+		if !asRoot {
 			continue
 		}
 		identity, err := identifyExecutable(exe)
@@ -130,6 +148,36 @@ func exited(dir string, err error) bool {
 	}
 	_, err = os.Stat(dir)
 	return errors.Is(err, os.ErrNotExist)
+}
+
+// runsAsRoot reports whether the process in dir has real UID 0. Only root runs
+// the bot: another user's process named like it is neither executed nor allowed
+// to close the gate, and one that exited does not run at all. A status that
+// cannot be read, or has no Uid: line, is a refusal.
+func runsAsRoot(dir string) (bool, error) {
+	status, err := readProcPrefix(filepath.Join(dir, "status"), 8<<10)
+	if err != nil {
+		if exited(dir, err) {
+			return false, nil
+		}
+		return false, ErrIncompatible
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		rest, ok := strings.CutPrefix(line, "Uid:")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(rest)
+		if len(fields) == 0 {
+			break
+		}
+		uid, err := strconv.ParseUint(fields[0], 10, 32)
+		if err != nil {
+			break
+		}
+		return uid == 0, nil
+	}
+	return false, ErrIncompatible
 }
 
 func botExecutableName(path, botPath string) bool {
