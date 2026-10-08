@@ -254,9 +254,9 @@ ack endpoint. An old daemon without watch IPC is `not_running` for automation ev
 monitor answers. Logs are `/tmp/vpn-director-watchd.log` (bot `/logs watchd`, Web UI log source
 `watchd`); the init process check alone cannot tell whether automation is incompatible.
 
-The state survives a restart: `/tmp/vpn-director/watchd-state.json`, saved every minute when it
-changed and at shutdown, read at startup; the first refresh takes the entries of keys still in
-the set.
+The state survives a restart: `/tmp/vpn-director/watchd-state.json`, saved at once when an
+endpoint's status changes, other monitor state at most once a minute, and at shutdown; it is
+read at startup, and the first refresh takes the entries of keys still in the set.
 
 ## Dev mode
 

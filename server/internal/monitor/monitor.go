@@ -103,6 +103,8 @@ type Monitor struct {
 	lag          time.Duration
 	lagWarned    bool
 	dirty        bool
+	statusDirty  bool // an endpoint's status changed since the last save: saved at once
+	saveFailed   bool // the last save failed: the next waits SaveEvery
 	lastSave     time.Time
 	updated      time.Time
 	warned       map[string]string
@@ -401,7 +403,7 @@ func (m *Monitor) reassessRejected(now time.Time) {
 		changed = true
 	}
 	if changed {
-		m.dirty = true
+		m.dirty, m.statusDirty = true, true
 		m.updated = now
 		m.invalidateEvidence()
 	}
@@ -420,7 +422,7 @@ func (m *Monitor) merge(now time.Time, eps []Endpoint, refused map[string]string
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	changed := len(m.restored) > 0
-	identityChanged := false
+	identityChanged, statusChanged := false, false
 	next := make(map[string]*entry, len(eps)+len(refused))
 	order := make([]string, 0, len(eps))
 	for _, ep := range eps {
@@ -439,7 +441,7 @@ func (m *Monitor) merge(now time.Time, eps []Endpoint, refused map[string]string
 			e.st = watchdapi.EndpointState{Status: watchdapi.StatusUnknown, NextAt: now, Since: now}
 			e.revision++
 			e.rejectedCurrent = false
-			identityChanged, changed = true, true
+			identityChanged, changed, statusChanged = true, true, true
 		}
 		next[ep.Key] = e
 		order = append(order, ep.Key)
@@ -457,12 +459,16 @@ func (m *Monitor) merge(now time.Time, eps []Endpoint, refused map[string]string
 		before := e.st
 		e.reject(now, reason, false)
 		changed = changed || before != e.st
+		statusChanged = statusChanged || before.Status != e.st.Status
 		next[key] = e
 	}
 	identityChanged = identityChanged || len(next) != len(m.entries) || !sameKeys(next, m.entries)
 	if changed || identityChanged {
 		m.dirty = true
 		m.updated = now
+	}
+	if statusChanged {
+		m.statusDirty = true
 	}
 	m.entries = next
 	m.order = order
@@ -670,6 +676,7 @@ func (m *Monitor) rejectKey(now time.Time, key, reason string) {
 	m.dirty = true
 	m.updated = now
 	if wasCheckable {
+		m.statusDirty = true
 		m.invalidateEvidence()
 	} else {
 		m.notify()
@@ -777,7 +784,10 @@ func (m *Monitor) tick(ctx context.Context, now time.Time) {
 			m.dispatch(ctx, now)
 		}
 	}
-	if m.dirty && now.Sub(m.lastSave) >= SaveEvery {
+	// A changed status is saved at once: the health publisher persists what it
+	// folds from the statuses immediately, and a restart must not restore older
+	// ones. After a failed save the next waits SaveEvery.
+	if m.dirty && (m.statusDirty && !m.saveFailed || now.Sub(m.lastSave) >= SaveEvery) {
 		m.save(now)
 	}
 }
@@ -892,6 +902,7 @@ func (m *Monitor) apply(ctx context.Context, r result) {
 			m.crashBatches, m.crashes = 0, nil
 		}
 		if e.succeed(now, r.latency, m.settings, m.d.Jitter()) {
+			m.statusDirty = true
 			slog.Info("Monitor: server alive", "server", e.ep.Label, "latency", r.latency.Round(time.Millisecond))
 		}
 		m.completed(e, o)
@@ -938,6 +949,7 @@ func (m *Monitor) publishPending() {
 	for key, o := range m.pending {
 		if e := m.entries[key]; e != nil && e.checkable() && e.pending {
 			if e.fail(o.at, o.reason, m.settings) {
+				m.statusDirty = true
 				slog.Info("Monitor: server down", "server", e.ep.Label, "error", o.reason)
 			}
 			e.pending = false
@@ -1182,8 +1194,14 @@ func (m *Monitor) untilNext(now, nextRefresh time.Time) time.Duration {
 			}
 		}
 	}
-	if m.dirty && m.lastSave.Add(SaveEvery).Before(next) {
-		next = m.lastSave.Add(SaveEvery)
+	if m.dirty {
+		save := m.lastSave.Add(SaveEvery)
+		if m.statusDirty && !m.saveFailed {
+			save = now
+		}
+		if save.Before(next) {
+			next = save
+		}
 	}
 	return max(0, next.Sub(now))
 }

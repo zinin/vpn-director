@@ -626,6 +626,91 @@ func TestMonitor_FailedSaveRetriesWithoutNewChecks(t *testing.T) {
 	}
 }
 
+// A status the health publisher folds is saved at once: a watchd killed within
+// the minute must not come back with statuses older than the health it already
+// published. Every other change keeps the once-a-minute cadence.
+func TestMonitor_AStatusChangeIsSavedAtOnce(t *testing.T) {
+	saved := func(t *testing.T, path string) savedState {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		var s savedState
+		if err == nil {
+			err = json.Unmarshal(data, &s)
+		}
+		if err != nil {
+			t.Fatalf("state file %q: %v", data, err)
+		}
+		return s
+	}
+	start := func(t *testing.T) (*harness, string) {
+		t.Helper()
+		h := newHarness(t, "k1")
+		path := filepath.Join(t.TempDir(), "state.json")
+		h.m = New(h.deps(path))
+		h.at(0, true)
+		if s := saved(t, path); !s.SavedAt.Equal(t0) || s.Entries["k1"].State.Status != watchdapi.StatusAlive {
+			t.Fatalf("first save %+v", s)
+		}
+		return h, path
+	}
+
+	t.Run("a status change", func(t *testing.T) {
+		h, path := start(t)
+		h.now = t0.Add(20 * time.Second)
+		h.complete("k1", errTimeout)
+		h.m.tick(h.ctx, h.now)
+		if s := saved(t, path); !s.SavedAt.Equal(h.now) || s.Entries["k1"].State.Status != watchdapi.StatusDead {
+			t.Fatalf("saved %+v, want the dead status at once", s)
+		}
+	})
+
+	t.Run("a change that keeps every status", func(t *testing.T) {
+		h, path := start(t)
+		h.now = t0.Add(20 * time.Second)
+		h.complete("k1", nil)
+		h.m.tick(h.ctx, h.now)
+		if s := saved(t, path); !s.SavedAt.Equal(t0) {
+			t.Fatalf("saved at %v before SaveEvery with every status unchanged", s.SavedAt)
+		}
+		h.now = t0.Add(SaveEvery)
+		h.m.tick(h.ctx, h.now)
+		if s := saved(t, path); !s.SavedAt.Equal(h.now) || !s.Entries["k1"].State.CheckedAt.Equal(t0.Add(20*time.Second)) {
+			t.Fatalf("saved %+v, want the later check at SaveEvery", s)
+		}
+	})
+
+	t.Run("a failed prompt save retries", func(t *testing.T) {
+		h, path := start(t)
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(path, 0700); err != nil {
+			t.Fatal(err)
+		}
+		failed := t0.Add(20 * time.Second)
+		h.now = failed
+		h.complete("k1", errTimeout)
+		h.m.tick(h.ctx, h.now)
+		if !h.m.dirty {
+			t.Fatal("a failed save cleared dirty")
+		}
+		if wait := h.m.untilNext(h.now, h.now.Add(RefreshEvery)); wait <= 0 {
+			t.Fatalf("a failed save is retried in a busy loop: %s", wait)
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		h.now = failed.Add(SaveEvery)
+		h.m.tick(h.ctx, h.now)
+		if s := saved(t, path); !s.SavedAt.Equal(h.now) || s.Entries["k1"].State.Status != watchdapi.StatusDead {
+			t.Fatalf("saved %+v, want the dead status on the retry", s)
+		}
+		if h.m.dirty {
+			t.Fatal("a successful retry stayed dirty")
+		}
+	})
+}
+
 func TestMonitor_IdleStartupReconcilesAndPreservesTheSavedState(t *testing.T) {
 	for _, idle := range []watchdapi.State{watchdapi.StateStopped, watchdapi.StateDisabled, watchdapi.StateNoXray} {
 		t.Run(string(idle), func(t *testing.T) {

@@ -69,7 +69,10 @@ func (m *Monitor) save(now time.Time) {
 		}
 	}
 	m.mu.Lock()
-	m.dirty = err != nil
+	m.dirty, m.saveFailed = err != nil, err != nil
+	if err == nil {
+		m.statusDirty = false
+	}
 	m.mu.Unlock()
 	if err != nil {
 		slog.Warn("Monitor: cannot save the state", "path", m.d.StatePath, "error", err)
