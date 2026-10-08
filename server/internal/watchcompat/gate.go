@@ -92,16 +92,24 @@ func (g *Gate) Check(ctx context.Context) error {
 		}
 		next[target] = struct{}{}
 	}
-	// Executing capabilities must not bless a replaced file or a reused PID.
+	// Executing capabilities must not bless a replaced file or a reused PID. A
+	// process that exited meanwhile adds no unverified code.
 	after, err := g.targets(ctx)
 	if ctx.Err() != nil {
 		return ErrIncompatible
 	}
-	if err != nil || !sameTargets(before, after) {
+	if err != nil {
 		return deny()
 	}
-	g.cache = next
-	g.verified = before
+	cache := make(map[executableTarget]struct{}, len(after))
+	for _, target := range after {
+		if _, ok := next[target]; !ok {
+			return deny()
+		}
+		cache[target] = struct{}{}
+	}
+	g.cache = cache
+	g.verified = after
 	return nil
 }
 

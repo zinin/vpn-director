@@ -276,8 +276,8 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 **Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client.
 
 **Ready marker**: `tproxy_apply()` writes `/tmp/xray_tproxy/ready` (`XRAY_TPROXY_READY`) only when
-every rule went in, the platform's own included, and removes it on any soft-fail. The Telegram
-bot's subscription watch waits for it before Xray clients leave the fallback tunnel. A failed
+every rule went in, the platform's own included, and removes it on any soft-fail.
+watchd's subscription watch waits for it before Xray clients leave the fallback tunnel. A failed
 `platform_tproxy_extra_rules apply` (Keenetic's mangle INPUT accept) fails `_tproxy_setup_iptables`
 only after the PREROUTING jumps are in place, so interception stays as it was and only the marker
 is withheld. Rule 1 (`! XRAY_CLIENTS`), a private-range RETURN or a TPROXY target that does not

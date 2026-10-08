@@ -138,17 +138,27 @@ func validNotificationRecipients(recipients []Recipient) bool {
 }
 
 func validNotificationEventID(id EventID) bool {
+	_, _, ok := ParseEventID(id)
+	return ok
+}
+
+// ParseEventID splits an EventID into its store epoch, 32 lowercase hex
+// characters, and its sequence, a canonical non-zero decimal uint64 after ':'.
+func ParseEventID(id EventID) (epoch string, sequence uint64, ok bool) {
 	value := string(id)
 	if len(value) < 34 || len(value) > 53 || value[32] != ':' {
-		return false
+		return "", 0, false
 	}
 	for i := 0; i < 32; i++ {
 		if (value[i] < '0' || value[i] > '9') && (value[i] < 'a' || value[i] > 'f') {
-			return false
+			return "", 0, false
 		}
 	}
 	sequence, err := strconv.ParseUint(value[33:], 10, 64)
-	return err == nil && sequence != 0 && strconv.FormatUint(sequence, 10) == value[33:]
+	if err != nil || sequence == 0 || strconv.FormatUint(sequence, 10) != value[33:] {
+		return "", 0, false
+	}
+	return value[:32], sequence, true
 }
 
 func writeNotificationError(w http.ResponseWriter, err error) {

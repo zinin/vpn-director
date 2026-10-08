@@ -259,56 +259,6 @@ func (m *Monitor) queue(keys []string, fresh bool) (int, error) {
 	return n, nil
 }
 
-// Check makes the endpoints of keys due now and waits until each has an
-// answer from after the call, or ctx ends; it returns their states as they
-// stand then. A key not in the set yet is waited for too. The watch's
-// failover (stage 3) calls it in-process, with a deadline.
-func (m *Monitor) Check(ctx context.Context, keys []string) (map[string]watchdapi.EndpointState, error) {
-	m.mu.Lock()
-	start := m.sequence
-	if len(keys) == 0 {
-		keys = make([]string, 0, len(m.entries))
-		for k := range m.entries {
-			keys = append(keys, k)
-		}
-	}
-	_, err := m.queue(keys, true)
-	m.mu.Unlock()
-	if err != nil {
-		return nil, err
-	}
-	for {
-		m.mu.Lock()
-		out := make(map[string]watchdapi.EndpointState, len(keys))
-		done := true
-		for _, k := range keys {
-			e := m.entries[k]
-			if e == nil {
-				done = false
-				continue
-			}
-			out[k] = e.st
-			if e.checkable() && (e.completed <= start || e.completedSession != m.session || m.session == nil || exited(m.session)) {
-				done = false
-			}
-		}
-		inactive := m.state == watchdapi.StateStopped || m.state == watchdapi.StateDisabled
-		ch := m.changed
-		m.mu.Unlock()
-		if inactive {
-			return out, watchdapi.ErrNotActive
-		}
-		if done {
-			return out, nil
-		}
-		select {
-		case <-ctx.Done():
-			return out, ctx.Err()
-		case <-ch:
-		}
-	}
-}
-
 // refresh rereads the settings and the subscriptions, looks at the state of
 // VPN Director and starts, keeps or stops the prober.
 func (m *Monitor) refresh(ctx context.Context, now time.Time) {

@@ -219,7 +219,7 @@ func (s *Store) pageCursor(chatID int64, sequence uint64) string {
 }
 
 func (s *Store) Ack(chatID int64, eventID watchdapi.EventID) error {
-	epoch, sequence, valid := parseEventID(eventID)
+	epoch, sequence, valid := watchdapi.ParseEventID(eventID)
 	if !valid {
 		return errEventID
 	}
@@ -402,20 +402,7 @@ func validEpoch(epoch string) bool {
 	return true
 }
 
-func parseEventID(id watchdapi.EventID) (string, uint64, bool) {
-	value := string(id)
-	if len(value) < 34 || value[32] != ':' || !validEpoch(value[:32]) {
-		return "", 0, false
-	}
-	digits := value[33:]
-	sequence, err := strconv.ParseUint(digits, 10, 64)
-	if err != nil || sequence == 0 || strconv.FormatUint(sequence, 10) != digits {
-		return "", 0, false
-	}
-	return value[:32], sequence, true
-}
-
 func eventSequence(id watchdapi.EventID) uint64 {
-	_, sequence, _ := parseEventID(id)
+	_, sequence, _ := watchdapi.ParseEventID(id)
 	return sequence
 }

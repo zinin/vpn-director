@@ -454,20 +454,76 @@ func TestGate_CancellationKeepsTheVerifiedCache(t *testing.T) {
 }
 
 func TestGate_ProcessChangesDuringCheck(t *testing.T) {
-	for _, change := range []string{"PID reused", "process vanished"} {
-		t.Run(change, func(t *testing.T) {
+	for _, tc := range []struct {
+		change     string
+		compatible bool
+	}{{"PID reused", false}, {"process vanished", true}} {
+		t.Run(tc.change, func(t *testing.T) {
 			g := gateFixture(t)
 			writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
 			running := filepath.Join(t.TempDir(), "vpn-director-bot")
 			dir := filepath.Join(g.ProcRoot, "71")
 			body := fmt.Sprintf("printf '%%s' %s > %q", shellQuote(gateProcessStat(71, 302)), filepath.Join(dir, "stat"))
-			if change == "process vanished" {
+			if tc.change == "process vanished" {
 				body = fmt.Sprintf("/bin/rm -r -- %q", dir)
 			}
 			writeCapabilityExecutable(t, running, body+"\n"+capabilityReply(compatibleJSON))
 			writeBotProcess(t, g.ProcRoot, 71, 301, running, g.BotPath)
-			checkGate(t, g, false)
+			checkGate(t, g, tc.compatible)
 			checkGate(t, g, true)
+		})
+	}
+}
+
+// A bot process that exits between the two scans adds no unverified code, so
+// the check stands; one that appears between them was never run and refuses it.
+func TestGate_ProcessesBetweenTheScans(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		first, second bool // the bot process is in the first, the second scan
+		compatible    bool
+	}{
+		{"exited after the first scan", true, false, true},
+		{"started after the first scan", false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := gateFixture(t)
+			writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+			running := filepath.Join(t.TempDir(), "vpn-director-bot")
+			writeCapabilityExecutable(t, running, capabilityReply(compatibleJSON))
+			identity, err := identifyExecutable(running)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bot := executableTarget{path: running, identity: identity, pid: 91, start: 501}
+			scans, runs := 0, 0
+			g.proc = func(context.Context, string, string) ([]executableTarget, error) {
+				scans++
+				if (scans == 1 && tc.first) || (scans == 2 && tc.second) {
+					return []executableTarget{bot}, nil
+				}
+				return nil, nil
+			}
+			g.exec = func(ctx context.Context, path string) ([]byte, error) {
+				runs++
+				return readCapabilities(ctx, path)
+			}
+			checkGate(t, g, tc.compatible)
+			if scans != 2 {
+				t.Fatalf("scans %d, want 2", scans)
+			}
+			if !tc.compatible {
+				return
+			}
+			if _, ok := g.cache[bot]; ok {
+				t.Fatal("the cache keeps a process the second scan no longer saw")
+			}
+			// The verified set is what the second scan saw: the next check finds
+			// it unchanged and runs nothing again.
+			checkGate(t, g, true)
+			if runs != 2 {
+				t.Fatalf("capability runs %d, want 2", runs)
+			}
 		})
 	}
 }

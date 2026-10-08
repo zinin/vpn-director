@@ -317,16 +317,6 @@ func publishSocket(ctx context.Context, path string, chmod func(string, os.FileM
 	return listener, info, nil
 }
 
-// Serve answers the API on an owned unix socket until ctx ends.
-func Serve(ctx context.Context, path string, src Source) error {
-	l, err := Listen(ctx, path)
-	if err != nil {
-		return err
-	}
-	defer l.Close()
-	return ServeListener(ctx, l, src)
-}
-
 // ServeListener serves an acquired listener. Its caller retains the lifetime
 // lock until both serving and the monitor's prober/state shutdown have ended.
 func ServeListener(ctx context.Context, l net.Listener, src Source, automation ...AutomationSource) error {

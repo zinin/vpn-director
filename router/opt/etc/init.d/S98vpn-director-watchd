@@ -23,7 +23,7 @@ STOP_TIMEOUT=320
 start() {
     [ "$ENABLED" != "yes" ] && return 0
     if [ ! -x "$WATCHD_PATH" ]; then
-        local message="Cannot start monitoring and automatic failover: $WATCHD_PATH is missing or not executable. An existing watchd may still be running; runtime state is unconfirmed. Reinstall VPN Director to restore it, then run $0 start."
+        message="Cannot start monitoring and automatic failover: $WATCHD_PATH is missing or not executable. An existing watchd may still be running; runtime state is unconfirmed. Reinstall VPN Director to restore it, then run $0 start."
         echo "$message"
         logger -t "$LOGTAG" "$message"
         return 0

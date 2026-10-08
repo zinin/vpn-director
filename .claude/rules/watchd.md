@@ -112,6 +112,8 @@ Incomplete/invalid monitor evidence falls back to the legacy path, not an invent
 The legacy path confirms death after 1 minute of proven TCP unreachability with a working WAN,
 otherwise 3 minutes. It remains available with monitoring disabled/unavailable. UDP/QUIC-only
 outbounds do not gain false TCP proof. The walk keeps `OwnFirst=3`, then round-robins subscriptions;
+with valid monitor evidence the endpoints the monitor last saw alive go first and those Xray
+rejected in the current generation are skipped;
 `endpoint.PerAddress` and `DialKey` deduplicate connections rather than provider labels. A refresh
 that fails keeps the previous list; deleted/relinked subscriptions cannot be republished by an
 old download. Preferred return waits 5 minutes, retries at 10–30 minutes, holds success for

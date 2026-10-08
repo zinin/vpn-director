@@ -117,7 +117,7 @@ func validSavedState(state savedState) bool {
 	validEvents := func(events []storedEvent) bool {
 		var previous uint64
 		for _, event := range events {
-			epoch, sequence, valid := parseEventID(event.EventID)
+			epoch, sequence, valid := watchdapi.ParseEventID(event.EventID)
 			if !valid || epoch != state.Epoch || sequence > state.Sequence || sequence <= previous {
 				return false
 			}
@@ -149,7 +149,7 @@ func validSavedState(state savedState) bool {
 	}
 	for _, progress := range state.Closed {
 		for id, at := range progress {
-			epoch, sequence, valid := parseEventID(id)
+			epoch, sequence, valid := watchdapi.ParseEventID(id)
 			if !valid || epoch != state.Epoch || sequence > state.Sequence {
 				return false
 			}

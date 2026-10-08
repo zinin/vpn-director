@@ -914,12 +914,14 @@ EOF
             assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "old monitor"
             assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$VPD_DIR/vpn-director-watchd")" "$old_identity"
             [[ ! -e "$BATS_TEST_TMPDIR/watchd.chmod.calls" ]]
+            assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.rm.calls")" "$VPD_DIR/vpn-director-watchd.tmp"
             ;;
         chmod)
             assert_output --partial "Warning: Failed to make the server monitor executable (optional component)"
             assert_equal "$(cat "$VPD_DIR/vpn-director-watchd")" "new monitor"
             [[ ! -x "$VPD_DIR/vpn-director-watchd" ]]
             assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.chmod.calls")" $'+x\n'"$VPD_DIR/vpn-director-watchd"
+            [[ ! -e "$BATS_TEST_TMPDIR/watchd.rm.calls" ]]
             ;;
     esac
     assert_watchd_repair_hint
@@ -928,7 +930,6 @@ EOF
     [[ ! -f "$BATS_TEST_TMPDIR/watchd.running" ]]
     assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.mv.calls")" \
         "$VPD_DIR/vpn-director-watchd.tmp"$'\n'"$VPD_DIR/vpn-director-watchd"
-    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.rm.calls")" "$VPD_DIR/vpn-director-watchd.tmp"
     assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$INIT_DIR/S98vpn-director-watchd" \
         "$VPD_DIR/"{telegram-bot,webui,vpn-director.json,watchd.unrelated.tmp})" "$protected_identity"
     local file

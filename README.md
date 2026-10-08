@@ -260,7 +260,7 @@ Traffic from specified LAN clients is transparently redirected through Xray usin
 
 Subscriptions it reads: share links (`vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://` / `hy2://`), base64-encoded or plain, and Xray JSON - the array of Xray configs panels such as Remnawave and Marzban give Xray clients. An entry Xray cannot run - TUIC, SSR, a balancer, a chained config - is skipped, and the import says why.
 
-Up to ten subscriptions live side by side; you pick the running server from any of them. When it fails, watchd first tries a direct server switch based on fresh active-dead/candidate-alive monitor evidence and a working WAN, keeping client assignments and TPROXY routing in place. Without that proof or when the direct attempt fails, its legacy path confirms the failure, moves eligible LAN clients onto a Tunnel Director tunnel, refreshes every linked subscription at once and walks their servers — the chosen one and two more of its subscription, then one server of each subscription in turn — until one answers, and restores the moved clients once Xray TPROXY is ready.
+Up to ten subscriptions live side by side; you pick the running server from any of them. When it fails, watchd first tries a direct server switch based on fresh active-dead/candidate-alive monitor evidence and a working WAN, keeping client assignments and TPROXY routing in place. Without that proof or when the direct attempt fails, its legacy path confirms the failure, moves eligible LAN clients onto a Tunnel Director tunnel, refreshes every linked subscription at once and walks their servers — the chosen one and two more of its subscription, then one server of each subscription in turn; with valid monitor evidence, the endpoints the monitor last saw alive go first and those Xray rejected in the current generation are skipped — until one answers, and restores the moved clients once Xray TPROXY is ready.
 
 ### Tunnel Director
 
@@ -358,7 +358,7 @@ Xray, Telegram bot, Web UI, and the server monitor may occasionally crash. Use m
    ```
    check process vpn-director-watchd matching "vpn-director-watchd"
        start program = "/opt/etc/init.d/S98vpn-director-watchd start"
-       stop program = "/opt/etc/init.d/S98vpn-director-watchd stop"
+       stop program = "/opt/etc/init.d/S98vpn-director-watchd stop" with timeout 330 seconds
        if does not exist then restart
    ```
 

@@ -197,7 +197,7 @@ _prune_keeping() {
 }
 
 ###################################################################################################
-# --unless-stopped is for automatic callers - the Telegram bot's subscription watch. Once stop has
+# --unless-stopped is for automatic callers - watchd's subscription watch. Once stop has
 # left its marker, only an apply without it turns routing back on. The commands check right after
 # taking the lock, so an apply that queued behind that stop still sees the marker it left.
 ###################################################################################################
@@ -269,7 +269,7 @@ cmd_apply() {
         return 0
     fi
 
-    # stop's marker pauses the Telegram bot's subscription watch, and an apply
+    # stop's marker pauses watchd's subscription watch, and an apply
     # of everything hands routing back to it - a real one only, so not above
     # the dry run. One component turned back on leaves the stop of the rest in
     # force: a Web UI server switch restarts xray alone, and a watch that read

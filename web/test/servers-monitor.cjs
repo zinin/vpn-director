@@ -11,6 +11,10 @@ const exposed = ['groups', 'monitor', 'load', 'loadMonitor', 'healthOf', 'aliveT
 const code = ts.transpileModule(script + '\nexport const exposed = {' + exposed.join(',') + ', checkNotice: typeof checkNotice === "undefined" ? undefined : checkNotice}', {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
+const monitorModule = { exports: {} }
+vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(sourceRoot, 'monitor.ts'), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+}).outputText, monitorModule)
 const server = { name: 'Synthetic', fingerprint: 'abcdef01', address: '192.0.2.1', port: 443, ips: [], protocol: 'trojan' }
 const group = { id: '0a1b2c3d', name: 'Synthetic', servers: [server] }
 const row = { index: 0, fingerprint: server.fingerprint, status: 'alive', latency_ms: 142 }
@@ -38,6 +42,7 @@ function setup() {
   const vue = { ref: value => ({ value }), computed: fn => ({ get value() { return fn() } }), onMounted: () => {}, onUnmounted: fn => unmount.push(fn) }
   const context = { exports: {}, require: name => name === 'vue' ? vue
     : name === '../watch' ? require('./watch-status.cjs').loadWatchModule()
+    : name === '../monitor' ? monitorModule.exports
     : name === './WatchStatus.vue' ? { default: { filename: path.join(sourceRoot, 'components/WatchStatus.vue') } }
     : { default: api }, Date, AbortController,
     alert: message => alerts.push(message), confirm: () => true,

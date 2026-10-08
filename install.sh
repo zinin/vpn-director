@@ -570,7 +570,7 @@ download_watchd() {
     # Stop a running monitor before its binary is replaced; start_watchd
     # starts it again.
     if pidof vpn-director-watchd >/dev/null 2>&1; then
-        print_info "Stopping the running server monitor..."
+        print_info "Stopping the running server monitor (up to about 5 minutes if an automatic apply or Xray restart is finishing)..."
         if [[ -x "$INIT_DIR/S98vpn-director-watchd" ]]; then
             "$INIT_DIR/S98vpn-director-watchd" stop >/dev/null 2>&1 || true
         else
@@ -594,7 +594,6 @@ download_watchd() {
     if ! chmod +x "$watchd_path"; then
         print_info "Warning: Failed to make the server monitor executable (optional component)"
         print_info "Monitoring and automatic failover are unavailable: $watchd_path is not executable. Reinstall VPN Director to restore it, then run $INIT_DIR/S98vpn-director-watchd start."
-        rm -f "$tmp_path" 2>/dev/null || true
         return 0
     fi
     print_success "Installed the server monitor"
