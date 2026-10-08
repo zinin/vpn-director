@@ -65,7 +65,9 @@ cancels and drains monitor/watch/API workers, stops only `vpn-director-probe`, f
 and releases the socket. It cancels read-only commands, downloads and validation, while an
 automatic apply or Xray process restart already running finishes (bounded by its timeout), so
 main Xray and current routes are not left half-changed. It preserves main Xray, ready/stopped
-markers and current routes.
+markers and current routes. `S98vpn-director-watchd stop` therefore waits up to 320 seconds
+before SIGKILL: a watchd killed sooner leaves that command running on its own, holding the
+VPN Director lock, while stop reports watchd stopped.
 Stopping the bot stops delivery/management, not watchd automation. These daemon stops differ
 from `vpn-director.sh stop` or bot `/stop`, which fence automation and tear down routing.
 

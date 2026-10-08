@@ -831,7 +831,7 @@ watchd_init_sandbox() {
     export WATCHD_TEST_BIN="$BATS_TEST_TMPDIR/watchd-bin"
     export WATCHD_TEST_PATH="$BATS_TEST_TMPDIR/vpn-director-watchd"
     export WATCHD_TEST_CONFIG="$BATS_TEST_TMPDIR/vpn-director.json"
-    export WATCHD_INIT_SURVIVES=0 WATCHD_INIT_FORCE_SURVIVES=0
+    export WATCHD_INIT_SURVIVES=0 WATCHD_INIT_FORCE_SURVIVES=0 WATCHD_INIT_EXITS_AFTER=
     mkdir -p "$WATCHD_TEST_BIN"
     printf '{}\n' > "$WATCHD_TEST_CONFIG"
     chmod 600 "$WATCHD_TEST_CONFIG"
@@ -868,7 +868,14 @@ EOF
 [ "$#" = 1 ] || exit 99
 printf 'sleep %s\n' "$1" >> "$BATS_TEST_TMPDIR/watchd-init.events"
 case "$1" in
-    1) exit 0 ;;
+    1)
+        # A watchd that ignored SIGTERM exits by itself after this many seconds.
+        if [ -n "$WATCHD_INIT_EXITS_AFTER" ] &&
+            [ "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" -ge "$WATCHD_INIT_EXITS_AFTER" ]; then
+            /bin/rm -f "$BATS_TEST_TMPDIR/watchd.running"
+        fi
+        exit 0
+        ;;
     2)
         count=0
         while [ ! -f "$BATS_TEST_TMPDIR/watchd.running" ] && [ "$count" -lt 100 ]; do
@@ -957,11 +964,31 @@ assert_watchd_init_preserves_routing() {
     run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" stop
 
     assert_success
+    assert_output --partial "may be finishing"
     assert_output --partial "Force killing"
     [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
-    assert_equal "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" 11
+    assert_equal "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" 321
     assert_equal "$(grep '^killall ' "$BATS_TEST_TMPDIR/watchd-init.events")" \
         $'killall vpn-director-watchd\nkillall -9 vpn-director-watchd'
+    assert_watchd_init_preserves_routing
+}
+
+# watchd waits for an automatic apply or Xray restart already running (up to
+# ApplyTimeout) before it exits; a SIGKILL after 10 s would orphan that command.
+@test "watchd init: stop waits out an automatic apply before force killing" {
+    watchd_init_sandbox
+    export WATCHD_INIT_SURVIVES=1 WATCHD_INIT_EXITS_AFTER=45
+    printf 'first-owner-4242\n' > "$BATS_TEST_TMPDIR/watchd.running"
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" stop
+
+    assert_success
+    assert_output --partial "may be finishing"
+    assert_output --partial "server monitor stopped"
+    refute_output --partial "Force killing"
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
+    assert_equal "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" 45
+    assert_equal "$(grep '^killall ' "$BATS_TEST_TMPDIR/watchd-init.events")" 'killall vpn-director-watchd'
     assert_watchd_init_preserves_routing
 }
 
@@ -977,7 +1004,7 @@ assert_watchd_init_preserves_routing() {
     assert_failure
     assert_output --partial "Failed to stop"
     assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/watchd.running")" "$first_identity"
-    assert_equal "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" 11
+    assert_equal "$(grep -c '^sleep 1$' "$BATS_TEST_TMPDIR/watchd-init.events")" 321
     run cat "$BATS_TEST_TMPDIR/watchd-init.events"
     refute_output --partial "nohup"
     assert_watchd_init_preserves_routing

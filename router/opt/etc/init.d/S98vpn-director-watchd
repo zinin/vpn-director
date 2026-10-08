@@ -13,6 +13,12 @@ WATCHD_PATH="/opt/vpn-director/vpn-director-watchd"
 WATCHD_NAME="vpn-director-watchd"
 WATCHD_CONFIG="/opt/vpn-director/vpn-director.json"
 LOGTAG="S98vpn-director-watchd"
+# Seconds stop waits before SIGKILL. watchd lets an automatic apply or Xray
+# process restart that is already running finish before it exits: ApplyTimeout
+# (5 minutes), the executor's 10-second kill grace and a margin to drain. A
+# watchd killed sooner leaves that vpn-director.sh running on its own, holding
+# the VPN Director lock, while stop reports watchd stopped.
+STOP_TIMEOUT=320
 
 start() {
     [ "$ENABLED" != "yes" ] && return 0
@@ -48,7 +54,10 @@ stop() {
     fi
     killall "$WATCHD_NAME" 2>/dev/null
     count=0
-    while pidof "$WATCHD_NAME" >/dev/null 2>&1 && [ "$count" -lt 10 ]; do
+    while pidof "$WATCHD_NAME" >/dev/null 2>&1 && [ "$count" -lt "$STOP_TIMEOUT" ]; do
+        if [ "$count" -eq 10 ]; then
+            echo "Still waiting for $DESC to exit: an automatic apply or Xray restart may be finishing (up to ${STOP_TIMEOUT}s)"
+        fi
         sleep 1
         count=$((count + 1))
     done
