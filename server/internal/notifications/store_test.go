@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
@@ -650,6 +651,154 @@ func TestOpenStore_DefersUntilThePathResolves(t *testing.T) {
 		messages := notificationsForChat(pendingNotifications(t, s), 100)
 		if len(messages) != 1 || messages[0].Text != "deferred" || !messages[0].At.Equal(published) {
 			t.Fatalf("pending %+v; want the deferred event at its own time", messages)
+		}
+	})
+}
+
+// A restart restores the sequence at the saved reserve, so the first event
+// needs a save that extends it. While writes fail, Publish hands out no ID
+// beyond the saved reserve - a restart with storage still failing would hand
+// it out again - and keeps the event in memory until a save succeeds.
+func TestStore_PublishWaitsWhileTheReserveCannotBeSaved(t *testing.T) {
+	// restarted saves a store with chat 100 and one event, then restores it
+	// as a restart does with every write failing; enable lets writes through.
+	restarted := func(t *testing.T) (s *Store, path string, clock *time.Time, enable func()) {
+		t.Helper()
+		at := notificationTestTime()
+		now := func() time.Time { return at }
+		path = filepath.Join(t.TempDir(), "watchd-notifications.json")
+		before := newNotificationStore(t, path, now)
+		replaceNotificationRecipients(t, before, watchdapi.Recipient{ChatID: 100, FirstSeen: at.Add(-time.Hour)})
+		publishNotification(t, before, "before the restart")
+		at = at.Add(time.Minute)
+		s = newStore(path, now)
+		enable = failNotificationIO(t, s, "write")
+		if err := s.open(); err == nil {
+			t.Fatal("the restart saved its reserve despite failing writes")
+		}
+		s.mu.Lock()
+		spent := s.sequence >= s.reservedThrough
+		s.mu.Unlock()
+		if !spent {
+			t.Fatal("the restored store holds event IDs no save reserved")
+		}
+		return s, path, &at, enable
+	}
+	waitFor := func(t *testing.T, s *Store, clock *time.Time, texts ...string) []time.Time {
+		t.Helper()
+		var times []time.Time
+		for _, text := range texts {
+			if id, err := s.Publish(text); id != "" || !errors.Is(err, ErrDeferred) {
+				t.Fatalf("Publish(%q) = %q, %v; want no ID and ErrDeferred", text, id, err)
+			}
+			times = append(times, *clock)
+			*clock = clock.Add(time.Second)
+		}
+		return times
+	}
+	texts := func(messages []watchdapi.Notification) []string {
+		var out []string
+		for _, message := range messages {
+			out = append(out, message.Text)
+		}
+		return out
+	}
+
+	t.Run("waits in order, bounded", func(t *testing.T) {
+		s, _, clock, _ := restarted(t)
+		var published []string
+		for i := 0; i < maxRecent+3; i++ {
+			published = append(published, fmt.Sprintf("waiting %d", i))
+		}
+		waitFor(t, s, clock, published...)
+		if len(s.backlog) != maxRecent {
+			t.Fatalf("backlog holds %d events, want %d", len(s.backlog), maxRecent)
+		}
+		for i, event := range s.backlog {
+			if event.Text != published[i+3] {
+				t.Fatalf("backlog %d is %q, want %q: the oldest go first", i, event.Text, published[i+3])
+			}
+		}
+		if status := s.Status(); status.StorageError == "" || status.Pending != 1 {
+			t.Fatalf("status %+v; want the failing save named and only the restored event pending", status)
+		}
+	})
+
+	t.Run("drains once a save succeeds", func(t *testing.T) {
+		s, path, clock, enable := restarted(t)
+		times := waitFor(t, s, clock, "first waiting", "second waiting")
+		enable()
+		if err := s.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if len(s.backlog) != 0 {
+			t.Fatalf("backlog %+v after a successful save", s.backlog)
+		}
+		messages := notificationsForChat(pendingNotifications(t, s), 100)
+		if got := texts(messages); !reflect.DeepEqual(got, []string{"before the restart", "first waiting", "second waiting"}) {
+			t.Fatalf("pending %v", got)
+		}
+		for i, at := range times {
+			if !messages[i+1].At.Equal(at) {
+				t.Errorf("%q at %v, want its own time %v", messages[i+1].Text, messages[i+1].At, at)
+			}
+		}
+		next := publishNotification(t, s, "after the drain")
+		_, nextSequence := splitNotificationID(t, next)
+		_, lastSequence := splitNotificationID(t, messages[2].EventID)
+		if nextSequence <= lastSequence {
+			t.Fatalf("%s came before the drained %s", next, messages[2].EventID)
+		}
+		reopened := newNotificationStore(t, path, func() time.Time { return *clock })
+		if got := texts(notificationsForChat(pendingNotifications(t, reopened), 100)); !reflect.DeepEqual(got, []string{"before the restart", "first waiting", "second waiting", "after the drain"}) {
+			t.Fatalf("the file holds %v", got)
+		}
+	})
+
+	t.Run("a failed save leaves the rest waiting", func(t *testing.T) {
+		s, _, clock, enable := restarted(t)
+		waitFor(t, s, clock, "one", "two", "three")
+		enable()
+		// The reserve's save and the first drained event's save go through.
+		write, writes := s.io.write, 0
+		s.io.write = func(f *os.File, data []byte) (int, error) {
+			writes++
+			if writes > 2 {
+				return 0, errors.New("injected write failure during the drain")
+			}
+			return write(f, data)
+		}
+		if err := s.Flush(); err == nil {
+			t.Fatal("the drain hid a failed save")
+		}
+		if len(s.backlog) != 1 || s.backlog[0].Text != "three" {
+			t.Fatalf("backlog %+v; want only the entry the drain did not reach", s.backlog)
+		}
+		if got := texts(notificationsForChat(pendingNotifications(t, s), 100)); !reflect.DeepEqual(got, []string{"before the restart", "one", "two"}) {
+			t.Fatalf("pending %v", got)
+		}
+		if id, err := s.Publish("behind the waiting one"); id != "" || !errors.Is(err, ErrDeferred) {
+			t.Fatalf("Publish = %q, %v; a newer event must wait behind the older one", id, err)
+		}
+		s.io.write = write
+		if err := s.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if got := texts(notificationsForChat(pendingNotifications(t, s), 100)); !reflect.DeepEqual(got, []string{"before the restart", "one", "two", "three", "behind the waiting one"}) {
+			t.Fatalf("pending %v", got)
+		}
+	})
+
+	t.Run("health after the drained messages", func(t *testing.T) {
+		s, _, clock, enable := restarted(t)
+		waitFor(t, s, clock, "waiting one", "waiting two")
+		enable()
+		sub := healthTestSubscription()
+		if err := s.ObserveSubscriptions([]vpnconfig.Subscription{sub}, healthTestSnapshot(sub, watchdapi.StatusDead)); err != nil {
+			t.Fatal(err)
+		}
+		if got := texts(notificationsForChat(pendingNotifications(t, s), 100)); !reflect.DeepEqual(got, []string{"before the restart", "waiting one", "waiting two", "Subscription North has no live servers"}) {
+			t.Fatalf("pending %v", got)
 		}
 	})
 }

@@ -157,7 +157,11 @@ Monitoring and failover continue with the available queue. RAM events after fail
 can be lost on crash: a failed write or ack is not a durable-delivery guarantee. When the data
 path cannot be read at startup, watchd keeps up to 20 new events in memory without IDs, answers
 notification IPC with 503, retries the path every 10 seconds, and on success restores the file
-there and queues the waiting events; a restart before that loses them.
+there and queues the waiting events; a restart before that loses them. When the event-ID reserve
+cannot be saved (writes failing after a restart), new watch messages wait in memory without IDs
+(up to 20) and are queued in order, with their original times, once a save succeeds;
+subscription-health transitions are derived again and published then; a restart before that
+loses the waiting messages.
 
 Ack is idempotent and succeeds only after durable progress is flushed; storage failures return
 503. Delivery is at-least-once, not exactly-once Telegram: a send followed by an unconfirmed ack

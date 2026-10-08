@@ -41,10 +41,12 @@ var (
 	errEventID  = watchdapi.ErrInvalidEventID
 	errPageSize = errors.New("notification exceeds page size")
 
-	errUnavailable = errors.New("notification data path is unavailable")
-	// ErrDeferred is Publish on a store not open yet: the event waits in
-	// memory, without an ID, until a Flush opens the store.
-	ErrDeferred = errors.New("notification storage is not open; the event waits in memory")
+	errUnavailable    = errors.New("notification data path is unavailable")
+	errReserveUnsaved = errors.New("cannot save the notification event-ID reserve")
+	// ErrDeferred is Publish while no event ID can be saved - the store is not
+	// open yet, or its ID reserve cannot be extended: the event waits in
+	// memory, without an ID, until a save succeeds.
+	ErrDeferred = errors.New("notification storage cannot save yet; the event waits in memory")
 )
 
 type storedEvent struct {
@@ -154,25 +156,49 @@ func (s *Store) openLocked() error {
 	}
 	s.path = path
 	loadErr, identityErr := s.load()
-	errs := []error{loadErr, identityErr, s.saveLocked(0)}
+	saveErr := s.saveLocked(0)
+	var drainErr error
+	if saveErr == nil {
+		drainErr = s.drainLocked()
+	}
+	s.mu.Lock()
+	s.resolve = nil
+	s.mu.Unlock()
+	if saveErr == nil && drainErr == nil {
+		// What Publish kept between the drain and the switch.
+		drainErr = s.drainLocked()
+	}
+	return errors.Join(loadErr, identityErr, saveErr, drainErr)
+}
+
+// drainLocked queues the events Publish kept while no event ID could be
+// saved, in order and at their own times, once a save has reserved IDs. An
+// entry leaves the backlog only with an ID; a save that fails stops the drain
+// and leaves the rest waiting. Caller holds saving.
+func (s *Store) drainLocked() error {
 	save := func() error { return s.saveLocked(0) }
 	for {
 		s.mu.Lock()
-		backlog := s.backlog
-		s.backlog = nil
-		if len(backlog) == 0 {
-			s.resolve = nil
+		if len(s.backlog) == 0 {
 			s.mu.Unlock()
-			break
+			return nil
 		}
+		event := s.backlog[0]
 		s.mu.Unlock()
-		for _, event := range backlog {
-			if _, err := s.publishAt(event.Text, event.At, save); err != nil {
-				errs = append(errs, err)
+		id, err := s.publishAt(event.Text, event.At, save)
+		if id != "" {
+			s.mu.Lock()
+			// Publish drops the oldest of a full backlog, which may have been
+			// this entry meanwhile.
+			if len(s.backlog) > 0 && s.backlog[0].Text == event.Text && s.backlog[0].At.Equal(event.At) {
+				s.backlog = s.backlog[1:]
 			}
+			s.mu.Unlock()
+		}
+		if err != nil {
+			return err
 		}
 	}
-	return errors.Join(errs...)
 }
 
 // unopened reports a store OpenStore could not open yet.
@@ -185,23 +211,40 @@ func (s *Store) unopened() bool {
 func (s *Store) Publish(text string) (watchdapi.EventID, error) {
 	at := s.now()
 	s.mu.Lock()
-	if s.resolve != nil {
-		event := storedEvent{At: at, Text: text}
-		if len(s.backlog) == maxRecent {
-			copy(s.backlog, s.backlog[1:])
-			s.backlog[len(s.backlog)-1] = event
-		} else {
-			s.backlog = append(s.backlog, event)
-		}
+	// An event waits behind those already waiting: none gets an ID ahead of
+	// an older one.
+	if s.resolve != nil || len(s.backlog) > 0 {
+		s.deferLocked(text, at)
 		s.mu.Unlock()
 		return "", ErrDeferred
 	}
 	s.mu.Unlock()
-	return s.publishAt(text, at, s.Flush)
+	id, err := s.publishAt(text, at, s.Flush)
+	if errors.Is(err, errReserveUnsaved) {
+		// No ID outside the saved reserve: a restart would hand it out again.
+		s.mu.Lock()
+		s.deferLocked(text, at)
+		s.mu.Unlock()
+		return "", ErrDeferred
+	}
+	return id, err
+}
+
+// deferLocked keeps an event that cannot get an ID yet, dropping the oldest
+// when maxRecent already wait. Caller holds mu.
+func (s *Store) deferLocked(text string, at time.Time) {
+	event := storedEvent{At: at, Text: text}
+	if len(s.backlog) == maxRecent {
+		copy(s.backlog, s.backlog[1:])
+		s.backlog[len(s.backlog)-1] = event
+	} else {
+		s.backlog = append(s.backlog, event)
+	}
 }
 
 // publishAt appends text as an event at at, leasing more IDs through save
-// when the reserve is spent, and saves it.
+// when the reserve is spent, and saves it. A lease that cannot be saved
+// answers errReserveUnsaved and appends nothing.
 func (s *Store) publishAt(text string, at time.Time, save func() error) (watchdapi.EventID, error) {
 	if err := s.ensureEpoch(); err != nil {
 		return "", err
@@ -216,7 +259,7 @@ func (s *Store) publishAt(text string, at time.Time, save func() error) (watchda
 		if s.sequence >= s.reservedThrough {
 			s.mu.Unlock()
 			if err := save(); err != nil {
-				return "", err
+				return "", errors.Join(errReserveUnsaved, err)
 			}
 			continue
 		}

@@ -92,7 +92,7 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 	// its own checks decide what a stop silences, so an ended tick drops nothing.
 	w.Notify = func(text string) {
 		if _, err := q.Publish(text); errors.Is(err, notifications.ErrDeferred) {
-			slog.Warn("Notification storage is not open; the event waits in memory until it opens")
+			slog.Warn("Notification storage cannot save yet; the event waits in memory until it can")
 		} else if err != nil {
 			slog.Warn("Notification storage publish failed; delivery will retry")
 		}
