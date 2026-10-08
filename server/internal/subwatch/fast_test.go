@@ -1,10 +1,13 @@
 package subwatch
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -504,6 +507,117 @@ func TestFast_InconclusiveUsesLegacy(t *testing.T) {
 			t.Fatalf("requests %d, finished %d; active, candidate and WAN checks must be joined on timeout", len(s.h.requests()), finished.Load())
 		}
 	})
+}
+
+// fastLogKinds captures the log for the rest of the test and returns, when
+// called, the error kind of every record saying the fast attempt did not switch.
+func fastLogKinds(t *testing.T) func() []string {
+	t.Helper()
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return func() []string {
+		t.Helper()
+		kinds := []string{}
+		decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+		for {
+			var record struct {
+				Level   string `json:"level"`
+				Message string `json:"msg"`
+				Error   struct {
+					Kind string `json:"kind"`
+				} `json:"error"`
+			}
+			if err := decoder.Decode(&record); errors.Is(err, io.EOF) {
+				return kinds
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if record.Message == "Fast failover did not switch; confirming the failure" {
+				if record.Level != "INFO" {
+					t.Fatalf("fast attempt logged at %s, want INFO", record.Level)
+				}
+				kinds = append(kinds, record.Error.Kind)
+			}
+		}
+	}
+}
+
+// A fast attempt that leaves the death to the legacy confirmation says so, and
+// why, once a failure episode.
+func TestFast_InconclusiveAttemptLogsOncePerEpisode(t *testing.T) {
+	t.Run("stale evidence", func(t *testing.T) {
+		s := newFastFixture(t)
+		kinds := fastLogKinds(t)
+		s.h.invalidate(s.activeKeys()[0])
+		start := s.f.now
+		for _, elapsed := range []time.Duration{0, 30 * time.Second, time.Minute} {
+			s.f.now = start.Add(elapsed)
+			s.w.Tick(context.Background())
+		}
+		s.assertNoMutation(t)
+		if got := kinds(); !reflect.DeepEqual(got, []string{"evidence"}) {
+			t.Fatalf("fast attempt records %v, want one with kind evidence for the episode", got)
+		}
+		healthy := true
+		s.w.Probe = func(context.Context, int) error {
+			s.probes++
+			if healthy {
+				return nil
+			}
+			return errProbe
+		}
+		s.f.now = start.Add(90 * time.Second)
+		s.w.Tick(context.Background())
+		healthy = false
+		s.f.now = start.Add(2 * time.Minute)
+		s.w.Tick(context.Background())
+		if got := kinds(); !reflect.DeepEqual(got, []string{"evidence", "evidence"}) {
+			t.Fatalf("fast attempt records %v, want one more for the new episode", got)
+		}
+	})
+	for _, tc := range []struct {
+		name  string
+		setup func(*fastFixture)
+	}{
+		{"monitor disabled", func(s *fastFixture) {
+			s.h.cached.State, s.h.fresh.State = watchdapi.StateDisabled, watchdapi.StateDisabled
+		}},
+		{"no monitor", func(s *fastFixture) { s.w.Health = nil }},
+	} {
+		t.Run("not applicable/"+tc.name, func(t *testing.T) {
+			s := newFastFixture(t)
+			kinds := fastLogKinds(t)
+			tc.setup(s)
+			s.w.Tick(context.Background())
+			s.assertNoMutation(t)
+			if got := kinds(); !reflect.DeepEqual(got, []string{"unavailable"}) {
+				t.Fatalf("fast attempt records %v, want one with kind unavailable", got)
+			}
+		})
+	}
+	for _, outcome := range []string{"switched", "fallback"} {
+		t.Run(outcome+" attempt logs nothing", func(t *testing.T) {
+			s := newFastFixture(t)
+			kinds := fastLogKinds(t)
+			if outcome == "fallback" {
+				state := s.h.fresh.Endpoints[s.candidateKey()]
+				state.Status = watchdapi.StatusDead
+				s.h.fresh.Endpoints[s.candidateKey()] = state
+			}
+			s.w.Tick(context.Background())
+			if outcome == "switched" && (s.restarts != 1 || s.f.cfg.Xray.ActiveServer.Name != "Backup") {
+				t.Fatalf("restart %d, active %+v; the fixture must switch", s.restarts, s.f.cfg.Xray.ActiveServer)
+			}
+			if outcome == "fallback" && s.f.cfg.Xray.Failover == nil {
+				t.Fatal("the fixture must fall back to the tunnel")
+			}
+			if got := kinds(); len(got) != 0 {
+				t.Fatalf("fast attempt records %v after a %s attempt", got, outcome)
+			}
+		})
+	}
 }
 
 func TestFast_StopAndCompatibilityDrainFreshChecks(t *testing.T) {

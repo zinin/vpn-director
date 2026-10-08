@@ -41,6 +41,9 @@ type fastAttempt struct {
 	Config  *vpnconfig.VPNDirectorConfig
 	Outcome fastOutcome
 	Guard   func(*vpnconfig.VPNDirectorConfig) error
+	// Err is what ended an attempt that did not switch; nil when the fast
+	// path did not apply.
+	Err error
 }
 
 var errFastEvidence = errors.New("fresh monitor evidence is no longer applicable")
@@ -323,6 +326,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 				err = refused
 			}
 		}
+		out.Err = err
 		if w.mutationEnded(ctx) || fastTerminal(err) {
 			if mutationInterrupted(err) {
 				w.mutationFailed.Store(true)

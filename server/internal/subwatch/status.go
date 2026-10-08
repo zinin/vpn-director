@@ -110,6 +110,8 @@ func watchErrorAttr(err error) slog.Attr {
 		kind = "superseded"
 	case errors.Is(err, vpnconfig.ErrSubscriptionGone):
 		kind = "subscription_gone"
+	case errors.Is(err, errFastEvidence):
+		kind = "evidence"
 	}
 	return slog.Group("error", "kind", kind)
 }

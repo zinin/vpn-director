@@ -106,6 +106,7 @@ type Watch struct {
 	fastOwned         *fastSelection
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
+	fastLogged        time.Time // failSince of the episode whose fast attempt was last logged as not switching
 	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
 	lastImport        time.Time
 	importRetry       time.Duration                 // current wait between import waves; zero means ImportRetry
@@ -361,6 +362,12 @@ func (w *Watch) Tick(ctx context.Context) {
 	case fastFallback:
 		w.failOutbound(ctx, attempt.Config, "monitor", attempt.Guard)
 		return
+	}
+	// The death is left to the legacy confirmation: say so, and why, once an
+	// episode.
+	if !w.fastLogged.Equal(w.failSince) {
+		w.fastLogged = w.failSince
+		slog.Info("Fast failover did not switch; confirming the failure", watchErrorAttr(attempt.Err))
 	}
 	cfg = attempt.Config
 	// Past DeadAfter the outbound is dead whatever a look finds.
