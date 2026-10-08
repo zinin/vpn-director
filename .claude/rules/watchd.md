@@ -251,6 +251,10 @@ while checks are paused.
 | `GET /v1/notifications/pending?cursor=...` | Ordered per-chat events and `next_cursor` |
 | `POST /v1/notifications/ack` | Idempotent durable progress for `chat_id`/`event_id` |
 
+watchd refuses to start when the socket's directory (`/tmp/vpn-director`) is a symlink, is not
+owned by root, or is writable by group or others, and logs why; the prober directory must also
+be a root-owned `0700` directory.
+
 Each client request is bounded by 2 seconds. Notification POST bodies are capped at 1 MiB
 (413 on oversize); responses are bounded by 16 MiB, pending pages by 100 messages, cursors by
 256 characters. Invalid cursor/event ID is 400; storage failure is 503, not false success.

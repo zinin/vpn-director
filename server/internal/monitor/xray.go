@@ -14,6 +14,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 // Launcher starts probers. XrayLauncher runs Xray; FakeLauncher stands in for
@@ -197,7 +199,7 @@ func (l *XrayLauncher) writeConfig(name string, eps []Endpoint, accounts []accou
 	if err != nil {
 		return "", err
 	}
-	if err := os.MkdirAll(l.ConfigDir, 0700); err != nil {
+	if err := watchdapi.OwnedDir(l.ConfigDir, 0700, true); err != nil {
 		return "", err
 	}
 	path := filepath.Join(l.ConfigDir, name)

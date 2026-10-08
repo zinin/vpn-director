@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -127,11 +128,52 @@ func listen(ctx context.Context, path string, dial func(context.Context, string,
 	return listenWithPublication(ctx, path, dial, os.Chmod, os.Link)
 }
 
+// OwnedDir creates dir with perm when it is missing and refuses it unless it
+// is a real directory of this user that group and others cannot write to -
+// with private, cannot use at all. Another user able to write there could
+// replace the socket after publication or plant files root then writes to.
+// The error names only the directory and the check it failed.
+func OwnedDir(dir string, perm os.FileMode, private bool) error {
+	if err := os.MkdirAll(dir, perm); err != nil {
+		return err
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	refuse := func(check string) error {
+		return &os.PathError{Op: "verify directory", Path: dir, Err: errors.New(check)}
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return refuse("symlink")
+	}
+	if !info.IsDir() {
+		return refuse("not a directory")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return refuse("owner unknown")
+	}
+	if int(stat.Uid) != os.Geteuid() {
+		return refuse(fmt.Sprintf("owner uid %d", stat.Uid))
+	}
+	mask := os.FileMode(0022)
+	if private {
+		mask = 0077
+	}
+	if info.Mode().Perm()&mask != 0 {
+		return refuse(fmt.Sprintf("mode %04o", info.Mode().Perm()))
+	}
+	return nil
+}
+
 func listenWithPublication(ctx context.Context, path string, dial func(context.Context, string, string) (net.Conn, error), chmod func(string, os.FileMode) error, link func(string, string) error) (net.Listener, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+	// watchd logs its socket error with a fixed text; this says why.
+	if err := OwnedDir(filepath.Dir(path), 0755, false); err != nil {
+		slog.Error("watchd refuses its socket directory", "error", err)
 		return nil, err
 	}
 	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)

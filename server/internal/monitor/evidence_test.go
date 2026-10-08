@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -711,7 +712,7 @@ func TestEvidence_RestoredXrayRejection(t *testing.T) {
 			t.Fatal("restored Xray rejection did not reach launcher reevaluation")
 		}
 
-		path := filepath.Join(t.TempDir(), "w.sock")
+		path := privateSocketPath(t)
 		listener, err := watchdapi.Listen(h.ctx, path)
 		if err != nil {
 			t.Fatal(err)
@@ -770,6 +771,18 @@ func TestEvidence_RestoredXrayRejection(t *testing.T) {
 	})
 }
 
+// privateSocketPath is a socket path in a directory only the test user can
+// write to: t.TempDir follows the umask, and Listen refuses a socket directory
+// group or others can write to.
+func privateSocketPath(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	return filepath.Join(dir, "w.sock")
+}
+
 func TestEvidence_DoesNotBlockIPC(t *testing.T) {
 	captureEngineLogs(t)
 	for _, stage := range []string{"endpoint-build", "launcher-validation"} {
@@ -777,7 +790,7 @@ func TestEvidence_DoesNotBlockIPC(t *testing.T) {
 			h := newHarness(t, "k1")
 			h.at(0, true)
 			before := applicableEvidence(t, h.m, []string{"k1"})
-			path := filepath.Join(t.TempDir(), "w.sock")
+			path := privateSocketPath(t)
 			listener, err := watchdapi.Listen(h.ctx, path)
 			if err != nil {
 				t.Fatal(err)

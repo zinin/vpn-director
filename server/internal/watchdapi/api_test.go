@@ -648,19 +648,92 @@ func TestListen_FailedListenReleasesStableLockAndCanRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fd, err := os.Open(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fd.Close()
-	short := fmt.Sprintf("/proc/self/fd/%d/watchd.sock", fd.Fd())
-	listener, err := Listen(context.Background(), short)
+	// A relative address is short and names the same directory; a
+	// /proc/self/fd one would make the socket's directory a symlink, which
+	// Listen refuses.
+	t.Chdir(dir)
+	listener, err := Listen(context.Background(), "watchd.sock")
 	if err != nil {
 		t.Fatal("restart on the same filesystem socket/lock via a bounded address failed:", err)
 	}
 	defer listener.Close()
 	if after, err := os.Lstat(path + ".lock"); err != nil || !os.SameFile(before, after) {
 		t.Error("failed listen/restart changed the lock inode")
+	}
+}
+
+// Another user able to write to the socket's directory could replace the
+// socket after publication. Listen refuses a directory that is a symlink or
+// that group or others can write to, before it creates anything there, and
+// creates a missing one.
+func TestListen_RefusesAnUntrustedSocketDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, dir string)
+		check string // the refusal; empty accepts
+	}{
+		{"missing directory is created", func(*testing.T, string) {}, ""},
+		{"existing 0755 directory", func(t *testing.T, dir string) { mkdirMode(t, dir, 0755) }, ""},
+		{"symlink to a directory", func(t *testing.T, dir string) {
+			if err := os.Symlink(t.TempDir(), dir); err != nil {
+				t.Fatal(err)
+			}
+		}, "symlink"},
+		{"group writable", func(t *testing.T, dir string) { mkdirMode(t, dir, 0775) }, "mode 0775"},
+		{"other writable", func(t *testing.T, dir string) { mkdirMode(t, dir, 0757) }, "mode 0757"},
+		{"world writable", func(t *testing.T, dir string) { mkdirMode(t, dir, 0777) }, "mode 0777"},
+		{"shared like /tmp", func(t *testing.T, dir string) { mkdirMode(t, dir, 0777|os.ModeSticky) }, "mode 0777"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(filepath.Dir(ownedSocketPath(t)), "run")
+			tc.setup(t, dir)
+			path := filepath.Join(dir, "watchd.sock")
+			listener, err := Listen(context.Background(), path)
+			if tc.check == "" {
+				if err != nil {
+					t.Fatal("trusted socket directory refused:", err)
+				}
+				listener.Close()
+				return
+			}
+			if listener != nil {
+				listener.Close()
+			}
+			var pe *os.PathError
+			if !errors.As(err, &pe) || pe.Path != dir || pe.Err.Error() != tc.check {
+				t.Fatalf("Listen error %v, want the directory refused for %s", err, tc.check)
+			}
+			for _, name := range []string{path, path + ".lock"} {
+				if _, err := os.Lstat(name); !errors.Is(err, os.ErrNotExist) {
+					t.Errorf("refused directory got %s: %v", filepath.Base(name), err)
+				}
+			}
+		})
+	}
+	t.Run("owned by another user", func(t *testing.T) {
+		info, err := os.Lstat("/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		uid := info.Sys().(*syscall.Stat_t).Uid
+		if int(uid) == os.Geteuid() {
+			t.Skip("the test user owns /")
+		}
+		var pe *os.PathError
+		if err := OwnedDir("/", 0755, false); !errors.As(err, &pe) || pe.Err.Error() != fmt.Sprintf("owner uid %d", uid) {
+			t.Fatalf("OwnedDir(/) = %v, want the owner refused", err)
+		}
+	})
+}
+
+// mkdirMode creates dir with exactly mode, whatever the umask.
+func mkdirMode(t *testing.T, dir string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Mkdir(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, mode); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -1231,7 +1304,7 @@ func TestListen_PublicationPreservesConcurrentDestinations(t *testing.T) {
 }
 
 func TestListen_PrivatePublicationKeepsExistingDirectoryModes(t *testing.T) {
-	for _, mode := range []os.FileMode{0700, 0711, 0750, 0777 | os.ModeSticky} {
+	for _, mode := range []os.FileMode{0700, 0711, 0750, 0755 | os.ModeSticky} {
 		t.Run(fmt.Sprintf("%o", mode), func(t *testing.T) {
 			path := ownedSocketPath(t)
 			parent := filepath.Dir(path)

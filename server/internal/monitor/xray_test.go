@@ -52,6 +52,73 @@ func script(t *testing.T, dir, body string) string {
 	return bin
 }
 
+// The prober's config holds every server's credentials, so its directory must
+// be a real, private directory of the daemon's own: one that already exists
+// with a looser mode, or a symlink planted where it belongs, is refused before
+// anything is written through it.
+func TestXrayLauncher_ConfigDirMustBePrivate(t *testing.T) {
+	accounts, err := newAccounts(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		setup func(t *testing.T, dir string) string // the directory the config would land in
+		check string                                // the refusal; empty accepts
+	}{
+		{"fresh", func(_ *testing.T, dir string) string { return dir }, ""},
+		{"existing 0700", func(t *testing.T, dir string) string {
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		}, ""},
+		{"existing 0755", func(t *testing.T, dir string) string {
+			if err := os.Mkdir(dir, 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			return dir
+		}, "mode 0755"},
+		{"symlink", func(t *testing.T, dir string) string {
+			target := t.TempDir()
+			if err := os.Symlink(target, dir); err != nil {
+				t.Fatal(err)
+			}
+			return target
+		}, "symlink"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "probe")
+			landing := tc.setup(t, dir)
+			l := &XrayLauncher{ProbeBinary: filepath.Join(t.TempDir(), "missing"), ConfigDir: dir}
+			path, err := l.writeConfig("config.json", twoEndpoints(), accounts, 12000)
+			if tc.check == "" {
+				if err != nil {
+					t.Fatal("private config directory refused:", err)
+				}
+				if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0600 {
+					t.Fatalf("config %s: %v", path, err)
+				}
+				return
+			}
+			var pe *os.PathError
+			if !errors.As(err, &pe) || pe.Path != dir || pe.Err.Error() != tc.check {
+				t.Fatalf("writeConfig error %v, want the directory refused for %s", err, tc.check)
+			}
+			if entries, err := os.ReadDir(landing); err != nil || len(entries) != 0 {
+				t.Fatalf("a refused directory got %v (%v)", entries, err)
+			}
+			// The prober's start reports the refusal under its safe operation text.
+			if _, err := l.Start(context.Background(), twoEndpoints()); err == nil || err.Error() != "write the prober config" || !errors.As(err, &pe) {
+				t.Fatalf("Start error %v, want the safe launch error over the refusal", err)
+			}
+		})
+	}
+}
+
 func TestXrayLauncher_ARefusedOutboundNamesItsEndpoint(t *testing.T) {
 	dir := t.TempDir()
 	l := &XrayLauncher{ProbeBinary: script(t, dir, "echo '"+refusalLine+"' >&2\nexit 23"), ConfigDir: filepath.Join(dir, "probe")}
