@@ -130,6 +130,9 @@ func run() int {
 			launcher = &monitor.XrayLauncher{ProbeBinary: p.ProbeBinary, ConfigDir: p.ProbeDir}
 		}
 		vpnSvc := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(ctx, executor))
+		// The watch's apply and Xray process restart finish even when the
+		// daemon stops (newWatch): only their timeout bounds them.
+		mutatingSvc := service.NewVPNDirectorService(p.ScriptsDir, executor)
 		xraySvc := service.NewXrayServiceForContext(ctx, p.XrayTemplate, p.XrayConfig)
 		readiness := netpath.Readiness{StoppedPath: p.StoppedMarker}
 		wanUp := func(ctx context.Context) bool {
@@ -144,7 +147,7 @@ func run() int {
 			StatePath:  p.WatchdState,
 			OnSettings: levelSetter(logger),
 		})
-		watch := newWatch(ctx, p, configSvc, vpnSvc, xraySvc, queue, gate, m, wanUp)
+		watch := newWatch(ctx, p, configSvc, vpnSvc, mutatingSvc, xraySvc, queue, gate, m, wanUp)
 		if *devFlag {
 			// Dev has no installed or running router bot to attest.
 			watch.CanMutate = func() error {

@@ -73,8 +73,9 @@ func runtimeGate(t *testing.T, p paths.Paths) *watchcompat.Gate {
 func runtimeWatch(t *testing.T, ctx context.Context, p paths.Paths, cfg *service.ConfigService, q *notifications.Store, executor service.ShellExecutor) *subwatch.Watch {
 	t.Helper()
 	vpn := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(ctx, executor))
+	mutating := service.NewVPNDirectorService(p.ScriptsDir, executor)
 	xray := service.NewXrayServiceForContext(ctx, p.XrayTemplate, p.XrayConfig)
-	return newWatch(ctx, p, cfg, vpn, xray, q, runtimeGate(t, p), nil, nil)
+	return newWatch(ctx, p, cfg, vpn, mutating, xray, q, runtimeGate(t, p), nil, nil)
 }
 
 func startRuntime(t *testing.T, ctx context.Context, cancel context.CancelFunc, path string, build func() (runtimeDeps, error), release ...func()) <-chan error {
@@ -748,12 +749,14 @@ func TestRuntime_NewWatchUsesSoleMonitorAndCallerWANContext(t *testing.T) {
 		return ctx.Err() == nil
 	}
 	shellCalls := 0
-	vpn := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(root, runtimeExecutor(func(context.Context, string, ...string) (*shell.Result, error) {
+	executor := runtimeExecutor(func(context.Context, string, ...string) (*shell.Result, error) {
 		shellCalls++
 		return &shell.Result{}, nil
-	})))
+	})
+	vpn := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(root, executor))
+	mutating := service.NewVPNDirectorService(p.ScriptsDir, executor)
 	xray := service.NewXrayServiceForContext(root, p.XrayTemplate, p.XrayConfig)
-	w := newWatch(root, p, cfg, vpn, xray, q, runtimeGate(t, p), m, wan)
+	w := newWatch(root, p, cfg, vpn, mutating, xray, q, runtimeGate(t, p), m, wan)
 	if w.Health != m || w.WANUp == nil || calls != 0 || shellCalls != 0 {
 		t.Fatal("newWatch must share the runtime Monitor, without constructor checks or side effects")
 	}
@@ -991,46 +994,162 @@ func TestRuntime_NewWatchKeepsShellErrorsPrivate(t *testing.T) {
 	}
 }
 
-func TestRuntime_NewWatchCancelsShellWithTickWhileParentLives(t *testing.T) {
-	p := runtimePaths(t)
-	cfg := runtimeConfig(t, p, runtimePending)
-	before, err := os.ReadFile(cfg.ConfigPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-	q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "resolved-data", "watchd-notifications.json"))
-	root, stopRoot := context.WithCancel(context.Background())
-	defer stopRoot()
-	started := make(chan context.Context, 1)
-	w := runtimeWatch(t, root, p, cfg, q, runtimeExecutor(func(ctx context.Context, _ string, args ...string) (*shell.Result, error) {
-		if !reflect.DeepEqual(args, []string{"--wait", "--unless-stopped", "apply"}) {
-			return nil, fmt.Errorf("unexpected recovery command: %q", args)
+// An automatic apply or Xray process restart runs to its end: cancelling it
+// would signal the script's process group, a main Xray it has just started
+// among it. Neither the tick's end nor the daemon's reaches the command, while
+// the platform lookup, which changes nothing, still ends with the tick.
+func TestRuntime_NewWatchLetsMutatingCommandsFinish(t *testing.T) {
+	for _, cancelled := range []string{"tick", "daemon"} {
+		for _, command := range []string{"apply", "restart xray-process"} {
+			t.Run(cancelled+"/"+command, func(t *testing.T) {
+				p := runtimePaths(t)
+				args := []string{"--wait", "--unless-stopped", "apply"}
+				var cfg *service.ConfigService
+				if command == "apply" {
+					// An interrupted restore applies first.
+					cfg = runtimeConfig(t, p, runtimePending)
+				} else {
+					// A return to the preferred server restarts the Xray process.
+					args = []string{"--wait", "--unless-stopped", "restart", "xray-process"}
+					cfg = runtimeConfig(t, p, `{"data_dir":"resolved-data","xray":{"clients":["192.168.50.8"],"active_server":{"name":"Madrid","address":"madrid.example","port":443,"subscription":"0a1b2c3d","seq":7},"preferred_server":{"name":"Oslo","address":"oslo.example","port":443,"subscription":"0a1b2c3d"}}}`)
+					servers := []vpnconfig.Server{
+						{Name: "Oslo", Address: "oslo.example", Port: 443, IPs: []string{"192.0.2.10"}, UUID: "00000000-0000-0000-0000-000000000001", Security: "tls", SNI: "oslo.example"},
+						{Name: "Madrid", Address: "madrid.example", Port: 443, IPs: []string{"192.0.2.20"}, UUID: "00000000-0000-0000-0000-000000000002", Security: "tls", SNI: "madrid.example"},
+					}
+					if err := cfg.SaveSubscription(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "synthetic", Servers: servers}); err != nil {
+						t.Fatal(err)
+					}
+					for path, text := range map[string]string{
+						p.XrayTemplate: `{"inbounds":[{"tag":"tproxy-in","protocol":"dokodemo-door","port":12345},{"tag":"socks-in","protocol":"socks","port":12346}],"outbounds":[]}`,
+						p.XrayConfig:   "previous main Xray\n",
+					} {
+						if err := os.WriteFile(path, []byte(text), 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					t.Setenv("PATH", t.TempDir())
+				}
+				before, err := cfg.LoadVPNConfig()
+				if err != nil {
+					t.Fatal(err)
+				}
+				raw, err := os.ReadFile(cfg.ConfigPath())
+				if err != nil {
+					t.Fatal(err)
+				}
+				q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "resolved-data", "watchd-notifications.json"))
+				root, stopRoot := context.WithCancel(context.Background())
+				defer stopRoot()
+				started, release := make(chan struct{}), make(chan struct{})
+				ended := make(chan error, 1)
+				var calls atomic.Int32
+				w := runtimeWatch(t, root, p, cfg, q, runtimeExecutor(func(ctx context.Context, _ string, got ...string) (*shell.Result, error) {
+					if !reflect.DeepEqual(got, args) || calls.Add(1) > 1 {
+						return nil, fmt.Errorf("unexpected command: %q", got)
+					}
+					close(started)
+					select {
+					case <-release:
+					case <-ctx.Done():
+					}
+					ended <- ctx.Err()
+					return &shell.Result{ExitCode: 1, Output: "synthetic failure"}, nil
+				}))
+				if command != "apply" {
+					w.Probe = func(context.Context, int) error { return nil }
+					w.Reachable = func(_ context.Context, ip string, port int) bool { return ip == "192.0.2.10" && port == 443 }
+					w.AfterRestart = func(time.Duration) {}
+				}
+				tick, cancel := context.WithCancel(root)
+				defer cancel()
+				done := make(chan struct{})
+				go func() {
+					w.Tick(tick)
+					close(done)
+				}()
+				select {
+				case <-started:
+				case <-time.After(2 * time.Second):
+					t.Fatalf("the tick did not start its %s", command)
+				}
+				if cancelled == "tick" {
+					cancel()
+				} else {
+					stopRoot()
+				}
+				select {
+				case err := <-ended:
+					t.Fatalf("the %s's end reached the running %s: %v", cancelled, command, err)
+				case <-time.After(200 * time.Millisecond):
+				}
+				close(release)
+				if err := <-ended; err != nil {
+					t.Fatalf("the %s ran on a context that ended: %v", command, err)
+				}
+				await(t, done)
+				if n := calls.Load(); n != 1 {
+					t.Fatalf("%d commands, want the one %s", n, command)
+				}
+				after, err := cfg.LoadVPNConfig()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(after.Xray.Failover, before.Xray.Failover) || !reflect.DeepEqual(after.Xray.PendingRestore, before.Xray.PendingRestore) {
+					t.Fatalf("a failed %s changed the durable recovery intent: failover %+v, pending restore %+v", command, after.Xray.Failover, after.Xray.PendingRestore)
+				}
+				if command == "apply" {
+					if now, err := os.ReadFile(cfg.ConfigPath()); err != nil || !bytes.Equal(raw, now) {
+						t.Fatal("a failed restore apply changed the configuration")
+					}
+				}
+			})
 		}
-		started <- ctx
-		<-ctx.Done()
-		return &shell.Result{ExitCode: -1}, ctx.Err()
-	}))
-	tick, cancel := context.WithCancel(root)
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		w.Tick(tick)
-		close(done)
-	}()
-	var operation context.Context
-	select {
-	case operation = <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("recovery did not start its scoped shell command")
 	}
-	cancel()
-	await(t, done)
-	if root.Err() != nil || !errors.Is(operation.Err(), context.Canceled) {
-		t.Fatalf("Tick cancellation did not reach shell independently: root=%v operation=%v", root.Err(), operation.Err())
-	}
-	if after, err := os.ReadFile(cfg.ConfigPath()); err != nil || !bytes.Equal(before, after) {
-		t.Fatal("cancelled Tick changed durable recovery intent")
-	}
+
+	t.Run("platform lookup ends with the tick", func(t *testing.T) {
+		p := runtimePaths(t)
+		cfg := runtimeConfig(t, p, `{"data_dir":"resolved-data","tunnel_director":{"tunnels":{"wgc1":{"clients":["192.168.50.20"]}}},"xray":{"clients":["192.168.50.8"]}}`)
+		if err := cfg.SaveSubscription(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "static", Servers: []vpnconfig.Server{}}); err != nil {
+			t.Fatal(err)
+		}
+		q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "resolved-data", "watchd-notifications.json"))
+		root, stopRoot := context.WithCancel(context.Background())
+		defer stopRoot()
+		started := make(chan context.Context, 1)
+		w := runtimeWatch(t, root, p, cfg, q, runtimeExecutor(func(ctx context.Context, _ string, args ...string) (*shell.Result, error) {
+			if !reflect.DeepEqual(args, []string{"platform"}) {
+				return nil, fmt.Errorf("unexpected command: %q", args)
+			}
+			started <- ctx
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}))
+		var clock atomic.Int64
+		clock.Store(time.Now().UnixNano())
+		w.Now = func() time.Time { return time.Unix(0, clock.Load()) }
+		w.Probe = func(context.Context, int) error { return errors.New("synthetic dead outbound") }
+		w.Reachable = nil
+		w.Tick(root)
+		clock.Add(int64(3 * time.Minute))
+		tick, cancel := context.WithCancel(root)
+		defer cancel()
+		done := make(chan struct{})
+		go func() {
+			w.Tick(tick)
+			close(done)
+		}()
+		var operation context.Context
+		select {
+		case operation = <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("the dead outbound did not look up the platform")
+		}
+		cancel()
+		await(t, done)
+		if root.Err() != nil || !errors.Is(operation.Err(), context.Canceled) {
+			t.Fatalf("the tick's end did not reach the platform lookup: root=%v operation=%v", root.Err(), operation.Err())
+		}
+	})
 }
 
 func TestRuntime_NewWatchPortSnapshotAcrossConfigLockWait(t *testing.T) {
@@ -1149,8 +1268,9 @@ func TestRuntime_NewWatchPortSnapshotAcrossConfigLockWait(t *testing.T) {
 				health = monitor.New(monitor.Deps{Settings: settingsReader(cfg), Endpoints: endpointsReader(cfg), Launcher: monitor.FakeLauncher{}})
 			}
 			vpn := service.NewVPNDirectorService(p.ScriptsDir, service.WithContext(ctx, executor))
+			mutating := service.NewVPNDirectorService(p.ScriptsDir, executor)
 			xray := service.NewXrayServiceForContext(ctx, p.XrayTemplate, p.XrayConfig)
-			w := newWatch(ctx, p, cfg, vpn, xray, q, runtimeGate(t, p), health, nil)
+			w := newWatch(ctx, p, cfg, vpn, mutating, xray, q, runtimeGate(t, p), health, nil)
 			w.Now = func() time.Time { return time.Unix(1_700_000_000, 0) }
 			w.Reachable = func(_ context.Context, ip string, port int) bool { return ip == "192.0.2.10" && port == 443 }
 			w.AfterRestart = func(wait time.Duration) {

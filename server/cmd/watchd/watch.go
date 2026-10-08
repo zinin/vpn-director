@@ -14,7 +14,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/watchcompat"
 )
 
-func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vpn *service.VPNDirectorService, xray *service.XrayService, q *notifications.Store, gate *watchcompat.Gate, health subwatch.HealthMonitor, wanUp func(context.Context) bool) *subwatch.Watch {
+func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vpn, mutating *service.VPNDirectorService, xray *service.XrayService, q *notifications.Store, gate *watchcompat.Gate, health subwatch.HealthMonitor, wanUp func(context.Context) bool) *subwatch.Watch {
 	readiness := netpath.Readiness{
 		TablesPath:   p.TunnelTables,
 		FailoverPath: p.FailoverReady,
@@ -53,11 +53,15 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 		info, err := vpn.ForContext(operationContext()).Platform()
 		return info, privateWatchError("Platform lookup failed", err)
 	}
+	// An automatic apply or Xray process restart runs to its end, bounded by
+	// ApplyTimeout, whatever ends the tick or the daemon: cancelling it would
+	// signal the script's whole process group, a main Xray just started there
+	// included, and leave routing half-changed. mutating is not scoped to ctx.
 	w.Apply = func() error {
-		return privateWatchError("VPN Director apply failed", vpn.ForContext(operationContext()).ApplyUnlessStopped())
+		return privateWatchError("VPN Director apply failed", mutating.ApplyUnlessStopped())
 	}
 	w.RestartXray = func() error {
-		return privateWatchError("Xray process restart failed", vpn.ForContext(operationContext()).RestartXrayProcessUnlessStopped())
+		return privateWatchError("Xray process restart failed", mutating.RestartXrayProcessUnlessStopped())
 	}
 	w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 		current := operationContext()

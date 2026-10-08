@@ -62,7 +62,10 @@ allows watchd. Do not start the bot or add a token merely to open the gate.
 Watchd acquires lifetime socket ownership before building its workers or touching the prober.
 A second instance cannot replace the first socket or start another watch/prober. Shutdown
 cancels and drains monitor/watch/API workers, stops only `vpn-director-probe`, flushes the queue
-and releases the socket. It preserves main Xray, ready/stopped markers and current routes.
+and releases the socket. It cancels read-only commands, downloads and validation, while an
+automatic apply or Xray process restart already running finishes (bounded by its timeout), so
+main Xray and current routes are not left half-changed. It preserves main Xray, ready/stopped
+markers and current routes.
 Stopping the bot stops delivery/management, not watchd automation. These daemon stops differ
 from `vpn-director.sh stop` or bot `/stop`, which fence automation and tear down routing.
 
