@@ -81,8 +81,8 @@ var errNoTunnel = errors.New("no tunnel to look the host up over")
 // asks for it, and once: finding it runs vpn-director.sh platform, and a wave
 // of the watch fetches every subscription at once, mostly over a WAN that
 // serves them all. client answers nil, and lookup an error, without a tunnel.
-func lazyTunnel(ctx context.Context, cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath ...string) (client func() *http.Client, lookup func(host string) ([]net.IP, error)) {
-	find := sync.OnceValues(func() (netpath.Path, *http.Client) { return subscriptionTunnel(cfgSvc, vpnSvc, tablesPath...) })
+func lazyTunnel(ctx context.Context, cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath string) (client func() *http.Client, lookup func(host string) ([]net.IP, error)) {
+	find := sync.OnceValues(func() (netpath.Path, *http.Client) { return subscriptionTunnel(cfgSvc, vpnSvc, tablesPath) })
 	client = func() *http.Client {
 		_, c := find()
 		return c
@@ -202,7 +202,7 @@ func serversFromSubscriptionLookup(body []byte, lookup func(host string) ([]net.
 	return result.Servers, nil
 }
 
-func subscriptionTunnel(cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath ...string) (netpath.Path, *http.Client) {
+func subscriptionTunnel(cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath string) (netpath.Path, *http.Client) {
 	if cfgSvc == nil || vpnSvc == nil {
 		return netpath.Path{}, nil
 	}
@@ -221,8 +221,8 @@ func subscriptionTunnel(cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath ...st
 		return netpath.Path{}, nil
 	}
 	path := defaultTunnelTablesPath
-	if len(tablesPath) > 0 && tablesPath[0] != "" {
-		path = tablesPath[0]
+	if tablesPath != "" {
+		path = tablesPath
 	}
 	p := netpath.TunnelPath(cfg, plat, id, path)
 	return p, newTunnelHTTPClient(func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -261,4 +261,3 @@ func refusePrivatePeer(conn net.Conn, err error) (net.Conn, error) {
 	}
 	return conn, nil
 }
-

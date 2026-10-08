@@ -139,7 +139,7 @@ func TestSubscriptionTunnel_DialsTheTunnelTheClientsWereMovedTo(t *testing.T) {
 		{ID: "wgc1", Iface: "wgc1", Connected: true},
 	}}
 
-	p, client := subscriptionTunnel(configOnly{cfg: cfg}, platformOnly{plat: plat})
+	p, client := subscriptionTunnel(configOnly{cfg: cfg}, platformOnly{plat: plat}, "")
 
 	if client == nil {
 		t.Fatal("no tunnel client")
@@ -610,7 +610,7 @@ func (p *countingPlatform) Platform() (vpnconfig.PlatformInfo, error) {
 // the lookup share that one platform run.
 func TestLazyTunnel_FindsTheTunnelOnceAndOnlyWhenAskedFor(t *testing.T) {
 	plat := &countingPlatform{}
-	client, lookup := lazyTunnel(context.Background(), configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat)
+	client, lookup := lazyTunnel(context.Background(), configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat, "")
 	if plat.runs != 0 {
 		t.Fatalf("%d platform runs before the tunnel was asked for", plat.runs)
 	}
@@ -636,7 +636,7 @@ func TestLazyTunnel_AnEndedContextLooksForNoTunnel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	plat := &countingPlatform{}
-	_, lookup := lazyTunnel(ctx, configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat)
+	_, lookup := lazyTunnel(ctx, configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat, "")
 
 	ips, err := lookup("example.com")
 
@@ -674,7 +674,7 @@ func TestSubscriptionFetcher_SharedDeadlinePublishesNoPartialList(t *testing.T) 
 				VPN:        plat,
 				TablesPath: "",
 			}
-			tunnel, tunnelLookup := lazyTunnel(ctx, fetcher.Store, fetcher.VPN)
+			tunnel, tunnelLookup := lazyTunnel(ctx, fetcher.Store, fetcher.VPN, fetcher.TablesPath)
 			wan := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if req.Context() != ctx {
 					t.Error("download must use the same context as resolution")

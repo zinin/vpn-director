@@ -401,6 +401,48 @@ func TestReceiver_AuthorizedOncePerChat(t *testing.T) {
 	}
 }
 
+func TestReceiver_NewChatOfAKnownUserStartsAtItsOwnAppearance(t *testing.T) {
+	store := chatstore.New(filepath.Join(t.TempDir(), "chats.json"))
+	q, err := notifications.NewStore(filepath.Join(t.TempDir(), "watchd-notifications.json"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &Bot{auth: NewAuth([]string{"alice"}), chatStore: store, notificationAPI: queueNotificationAPI{q}}
+	if err := store.RecordInteraction("alice", 100); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.syncRecipients(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	earlier := legacyPublish(t, q, "Xray outbound is down")
+	page, err := q.Pending("")
+	if err != nil || len(page.Messages) != 1 || page.Messages[0].ChatID != 100 || page.Messages[0].EventID != earlier {
+		t.Fatalf("private chat queue = %+v, %v; want the event", page, err)
+	}
+
+	before := time.Now()
+	if err := store.RecordInteraction("alice", -500); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	recipients := b.notificationRecipients()
+	if len(recipients) != 1 || recipients[0].ChatID != -500 || recipients[0].FirstSeen.Before(before) || recipients[0].FirstSeen.After(after) {
+		t.Fatalf("recipients %+v, want chat -500 first seen at its interaction, between %v and %v", recipients, before, after)
+	}
+	if err := b.syncRecipients(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	page, err = q.Pending("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range page.Messages {
+		if n.ChatID == -500 {
+			t.Fatalf("the new chat was queued %q, published before it appeared", n.Text)
+		}
+	}
+}
+
 func TestReceiver_SyncBeforeGetMe(t *testing.T) {
 	for _, failGetMe := range []bool{false, true} {
 		name := "successful_getme"

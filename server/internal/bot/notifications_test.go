@@ -1,8 +1,10 @@
 package bot
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -675,6 +677,34 @@ func TestNotificationText_MinuteBoundary(t *testing.T) {
 			t.Fatalf("bounded delivery acks = %+v, want %+v", acks, want)
 		}
 	})
+}
+
+// watchd is an optional download: without it every poll fails, and the log
+// gets one WARN for the outage and one INFO when delivery comes back.
+func TestReceiver_FailingPollsWarnOncePerOutage(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{
+		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey && len(groups) == 0 {
+				return slog.Attr{}
+			}
+			return a
+		},
+	})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	var polls notificationPollStreak
+	for _, failed := range []bool{true, true, true, false, false, true, true} {
+		polls.observe(failed)
+	}
+	want := []string{
+		`level=WARN msg="Watch notification delivery will retry"`,
+		`level=INFO msg="Watch notification delivery resumed"`,
+		`level=WARN msg="Watch notification delivery will retry"`,
+	}
+	if got := strings.Split(strings.TrimSpace(logs.String()), "\n"); !reflect.DeepEqual(got, want) {
+		t.Fatalf("poll log %q, want %q", got, want)
+	}
 }
 
 func TestReceiver_PollsAndSyncsActivityEveryTenSeconds(t *testing.T) {

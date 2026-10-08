@@ -96,6 +96,10 @@ func (s *Store) RecordInteraction(username string, chatID int64) error {
 	username = strings.ToLower(username) // Normalize for consistency with auth
 	now := time.Now()
 	if record, ok := s.users[username]; ok {
+		// A new chat's allowed history starts with its own first interaction.
+		if record.ChatID != chatID {
+			record.FirstSeen = now
+		}
 		record.ChatID = chatID
 		record.LastSeen = now
 		record.Active = true

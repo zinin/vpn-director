@@ -262,6 +262,25 @@ func TestRecipients_ClosedProgressPrunedWithRecentHistory(t *testing.T) {
 	})
 }
 
+func TestRecipients_DuplicatedChatKeepsTheEarliestFirstSeen(t *testing.T) {
+	at := notificationTestTime()
+	earlier := watchdapi.Recipient{ChatID: 100, FirstSeen: at.Add(-time.Minute)}
+	later := watchdapi.Recipient{ChatID: 100, FirstSeen: at.Add(time.Minute)}
+	for name, recipients := range map[string][]watchdapi.Recipient{
+		"earlier first": {earlier, later},
+		"later first":   {later, earlier},
+	} {
+		t.Run(name, func(t *testing.T) {
+			clock := at
+			s := newNotificationStore(t, filepath.Join(t.TempDir(), "watchd-notifications.json"), func() time.Time { return clock })
+			id := publishNotification(t, s, "between the two first uses")
+			clock = at.Add(2 * time.Minute)
+			replaceNotificationRecipients(t, s, recipients...)
+			assertNotificationIDs(t, pendingNotifications(t, s), []watchdapi.EventID{id})
+		})
+	}
+}
+
 func TestRecipients_EmptyListRevokesAllChats(t *testing.T) {
 	for _, recipients := range [][]watchdapi.Recipient{nil, {}} {
 		name := "empty"

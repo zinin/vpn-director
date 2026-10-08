@@ -24,9 +24,7 @@ server/
 │   │   ├── path.go           # Telegram API path identity and candidates
 │   │   ├── pathmanager.go    # Probe cycle and current-path selection
 │   │   ├── probe.go          # One getMe over a given path; any HTTP status counts as live
-│   │   ├── transport.go      # DialPath, NewPathClient, SO_BINDTODEVICE
-│   │   ├── transport_linux.go # SO_BINDTODEVICE + SO_MARK socket control
-│   │   ├── transport_other.go # Non-Linux stub that fails the dial
+│   │   ├── transport.go      # NewPathClient: the path-bound HTTP transport, dialing through netpath.DialPath
 │   │   ├── notifications.go  # watchd recipient sync, pending delivery and durable ack
 │   │   └── notification_text.go # delayed timestamp and plain-text message splitting
 │   ├── chatstore/            # Chat ID persistence
@@ -53,6 +51,7 @@ server/
 │   │   └── paths.go          # BotLogPath, VPNLogPath, etc.
 │   ├── service/              # Business logic interfaces
 │   │   ├── interfaces.go     # ShellExecutor, Network, etc.
+│   │   ├── subfetch.go       # Subscription fetch of watchd's watch: WAN, then the tunnel fallback; SSRF guard
 │   │   └── subscriptions.go  # One download path; add, refresh, rename, delete for both daemons
 │   ├── shell/                # Shell command execution
 │   │   └── shell.go          # Real command executor
@@ -61,7 +60,7 @@ server/
 │   │   └── notify.go         # Post-update notification
 │   ├── notifications/        # watchd-only durable queue; bot accesses it through IPC
 │   ├── watchcompat/          # installed/running bot attestation for watchd
-│   ├── netpath/              # shared readiness, reachability and subscription fetch paths
+│   ├── netpath/              # path dialing (DialPath, SO_BINDTODEVICE/SO_MARK control), readiness markers and TCP reach
 │   ├── subwatch/             # watchd-owned Xray watch (SOCKS probe, failover, restore)
 │   │   ├── order.go          # The hybrid walk order and the dedupe key
 │   │   ├── probe.go          # HTTPS 204 through Xray SOCKS

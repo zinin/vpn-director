@@ -224,6 +224,47 @@ func TestRecipients_StoreFirstSeenSurvivesInteractionAndReload(t *testing.T) {
 	}
 }
 
+func TestRecipients_NewChatStartsItsOwnFirstSeen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "chats.json")
+	data := `{"alice":{"chat_id":100,"first_seen":"2026-01-02T15:04:00Z","last_seen":"2026-01-03T15:04:00Z","active":true,"notified_versions":["v1.0.0"]}}`
+	if err := os.WriteFile(path, []byte(data), 0600); err != nil {
+		t.Fatal(err)
+	}
+	store := New(path)
+	original := time.Date(2026, 1, 2, 15, 4, 0, 0, time.UTC)
+	if err := store.RecordInteraction("alice", 100); err != nil {
+		t.Fatal(err)
+	}
+	if users, err := store.GetActiveUsers(); err != nil || len(users) != 1 || !users[0].FirstSeen.Equal(original) {
+		t.Fatalf("repeat interaction in the same chat = %+v, %v; want FirstSeen %v", users, err, original)
+	}
+
+	before := time.Now()
+	if err := store.RecordInteraction("ALICE", -500); err != nil {
+		t.Fatal(err)
+	}
+	after := time.Now()
+	var moved time.Time
+	for _, current := range []*Store{store, New(path)} {
+		users, err := current.GetActiveUsers()
+		if err != nil || len(users) != 1 || users[0].ChatID != -500 {
+			t.Fatalf("users after the move = %+v, %v; want alice in chat -500", users, err)
+		}
+		if moved = users[0].FirstSeen; moved.Before(before) || moved.After(after) {
+			t.Fatalf("FirstSeen %v in the new chat, want its first interaction, between %v and %v", moved, before, after)
+		}
+	}
+	if err := store.RecordInteraction("alice", -500); err != nil {
+		t.Fatal(err)
+	}
+	if users, err := New(path).GetActiveUsers(); err != nil || len(users) != 1 || !users[0].FirstSeen.Equal(moved) {
+		t.Fatalf("repeat interaction in the new chat = %+v, %v; want FirstSeen %v", users, err, moved)
+	}
+	if !New(path).IsNotified("alice", "v1.0.0") {
+		t.Fatal("moving to a new chat lost update notification history")
+	}
+}
+
 func TestRecipients_SetInactiveChatDeactivatesEveryAliasPersistently(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "chats.json")
 	store := New(path)

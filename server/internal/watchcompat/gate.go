@@ -54,11 +54,19 @@ func (g *Gate) Check(ctx context.Context) error {
 		g.verified = nil
 		return ErrIncompatible
 	}
-	if ctx.Err() != nil || !filepath.IsAbs(g.BotPath) {
+	// A caller that went away is no evidence against what was verified: the
+	// refusal keeps the cache.
+	if ctx.Err() != nil {
+		return ErrIncompatible
+	}
+	if !filepath.IsAbs(g.BotPath) {
 		return deny()
 	}
 	before, err := g.targets(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return ErrIncompatible
+		}
 		return deny()
 	}
 	if !sameTargets(before, g.verified) {
@@ -71,11 +79,14 @@ func (g *Gate) Check(ctx context.Context) error {
 	next := make(map[executableTarget]struct{}, len(before))
 	for _, target := range before {
 		if ctx.Err() != nil {
-			return deny()
+			return ErrIncompatible
 		}
 		if _, ok := g.cache[target]; !ok {
 			body, err := run(ctx, target.path)
 			if err != nil || !compatibleCapabilities(body) {
+				if ctx.Err() != nil {
+					return ErrIncompatible
+				}
 				return deny()
 			}
 		}
@@ -83,7 +94,10 @@ func (g *Gate) Check(ctx context.Context) error {
 	}
 	// Executing capabilities must not bless a replaced file or a reused PID.
 	after, err := g.targets(ctx)
-	if err != nil || ctx.Err() != nil || !sameTargets(before, after) {
+	if ctx.Err() != nil {
+		return ErrIncompatible
+	}
+	if err != nil || !sameTargets(before, after) {
 		return deny()
 	}
 	g.cache = next

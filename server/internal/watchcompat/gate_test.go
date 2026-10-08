@@ -195,6 +195,23 @@ func TestGate_InstalledAndRunningExecutables(t *testing.T) {
 		writeBotProcess(t, g.ProcRoot, 50, 107, other, other, "--file", g.BotPath)
 		checkGate(t, g, true)
 	})
+	t.Run("process that exited after the listing", func(t *testing.T) {
+		g := gateFixture(t)
+		writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+		writeBotProcess(t, g.ProcRoot, 52, 109, g.BotPath, g.BotPath)
+		// Listed, while the PID directory and every file in it are gone.
+		if err := os.Symlink(filepath.Join(t.TempDir(), "reaped"), filepath.Join(g.ProcRoot, "53")); err != nil {
+			t.Fatal(err)
+		}
+		checkGate(t, g, true)
+	})
+	t.Run("unrelated process with a command line over 64 KiB", func(t *testing.T) {
+		g := gateFixture(t)
+		other := filepath.Join(t.TempDir(), "utility")
+		writeCapabilityExecutable(t, other, "exit 93")
+		writeBotProcess(t, g.ProcRoot, 54, 110, other, other, strings.Repeat("x", 64<<10))
+		checkGate(t, g, true)
+	})
 	t.Run("replaced installed path leaves old proc exe", func(t *testing.T) {
 		g := gateFixture(t)
 		writeCapabilityExecutable(t, g.BotPath, capabilityReply(`{}`))
@@ -317,6 +334,39 @@ func TestGate_CacheInvalidation(t *testing.T) {
 		}
 		checkGate(t, g, false)
 	})
+}
+
+func TestGate_CancellationKeepsTheVerifiedCache(t *testing.T) {
+	for _, when := range []string{"before the check", "during the scan"} {
+		t.Run(when, func(t *testing.T) {
+			g := gateFixture(t)
+			writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+			runs := 0
+			g.exec = func(ctx context.Context, path string) ([]byte, error) {
+				runs++
+				return readCapabilities(ctx, path)
+			}
+			checkGate(t, g, true)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if when == "before the check" {
+				cancel()
+			} else {
+				g.proc = func(ctx context.Context, root, botPath string) ([]executableTarget, error) {
+					cancel()
+					return runningBots(ctx, root, botPath)
+				}
+			}
+			if err := g.Check(ctx); !errors.Is(err, ErrIncompatible) {
+				t.Fatalf("cancelled check %v, want ErrIncompatible", err)
+			}
+			g.proc = nil
+			checkGate(t, g, true)
+			if runs != 1 {
+				t.Fatalf("capability runs %d, want 1: a cancelled check is no evidence against the verified bot", runs)
+			}
+		})
+	}
 }
 
 func TestGate_ProcessChangesDuringCheck(t *testing.T) {

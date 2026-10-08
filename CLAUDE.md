@@ -87,6 +87,7 @@ cd server && go run ./cmd/watchd --dev
 | `server/internal/notifications/` | Watchd's durable events, per-chat delivery progress and subscription-health transitions |
 | `server/internal/watchdapi/` | Unix IPC: independent monitor/watch status, recipient sync, pending events and ack |
 | `server/internal/endpoint/` | One address of one server as the walk dials it: `PerAddress`, `ServerForDial`, `DialKey`, the monitor's `Key` |
+| `server/internal/netpath/` | Path dialing (`DialPath`, SO_BINDTODEVICE/SO_MARK control), readiness markers and TCP reach |
 | `router/opt/etc/init.d/S98vpn-director-watchd` | Entware init.d script of the server monitor |
 | `server/internal/webapi/` | HTTP API: router, JWT middleware, handlers, response deadlines |
 | `server/internal/subscription/` | Go subscription decoder, the twin of `lib/subscription.sh`; resolution and import summaries |

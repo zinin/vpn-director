@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -211,6 +212,169 @@ func TestRuntime_OwnershipBeforeEverySideEffect(t *testing.T) {
 		t.Fatal("drained runtime retained ownership:", err)
 	}
 	listener.Close()
+}
+
+func TestRuntime_DuplicateLeavesThePrimaryAnswering(t *testing.T) {
+	p := runtimePaths(t)
+	q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "watchd-notifications.json"))
+	primary := &ownershipMonitor{snap: watchdapi.Snapshot{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{"primary": {Status: watchdapi.StatusAlive}}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	startRuntime(t, ctx, cancel, p.WatchdSocket, func() (runtimeDeps, error) {
+		return runtimeDeps{Monitor: primary, Watch: &subwatch.Watch{}, Queue: q}, nil
+	})
+	before, err := os.Lstat(p.WatchdSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := &ownershipMonitor{snap: watchdapi.Snapshot{State: watchdapi.StateDisabled}}
+	var builds atomic.Int64
+	duplicateCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer stop()
+	err = runRuntime(duplicateCtx, p.WatchdSocket, func() (runtimeDeps, error) {
+		builds.Add(1)
+		return runtimeDeps{Monitor: duplicate, Watch: &subwatch.Watch{}, Queue: q}, nil
+	})
+	if err == nil || builds.Load() != 0 || duplicate.runs.Load() != 0 {
+		t.Fatalf("duplicate built or started: error=%v builds=%d runs=%d", err, builds.Load(), duplicate.runs.Load())
+	}
+	if after, err := os.Lstat(p.WatchdSocket); err != nil || !os.SameFile(before, after) {
+		t.Fatal("duplicate changed the primary socket")
+	}
+	client := watchdapi.NewClient(p.WatchdSocket)
+	if snap, err := client.Monitor(context.Background()); err != nil || snap.State != watchdapi.StateOK || len(snap.Endpoints) != 1 {
+		t.Fatalf("primary health was disturbed: state=%s error=%v", snap.State, err)
+	}
+	for _, keys := range [][]string{{"primary"}, nil} {
+		if n, err := client.Check(context.Background(), keys); err != nil || n != 1 {
+			t.Fatalf("primary check failed after the duplicate: n=%d error=%v", n, err)
+		}
+	}
+}
+
+func TestRuntime_FailedOrCancelledAcquisitionSkipsBuild(t *testing.T) {
+	t.Run("acquisition failure", func(t *testing.T) {
+		path := daemonSocketPath(t)
+		parent := filepath.Join(filepath.Dir(path), "SECRET_SENTINEL")
+		if err := os.WriteFile(parent, []byte("synthetic regular file"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var builds atomic.Int64
+		err := runRuntime(context.Background(), filepath.Join(parent, "watchd.sock"), func() (runtimeDeps, error) {
+			builds.Add(1)
+			return runtimeDeps{}, errors.New("a failed acquisition must not build")
+		})
+		var cause *os.PathError
+		if err == nil || !errors.As(err, &cause) || strings.Contains(err.Error(), "SECRET_SENTINEL") {
+			t.Fatalf("acquisition did not return a safe wrapped cause: %v", err)
+		}
+		if builds.Load() != 0 {
+			t.Fatal("failed acquisition built the runtime")
+		}
+	})
+	t.Run("cancelled startup", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		var builds atomic.Int64
+		err := runRuntime(ctx, daemonSocketPath(t), func() (runtimeDeps, error) {
+			builds.Add(1)
+			return runtimeDeps{}, errors.New("a cancelled startup must not build")
+		})
+		if !errors.Is(err, context.Canceled) || builds.Load() != 0 {
+			t.Fatalf("cancelled acquisition built the runtime: error=%v builds=%d", err, builds.Load())
+		}
+	})
+}
+
+// failRuntimeListener makes the runtime's socket fail with what fail returns.
+func failRuntimeListener(t *testing.T, fail func() error) {
+	t.Helper()
+	previous := serveListener
+	serveListener = func(context.Context, net.Listener, watchdapi.Source, ...watchdapi.AutomationSource) error {
+		return fail()
+	}
+	t.Cleanup(func() { serveListener = previous })
+}
+
+func TestRuntime_ListenerFailureCancelsWorkersAndWaitsForMonitorShutdown(t *testing.T) {
+	t.Run("waits for the monitor", func(t *testing.T) {
+		p := runtimePaths(t)
+		q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "watchd-notifications.json"))
+		m := &lifecycleMonitor{make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{})}
+		var finish sync.Once
+		release := func() { finish.Do(func() { close(m.finish) }) }
+		t.Cleanup(release)
+		sentinel := errors.New("listener failure with SECRET_SENTINEL")
+		failRuntimeListener(t, func() error {
+			<-m.started
+			return sentinel
+		})
+		result := make(chan error, 1)
+		go func() {
+			result <- runRuntime(context.Background(), p.WatchdSocket, func() (runtimeDeps, error) {
+				return runtimeDeps{Monitor: m, Watch: &subwatch.Watch{}, Queue: q}, nil
+			})
+		}()
+		await(t, m.canceled)
+		select {
+		case err := <-result:
+			t.Fatalf("returned before the monitor's shutdown: %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+		release()
+		select {
+		case err := <-result:
+			if err == nil || !errors.Is(err, sentinel) || strings.Contains(err.Error(), "SECRET_SENTINEL") {
+				t.Fatalf("socket failure must return a safe nonzero cause: %v", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("runtime did not finish after the monitor's shutdown")
+		}
+		await(t, m.saved)
+	})
+
+	t.Run("stops the prober and saves state", func(t *testing.T) {
+		p := runtimePaths(t)
+		q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "watchd-notifications.json"))
+		session := &cleanupSession{started: make(chan struct{}), exited: make(chan struct{})}
+		state := filepath.Join(t.TempDir(), "state.json")
+		settings, _ := monitor.SettingsFrom(nil)
+		m := monitor.New(monitor.Deps{
+			Settings: func() (monitor.Settings, error) { return settings, nil },
+			Endpoints: func() ([]monitor.Endpoint, map[string]string, error) {
+				return []monitor.Endpoint{{Key: strings.Repeat("a", 64)}}, nil, nil
+			},
+			Launcher:  &cleanupLauncher{session},
+			Stopped:   func() bool { return false },
+			WANUp:     func(context.Context) bool { return true },
+			StatePath: state,
+		})
+		failRuntimeListener(t, func() error {
+			<-session.started
+			return errors.New("synthetic listener failure")
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		err := runRuntime(ctx, p.WatchdSocket, func() (runtimeDeps, error) {
+			return runtimeDeps{Monitor: m, Watch: &subwatch.Watch{}, Queue: q}, nil
+		})
+		if err == nil || ctx.Err() != nil {
+			t.Fatalf("listener failure must end the runtime, not wait for a deadline: %v", err)
+		}
+		await(t, session.exited)
+		data, err := os.ReadFile(state)
+		if err != nil {
+			t.Fatal("shutdown did not save state:", err)
+		}
+		var saved struct {
+			Entries map[string]json.RawMessage `json:"entries"`
+		}
+		if err := json.Unmarshal(data, &saved); err != nil || len(saved.Entries) != 1 {
+			t.Fatalf("shutdown state is incomplete: %v", err)
+		}
+		if info, err := os.Stat(state); err != nil || info.Mode().Perm() != 0600 {
+			t.Fatal("shutdown state does not have mode 0600")
+		}
+	})
 }
 
 func TestRuntime_BotIndependentAndStopped(t *testing.T) {
@@ -1245,6 +1409,35 @@ func TestPublishSubscriptionHealth_RuntimeDrainsBeforeUnlock(t *testing.T) {
 		t.Fatal("drained publisher retained runtime ownership:", err)
 	}
 	listener.Close()
+}
+
+func TestPublishSubscriptionHealth_RuntimeReadsTheProvidedLoader(t *testing.T) {
+	p := runtimePaths(t)
+	q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "watchd-notifications.json"))
+	if err := q.ReplaceRecipients([]watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Now().Add(-time.Hour)}}); err != nil {
+		t.Fatal(err)
+	}
+	sub := publisherTestSubscription()
+	var watchLoads, healthLoads atomic.Int64
+	w := &subwatch.Watch{LoadSubscriptions: func() ([]vpnconfig.Subscription, error) {
+		watchLoads.Add(1)
+		return nil, errors.New("the watch's own reader")
+	}}
+	m := &ownershipMonitor{snap: publisherTestSnapshot(sub, watchdapi.StatusDead)}
+	ctx, cancel := context.WithCancel(context.Background())
+	startRuntime(t, ctx, cancel, p.WatchdSocket, func() (runtimeDeps, error) {
+		return runtimeDeps{Monitor: m, Watch: w, Queue: q, HealthSubscriptions: func() ([]vpnconfig.Subscription, error) {
+			healthLoads.Add(1)
+			return []vpnconfig.Subscription{sub}, nil
+		}}, nil
+	})
+	messages := awaitHealthMessages(t, q, 1, 2*time.Second)
+	if messages[0].Text != "Subscription North has no live servers" {
+		t.Fatalf("health from the provided loader = %+v", messages)
+	}
+	if healthLoads.Load() == 0 || watchLoads.Load() != 0 {
+		t.Fatalf("health loads %d, watch loads %d; the publisher must read the loader it was given", healthLoads.Load(), watchLoads.Load())
+	}
 }
 
 func TestPublishSubscriptionHealth_RuntimeStoreErrorDoesNotStopWatch(t *testing.T) {

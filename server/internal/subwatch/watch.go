@@ -177,11 +177,17 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.mu.Unlock()
 	}()
 	w.applyDefaults()
-	w.setStatus(nil)
 	if err := w.mutationAllowed(); err != nil {
 		w.setStatus(err)
+		// The flags say what the config holds, whether or not the watch may act on it.
+		if w.LoadVPN != nil {
+			if cfg, err := w.LoadVPN(); err == nil {
+				w.setStatusConfig(cfg)
+			}
+		}
 		return
 	}
+	w.setStatus(nil)
 
 	if w.LoadVPN == nil {
 		return
@@ -189,6 +195,9 @@ func (w *Watch) Tick(ctx context.Context) {
 	cfg, err := w.LoadVPN()
 	if refused := w.mutationAllowed(); refused != nil {
 		w.setStatus(refused)
+		if err == nil {
+			w.setStatusConfig(cfg)
+		}
 		return
 	}
 	if err != nil {
@@ -1337,10 +1346,22 @@ func (w *Watch) cancelOnStop(ctx context.Context) (context.Context, func()) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
-				if err := w.mutationAllowedContext(nil); err != nil {
-					cancel(err)
+				if ctx.Err() != nil {
 					return
 				}
+				err := w.mutationRefused()
+				if err == nil {
+					continue
+				}
+				// A refusal that comes back after the tick ended - its own end
+				// cancels the context the check may be using - is no refusal of
+				// the tick.
+				if ctx.Err() != nil {
+					return
+				}
+				w.mutationFailed.Store(true)
+				cancel(err)
+				return
 			}
 		}
 	}()

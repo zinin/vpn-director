@@ -13,14 +13,20 @@ func (w *Watch) mutationAllowed() error {
 	return w.mutationAllowedContext(w.mutationContext)
 }
 
-func (w *Watch) mutationAllowedContext(ctx context.Context) error {
-	var err error
+// mutationRefused is why a mutation may not happen now, with none of the side
+// effects of mutationAllowedContext.
+func (w *Watch) mutationRefused() error {
 	switch {
 	case w.stopped():
-		err = errStopped
+		return errStopped
 	case w.CanMutate != nil:
-		err = w.CanMutate()
+		return w.CanMutate()
 	}
+	return nil
+}
+
+func (w *Watch) mutationAllowedContext(ctx context.Context) error {
+	err := w.mutationRefused()
 	if err == nil && ctx != nil {
 		err = context.Cause(ctx)
 	}

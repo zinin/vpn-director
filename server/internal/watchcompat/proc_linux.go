@@ -48,18 +48,24 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 			continue
 		}
 		dir := filepath.Join(root, entry.Name())
-		cmdline, cmdErr := readProcFile(filepath.Join(dir, "cmdline"), 64<<10)
+		cmdline, cmdErr := readProcPrefix(filepath.Join(dir, "cmdline"), 64<<10)
 		exe := filepath.Join(dir, "exe")
 		link, exeErr := os.Readlink(exe)
 		argv0 := string(bytes.SplitN(cmdline, []byte{0}, 2)[0])
 		isBot := botExecutableName(link, botPath) || botExecutableName(argv0, botPath)
 		if cmdErr != nil || exeErr != nil {
 			if isBot {
+				if exited(dir, cmdErr) || exited(dir, exeErr) {
+					continue
+				}
 				return nil, ErrIncompatible
 			}
 			if cmdErr == nil && len(cmdline) == 0 && errors.Is(exeErr, os.ErrNotExist) {
 				stat, err := readProcFile(filepath.Join(dir, "stat"), 8<<10)
 				if err != nil {
+					if exited(dir, err) {
+						continue
+					}
 					return nil, ErrIncompatible
 				}
 				comm, state, _, err := parseProcessStat(stat, pid)
@@ -68,6 +74,10 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 				}
 				continue
 			}
+			if exited(dir, cmdErr) || exited(dir, exeErr) {
+				continue
+			}
+			// An unreadable entry (hidepid, for one) could hide a bot, so it stays a refusal.
 			return nil, ErrIncompatible
 		}
 		if !isBot {
@@ -75,6 +85,9 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 		}
 		stat, err := readProcFile(filepath.Join(dir, "stat"), 8<<10)
 		if err != nil {
+			if exited(dir, err) {
+				continue
+			}
 			return nil, ErrIncompatible
 		}
 		_, state, start, err := parseProcessStat(stat, pid)
@@ -86,10 +99,16 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 		}
 		identity, err := identifyExecutable(exe)
 		if err != nil {
+			if exited(dir, err) {
+				continue
+			}
 			return nil, ErrIncompatible
 		}
 		stat, err = readProcFile(filepath.Join(dir, "stat"), 8<<10)
 		if err != nil {
+			if exited(dir, err) {
+				continue
+			}
 			return nil, ErrIncompatible
 		}
 		_, state, rechecked, err := parseProcessStat(stat, pid)
@@ -100,6 +119,17 @@ func runningBots(ctx context.Context, root, botPath string) ([]executableTarget,
 	}
 	sort.Slice(targets, func(i, j int) bool { return targets[i].pid < targets[j].pid })
 	return targets, nil
+}
+
+// exited reports whether a read failed because the process is gone: a PID the
+// listing showed whose directory no longer exists. A directory that is still
+// there keeps the read failure a refusal.
+func exited(dir string, err error) bool {
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ESRCH) {
+		return false
+	}
+	_, err = os.Stat(dir)
+	return errors.Is(err, os.ErrNotExist)
 }
 
 func botExecutableName(path, botPath string) bool {
@@ -134,14 +164,26 @@ func parseProcessStat(body []byte, pid int) (comm, state string, start uint64, e
 }
 
 func readProcFile(path string, limit int64) ([]byte, error) {
+	body, err := readProcPrefix(path, limit+1)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(body)) > limit {
+		return nil, ErrIncompatible
+	}
+	return body, nil
+}
+
+// readProcPrefix reads at most limit bytes; a longer file is not an error.
+func readProcPrefix(path string, limit int64) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	body, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil || int64(len(body)) > limit {
-		return nil, ErrIncompatible
+	body, err := io.ReadAll(io.LimitReader(f, limit))
+	if err != nil {
+		return nil, err
 	}
 	return body, nil
 }

@@ -154,7 +154,17 @@ func run() int {
 				return ctx.Err()
 			}
 		}
-		return runtimeDeps{Monitor: m, Watch: watch, Queue: queue}, errors.Join(pathErr, storageErr)
+		// The health publisher reads every subscription each 10 s: unchanged
+		// files are reused rather than parsed again.
+		healthCache := vpnconfig.NewSubscriptionCache()
+		healthSubscriptions := func() ([]vpnconfig.Subscription, error) {
+			dir, err := configSvc.SubscriptionsDir()
+			if err != nil {
+				return nil, err
+			}
+			return healthCache.Load(dir)
+		}
+		return runtimeDeps{Monitor: m, Watch: watch, Queue: queue, HealthSubscriptions: healthSubscriptions}, errors.Join(pathErr, storageErr)
 	}); err != nil {
 		slog.Error("the monitor's socket stopped", "path", p.WatchdSocket, "error", err)
 		return 1
@@ -168,46 +178,10 @@ type daemonMonitor interface {
 	Run(context.Context)
 }
 
-// Instance ownership precedes every prober side effect and outlives shutdown.
-func runMonitor(ctx context.Context, path string, build func() daemonMonitor) error {
-	listener, err := watchdapi.Listen(ctx, path)
-	if err != nil {
-		return &socketError{cause: err}
-	}
-	defer listener.Close()
-	if err := ctx.Err(); err != nil {
-		return &socketError{cause: err}
-	}
-	return runDaemon(ctx, path, build(), func(ctx context.Context, _ string, src watchdapi.Source) error {
-		return watchdapi.ServeListener(ctx, listener, src)
-	})
-}
-
 type socketError struct{ cause error }
 
 func (*socketError) Error() string   { return "serve the monitor's socket" }
 func (e *socketError) Unwrap() error { return e.cause }
-
-// runDaemon waits for both the monitor's prober/state shutdown and the socket.
-// A listener failure cancels the monitor and retains a safe failure cause.
-func runDaemon(ctx context.Context, path string, m daemonMonitor, serve func(context.Context, string, watchdapi.Source) error) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	served := make(chan error, 1)
-	go func() {
-		err := serve(ctx, path, m)
-		if err != nil {
-			cancel()
-		}
-		served <- err
-	}()
-	m.Run(ctx)
-	cancel()
-	if err := <-served; err != nil {
-		return &socketError{cause: err}
-	}
-	return nil
-}
 
 // settingsReader reads the monitor section at every refresh and warns once
 // about each distinct set of values out of bounds.

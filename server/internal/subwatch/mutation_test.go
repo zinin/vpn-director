@@ -551,6 +551,49 @@ func TestMutation_GateLossCancelsInflightFetch(t *testing.T) {
 	}
 }
 
+// The tick's own end cancels its context while a poll may be asking for
+// permission; a refusal that comes back after that is no refusal of the tick,
+// and the outbound's failure confirmation keeps counting.
+func TestMutation_PollRefusedAtTheTickEndKeepsTheFailureClock(t *testing.T) {
+	defer func(poll time.Duration) { stopPoll = poll }(stopPoll)
+	stopPoll = time.Millisecond
+	f := &fake{cfg: mutationConfig(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	start := f.now.Add(-time.Minute)
+	w.failSince = start
+	var block, refused atomic.Bool
+	var tick context.Context
+	inflight := make(chan struct{})
+	w.CanMutate = func() error {
+		if !block.CompareAndSwap(true, false) {
+			return nil
+		}
+		close(inflight)
+		<-tick.Done()
+		refused.Store(true)
+		return watchcompat.ErrIncompatible
+	}
+	w.Probe = func(ctx context.Context, _ int) error {
+		tick = ctx
+		block.Store(true)
+		select {
+		case <-inflight:
+		case <-time.After(5 * time.Second):
+			t.Error("no poll asked for permission while the probe waited")
+		}
+		return errProbe
+	}
+
+	w.Tick(context.Background())
+
+	if !refused.Load() {
+		t.Fatal("the poll's permission check did not end with the tick")
+	}
+	if !w.failSince.Equal(start) {
+		t.Fatalf("failSince %v, want %v: the tick's own end restarted the failure confirmation", w.failSince, start)
+	}
+}
+
 func TestMutation_IncompatibleAndCancellationEndWalkAndReturn(t *testing.T) {
 	for _, refusal := range []error{watchcompat.ErrIncompatible, context.Canceled, context.DeadlineExceeded} {
 		for _, route := range []string{"walk", "preferred return"} {

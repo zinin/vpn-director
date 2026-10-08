@@ -8,6 +8,7 @@ import (
 
 	"github.com/zinin/vpn-director/server/internal/notifications"
 	"github.com/zinin/vpn-director/server/internal/subwatch"
+	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
@@ -15,7 +16,13 @@ type runtimeDeps struct {
 	Monitor daemonMonitor
 	Watch   *subwatch.Watch
 	Queue   *notifications.Store
+	// HealthSubscriptions feeds the subscription-health publisher; nil reads
+	// through Watch.LoadSubscriptions.
+	HealthSubscriptions func() ([]vpnconfig.Subscription, error)
 }
+
+// serveListener is watchdapi.ServeListener; tests fail the socket through it.
+var serveListener = watchdapi.ServeListener
 
 type runtimeError struct{ cause error }
 
@@ -53,13 +60,17 @@ func runRuntime(ctx context.Context, socket string, build func() (runtimeDeps, e
 			run(ctx)
 		}()
 	}
+	healthSubscriptions := deps.HealthSubscriptions
+	if healthSubscriptions == nil {
+		healthSubscriptions = deps.Watch.LoadSubscriptions
+	}
 	start(deps.Monitor.Run)
 	start(deps.Watch.Start)
 	start(deps.Queue.Run)
 	start(func(ctx context.Context) {
-		publishSubscriptionHealth(ctx, deps.Watch.LoadSubscriptions, deps.Monitor, deps.Queue)
+		publishSubscriptionHealth(ctx, healthSubscriptions, deps.Monitor, deps.Queue)
 	})
-	err = watchdapi.ServeListener(ctx, listener, source, source)
+	err = serveListener(ctx, listener, source, source)
 	cancel()
 	// HTTP handlers may still be finishing a durable write after socket close.
 	source.close()

@@ -322,6 +322,76 @@ func TestWatchSnapshot_AvailabilityAndAction(t *testing.T) {
 	})
 }
 
+func TestWatchSnapshot_ClosedGate(t *testing.T) {
+	at := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+
+	for _, tc := range []struct {
+		name  string
+		close func(*Watch)
+		want  watchdapi.WatchState
+	}{
+		{"stopped", func(w *Watch) { w.Stopped = func() bool { return true } }, watchdapi.WatchStopped},
+		{"incompatible", func(w *Watch) { w.CanMutate = func() error { return watchcompat.ErrIncompatible } }, watchdapi.WatchIncompatible},
+	} {
+		t.Run("first tick reads persisted intent/"+tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			store := service.NewConfigService(dir, filepath.Join(dir, "data"))
+			document := `{"monitor":{"enabled":false},"tunnel_director":{"tunnels":{"ovpnc2":{"clients":["192.168.1.8"]}}},"xray":{"clients":[],"failover":{"tunnel":"ovpnc2","clients":["192.168.1.8"],"added":["192.168.1.8"],"committed":true},"pending_restore":{"snapshot":{"tunnel":"ovpnc2","clients":["192.168.1.8"],"added":["192.168.1.8"],"committed":true},"restored":["192.168.1.8"],"active":null}}}`
+			if err := os.WriteFile(store.ConfigPath(), []byte(document), 0600); err != nil {
+				t.Fatal(err)
+			}
+			applies, restarts, probes := 0, 0, 0
+			var notes []string
+			w := &Watch{
+				LoadVPN:     store.LoadVPNConfig,
+				UpdateVPN:   store.UpdateVPNConfig,
+				Apply:       func() error { applies++; return nil },
+				RestartXray: func() error { restarts++; return nil },
+				Probe:       func(context.Context, int) error { probes++; return nil },
+				Notify:      func(msg string) { notes = append(notes, msg) },
+				Now:         func() time.Time { return at },
+			}
+			tc.close(w)
+			w.Tick(context.Background())
+			snapshot := w.Snapshot()
+			if snapshot.State != tc.want || !snapshot.CommittedFailover || !snapshot.PendingRestore {
+				t.Fatalf("snapshot %+v, want %s with the persisted committed failover and pending restore", snapshot, tc.want)
+			}
+			if applies != 0 || restarts != 0 || probes != 0 || len(notes) != 0 {
+				t.Fatalf("a closed gate acted: applies=%d restarts=%d probes=%d notes=%v", applies, restarts, probes, notes)
+			}
+			after, err := os.ReadFile(store.ConfigPath())
+			if err != nil || string(after) != document {
+				t.Fatalf("a closed gate changed persisted intent: %s, error=%v", after, err)
+			}
+			assertWatchSnapshotSafe(t, snapshot)
+		})
+	}
+
+	t.Run("a refusing gate check is not shown as active", func(t *testing.T) {
+		f := &fake{cfg: baseCfg(), now: at}
+		w := f.watch()
+		var during []watchdapi.WatchSnapshot
+		w.CanMutate = func() error {
+			during = append(during, w.Snapshot())
+			return watchcompat.ErrIncompatible
+		}
+		w.Tick(context.Background())
+		w.Tick(context.Background())
+		if len(during) != 2 {
+			t.Fatalf("gate checks %d, want one a tick", len(during))
+		}
+		for i, snapshot := range during {
+			if snapshot.State == watchdapi.WatchActive {
+				t.Fatalf("tick %d showed the watch active while its gate check refused: %+v", i+1, snapshot)
+			}
+		}
+		if during[1].State != watchdapi.WatchIncompatible {
+			t.Fatalf("later tick's check saw %q, want the incompatible state the last tick left", during[1].State)
+		}
+	})
+}
+
 func TestWatchSnapshot_LogsExcludeRawErrors(t *testing.T) {
 	fault := errors.New("https://provider.example/private/" + watchStatusSecret + " bot_token=synthetic-token provider-payload=private")
 	for _, tc := range []struct {

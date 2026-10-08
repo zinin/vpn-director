@@ -5,6 +5,9 @@ import (
 	"io"
 )
 
+// ProtocolVersion versions Capabilities. Watchd parses the reply strictly - an
+// unknown, duplicate or missing field is incompatible - so any change to
+// Capabilities must bump it.
 const ProtocolVersion = 1
 
 type Capabilities struct {

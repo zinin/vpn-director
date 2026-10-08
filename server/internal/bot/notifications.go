@@ -462,10 +462,11 @@ func (b *Bot) receiveNotifications(ctx context.Context) {
 			close(work)
 			workers.Wait()
 		}()
+		var polls notificationPollStreak
 		poll := func() {
 			api, jobs, err := b.readNotificationJobs(ctx)
-			if err != nil && ctx.Err() == nil {
-				slog.Warn("Watch notification delivery will retry")
+			if ctx.Err() == nil {
+				polls.observe(err != nil)
 			}
 			chats := make([]int64, 0, len(jobs))
 			for chatID := range jobs {
@@ -501,6 +502,23 @@ func (b *Bot) receiveNotifications(ctx context.Context) {
 			}
 		}
 	})
+}
+
+// notificationPollStreak keeps a watchd that does not answer - an optional
+// download - to one WARN per outage instead of one every poll.
+type notificationPollStreak struct{ failing bool }
+
+// observe logs the first failed poll of a streak and the first success after one.
+func (s *notificationPollStreak) observe(failed bool) {
+	if failed == s.failing {
+		return
+	}
+	s.failing = failed
+	if failed {
+		slog.Warn("Watch notification delivery will retry")
+	} else {
+		slog.Info("Watch notification delivery resumed")
+	}
 }
 
 // retryable excludes permanent Telegram refusals, but retains transport errors.

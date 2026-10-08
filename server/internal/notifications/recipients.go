@@ -10,7 +10,7 @@ func (s *Store) ReplaceRecipients(recipients []watchdapi.Recipient) error {
 	next := make(map[int64]watchdapi.Recipient, len(recipients))
 	for _, recipient := range recipients {
 		previous, exists := next[recipient.ChatID]
-		if !exists || recipient.FirstSeen.After(previous.FirstSeen) {
+		if !exists || recipient.FirstSeen.Before(previous.FirstSeen) {
 			next[recipient.ChatID] = recipient
 		}
 	}
