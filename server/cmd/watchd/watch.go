@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
@@ -90,7 +91,9 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 	// The watch notifies a change it has made and records the message as sent;
 	// its own checks decide what a stop silences, so an ended tick drops nothing.
 	w.Notify = func(text string) {
-		if _, err := q.Publish(text); err != nil {
+		if _, err := q.Publish(text); errors.Is(err, notifications.ErrDeferred) {
+			slog.Warn("Notification storage is not open; the event waits in memory until it opens")
+		} else if err != nil {
 			slog.Warn("Notification storage publish failed; delivery will retry")
 		}
 	}

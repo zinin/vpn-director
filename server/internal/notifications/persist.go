@@ -165,10 +165,19 @@ func (s *Store) Flush() error {
 	return s.flushForEvents(0)
 }
 
-// reserve is the minimum event-ID headroom for the next atomic mutation.
+// reserve is the minimum event-ID headroom for the next atomic mutation. A
+// store OpenStore could not open asks for its path first.
 func (s *Store) flushForEvents(reserve uint64) error {
 	s.saving.Lock()
 	defer s.saving.Unlock()
+	if err := s.openLocked(); err != nil {
+		return err
+	}
+	return s.saveLocked(reserve)
+}
+
+// saveLocked writes what changed since the last save. Caller holds saving.
+func (s *Store) saveLocked(reserve uint64) error {
 	if err := s.ensureEpoch(); err != nil {
 		s.recordStorageError(err)
 		return err

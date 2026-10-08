@@ -40,6 +40,11 @@ var (
 	errCursor   = watchdapi.ErrInvalidCursor
 	errEventID  = watchdapi.ErrInvalidEventID
 	errPageSize = errors.New("notification exceeds page size")
+
+	errUnavailable = errors.New("notification data path is unavailable")
+	// ErrDeferred is Publish on a store not open yet: the event waits in
+	// memory, without an ID, until a Flush opens the store.
+	ErrDeferred = errors.New("notification storage is not open; the event waits in memory")
 )
 
 type storedEvent struct {
@@ -67,15 +72,41 @@ type Store struct {
 	closed          map[int64]map[watchdapi.EventID]time.Time
 	health          map[string]json.RawMessage
 	storageError    string
+	// resolve answers the path of a store OpenStore could not open yet; nil
+	// once the store is open. backlog holds what Publish got meanwhile,
+	// without IDs.
+	resolve func() (string, error)
+	backlog []storedEvent
 
 	needsBackup bool // protected by saving
 }
 
 func NewStore(path string, now func() time.Time) (*Store, error) {
+	s := newStore(path, now)
+	return s, s.open()
+}
+
+// OpenStore opens the store at the path resolve answers. While resolve fails
+// the store stays unopened: it holds no epoch and no events, Publish keeps up
+// to maxRecent events in memory without IDs, the other operations answer
+// errUnavailable, and every Flush asks resolve again and, once it answers,
+// opens the store there for the life of the process.
+func OpenStore(resolve func() (string, error), now func() time.Time) (*Store, error) {
+	path, err := resolve()
+	if err == nil {
+		return NewStore(path, now)
+	}
+	s := newStore("", now)
+	s.resolve = resolve
+	s.storageError = errUnavailable.Error()
+	return s, err
+}
+
+func newStore(path string, now func() time.Time) *Store {
 	if now == nil {
 		now = time.Now
 	}
-	s := &Store{
+	return &Store{
 		path: path, now: now, io: realStoreIO(),
 		revision: 1, reservedThrough: sequenceReserve,
 		recent:     []storedEvent{},
@@ -84,8 +115,17 @@ func NewStore(path string, now func() time.Time) (*Store, error) {
 		closed:     make(map[int64]map[watchdapi.EventID]time.Time),
 		health:     make(map[string]json.RawMessage),
 	}
-	loadErr := s.restore()
-	identityErr := s.ensureEpoch()
+}
+
+// open restores the file at path, ensures the epoch, prunes and saves.
+func (s *Store) open() error {
+	loadErr, identityErr := s.load()
+	return errors.Join(loadErr, identityErr, s.Flush())
+}
+
+func (s *Store) load() (loadErr, identityErr error) {
+	loadErr = s.restore()
+	identityErr = s.ensureEpoch()
 	at := s.now()
 	s.mu.Lock()
 	s.pruneLocked(at)
@@ -93,14 +133,79 @@ func NewStore(path string, now func() time.Time) (*Store, error) {
 		s.storageError = loadErr.Error()
 	}
 	s.mu.Unlock()
-	return s, errors.Join(loadErr, identityErr, s.Flush())
+	return loadErr, identityErr
+}
+
+// openLocked opens a store OpenStore left unopened once resolve answers: as
+// NewStore does, then with the events Publish kept meanwhile, in order and at
+// their own times. Until it switches, every other operation still sees the
+// store unopened and touches none of the state it fills. Caller holds saving.
+func (s *Store) openLocked() error {
+	s.mu.Lock()
+	resolve := s.resolve
+	s.mu.Unlock()
+	if resolve == nil {
+		return nil
+	}
+	path, err := resolve()
+	if err != nil {
+		s.recordStorageError(err)
+		return err
+	}
+	s.path = path
+	loadErr, identityErr := s.load()
+	errs := []error{loadErr, identityErr, s.saveLocked(0)}
+	save := func() error { return s.saveLocked(0) }
+	for {
+		s.mu.Lock()
+		backlog := s.backlog
+		s.backlog = nil
+		if len(backlog) == 0 {
+			s.resolve = nil
+			s.mu.Unlock()
+			break
+		}
+		s.mu.Unlock()
+		for _, event := range backlog {
+			if _, err := s.publishAt(event.Text, event.At, save); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// unopened reports a store OpenStore could not open yet.
+func (s *Store) unopened() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.resolve != nil
 }
 
 func (s *Store) Publish(text string) (watchdapi.EventID, error) {
+	at := s.now()
+	s.mu.Lock()
+	if s.resolve != nil {
+		event := storedEvent{At: at, Text: text}
+		if len(s.backlog) == maxRecent {
+			copy(s.backlog, s.backlog[1:])
+			s.backlog[len(s.backlog)-1] = event
+		} else {
+			s.backlog = append(s.backlog, event)
+		}
+		s.mu.Unlock()
+		return "", ErrDeferred
+	}
+	s.mu.Unlock()
+	return s.publishAt(text, at, s.Flush)
+}
+
+// publishAt appends text as an event at at, leasing more IDs through save
+// when the reserve is spent, and saves it.
+func (s *Store) publishAt(text string, at time.Time, save func() error) (watchdapi.EventID, error) {
 	if err := s.ensureEpoch(); err != nil {
 		return "", err
 	}
-	at := s.now()
 	for {
 		s.mu.Lock()
 		s.pruneLocked(at)
@@ -110,14 +215,14 @@ func (s *Store) Publish(text string) (watchdapi.EventID, error) {
 		}
 		if s.sequence >= s.reservedThrough {
 			s.mu.Unlock()
-			if err := s.Flush(); err != nil {
+			if err := save(); err != nil {
 				return "", err
 			}
 			continue
 		}
 		id := s.appendEventLocked(text, at)
 		s.mu.Unlock()
-		return id, s.Flush()
+		return id, save()
 	}
 }
 
@@ -139,6 +244,9 @@ func (s *Store) appendEventLocked(text string, at time.Time) watchdapi.EventID {
 
 func (s *Store) Pending(cursor string) (watchdapi.NotificationPage, error) {
 	page := watchdapi.NotificationPage{Messages: make([]watchdapi.Notification, 0, pageSize)}
+	if s.unopened() {
+		return page, errUnavailable
+	}
 	if len(cursor) > maxCursorLength {
 		return page, errCursor
 	}
@@ -219,6 +327,9 @@ func (s *Store) pageCursor(chatID int64, sequence uint64) string {
 }
 
 func (s *Store) Ack(chatID int64, eventID watchdapi.EventID) error {
+	if s.unopened() {
+		return errUnavailable
+	}
 	epoch, sequence, valid := watchdapi.ParseEventID(eventID)
 	if !valid {
 		return errEventID
@@ -272,6 +383,9 @@ func (s *Store) Status() watchdapi.NotificationsStatus {
 	at := s.now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.resolve != nil {
+		return watchdapi.NotificationsStatus{StorageError: s.storageError}
+	}
 	s.pruneLocked(at)
 	status := watchdapi.NotificationsStatus{StorageError: s.storageError}
 	for _, queue := range s.pending {

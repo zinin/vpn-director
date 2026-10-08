@@ -604,6 +604,111 @@ func TestRuntime_WatchdStartupUsesResolvedDataDir(t *testing.T) {
 	}
 }
 
+// A configuration watchd cannot read at startup leaves its notification queue
+// unopened; once the file reads again, the queue opens at the data path on its
+// next flush, without a restart.
+func TestRuntime_WatchdOpensTheQueueOnceTheDataPathResolves(t *testing.T) {
+	root := filepath.Dir(daemonSocketPath(t))
+	dev := filepath.Join(root, "testdata", "dev")
+	if err := os.MkdirAll(dev, 0700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dev, "vpn-director.json")
+	if err := os.WriteFile(configPath, []byte("not a readable config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dev, "telegram-bot.json"), []byte("no token; not a bot config"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args, err := json.Marshal([]string{"--dev", "--config", configPath, "--platform", "keenetic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processCtx, kill := context.WithTimeout(context.Background(), 30*time.Second)
+	defer kill()
+	// The startup test's helper branch runs watchd's main with these arguments.
+	cmd := exec.CommandContext(processCtx, os.Args[0], "-test.run=^TestRuntime_WatchdStartupUsesResolvedDataDir$")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "VPD_TASK8_WATCHD_MAIN="+string(args), "VPD_PLATFORM=invalid-platform")
+	var output runtimeLog
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait(); close(done) }()
+	t.Cleanup(func() {
+		kill()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("owned startup helper did not exit")
+		}
+	})
+	client := watchdapi.NewClient(filepath.Join(dev, "watchd.sock"))
+	recipients := []watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Now().Add(-time.Minute)}}
+	var snap watchdapi.WatchSnapshot
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		request, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		snap, err = client.Watch(request)
+		stop()
+		if err == nil {
+			break
+		}
+		select {
+		case exitErr := <-done:
+			t.Fatalf("watchd exited before its API: %v output=%s", exitErr, output.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("watchd did not expose its API: %v output=%s", err, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if snap.Notifications.StorageError != "notification data path is unavailable" {
+		t.Fatalf("storage_error %q with an unreadable data path", snap.Notifications.StorageError)
+	}
+	if err := client.SetRecipients(context.Background(), recipients); err == nil {
+		t.Fatal("an unopened queue accepted recipients")
+	}
+
+	if err := os.WriteFile(configPath, []byte(`{"data_dir":"queues","monitor":{"enabled":false},"xray":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// The queue asks for its path again at its next periodic flush.
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		request, stop := context.WithTimeout(context.Background(), time.Second)
+		err = client.SetRecipients(request, recipients)
+		stop()
+		if err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the queue did not open once the data path resolved: %v output=%s", err, output.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if info, err := os.Stat(filepath.Join(dev, "queues", "watchd-notifications.json")); err != nil || info.Mode().Perm() != 0600 {
+		t.Fatalf("queue file at the resolved data path: %v", err)
+	}
+	if snap, err := client.Watch(context.Background()); err != nil || snap.Notifications.StorageError != "" {
+		t.Fatalf("watch snapshot %+v, %v; the open queue has no storage error", snap.Notifications, err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SIGTERM did not drain the runtime: %v output=%s", err, output.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the opened queue blocked shutdown")
+	}
+}
+
 func TestRuntime_WatchdBindsSelectedShellConfig(t *testing.T) {
 	if raw := os.Getenv("VPD_TASK8_CONFIG_ARGS"); raw != "" {
 		var args []string

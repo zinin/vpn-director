@@ -21,6 +21,9 @@ type subscriptionHealthUpdate struct {
 
 // ObserveSubscriptions persists confirmed health and its events as one intent.
 func (s *Store) ObserveSubscriptions(subs []vpnconfig.Subscription, snapshot watchdapi.Snapshot) error {
+	if s.unopened() {
+		return errUnavailable
+	}
 	if err := s.ensureEpoch(); err != nil {
 		return err
 	}

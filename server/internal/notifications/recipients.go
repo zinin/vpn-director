@@ -7,6 +7,9 @@ import (
 )
 
 func (s *Store) ReplaceRecipients(recipients []watchdapi.Recipient) error {
+	if s.unopened() {
+		return errUnavailable
+	}
 	next := make(map[int64]watchdapi.Recipient, len(recipients))
 	for _, recipient := range recipients {
 		previous, exists := next[recipient.ChatID]

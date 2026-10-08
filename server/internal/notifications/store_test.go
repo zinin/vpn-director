@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -519,4 +520,136 @@ func TestPending_AckValidationIsAtomic(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A data path watchd cannot read at startup leaves the store unopened: it
+// hands out no event ID, keeps what Publish gets in memory and refuses every
+// other operation, until a Flush finds the path and opens the store there.
+func TestOpenStore_DefersUntilThePathResolves(t *testing.T) {
+	pathErr := errors.New("synthetic unreadable configuration")
+	deferred := func(t *testing.T, now func() time.Time) (*Store, func(string)) {
+		t.Helper()
+		resolved := ""
+		resolve := func() (string, error) {
+			if resolved == "" {
+				return "", pathErr
+			}
+			return resolved, nil
+		}
+		s, err := OpenStore(resolve, now)
+		if !errors.Is(err, pathErr) || s == nil {
+			t.Fatalf("OpenStore = %v, %v; want an unopened store and the resolver's error", s, err)
+		}
+		return s, func(path string) { resolved = path }
+	}
+
+	t.Run("unopened", func(t *testing.T) {
+		clock := notificationTestTime()
+		s, _ := deferred(t, func() time.Time { return clock })
+		if status := s.Status(); status.StorageError != "notification data path is unavailable" || status.Pending != 0 {
+			t.Fatalf("status %+v", status)
+		}
+		for i := 0; i < maxRecent+5; i++ {
+			id, err := s.Publish(fmt.Sprintf("event %d", i))
+			if id != "" || !errors.Is(err, ErrDeferred) {
+				t.Fatalf("Publish = %q, %v; want no ID and ErrDeferred", id, err)
+			}
+			clock = clock.Add(time.Second)
+		}
+		if len(s.backlog) != maxRecent || s.backlog[0].Text != "event 5" || s.backlog[maxRecent-1].Text != fmt.Sprintf("event %d", maxRecent+4) {
+			t.Fatalf("backlog %+v; want the newest %d events", s.backlog, maxRecent)
+		}
+		if _, err := s.Pending(""); !errors.Is(err, errUnavailable) {
+			t.Errorf("Pending = %v", err)
+		}
+		if err := s.Ack(100, watchdapi.EventID(strings.Repeat("a", 32)+":1")); !errors.Is(err, errUnavailable) {
+			t.Errorf("Ack = %v", err)
+		}
+		if err := s.ReplaceRecipients([]watchdapi.Recipient{{ChatID: 100, FirstSeen: clock.Add(-time.Hour)}}); !errors.Is(err, errUnavailable) {
+			t.Errorf("ReplaceRecipients = %v", err)
+		}
+		if err := s.ObserveSubscriptions(nil, watchdapi.Snapshot{State: watchdapi.StateOK}); !errors.Is(err, errUnavailable) {
+			t.Errorf("ObserveSubscriptions = %v", err)
+		}
+		if s.epoch != "" || len(s.recipients) != 0 || len(s.recent) != 0 || len(s.pending) != 0 {
+			t.Fatalf("an unopened store took state: epoch %q, recipients %v, recent %v", s.epoch, s.recipients, s.recent)
+		}
+		if err := s.Flush(); !errors.Is(err, pathErr) || s.Status().StorageError != pathErr.Error() {
+			t.Fatalf("Flush = %v, status %+v; want the resolver's error recorded", err, s.Status())
+		}
+	})
+
+	t.Run("opens the existing file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "watchd-notifications.json")
+		clock := notificationTestTime()
+		now := func() time.Time { return clock }
+		existing := newNotificationStore(t, path, now)
+		replaceNotificationRecipients(t, existing, watchdapi.Recipient{ChatID: 100, FirstSeen: clock.Add(-time.Hour)})
+		before := publishNotification(t, existing, "before the restart")
+		epoch, _ := splitNotificationID(t, before)
+
+		clock = clock.Add(time.Minute)
+		s, resolve := deferred(t, now)
+		first := clock
+		if _, err := s.Publish("deferred one"); !errors.Is(err, ErrDeferred) {
+			t.Fatal(err)
+		}
+		clock = clock.Add(time.Minute)
+		second := clock
+		if _, err := s.Publish("deferred two"); !errors.Is(err, ErrDeferred) {
+			t.Fatal(err)
+		}
+		clock = clock.Add(time.Minute)
+		resolve(path)
+		if err := s.Flush(); err != nil {
+			t.Fatal("the resolved Flush did not open the store:", err)
+		}
+		if status := s.Status(); status.StorageError != "" || status.Pending != 3 {
+			t.Fatalf("status %+v", status)
+		}
+		messages := notificationsForChat(pendingNotifications(t, s), 100)
+		if len(messages) != 3 || messages[0].EventID != before {
+			t.Fatalf("pending %+v; want the restored event, then the deferred ones", messages)
+		}
+		for i, want := range []struct {
+			text string
+			at   time.Time
+		}{{"deferred one", first}, {"deferred two", second}} {
+			got := messages[i+1]
+			gotEpoch, _ := splitNotificationID(t, got.EventID)
+			if got.Text != want.text || !got.At.Equal(want.at) || gotEpoch != epoch {
+				t.Errorf("deferred event %+v; want %q at %v in epoch %s", got, want.text, want.at, epoch)
+			}
+		}
+		if len(s.backlog) != 0 {
+			t.Fatalf("backlog %+v after opening", s.backlog)
+		}
+		reopened := newNotificationStore(t, path, now)
+		if got := notificationsForChat(pendingNotifications(t, reopened), 100); !reflect.DeepEqual(got, messages) {
+			t.Fatalf("the file holds %+v, want %+v", got, messages)
+		}
+	})
+
+	t.Run("starts a new file", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "data", "watchd-notifications.json")
+		clock := notificationTestTime()
+		s, resolve := deferred(t, func() time.Time { return clock })
+		published := clock
+		if _, err := s.Publish("deferred"); !errors.Is(err, ErrDeferred) {
+			t.Fatal(err)
+		}
+		clock = clock.Add(time.Minute)
+		resolve(path)
+		if err := s.Flush(); err != nil {
+			t.Fatal(err)
+		}
+		if info, err := os.Stat(path); err != nil || info.Mode().Perm() != 0600 {
+			t.Fatalf("new store file: %v", err)
+		}
+		replaceNotificationRecipients(t, s, watchdapi.Recipient{ChatID: 100, FirstSeen: published.Add(-time.Minute)})
+		messages := notificationsForChat(pendingNotifications(t, s), 100)
+		if len(messages) != 1 || messages[0].Text != "deferred" || !messages[0].At.Equal(published) {
+			t.Fatalf("pending %+v; want the deferred event at its own time", messages)
+		}
+	})
 }

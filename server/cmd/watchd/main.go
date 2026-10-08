@@ -110,14 +110,8 @@ func run() int {
 		if err := os.Setenv("VPD_CONFIG_FILE", selectedConfig); err != nil {
 			return runtimeDeps{}, errors.New("could not export VPN Director configuration path")
 		}
-		queuePath := ""
-		dataDir, pathErr := configSvc.DataDir()
-		if pathErr == nil && dataDir != "" {
-			queuePath = filepath.Join(dataDir, "watchd-notifications.json")
-		} else {
-			pathErr = errors.New("notification data path is unavailable")
-		}
-		queue, storageErr := notifications.NewStore(queuePath, nil)
+		// A data path that cannot be read now is asked again at every flush.
+		queue, storageErr := notifications.OpenStore(notificationPath(configSvc), nil)
 		var executor service.ShellExecutor = service.DefaultExecutor()
 		var launcher monitor.Launcher
 		var gate *watchcompat.Gate
@@ -167,13 +161,25 @@ func run() int {
 			}
 			return healthCache.Load(dir)
 		}
-		return runtimeDeps{Monitor: m, Watch: watch, Queue: queue, HealthSubscriptions: healthSubscriptions}, errors.Join(pathErr, storageErr)
+		return runtimeDeps{Monitor: m, Watch: watch, Queue: queue, HealthSubscriptions: healthSubscriptions}, storageErr
 	}); err != nil {
 		slog.Error("the monitor's socket stopped", "path", p.WatchdSocket, "error", err)
 		return 1
 	}
 	slog.Info("vpn-director-watchd stopped")
 	return 0
+}
+
+// notificationPath resolves the notification store's file under the data
+// directory of the selected configuration.
+func notificationPath(configSvc *service.ConfigService) func() (string, error) {
+	return func() (string, error) {
+		dataDir, err := configSvc.DataDir()
+		if err != nil || dataDir == "" {
+			return "", errors.New("notification data path is unavailable")
+		}
+		return filepath.Join(dataDir, "watchd-notifications.json"), nil
+	}
 }
 
 type daemonMonitor interface {
