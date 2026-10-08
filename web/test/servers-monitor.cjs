@@ -708,6 +708,473 @@ async function showWANNotice(c) {
     c.unmount()
     assert.equal(c.timers.size, 0)
   })
+  const passiveA = { subscription: watchVM.group.id, name: 'Primary', address: '192.0.2.1', port: 443, seq: 1 }
+  const passiveB = { subscription: watchVM.group.id, name: 'Secondary', address: '198.51.100.2', port: 8443, seq: 2 }
+  const passiveServers = active => ({ subscriptions: [watchVM.group], active })
+  const passiveFailure = { response: { status: 500, data: { error: 'Synthetic passive read failure' } } }
+
+  async function withPassivePage(fn, prepare = () => {}) {
+    const http = watchVM.makeHTTP()
+    http.set('/api/servers', passiveServers(passiveA))
+    prepare(http)
+    const c = watchVM.setupPage('Servers', http)
+    try {
+      await c.mount()
+      await fn(c, http)
+    } finally {
+      c.unmount()
+      for (const r of http.requests.filter(r => !r.settled)) http.reject(r, Error('Synthetic test cleanup'))
+      await watchVM.flush()
+    }
+  }
+
+  function passiveTimer(c) {
+    const timers = [...c.timers.entries()].filter(([, t]) => t.kind === 'interval')
+    assert.equal(timers.length, 1, 'Passive active reads must share the existing poll')
+    assert.equal(timers[0][1].ms, 15000)
+    return timers[0]
+  }
+
+  function visibleRows(c) {
+    return { groups: c.x.groups.value, subscriptions: c.x.subscriptions.value,
+      servers: c.x.groups.value.map(g => g.servers), rows: c.x.groups.value.flatMap(g => g.servers ?? []) }
+  }
+
+  function assertSameRows(c, before) {
+    assert.equal(c.x.groups.value, before.groups, 'Passive reads must retain visible group identity')
+    assert.equal(c.x.subscriptions.value, before.subscriptions, 'Passive reads must not reload subscription rows')
+    const current = visibleRows(c)
+    current.servers.forEach((servers, i) => assert.equal(servers, before.servers[i]))
+    current.rows.forEach((server, i) => assert.equal(server, before.rows[i]))
+    assert.equal(current.rows.map(s => s.fingerprint).join(','), before.rows.map(s => s.fingerprint).join(','))
+  }
+
+  function renderedNodes(tree) {
+    if (Array.isArray(tree)) return tree.flatMap(renderedNodes)
+    if (!tree || typeof tree !== 'object') return []
+    return [tree, ...renderedNodes(tree.children)]
+  }
+
+  function assertPassiveBadges(c, selected) {
+    assert.equal(JSON.stringify(c.x.active.value), JSON.stringify(selected))
+    for (const g of c.x.groups.value) {
+      assert.equal(c.x.runsFrom(g.id), g.id === selected?.subscription, 'Running badge must follow the active subscription')
+      for (const s of g.servers ?? []) {
+        const matches = selected != null && selected.subscription === g.id && selected.name === s.name && selected.address === s.address && selected.port === s.port
+        assert.equal(c.x.isActive(g.id, s), matches, 'Active badge must match the authoritative row identity')
+      }
+      const details = renderedNodes(c.render()).find(n => n.type === 'details' && n.props.key === g.id)
+      assert.ok(details, 'Expected the real subscription details')
+      const running = renderedNodes(details).filter(n => n.type === 'span' && watchVM.text(n) === 'running')
+      assert.equal(running.length, g.id === selected?.subscription ? 1 : 0)
+    }
+    const badges = renderedNodes(c.render()).filter(n => n.type === 'span' && watchVM.text(n) === 'Active')
+    assert.equal(badges.length, selected ? 1 : 0)
+    if (selected) assert.match(watchVM.text(c.render()), new RegExp(selected.name + ' Active'))
+  }
+
+  function assertPassiveReads(http, start) {
+    const requests = http.requests.slice(start)
+    for (const url of ['/api/servers', '/api/monitor', '/api/watch']) {
+      assert.equal(requests.filter(r => r.method === 'GET' && r.url === url).length, 1, 'Passive poll must independently read ' + url)
+    }
+    assert.equal(requests.length, 3, 'An unchanged list needs only three independent GETs')
+    assert.equal(requests.filter(r => r.method !== 'GET').length, 0, 'Polling must never mutate configuration')
+  }
+
+  await test('Task16 I16-F1 passive unchanged-list A to B and preferred B to A refresh Active without reloading rows', async () => {
+    await withPassivePage(async (c, http) => {
+      const before = visibleRows(c)
+      assertPassiveBadges(c, passiveA)
+      for (const active of [passiveB, { ...passiveA, seq: 3 }]) {
+        http.set('/api/servers', passiveServers(active))
+        const start = http.requests.length
+        await c.fire(passiveTimer(c)[0])
+        assertPassiveBadges(c, active)
+        assertSameRows(c, before)
+        assertPassiveReads(http, start)
+        assert.equal(c.x.aliveText(watchVM.group.id), '2/2 alive')
+        assert.equal(c.x.healthOf(c.x.groups.value[0], 1, c.x.groups.value[0].servers[1]).fingerprint, 'abcdef02')
+        assert.equal(c.x.loading.value, false)
+        assert.equal(c.x.error.value, '')
+        assert.deepEqual(c.alerts, [])
+      }
+      assert.equal(http.calls('/api/servers').length, 3)
+      assert.equal(http.calls('/api/subscriptions').length, 1)
+      assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
+    })
+  })
+
+  await test('Task16 I16-F1 passive cross-subscription switch and return move running and Active with identical endpoints', async () => {
+    const other = { id: '1b2c3d4e', name: 'Other synthetic', servers: [{ ...watchVM.primary, fingerprint: 'abcdef03' }] }
+    const groups = [watchVM.group, other]
+    const health = { ...watchVM.health, subscriptions: [...watchVM.health.subscriptions,
+      { id: other.id, alive: 1, total: 1, servers: [{ ...watchVM.health.subscriptions[0].servers[0], fingerprint: 'abcdef03' }] }] }
+    await withPassivePage(async (c, http) => {
+      const before = visibleRows(c)
+      assertPassiveBadges(c, passiveA)
+      for (const active of [{ ...passiveA, subscription: other.id, seq: 2 }, { ...passiveA, seq: 3 }]) {
+        http.set('/api/servers', { subscriptions: groups, active })
+        const start = http.requests.length
+        await c.fire(passiveTimer(c)[0])
+        assertPassiveBadges(c, active)
+        assertSameRows(c, before)
+        assertPassiveReads(http, start)
+        assert.equal(c.x.aliveText(other.id), '1/1 alive')
+        assert.equal(c.x.healthOf(c.x.groups.value[1], 0, c.x.groups.value[1].servers[0]).fingerprint, 'abcdef03')
+      }
+      c.unmount()
+      const status = watchVM.setupPage('Status', http)
+      try {
+        await status.mount()
+        assert.equal(status.x.activeLabel.value, 'Synthetic / Primary')
+        assert.equal(status.x.activeServer.value.seq, 3)
+      } finally { status.unmount() }
+      assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
+    }, http => {
+      http.set('/api/servers', { subscriptions: groups, active: passiveA })
+      http.set('/api/subscriptions', { subscriptions: groups.map(g => ({ id: g.id, name: g.name, host: 'subscription.example.test', static: false, servers: g.servers.length, added: '2026-10-07T12:00:00Z', refreshed: '2026-10-07T12:00:00Z' })) })
+      http.set('/api/monitor', health)
+    })
+  })
+
+  for (const state of ['disabled', 'not_running', 'GET500']) {
+    await test(`Task16 I16-F1 passive active refresh is independent of ${state} monitor and watch`, async () => {
+      await withPassivePage(async (c, http) => {
+        const before = visibleRows(c)
+        if (state === 'GET500') {
+          http.fail('/api/monitor', passiveFailure)
+          http.fail('/api/watch', passiveFailure)
+        } else {
+          http.set('/api/monitor', { ...watchVM.health, state })
+          http.set('/api/watch', { ...watchVM.watch, state: state === 'disabled' ? 'active' : 'not_running' })
+        }
+        http.set('/api/servers', passiveServers(passiveB))
+        const start = http.requests.length
+        await c.fire(passiveTimer(c)[0])
+        assertPassiveBadges(c, passiveB)
+        assertSameRows(c, before)
+        assertPassiveReads(http, start)
+        assert.equal(c.x.canCheck.value, false)
+        assert.equal(c.x.monitorLine.value, state === 'disabled' ? 'Monitoring: disabled in settings' : state === 'GET500' ? 'Monitoring: unavailable' : 'Monitoring: not running')
+        assert.equal(watchVM.watchProps(c).unavailable, state === 'GET500')
+        if (state !== 'GET500') assert.equal(watchVM.watchProps(c).snapshot.state, state === 'disabled' ? 'active' : 'not_running')
+        assert.equal(http.calls('/api/subscriptions').length, 1)
+        assert.deepEqual(c.alerts, [])
+      })
+    })
+  }
+
+  await test('Task16 I16-F1 pending monitor and watch cannot delay the independent passive active read', async () => {
+    await withPassivePage(async (c, http) => {
+      const before = visibleRows(c)
+      http.hold('/api/monitor'); http.hold('/api/watch')
+      http.set('/api/servers', passiveServers(passiveB))
+      const start = http.requests.length
+      const polling = passiveTimer(c)[1].fn()
+      await watchVM.flush()
+      assertPassiveReads(http, start)
+      assert.equal(http.pending('/api/monitor').length, 1)
+      assert.equal(http.pending('/api/watch').length, 1)
+      assertPassiveBadges(c, passiveB)
+      assertSameRows(c, before)
+      assert.equal(c.x.loading.value, false)
+      http.answer(http.pending('/api/monitor')[0], { ...watchVM.health, state: 'wan_down' })
+      http.reject(http.pending('/api/watch')[0], passiveFailure)
+      await polling
+      assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+      assert.equal(watchVM.watchProps(c).unavailable, true)
+      assertPassiveBadges(c, passiveB)
+    })
+  })
+
+  await test('Task16 I16-F1 passive GET500 and recovery preserve rows form rename busy error summaries and WAN notice without flicker', async () => {
+    await withPassivePage(async (c, http) => {
+      const check = watchVM.click(c, 'Check all now')
+      http.answer(http.pending('/api/monitor/check')[0], { queued: 1 }); await check
+      c.x.addUrl.value = 'https://subscription.example.test/new-list'
+      c.x.addName.value = 'Unsaved synthetic'
+      c.x.startRename(c.x.subscriptions.value[0])
+      c.x.renameText.value = 'Unsaved rename'
+      c.x.error.value = 'Synthetic foreground reload error'
+      c.x.summaries.value = ['Synthetic: Imported 2 of 2 servers']
+      const rename = c.x.saveRename(c.x.subscriptions.value[0])
+      assert.equal(JSON.stringify(http.pending('/api/subscriptions/rename')[0].body), '{"name":"Unsaved rename"}')
+      const before = visibleRows(c), summaries = c.x.summaries.value
+      const assertIntent = () => {
+        assertSameRows(c, before)
+        assert.equal(c.x.addUrl.value, 'https://subscription.example.test/new-list')
+        assert.equal(c.x.addName.value, 'Unsaved synthetic')
+        assert.equal(c.x.renaming.value, watchVM.group.id)
+        assert.equal(c.x.renameText.value, 'Unsaved rename')
+        assert.equal(c.x.busy.value, 'rename:' + watchVM.group.id)
+        assert.equal(c.x.error.value, 'Synthetic foreground reload error')
+        assert.equal(c.x.summaries.value, summaries)
+        assert.equal(c.x.checkNotice.value, queuedNotice)
+        assert.equal(c.x.loading.value, false)
+        assert.deepEqual(c.alerts, [])
+      }
+      http.hold('/api/servers')
+      for (const outcome of ['GET500', 'recovery']) {
+        http.set('/api/monitor', { ...watchVM.wanHealth, lag_seconds: outcome === 'GET500' ? 5 : 9 })
+        http.set('/api/watch', { ...watchVM.watch, updated_at: outcome === 'GET500' ? '2026-10-07T12:00:01Z' : '2026-10-07T12:00:02Z', notifications: { pending: outcome === 'GET500' ? 1 : 2 } })
+        const start = http.requests.length
+        const polling = passiveTimer(c)[1].fn()
+        await watchVM.flush()
+        assert.equal(http.pending('/api/servers').length, 1, 'Passive polling must read authoritative active even during a control')
+        assertPassiveReads(http, start)
+        assertIntent()
+        assert.equal(c.x.monitorLine.value, 'Monitoring: WAN down, statuses kept')
+        assert.equal(c.x.monitor.value.lag_seconds, outcome === 'GET500' ? 5 : 9)
+        assert.equal(watchVM.watchProps(c).snapshot.notifications.pending, outcome === 'GET500' ? 1 : 2)
+        const read = http.pending('/api/servers')[0]
+        if (outcome === 'GET500') http.reject(read, passiveFailure)
+        else http.answer(read, passiveServers(passiveB))
+        await polling
+        assertIntent()
+        assertPassiveBadges(c, outcome === 'GET500' ? passiveA : passiveB)
+      }
+      assert.equal(http.calls('/api/subscriptions').length, 1)
+      assert.equal(http.calls('/api/monitor/check', 'POST').length, 1)
+      assert.equal(http.calls('/api/subscriptions/rename', 'POST').length, 1)
+      assert.equal(http.calls('/api/servers/active', 'POST').length, 0)
+      assert.equal([...c.timers.values()].find(t => t.kind === 'timeout').ms, 3000)
+      c.unmount()
+      http.answer(http.pending('/api/subscriptions/rename')[0], { ok: true }); await rename
+    }, http => http.set('/api/monitor', watchVM.wanHealth))
+  })
+
+  for (const outcome of ['success', 'GET500']) {
+    await test(`Task16 I16-F1 stale passive ${outcome} cannot undo a newer preferred return`, async () => {
+      await withPassivePage(async (c, http) => {
+        const before = visibleRows(c)
+        http.hold('/api/servers')
+        const first = passiveTimer(c)[1].fn(); await watchVM.flush()
+        const second = passiveTimer(c)[1].fn(); await watchVM.flush()
+        assert.equal(http.pending('/api/servers').length, 2, 'Each overlapping poll needs an independent active read')
+        const [old, fresh] = http.pending('/api/servers')
+        const returned = { ...passiveA, seq: 3 }
+        http.answer(fresh, passiveServers(returned)); await second
+        assertPassiveBadges(c, returned)
+        if (outcome === 'success') http.answer(old, passiveServers(passiveB))
+        else http.reject(old, passiveFailure)
+        await first
+        assertPassiveBadges(c, returned)
+        assertSameRows(c, before)
+        assert.equal(c.x.error.value, '')
+        assert.equal(c.x.loading.value, false)
+        assert.deepEqual(c.alerts, [])
+        assert.equal(http.calls('/api/servers').length, 3)
+        assert.equal(http.calls('/api/monitor').length, 3)
+        assert.equal(http.calls('/api/watch').length, 3)
+        assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
+      })
+    })
+  }
+
+  await test('Task16 I16-F1 latest passive GET500 fences older success and the next poll recovers', async () => {
+    await withPassivePage(async (c, http) => {
+      const before = visibleRows(c)
+      http.hold('/api/servers')
+      const first = passiveTimer(c)[1].fn(); await watchVM.flush()
+      const second = passiveTimer(c)[1].fn(); await watchVM.flush()
+      assert.equal(http.pending('/api/servers').length, 2)
+      const [old, fresh] = http.pending('/api/servers')
+      http.reject(fresh, passiveFailure); await second
+      assertPassiveBadges(c, passiveA)
+      http.answer(old, passiveServers(passiveB)); await first
+      assertPassiveBadges(c, passiveA)
+      http.recover('/api/servers')
+      http.set('/api/servers', passiveServers({ ...passiveB, seq: 3 }))
+      await c.fire(passiveTimer(c)[0])
+      assertPassiveBadges(c, { ...passiveB, seq: 3 })
+      assertSameRows(c, before)
+      assert.equal(c.x.error.value, '')
+      assert.deepEqual(c.alerts, [])
+      assert.equal(http.calls('/api/servers').length, 4)
+      assert.equal(http.calls('/api/subscriptions').length, 1)
+      assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
+    })
+  })
+
+  for (const origin of ['initial', 'reload']) {
+    await test(`Task16 I16-F1 late ${origin} list GET cannot restore active before a newer passive read`, async () => {
+      await withPassivePage(async (c, http) => {
+        let listRead
+        if (origin === 'reload') {
+          http.hold('/api/servers')
+          listRead = c.x.load()
+          await watchVM.flush()
+        }
+        assert.equal(http.pending('/api/servers').length, 1)
+        const old = http.pending('/api/servers')[0]
+        assert.equal(c.x.loading.value, true)
+        const polling = passiveTimer(c)[1].fn(); await watchVM.flush()
+        assert.equal(http.pending('/api/servers').length, 2)
+        http.answer(http.pending('/api/servers')[1], passiveServers(passiveB)); await polling
+        assert.equal(c.x.active.value.name, 'Secondary')
+        assert.equal(c.x.active.value.seq, 2)
+        assert.equal(c.x.loading.value, true, 'Passive completion must not finish a pending foreground list load')
+        http.answer(old, passiveServers(passiveA))
+        if (listRead) await listRead
+        await watchVM.flush()
+        assert.equal(c.x.groups.value.length, 1, 'A valid list reply must still populate the rows')
+        assert.equal(c.x.groups.value[0].servers.map(s => s.fingerprint).join(','), 'abcdef01,abcdef02')
+        assert.equal(c.x.subscriptions.value.length, 1)
+        assertPassiveBadges(c, passiveB)
+        assert.equal(c.x.loading.value, false)
+        assert.equal(http.calls('/api/servers').length, origin === 'initial' ? 2 : 3)
+        assert.equal(http.calls('/api/subscriptions').length, origin === 'initial' ? 1 : 2)
+        assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
+      }, http => { if (origin === 'initial') http.hold('/api/servers') })
+    })
+  }
+
+  await test('Task16 I16-F1 a monitor-triggered list reread fences the overlapping passive GET without losing refreshed rows', async () => {
+    await withPassivePage(async (c, http) => {
+      const changed = { ...watchVM.group, name: 'Updated synthetic', servers: [{ ...watchVM.primary, fingerprint: 'abcdef04' }, watchVM.group.servers[1]] }
+      const active = { ...passiveB, seq: 3 }
+      http.hold('/api/servers')
+      http.set('/api/subscriptions', { subscriptions: [{ ...c.x.subscriptions.value[0], name: changed.name }] })
+      http.set('/api/monitor', { ...watchVM.health, subscriptions: [{ ...watchVM.health.subscriptions[0], servers: [
+        { ...watchVM.health.subscriptions[0].servers[0], fingerprint: 'abcdef04', latency_ms: 201 }, watchVM.health.subscriptions[0].servers[1],
+      ] }] })
+      const polling = passiveTimer(c)[1].fn(); await watchVM.flush()
+      assert.equal(http.pending('/api/servers').length, 2, 'List mismatch must reread the list independently of the active-only poll')
+      const [old, fresh] = http.pending('/api/servers')
+      assert.equal(c.x.loading.value, true)
+      assert.equal(c.x.healthOf(c.x.groups.value[0], 0, c.x.groups.value[0].servers[0]), null)
+      http.answer(fresh, { subscriptions: [changed], active }); await watchVM.flush()
+      assertPassiveBadges(c, active)
+      assert.equal(c.x.groups.value[0].name, 'Updated synthetic')
+      assert.equal(c.x.subscriptions.value[0].name, 'Updated synthetic')
+      assert.equal(c.x.groups.value[0].servers[0].fingerprint, 'abcdef04')
+      assert.equal(c.x.healthOf(c.x.groups.value[0], 0, c.x.groups.value[0].servers[0]).latency_ms, 201)
+      assert.equal(c.x.loading.value, false)
+      const before = visibleRows(c)
+      http.answer(old, passiveServers(passiveA)); await polling
+      assertPassiveBadges(c, active)
+      assertSameRows(c, before)
+      assert.equal(c.x.aliveText(watchVM.group.id), '2/2 alive')
+      assert.equal(http.calls('/api/servers').length, 3)
+      assert.equal(http.calls('/api/subscriptions').length, 2)
+      assert.equal(http.calls('/api/monitor').length, 2)
+      assert.equal(http.calls('/api/watch').length, 3)
+      assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
+    })
+  })
+
+  for (const control of ['success', 'saved500']) {
+    await test(`Task16 I16-F1 a newer ${control} control reread fences an older passive GET`, async () => {
+      await withPassivePage(async (c, http) => {
+        http.hold('/api/servers')
+        const polling = passiveTimer(c)[1].fn(); await watchVM.flush()
+        assert.equal(http.pending('/api/servers').length, 1)
+        const old = http.pending('/api/servers')[0]
+        const action = watchVM.click(c, 'Select', 1)
+        const post = http.pending('/api/servers/active')[0]
+        assert.equal(JSON.stringify(post.body), '{"subscription":"0a1b2c3d","index":1,"name":"Secondary","address":"198.51.100.2","port":8443}')
+        if (control === 'saved500') http.reject(post, { response: { status: 500, data: { error: 'failed to restart xray: Synthetic saved selection' } } })
+        else http.answer(post, { ok: true })
+        await watchVM.flush()
+        assert.equal(http.pending('/api/servers').length, 2)
+        http.answer(http.pending('/api/servers')[1], passiveServers(passiveB)); await action
+        assertPassiveBadges(c, passiveB)
+        const before = visibleRows(c)
+        http.answer(old, passiveServers(passiveA)); await polling
+        assertPassiveBadges(c, passiveB)
+        assertSameRows(c, before)
+        assert.equal(c.x.busy.value, '')
+        assert.equal(c.x.loading.value, false)
+        assert.equal(c.x.error.value, '')
+        assert.deepEqual(c.alerts, [control === 'saved500' ? 'Error: failed to restart xray: Synthetic saved selection' : 'Server selected: Synthetic / Secondary'])
+        assert.equal(http.calls('/api/servers').length, 3)
+        assert.equal(http.calls('/api/subscriptions').length, 2)
+        assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+        assert.equal(http.requests.filter(r => r.method !== 'GET').length, 1)
+      })
+    })
+  }
+
+  await test('Task16 I16-F1 an older control reread cannot overwrite a newer passive preferred return', async () => {
+    await withPassivePage(async (c, http) => {
+      http.hold('/api/servers')
+      const action = watchVM.click(c, 'Select', 1)
+      http.answer(http.pending('/api/servers/active')[0], { ok: true }); await watchVM.flush()
+      assert.equal(http.pending('/api/servers').length, 1)
+      const old = http.pending('/api/servers')[0]
+      const polling = passiveTimer(c)[1].fn(); await watchVM.flush()
+      assert.equal(http.pending('/api/servers').length, 2)
+      const returned = { ...passiveA, seq: 3 }
+      http.answer(http.pending('/api/servers')[1], passiveServers(returned)); await polling
+      assertPassiveBadges(c, returned)
+      assert.equal(c.x.busy.value, 'select:0a1b2c3d:1')
+      assert.equal(c.x.loading.value, true)
+      http.answer(old, passiveServers(passiveB)); await action
+      assertPassiveBadges(c, returned)
+      assert.equal(c.x.loading.value, false)
+      assert.equal(c.x.busy.value, '')
+      assert.equal(http.calls('/api/servers').length, 3)
+      assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
+      assert.equal(http.requests.filter(r => r.method !== 'GET').length, 1)
+    })
+  })
+
+  await test('Task16 I16-F1 passive null active clears both badges without replacing rows', async () => {
+    await withPassivePage(async (c, http) => {
+      const before = visibleRows(c), start = http.requests.length
+      http.set('/api/servers', passiveServers(null))
+      await c.fire(passiveTimer(c)[0])
+      assertPassiveBadges(c, null)
+      assertSameRows(c, before)
+      assertPassiveReads(http, start)
+      assert.equal(c.x.aliveText(watchVM.group.id), '2/2 alive')
+    })
+  })
+
+  for (const departure of ['unmount', 'logout']) for (const outcome of ['success', 'GET500']) {
+    await test(`Task16 I16-F1 late passive ${outcome} after ${departure} cannot publish restart reads or affect a fresh instance`, async () => {
+      await withPassivePage(async (c, http) => {
+        for (const url of ['/api/servers', '/api/monitor', '/api/watch']) http.hold(url)
+        const polling = passiveTimer(c)[1].fn(); await watchVM.flush()
+        for (const url of ['/api/servers', '/api/monitor', '/api/watch']) assert.equal(http.pending(url).length, 1)
+        const callbacks = [...c.timers.values()].map(t => t.fn)
+        if (departure === 'logout') {
+          const logout = c.x.api.logout()
+          http.answer(http.pending('/api/logout')[0], { ok: true }); await logout
+        }
+        c.unmount()
+        const before = JSON.stringify({ active: c.x.active.value, monitor: c.x.monitor.value, watch: c.x.watch.value, error: c.x.error.value, loading: c.x.loading.value })
+        const rows = visibleRows(c), start = http.requests.length
+        for (const r of http.requests.filter(r => !r.settled)) {
+          if (outcome === 'GET500') http.reject(r, passiveFailure)
+          else http.answer(r, { '/api/servers': passiveServers(passiveB), '/api/monitor': { ...watchVM.health, state: 'stopped' }, '/api/watch': { ...watchVM.watch, pending_restore: true } }[r.url])
+        }
+        await polling
+        callbacks.forEach(fn => fn())
+        await c.x.pollStatus(); await c.x.load(); await c.x.loadMonitor(); await watchVM.flush()
+        assert.equal(JSON.stringify({ active: c.x.active.value, monitor: c.x.monitor.value, watch: c.x.watch.value, error: c.x.error.value, loading: c.x.loading.value }), before)
+        assertSameRows(c, rows)
+        assertPassiveBadges(c, passiveA)
+        assert.equal(http.requests.length, start)
+        assert.equal(c.timers.size, 0)
+        assert.deepEqual(c.alerts, [])
+        assert.equal(http.calls('/api/servers/active', 'POST').length, 0)
+        assert.equal(http.calls('/api/logout', 'POST').length, departure === 'logout' ? 1 : 0)
+        assert.equal(http.calls('/api/login', 'POST').length, 0)
+        assert.equal(http.calls('/api/version').length, 0)
+        const freshHTTP = watchVM.makeHTTP(), fresh = watchVM.setupPage('Servers', freshHTTP)
+        freshHTTP.set('/api/servers', passiveServers(passiveB))
+        try {
+          await fresh.mount()
+          assertPassiveBadges(fresh, passiveB)
+          assert.equal(freshHTTP.calls('/api/servers').length, 1)
+          assert.equal(fresh.timers.size, 1)
+          assertPassiveBadges(c, passiveA)
+        } finally { fresh.unmount() }
+      })
+    })
+  }
   console.log(`RESULT ${passes} PASS / ${failures} FAIL`)
   process.exitCode = failures ? 1 : 0
 })()

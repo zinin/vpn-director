@@ -248,7 +248,7 @@ The daemon rereads the section every minute; it logs to `/tmp/vpn-director-watch
 /opt/etc/init.d/S98vpn-director-watchd restart
 ```
 
-These are estimates, not router measurements; traffic depends on the protocol and retries. Names sharing the same address and outbound share one check, so the example assumes 100 distinct live endpoints. Stage 1 only reports health; failover stays in the bot's subscription watch.
+These are estimates, not router measurements; traffic depends on the protocol and retries. Names sharing the same address and outbound share one check, so the example assumes 100 distinct live endpoints. `vpn-director-watchd` owns monitoring and automatic failover; the Telegram bot provides management and notification delivery. Stopping the bot leaves watchd automation running; `monitor.enabled=false` disables endpoint monitoring and the prober while legacy failover continues.
 
 Router validation is still pending on the RT-AX86U (Merlin, BusyBox 1.25) and Keenetic: memory/CPU with real subscriptions, SOCKS user routing, the long daemon name with `pidof`/`killall` and init start/stop/check, live-Xray isolation through `S24xray` and monit, bytes per check, and the first update that introduces the daemon. If a target cannot route SOCKS users, release compatibility requires the per-endpoint-inbound fallback and fresh validation.
 
@@ -260,7 +260,7 @@ Traffic from specified LAN clients is transparently redirected through Xray usin
 
 Subscriptions it reads: share links (`vless://`, `vmess://`, `trojan://`, `ss://`, `hysteria2://` / `hy2://`), base64-encoded or plain, and Xray JSON - the array of Xray configs panels such as Remnawave and Marzban give Xray clients. An entry Xray cannot run - TUIC, SSR, a balancer, a chained config - is skipped, and the import says why.
 
-Up to ten subscriptions live side by side; you pick the running server from any of them. When it dies, the bot's subscription watch moves the clients onto a Tunnel Director tunnel, refreshes every subscription at once and walks their servers — the chosen one and two more of its subscription, then one server of each subscription in turn — until one answers, and brings the clients back on it.
+Up to ten subscriptions live side by side; you pick the running server from any of them. When it fails, watchd first tries a direct server switch based on fresh active-dead/candidate-alive monitor evidence and a working WAN, keeping client assignments and TPROXY routing in place. Without that proof or when the direct attempt fails, its legacy path confirms the failure, moves eligible LAN clients onto a Tunnel Director tunnel, refreshes every linked subscription at once and walks their servers — the chosen one and two more of its subscription, then one server of each subscription in turn — until one answers, and restores the moved clients once Xray TPROXY is ready.
 
 ### Tunnel Director
 

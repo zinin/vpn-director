@@ -177,7 +177,8 @@ func TestSubscriptionTunnel_NonDefaultTablesPath(t *testing.T) {
 	t.Cleanup(client.CloseIdleConnections)
 	want := netpath.Path{Kind: netpath.KindTunnel, ID: "wgc1", Iface: "wg-return", Mark: 0x70000}
 	if path != want {
-		t.Fatalf("subscription tunnel path %+v, want %+v from the non-default applied tables", path, want)
+		t.Fatalf("subscription tunnel path Kind=%v ID=%q Iface=%q Mark=0x%x, want Kind=%v ID=%q Iface=%q Mark=0x%x from the non-default applied tables",
+			path.Kind, path.ID, path.Iface, path.Mark, want.Kind, want.ID, want.Iface, want.Mark)
 	}
 }
 

@@ -316,7 +316,12 @@ func TestStatus_PreservesSuccessfulPeerWhenOtherTimesOut(t *testing.T) {
 			unblockSuccess := func() { successOnce.Do(func() { close(releaseSuccess) }) }
 			unblock := func() { releaseOnce.Do(func() { close(release) }) }
 			monitorDone, watchDone, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
-			done := make(chan string, 1)
+			type statusResult struct {
+				started time.Time
+				elapsed time.Duration
+				text    string
+			}
+			done := make(chan statusResult, 1)
 			t.Cleanup(func() {
 				unblockSuccess()
 				unblock()
@@ -363,10 +368,11 @@ func TestStatus_PreservesSuccessfulPeerWhenOtherTimesOut(t *testing.T) {
 					Notifications: watchdapi.NotificationsStatus{Pending: 7, StorageError: "cannot sync notification storage"},
 				}, err
 			})
-			started := time.Now()
 			go func() {
 				defer close(finished)
-				done <- automationStatus(monitor, watch)
+				started := time.Now()
+				text := automationStatus(monitor, watch)
+				done <- statusResult{started: started, elapsed: time.Since(started), text: text}
 			}()
 			var observed []read
 			for len(observed) < 2 {
@@ -381,15 +387,16 @@ func TestStatus_PreservesSuccessfulPeerWhenOtherTimesOut(t *testing.T) {
 			if first.component == second.component || !first.bounded || !second.bounded || first.ctx != second.ctx || !first.deadline.Equal(second.deadline) {
 				t.Fatalf("asymmetric reads lack a shared context/deadline: %+v %+v", first, second)
 			}
-			if budget := first.deadline.Sub(started); budget < 1900*time.Millisecond || budget > 2100*time.Millisecond {
-				t.Fatalf("asymmetric IPC budget=%s, want 2 seconds", budget)
-			}
 			unblockSuccess()
 			select {
-			case text := <-done:
-				if elapsed := time.Since(started); elapsed < 1500*time.Millisecond || elapsed > 3*time.Second {
-					t.Errorf("asymmetric reads took %s, want one 2-second budget", elapsed)
+			case result := <-done:
+				if budget := first.deadline.Sub(result.started); budget < 1900*time.Millisecond || budget > 2100*time.Millisecond {
+					t.Fatalf("asymmetric IPC budget=%s, want 2 seconds", budget)
 				}
+				if result.elapsed < 1500*time.Millisecond || result.elapsed > 3*time.Second {
+					t.Errorf("asymmetric reads took %s, want one 2-second budget", result.elapsed)
+				}
+				text := result.text
 				assertIndependentAutomationStates(t, text, tc.wantMonitor, tc.wantWatch)
 				lines := strings.Split(text, "\n")
 				for _, want := range tc.wantLines {

@@ -650,12 +650,12 @@ start_watchd() {
     # download_watchd skips unsupported architectures and tolerates a failed
     # download, so there is not always something to start.
     if [[ ! -x "$watchd_path" ]]; then
-        print_info "Monitoring and automatic failover are unavailable: $watchd_path is missing or not executable. Reinstall VPN Director to restore the daemon, then run $init_script start."
+        print_info "Cannot start monitoring and automatic failover: $watchd_path is missing or not executable. An existing watchd may still be running; runtime state is unconfirmed. Reinstall VPN Director to restore the daemon, then run $init_script start."
         return 0
     fi
     if [[ ! -x "$init_script" ]]; then
         print_info "Server monitor init script not found, skipping start"
-        print_info "Monitoring and automatic failover are unavailable: $init_script is missing or not executable. Reinstall VPN Director to restore the init script, then run $init_script start."
+        print_info "Cannot start monitoring and automatic failover: $init_script is missing or not executable. An existing watchd may still be running; runtime state is unconfirmed. Reinstall VPN Director to restore the init script, then run $init_script start."
         return 0
     fi
     # The init script's start is a no-op when the monitor is up.

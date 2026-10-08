@@ -17,8 +17,8 @@ LOGTAG="S98vpn-director-watchd"
 start() {
     [ "$ENABLED" != "yes" ] && return 0
     if [ ! -x "$WATCHD_PATH" ]; then
-        echo "Monitoring and automatic failover are unavailable: $WATCHD_PATH is missing or not executable. Reinstall VPN Director to restore it, then run $0 start."
-        logger -t "$LOGTAG" "vpn-director-watchd not found at $WATCHD_PATH; monitoring and automatic failover are unavailable; reinstall VPN Director"
+        echo "Cannot start monitoring and automatic failover: $WATCHD_PATH is missing or not executable. An existing watchd may still be running; runtime state is unconfirmed. Reinstall VPN Director to restore it, then run $0 start."
+        logger -t "$LOGTAG" "Cannot start monitoring and automatic failover: $WATCHD_PATH is missing or not executable. An existing watchd may still be running; runtime state is unconfirmed. Reinstall VPN Director to restore it, then run $0 start."
         return 0
     fi
     echo "Starting $DESC..."

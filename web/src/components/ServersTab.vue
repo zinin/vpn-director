@@ -41,6 +41,8 @@ let unmounted = false
 let monitorRequest = 0
 let watchRequest = 0
 let listRequest = 0
+// Active reads share a generation without invalidating list publication.
+let activeRequest = 0
 let listLoaded = false
 let checkRequest = 0
 
@@ -51,6 +53,7 @@ function errorText(e: any): string {
 async function load() {
   if (unmounted) return
   const request = ++listRequest
+  const activeGeneration = ++activeRequest
   loading.value = true
   error.value = ''
   const watchRead = loadWatch()
@@ -59,7 +62,7 @@ async function load() {
     if (unmounted || request !== listRequest) return
     subscriptions.value = subsRes.data.subscriptions ?? []
     groups.value = serversRes.data.subscriptions ?? []
-    active.value = serversRes.data.active ?? null
+    if (activeGeneration === activeRequest) active.value = serversRes.data.active ?? null
     listLoaded = true
   } catch (e: any) {
     if (unmounted || request !== listRequest) return
@@ -68,6 +71,18 @@ async function load() {
     if (!unmounted && request === listRequest) loading.value = false
   }
   await watchRead
+}
+
+async function loadActive() {
+  if (unmounted) return
+  const request = ++activeRequest
+  try {
+    const resp = await api.getServers()
+    if (unmounted || request !== activeRequest) return
+    active.value = resp.data.active ?? null
+  } catch {
+    return
+  }
 }
 
 async function loadWatch() {
@@ -381,7 +396,7 @@ async function selectServer(group: SubscriptionServers, index: number) {
 
 async function pollStatus() {
   if (unmounted) return
-  await Promise.all([loadMonitor(), loadWatch()])
+  await Promise.all([loadMonitor(), loadWatch(), loadActive()])
 }
 
 onMounted(() => {
@@ -393,6 +408,7 @@ onMounted(() => {
 onUnmounted(() => {
   unmounted = true
   listRequest++
+  activeRequest++
   monitorRequest++
   watchRequest++
   checkRequest++

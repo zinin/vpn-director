@@ -983,7 +983,80 @@ assert_watchd_init_preserves_routing() {
     assert_watchd_init_preserves_routing
 }
 
-@test "watchd init: partial installation names unavailable automation and recovery" {
+# A missing installed binary is not proof that the existing owner has stopped.
+assert_watchd_init_partial_start_context() {
+    assert_output --partial "automatic failover"
+    assert_output --regexp '[Cc]annot start|[Uu]nable to start'
+    assert_output --regexp '[Rr]untime state is unconfirmed|[Ww]atchd is (already |still )?running'
+    assert_output --regexp '[Rr]einstall|[Rr]epair|[Rr]estore'
+    refute_output --regexp '[Mm]onitoring and automatic failover are unavailable'
+}
+
+watchd_init_live_partial_case() {
+    local state="$1" owner_identity routing_identity binary_identity="" binary_contents=""
+    watchd_init_sandbox
+    printf 'first-owner-4242\n' > "$BATS_TEST_TMPDIR/watchd.running"
+    printf 'wgc1 192.168.1.8\n' > "$BATS_TEST_TMPDIR/routes.state"
+    chmod 600 "$BATS_TEST_TMPDIR/routes.state"
+    routing_identity="$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/routes.state")"
+    case "$state" in
+        missing) rm "$WATCHD_TEST_PATH" ;;
+        non-executable)
+            chmod 600 "$WATCHD_TEST_PATH"
+            binary_identity="$(stat -c '%d:%i:%s:%a:%Y' "$WATCHD_TEST_PATH")"
+            binary_contents="$(cat "$WATCHD_TEST_PATH")"
+            ;;
+        *) return 99 ;;
+    esac
+    owner_identity="$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/watchd.running")"
+    local command
+    for command in pkill ip iptables ip6tables ipset; do
+        cat > "$WATCHD_TEST_BIN/$command" <<'EOF'
+#!/bin/sh
+printf 'unexpected %s %s\n' "$0" "$*" >> "$BATS_TEST_TMPDIR/watchd-init.events"
+exit 99
+EOF
+        chmod +x "$WATCHD_TEST_BIN/$command"
+    done
+
+    run /bin/sh "$BATS_TEST_TMPDIR/watchd-init.sh" start
+
+    assert_success
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/watchd.running")" "$owner_identity"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.running")" "first-owner-4242"
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$BATS_TEST_TMPDIR/routes.state")" "$routing_identity"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/routes.state")" "wgc1 192.168.1.8"
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd-init.events" ]]
+    assert_watchd_init_preserves_routing
+    case "$state" in
+        missing) [[ ! -e "$WATCHD_TEST_PATH" ]] ;;
+        non-executable)
+            assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "$WATCHD_TEST_PATH")" "$binary_identity"
+            assert_equal "$(cat "$WATCHD_TEST_PATH")" "$binary_contents"
+            [[ ! -x "$WATCHD_TEST_PATH" ]]
+            ;;
+    esac
+    assert_watchd_init_partial_start_context
+    assert_output --partial "$WATCHD_TEST_PATH"
+    assert_output --partial "$BATS_TEST_TMPDIR/watchd-init.sh start"
+    refute_output --partial "server monitor started"
+
+    run cat "$BATS_TEST_TMPDIR/watchd-init.syslog"
+
+    assert_success
+    assert_watchd_init_partial_start_context
+    assert_output --partial "$WATCHD_TEST_PATH"
+}
+
+@test "watchd init: missing binary preserves a synthetic live owner and reports start-only failure" {
+    watchd_init_live_partial_case missing
+}
+
+@test "watchd init: non-executable binary preserves a synthetic live owner and reports start-only failure" {
+    watchd_init_live_partial_case non-executable
+}
+
+@test "watchd init: partial installation names start failure runtime uncertainty and recovery" {
     watchd_init_sandbox
     chmod -x "$WATCHD_TEST_PATH"
     local state
@@ -1002,9 +1075,8 @@ assert_watchd_init_preserves_routing() {
 
         assert_success
         assert_output --partial "$WATCHD_TEST_PATH"
-        assert_output --partial "automatic failover"
-        assert_output --regexp '[Uu]navailable'
-        assert_output --regexp '[Rr]einstall|[Rr]epair|[Rr]estore'
+        assert_watchd_init_partial_start_context
+        assert_output --partial "$BATS_TEST_TMPDIR/watchd-init.sh start"
         [[ ! -e "$BATS_TEST_TMPDIR/watchd.running" ]]
         [[ ! -e "$BATS_TEST_TMPDIR/watchd-init.events" ]]
         assert_watchd_init_preserves_routing

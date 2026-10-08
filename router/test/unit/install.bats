@@ -969,6 +969,114 @@ assert_watchd_repair_hint() {
     assert_output --regexp '[Rr]einstall|[Rr]epair|[Rr]estore'
 }
 
+# Installed files do not establish whether an older daemon is still running.
+assert_watchd_partial_start_context() {
+    assert_output --partial "automatic failover"
+    assert_output --regexp '[Cc]annot start|[Uu]nable to start'
+    assert_output --regexp '[Rr]untime state is unconfirmed|[Ww]atchd is (already |still )?running'
+    assert_output --regexp '[Rr]einstall|[Rr]epair|[Rr]estore'
+    refute_output --regexp '[Mm]onitoring and automatic failover are unavailable'
+}
+
+watchd_start_alive_sandbox() {
+    watchd_download_sandbox
+    old_watchd_binary
+    printf 'first-owner-12345\n' > "$BATS_TEST_TMPDIR/watchd.running"
+    fake_watchd_init 0
+    printf '%s\n' '{"xray":{"clients":["192.168.1.8"]},"monitor":{"enabled":true}}' > "$VPD_DIR/vpn-director.json"
+    cat > "$VPD_DIR/vpn-director-watchd" <<'EOF'
+#!/bin/sh
+printf 'daemon spawn\n' >> "$BATS_TEST_TMPDIR/watchd-start.effects"
+exit 99
+EOF
+    chmod 711 "$VPD_DIR/vpn-director-watchd"
+    local file command
+    for file in xray.running xray.ready stopped failover_ready routes.state; do
+        printf 'preserve %s\n' "$file" > "$BATS_TEST_TMPDIR/$file"
+        chmod 600 "$BATS_TEST_TMPDIR/$file"
+    done
+    for command in nohup pkill ip iptables ip6tables ipset; do
+        cat > "$BATS_TEST_TMPDIR/bin/$command" <<'EOF'
+#!/bin/sh
+printf 'unexpected %s %s\n' "$0" "$*" >> "$BATS_TEST_TMPDIR/watchd-start.effects"
+exit 99
+EOF
+        chmod +x "$BATS_TEST_TMPDIR/bin/$command"
+    done
+}
+
+watchd_start_alive_case() {
+    local component="$1" state="$2" failed_path
+    watchd_start_alive_sandbox
+    case "$component" in
+        binary) failed_path="$VPD_DIR/vpn-director-watchd" ;;
+        init) failed_path="$INIT_DIR/S98vpn-director-watchd" ;;
+        *) return 99 ;;
+    esac
+    case "$state" in
+        missing) rm "$failed_path" ;;
+        non-executable) chmod 600 "$failed_path" ;;
+        *) return 99 ;;
+    esac
+    local -a protected=("$BATS_TEST_TMPDIR/watchd.running" "$VPD_DIR/vpn-director.json"
+        "$VPD_DIR/telegram-bot" "$VPD_DIR/webui" "$VPD_DIR/watchd.unrelated.tmp"
+        "$BATS_TEST_TMPDIR/xray.running" "$BATS_TEST_TMPDIR/xray.ready"
+        "$BATS_TEST_TMPDIR/stopped" "$BATS_TEST_TMPDIR/failover_ready" "$BATS_TEST_TMPDIR/routes.state")
+    [[ ! -e "$VPD_DIR/vpn-director-watchd" ]] || protected+=("$VPD_DIR/vpn-director-watchd")
+    [[ ! -e "$INIT_DIR/S98vpn-director-watchd" ]] || protected+=("$INIT_DIR/S98vpn-director-watchd")
+    local identity contents
+    identity="$(stat -c '%d:%i:%s:%a:%Y' "${protected[@]}")"
+    contents="$(cat "${protected[@]}")"
+
+    run bash -c '
+        source "$1" --source-only
+        VPD_DIR="$2" INIT_DIR="$3"
+        kill() {
+            printf "unexpected kill %s\n" "$*" >> "$BATS_TEST_TMPDIR/watchd-start.effects"
+            return 99
+        }
+        start_watchd
+    ' bash "$PROJECT_ROOT/../install.sh" "$VPD_DIR" "$INIT_DIR"
+
+    assert_success
+    assert_equal "$(stat -c '%d:%i:%s:%a:%Y' "${protected[@]}")" "$identity"
+    assert_equal "$(cat "${protected[@]}")" "$contents"
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/watchd.running")" "first-owner-12345"
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd.calls" ]]
+    [[ ! -e "$BATS_TEST_TMPDIR/watchd-start.effects" ]]
+    if [[ -e "$BATS_TEST_TMPDIR/watchd.events" ]]; then
+        assert_equal "$(sed '/^pidof:alive$/d' "$BATS_TEST_TMPDIR/watchd.events")" ""
+    fi
+    case "$state" in
+        missing) [[ ! -e "$failed_path" ]] ;;
+        non-executable) [[ ! -x "$failed_path" ]] ;;
+    esac
+    assert_watchd_partial_start_context
+    assert_output --partial "$failed_path"
+    assert_output --partial "$INIT_DIR/S98vpn-director-watchd start"
+    refute_output --partial "Server monitor started"
+}
+
+@test "watchd install: missing binary preserves a synthetic live owner and reports start-only failure" {
+    load_installer
+    watchd_start_alive_case binary missing
+}
+
+@test "watchd install: non-executable binary preserves a synthetic live owner and reports start-only failure" {
+    load_installer
+    watchd_start_alive_case binary non-executable
+}
+
+@test "watchd install: missing init preserves a synthetic live owner and reports start-only failure" {
+    load_installer
+    watchd_start_alive_case init missing
+}
+
+@test "watchd install: non-executable init preserves a synthetic live owner and reports start-only failure" {
+    load_installer
+    watchd_start_alive_case init non-executable
+}
+
 @test "watchd install: independent startup and visible partial installation" {
     load_installer
     fake_watchd_init 0
@@ -995,7 +1103,7 @@ assert_watchd_repair_hint() {
     assert_equal "$(cat "$VPD_DIR/telegram-bot.json")" '{"bot_token":"","allowed_users":[],"log_level":"info","update_check_interval":"1h"}'
 }
 
-@test "watchd install: missing or non-executable binary explains unavailable automation" {
+@test "watchd install: missing or non-executable binary explains start failure and runtime uncertainty" {
     load_installer
     fake_watchd_init 0
     local state
@@ -1008,8 +1116,9 @@ assert_watchd_repair_hint() {
         run start_watchd
 
         assert_success
-        assert_watchd_repair_hint
+        assert_watchd_partial_start_context
         assert_output --partial "$VPD_DIR/vpn-director-watchd"
+        assert_output --partial "$INIT_DIR/S98vpn-director-watchd start"
         refute_output --partial "Server monitor started"
         [[ ! -e "$BATS_TEST_TMPDIR/watchd.calls" ]]
     done
@@ -1017,7 +1126,7 @@ assert_watchd_repair_hint() {
     [[ ! -x "$VPD_DIR/vpn-director-watchd" ]]
 }
 
-@test "watchd install: missing or non-executable init explains unavailable automation" {
+@test "watchd install: missing or non-executable init explains start failure and runtime uncertainty" {
     load_installer
     touch "$VPD_DIR/vpn-director-watchd"
     chmod +x "$VPD_DIR/vpn-director-watchd"
@@ -1032,8 +1141,8 @@ assert_watchd_repair_hint() {
 
         assert_success
         assert_output --partial "Server monitor init script not found, skipping start"
-        assert_watchd_repair_hint
-        assert_output --partial "$INIT_DIR/S98vpn-director-watchd"
+        assert_watchd_partial_start_context
+        assert_output --partial "$INIT_DIR/S98vpn-director-watchd start"
         refute_output --partial "Server monitor started"
         [[ ! -e "$BATS_TEST_TMPDIR/watchd.calls" ]]
     done
