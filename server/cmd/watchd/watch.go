@@ -87,10 +87,9 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 		}
 		return fetcher.Fetch(ctx, url)
 	}
+	// The watch notifies a change it has made and records the message as sent;
+	// its own checks decide what a stop silences, so an ended tick drops nothing.
 	w.Notify = func(text string) {
-		if operationContext().Err() != nil {
-			return
-		}
 		if _, err := q.Publish(text); err != nil {
 			slog.Warn("Notification storage publish failed; delivery will retry")
 		}

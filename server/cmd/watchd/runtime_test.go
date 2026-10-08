@@ -1152,6 +1152,55 @@ func TestRuntime_NewWatchLetsMutatingCommandsFinish(t *testing.T) {
 	})
 }
 
+// The watch calls Notify for a change it has already made, and records the
+// message as sent: an ended tick or daemon must not drop it.
+func TestRuntime_NewWatchPublishesNotifyAfterCancellation(t *testing.T) {
+	for _, cancelled := range []string{"tick", "daemon"} {
+		t.Run(cancelled, func(t *testing.T) {
+			p := runtimePaths(t)
+			cfg := runtimeConfig(t, p, `{"data_dir":"resolved-data","xray":{"clients":["192.168.50.8"]}}`)
+			if err := cfg.SaveSubscription(vpnconfig.Subscription{ID: "0a1b2c3d", Name: "static", Servers: []vpnconfig.Server{}}); err != nil {
+				t.Fatal(err)
+			}
+			q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "resolved-data", "watchd-notifications.json"))
+			if err := q.ReplaceRecipients([]watchdapi.Recipient{{ChatID: 100, FirstSeen: time.Now().Add(-time.Hour)}}); err != nil {
+				t.Fatal(err)
+			}
+			root, stopRoot := context.WithCancel(context.Background())
+			defer stopRoot()
+			w := runtimeWatch(t, root, p, cfg, q, runtimeExecutor(func(_ context.Context, _ string, args ...string) (*shell.Result, error) {
+				return nil, fmt.Errorf("unexpected command: %q", args)
+			}))
+			const text = "Xray switched to server static / Oslo"
+			if cancelled == "daemon" {
+				stopRoot()
+				w.Notify(text)
+			} else {
+				tick, cancel := context.WithCancel(root)
+				defer cancel()
+				probed := false
+				w.Probe = func(context.Context, int) error {
+					probed = true
+					cancel()
+					if w.Context().Err() == nil {
+						t.Error("the tick's context is still live after its cancellation")
+					}
+					w.Notify(text)
+					return nil
+				}
+				w.Tick(tick)
+				if !probed || root.Err() != nil {
+					t.Fatalf("probed %v, root %v; the tick must reach its probe with the daemon alive", probed, root.Err())
+				}
+			}
+			page, err := q.Pending("")
+			if err != nil || len(page.Messages) != 1 || page.Messages[0].Text != text {
+				t.Fatalf("pending %+v, error %v; want the message the watch sent", page, err)
+			}
+		})
+	}
+}
+
 func TestRuntime_NewWatchPortSnapshotAcrossConfigLockWait(t *testing.T) {
 	for _, test := range []struct {
 		name      string
