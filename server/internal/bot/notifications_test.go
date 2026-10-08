@@ -679,6 +679,147 @@ func TestNotificationText_MinuteBoundary(t *testing.T) {
 	})
 }
 
+// The update loop handles one update at a time and watchd may take
+// notificationIPCTimeout to answer: an update asks watchd only when the
+// recipients changed since the last sync it accepted. The poll asks every time.
+func TestReceiver_UpdateSyncsRecipientsOnlyWhenTheyChange(t *testing.T) {
+	update := func(t *testing.T, b *Bot, username string, chatID int64) error {
+		t.Helper()
+		if err := b.chatStore.RecordInteraction(username, chatID); err != nil {
+			t.Fatal(err)
+		}
+		return b.syncRecipientsIfChanged(context.Background())
+	}
+	calls := func(api *receiverAPI) int {
+		recipients, _, _ := api.snapshot()
+		return len(recipients)
+	}
+
+	t.Run("an unchanged list asks nothing", func(t *testing.T) {
+		api := &receiverAPI{}
+		b := receiverBot(t, api, nil)
+		if err := b.syncRecipients(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		for range 3 {
+			if err := update(t, b, "alice", 100); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := calls(api); n != 1 {
+			t.Fatalf("SetRecipients calls %d, want only the first sync", n)
+		}
+	})
+
+	t.Run("a new chat syncs once", func(t *testing.T) {
+		api := &receiverAPI{}
+		b := receiverBot(t, api, nil)
+		if err := b.syncRecipients(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		b.mu.Lock()
+		b.auth = NewAuth([]string{"alice", "alice_renamed", "bob", "new_user"})
+		b.mu.Unlock()
+		for range 2 {
+			if err := update(t, b, "new_user", 300); err != nil {
+				t.Fatal(err)
+			}
+		}
+		recipients, _, _ := api.snapshot()
+		if len(recipients) != 2 || len(recipients[1]) != 3 || recipients[1][2].ChatID != 300 {
+			t.Fatalf("SetRecipients calls %+v, want one more, with the new chat", recipients)
+		}
+	})
+
+	t.Run("a failed sync is retried by the next update", func(t *testing.T) {
+		var fail atomic.Bool
+		api := &receiverAPI{set: func(context.Context, []watchdapi.Recipient) error {
+			if fail.Load() {
+				return errors.New("synthetic watchd outage")
+			}
+			return nil
+		}}
+		b := receiverBot(t, api, nil)
+		if err := b.syncRecipients(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		fail.Store(true)
+		if err := b.syncRecipients(context.Background()); err == nil {
+			t.Fatal("the synthetic outage did not fail the poll's sync")
+		}
+		if err := update(t, b, "alice", 100); err == nil {
+			t.Fatal("the update did not retry the failed sync")
+		}
+		fail.Store(false)
+		for range 2 {
+			if err := update(t, b, "alice", 100); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := calls(api); n != 4 {
+			t.Fatalf("SetRecipients calls %d, want two syncs and the two updates that retried", n)
+		}
+	})
+
+	t.Run("every poll still syncs", func(t *testing.T) {
+		api := &receiverAPI{}
+		b := receiverBot(t, api, nil)
+		for range 3 {
+			if err := receiverPoll(b); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if n := calls(api); n != 3 {
+			t.Fatalf("SetRecipients calls %d, want one per poll", n)
+		}
+	})
+
+	t.Run("an unchanged update does not wait for a running sync", func(t *testing.T) {
+		entered, release := make(chan struct{}), make(chan struct{})
+		var enteredOnce, releaseOnce sync.Once
+		t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+		var hold atomic.Bool
+		api := &receiverAPI{set: func(ctx context.Context, _ []watchdapi.Recipient) error {
+			if hold.Load() {
+				enteredOnce.Do(func() { close(entered) })
+				select {
+				case <-release:
+				case <-ctx.Done():
+				}
+			}
+			return nil
+		}}
+		b := receiverBot(t, api, nil)
+		if err := b.syncRecipients(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		hold.Store(true)
+		polled := make(chan error, 1)
+		go func() { polled <- b.syncRecipients(context.Background()) }()
+		receiverWait(t, entered, "the poll's sync holding the lock")
+		if err := b.chatStore.RecordInteraction("alice", 100); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() { done <- b.syncRecipientsIfChanged(context.Background()) }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("an update with unchanged recipients waited for the running sync")
+		}
+		releaseOnce.Do(func() { close(release) })
+		if err := <-polled; err != nil {
+			t.Fatal(err)
+		}
+		if n := calls(api); n != 2 {
+			t.Fatalf("SetRecipients calls %d, want the first sync and the poll's", n)
+		}
+	})
+}
+
 // watchd is an optional download: without it every poll fails, and the log
 // gets one WARN for the outage and one INFO when delivery comes back.
 func TestReceiver_FailingPollsWarnOncePerOutage(t *testing.T) {

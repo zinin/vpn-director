@@ -40,6 +40,12 @@ type notificationReceiver struct {
 	sent     map[int64][]notificationReceipt
 	inFlight map[int64]*notificationChatJob
 	slots    chan struct{}
+
+	// synced is the recipient list watchd last accepted, guarded by mu; an
+	// update whose recipients equal it makes no IPC. syncedValid is false
+	// until a sync succeeds and again after one fails.
+	synced      []watchdapi.Recipient
+	syncedValid bool
 }
 
 type notificationChatJob struct {
@@ -106,11 +112,52 @@ func (b *Bot) syncRecipients(ctx context.Context) error {
 	b.notifications.prune(recipients, time.Now())
 	api := b.notificationSource()
 	if api == nil {
+		b.notifications.recordSynced(nil, false)
 		return nil
 	}
 	request, cancel := context.WithTimeout(ctx, notificationIPCTimeout)
 	defer cancel()
-	return api.SetRecipients(request, recipients)
+	err := api.SetRecipients(request, recipients)
+	b.notifications.recordSynced(recipients, err == nil)
+	return err
+}
+
+// syncRecipientsIfChanged is the update loop's sync. The loop handles one
+// update at a time and watchd may take up to notificationIPCTimeout to answer,
+// so a message or callback whose recipients watchd already holds asks nothing
+// - and does not wait for a sync the poll is running.
+func (b *Bot) syncRecipientsIfChanged(ctx context.Context) error {
+	if b.notifications.syncedUnchanged(b.notificationRecipients()) {
+		return nil
+	}
+	return b.syncRecipients(ctx)
+}
+
+// recordSynced remembers the list watchd accepted; ok false forgets it, so the
+// next update synchronizes again.
+func (r *notificationReceiver) recordSynced(recipients []watchdapi.Recipient, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.synced, r.syncedValid = nil, ok
+	if ok {
+		r.synced = append([]watchdapi.Recipient{}, recipients...)
+	}
+}
+
+// syncedUnchanged reports whether recipients, sorted as activeRecipients sorts
+// them, are the list watchd last accepted.
+func (r *notificationReceiver) syncedUnchanged(recipients []watchdapi.Recipient) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.syncedValid || len(recipients) != len(r.synced) {
+		return false
+	}
+	for i, recipient := range recipients {
+		if recipient.ChatID != r.synced[i].ChatID || !recipient.FirstSeen.Equal(r.synced[i].FirstSeen) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *notificationReceiver) prune(recipients []watchdapi.Recipient, now time.Time) {

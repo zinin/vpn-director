@@ -279,7 +279,7 @@ func (b *Bot) Run(ctx context.Context) {
 				// Record interaction for update notifications
 				if b.chatStore != nil {
 					_ = b.chatStore.RecordInteraction(username, msg.Chat.ID)
-					if err := b.syncRecipients(ctx); err != nil && ctx.Err() == nil {
+					if err := b.syncRecipientsIfChanged(ctx); err != nil && ctx.Err() == nil {
 						slog.Warn("Watch notification recipients will retry synchronization")
 					}
 				}
@@ -303,7 +303,7 @@ func (b *Bot) Run(ctx context.Context) {
 				// Note: cb.Message can be nil for inline callbacks, so check before accessing
 				if b.chatStore != nil && cb.Message != nil {
 					_ = b.chatStore.RecordInteraction(username, cb.Message.Chat.ID)
-					if err := b.syncRecipients(ctx); err != nil && ctx.Err() == nil {
+					if err := b.syncRecipientsIfChanged(ctx); err != nil && ctx.Err() == nil {
 						slog.Warn("Watch notification recipients will retry synchronization")
 					}
 				}
