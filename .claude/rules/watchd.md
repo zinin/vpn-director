@@ -105,7 +105,10 @@ Every 30 seconds the watch checks HTTPS 204 through the main Xray SOCKS port. Af
 fast path checks every active endpoint and at most three other distinct, previously live
 connections in hybrid walk order. Fresh checks share one 30-second deadline and the monitor's
 worker pool. Switching requires fresh active-dead/candidate-alive evidence and a working WAN;
-evidence from an old endpoint set, prober/session, activity epoch or completion is not proof.
+active-dead counts only when the monitor saw the active endpoints die after the main probe last
+succeeded on that same server, so a monitor that cannot reach what main Xray dials (stale stored
+IPs, plain HTTP blocked) never triggers the fast path; the legacy confirmation decides then.
+Evidence from an old endpoint set, prober/session, activity epoch or completion is not proof.
 The config-lock guard revalidates ownership, subscription identity, inbound ports and evidence.
 Incomplete/invalid monitor evidence falls back to the legacy path, not an invented healthy route.
 

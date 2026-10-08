@@ -247,6 +247,20 @@ func (w *Watch) fastGuardNow(ctx context.Context, guard func(*vpnconfig.VPNDirec
 	return cfg, guard(cfg)
 }
 
+// The monitor dials stored IPs over plain HTTP, main Xray may dial a hostname: its dead proves a death
+// only if it came after main Xray last worked on this server, else the legacy confirmation decides.
+func (w *Watch) diedAfterProbeOK(cfg *vpnconfig.VPNDirectorConfig, e monitor.Evidence, keys []string) bool {
+	if w.probeOKAt.IsZero() || w.probeOKActive != activeID(cfg.Xray.ActiveServer) {
+		return false
+	}
+	for _, key := range keys {
+		if !e.Endpoints[key].Since.After(w.probeOKAt) {
+			return false
+		}
+	}
+	return true
+}
+
 func fastTerminal(err error) bool {
 	return errors.Is(err, errStopped) || errors.Is(err, watchcompat.ErrIncompatible) ||
 		errors.Is(err, errSuperseded) || errors.Is(err, vpnconfig.ErrSubscriptionGone)
@@ -369,6 +383,9 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	}
 	if activeError != nil || !wan || !fastEvidenceStatus(activeEvidence, keys, watchdapi.StatusDead) ||
 		w.Health.ValidateEvidence(activeEvidence, keys) != nil {
+		return finish(errFastEvidence)
+	}
+	if !w.diedAfterProbeOK(cfg, activeEvidence, keys) {
 		return finish(errFastEvidence)
 	}
 	owner.evidence, owner.proofRequired = activeEvidence, true

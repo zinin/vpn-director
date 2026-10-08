@@ -106,6 +106,8 @@ type Watch struct {
 	fastOwned         *fastSelection
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
+	probeOKAt         time.Time // when the main SOCKS probe last succeeded,
+	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on
 	fastLogged        time.Time // failSince of the episode whose fast attempt was last logged as not switching
 	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
 	lastImport        time.Time
@@ -340,6 +342,8 @@ func (w *Watch) Tick(ctx context.Context) {
 		return
 	}
 	if err == nil {
+		w.probeOKAt = w.Now()
+		w.probeOKActive = activeID(cfg.Xray.ActiveServer)
 		w.resetFail()
 		w.importRetry = 0
 		w.lastRouteKind = noteNone

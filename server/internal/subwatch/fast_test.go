@@ -212,6 +212,36 @@ func (s *fastFixture) setHealth() {
 	}
 	s.h = &fastHealth{cached: cached, fresh: fresh, invalid: make(map[string]bool)}
 	s.w.Health = s.h
+	// The main probe last worked on the active server a minute before the
+	// monitor saw it die, so its dead is proof (diedAfterProbeOK).
+	s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(active)
+}
+
+// passThenMiss runs a tick whose main probe passes on the active server, has
+// the monitor see every active endpoint take its status died after that tick,
+// and leaves the main probe failing - until a switch writes another server -
+// for a tick ProbeInterval later.
+func (s *fastFixture) passThenMiss(died time.Duration) {
+	healthy := true
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		s.events = append(s.events, "probe")
+		if healthy || len(s.written) > 0 {
+			return nil
+		}
+		return errProbe
+	}
+	s.w.probeOKAt, s.w.probeOKActive = time.Time{}, ""
+	s.w.Tick(context.Background())
+	for _, key := range s.activeKeys() {
+		for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
+			state := endpoints[key]
+			state.Since = s.f.now.Add(died)
+			endpoints[key] = state
+		}
+	}
+	healthy = false
+	s.f.now = s.f.now.Add(ProbeInterval)
 }
 
 func (s *fastFixture) activeKeys() []string { return endpoint.Keys(cloneSubs(s.f.subs)[0].Servers[0]) }
@@ -266,6 +296,107 @@ func TestFast_FirstFailureSwitchesWithoutClientMove(t *testing.T) {
 	s.w.Tick(context.Background())
 	if s.restarts != 1 || s.f.applies != 0 || len(s.f.notes) != 1 {
 		t.Fatalf("healthy next tick repeated a switch: restart %d, apply %d, notes %v", s.restarts, s.f.applies, s.f.notes)
+	}
+}
+
+// The monitor dials the stored IPs over plain HTTP where main Xray may dial a
+// hostname, and can show a working server dead for days. A death it saw before
+// the main probe last passed on that server proves nothing: one miss neither
+// switches nor falls back, and the legacy confirmation moves the clients after
+// the full three minutes.
+func TestFast_ADeathBeforeTheLastWorkingProbeIsNoProof(t *testing.T) {
+	s := newFastFixture(t)
+	kinds := fastLogKinds(t)
+	s.passThenMiss(-24 * time.Hour)
+	start := s.f.now
+	s.w.Tick(context.Background())
+	if len(s.h.requests()) == 0 {
+		t.Fatal("the miss did not ask the monitor for fresh evidence")
+	}
+	s.assertNoMutation(t)
+	if s.f.cfg.Xray.Failover != nil || !s.w.failSince.Equal(start) {
+		t.Fatalf("failover %+v, failSince %v; the legacy confirmation must go on from the miss", s.f.cfg.Xray.Failover, s.w.failSince)
+	}
+	if got := kinds(); !reflect.DeepEqual(got, []string{"evidence"}) {
+		t.Fatalf("fast attempt records %v, want one inconclusive attempt of kind evidence", got)
+	}
+	for _, elapsed := range []time.Duration{30 * time.Second, DeadAfter - time.Second} {
+		s.f.now = start.Add(elapsed)
+		s.w.Tick(context.Background())
+		s.assertNoMutation(t)
+	}
+	s.f.now = start.Add(DeadAfter)
+	s.w.Tick(context.Background())
+	if !vpnconfig.FailoverCommitted(s.f.cfg) || s.f.applies != 2 || s.generateCalls != 0 || s.restarts != 0 {
+		t.Fatalf("failover %+v, apply %d, generate %d, restart %d; the legacy confirmation decides after three minutes", s.f.cfg.Xray.Failover, s.f.applies, s.generateCalls, s.restarts)
+	}
+	assertStillOnTunnel(t, s.f.cfg)
+}
+
+// A death the monitor saw after the main probe last passed on the active server
+// is proof: the first miss switches Xray at once.
+func TestFast_ADeathAfterTheLastWorkingProbeSwitches(t *testing.T) {
+	s := newFastFixture(t)
+	s.passThenMiss(10 * time.Second)
+	s.w.Tick(context.Background())
+	if s.generateCalls != 1 || s.restarts != 1 || s.f.applies != 0 || s.f.cfg.Xray.ActiveServer.Name != "Backup" {
+		t.Fatalf("generate %d, restart %d, apply %d, active %+v; the first miss must switch directly", s.generateCalls, s.restarts, s.f.applies, s.f.cfg.Xray.ActiveServer)
+	}
+	assertFastAssignments(t, s.f.cfg)
+	if len(s.f.notes) != 1 || !strings.Contains(s.f.notes[0], "Backup") {
+		t.Fatalf("notes %v; want one server-change event", s.f.notes)
+	}
+	if !s.w.failSince.IsZero() {
+		t.Fatalf("failSince %v; the working switch must settle", s.w.failSince)
+	}
+}
+
+// The same proof with no candidate alive falls back to the tunnel at once.
+func TestFast_ADeathAfterTheLastWorkingProbeFallsBack(t *testing.T) {
+	s := newFastFixture(t)
+	state := s.h.fresh.Endpoints[s.candidateKey()]
+	state.Status = watchdapi.StatusDead
+	s.h.fresh.Endpoints[s.candidateKey()] = state
+	s.passThenMiss(10 * time.Second)
+	s.w.Tick(context.Background())
+	if !vpnconfig.FailoverCommitted(s.f.cfg) || s.f.applies != 2 || s.generateCalls != 0 || s.restarts != 0 {
+		t.Fatalf("failover %+v, apply %d, generate %d, restart %d; the first miss must fall back to the tunnel", s.f.cfg.Xray.Failover, s.f.applies, s.generateCalls, s.restarts)
+	}
+	assertStillOnTunnel(t, s.f.cfg)
+	if countNotes(s.f.notes, "Xray outbound is down; LAN clients moved") != 1 {
+		t.Fatalf("notes %v; want one move to the tunnel", s.f.notes)
+	}
+}
+
+// With no working main probe of the active server on record - none yet, or the
+// last one passed on another server - the monitor's dead proves nothing.
+func TestFast_NoWorkingProbeOfTheActiveServerIsNoProof(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		worked *vpnconfig.ActiveServer // the server the last working probe ran on; nil for none
+	}{
+		{"no working probe yet", nil},
+		{"working probe of another server", &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Backup", Address: "backup.example", Port: 443, Seq: 6}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newFastFixture(t)
+			kinds := fastLogKinds(t)
+			s.w.probeOKAt, s.w.probeOKActive = time.Time{}, ""
+			if tc.worked != nil {
+				s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(tc.worked)
+			}
+			s.w.Tick(context.Background())
+			if len(s.h.requests()) == 0 {
+				t.Fatal("the miss did not ask the monitor for fresh evidence")
+			}
+			s.assertNoMutation(t)
+			if s.f.cfg.Xray.Failover != nil || !s.w.failSince.Equal(s.f.now) {
+				t.Fatalf("failover %+v, failSince %v; the legacy confirmation must go on from the miss", s.f.cfg.Xray.Failover, s.w.failSince)
+			}
+			if got := kinds(); !reflect.DeepEqual(got, []string{"evidence"}) {
+				t.Fatalf("fast attempt records %v, want one inconclusive attempt of kind evidence", got)
+			}
+		})
 	}
 }
 
