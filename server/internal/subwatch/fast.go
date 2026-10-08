@@ -419,11 +419,16 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		}
 		owner.last = &c
 		owner.record(c.server, seq, err)
-		if _, err := w.fastGuardNow(ctx, guard); err != nil {
+		// The candidate's config is published: ownership alone - a stop,
+		// incompatibility, a newer selection, a subscription or server gone -
+		// ends the switch now. Evidence a newer check replaced would leave the
+		// config on the candidate and Xray on the dead server.
+		published := func(current *vpnconfig.VPNDirectorConfig) error { return owner.ownership(w, ctx, current) }
+		if _, err := w.fastGuardNow(ctx, published); err != nil {
 			return finish(err)
 		}
 		restartErr := w.restartXray()
-		if _, err := w.fastGuardNow(ctx, guard); err != nil {
+		if _, err := w.fastGuardNow(ctx, published); err != nil {
 			return finish(err)
 		}
 		if restartErr != nil {
@@ -433,12 +438,12 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
-		current, err = w.fastGuardNow(ctx, guard)
+		current, err = w.fastGuardNow(ctx, published)
 		if err != nil {
 			return finish(err)
 		}
 		probeErr := w.Probe(ctx, w.socksPort(current))
-		current, err = w.fastGuardNow(ctx, guard)
+		current, err = w.fastGuardNow(ctx, published)
 		if err != nil {
 			return finish(err)
 		}

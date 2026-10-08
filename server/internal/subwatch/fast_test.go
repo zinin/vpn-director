@@ -829,6 +829,32 @@ func TestFast_GuardsAndFailureFallback(t *testing.T) {
 			assertFastAssignments(t, s.f.cfg)
 		})
 	}
+	for _, key := range []string{"active", "candidate"} {
+		t.Run("evidence stale after publication/"+key, func(t *testing.T) {
+			s := newFastFixture(t)
+			generate := s.w.Generate
+			s.w.Generate = func(server vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				generated, seq, err := generate(server, guard)
+				if key == "active" {
+					s.h.invalidate(s.activeKeys()[0])
+				} else {
+					s.h.invalidate(s.candidateKey())
+				}
+				return generated, seq, err
+			}
+			s.w.Tick(context.Background())
+			if s.generateCalls != 1 || s.restarts != 1 || s.probes != 2 || s.f.applies != 0 || s.f.cfg.Xray.ActiveServer.Name != "Backup" {
+				t.Fatalf("generate %d, restart %d, probes %d, apply %d, active %+v; a published switch must restart Xray and finish", s.generateCalls, s.restarts, s.probes, s.f.applies, s.f.cfg.Xray.ActiveServer)
+			}
+			if !reflect.DeepEqual(s.events, []string{"probe", "generate Backup", "restart", "settle", "probe"}) {
+				t.Fatalf("main-process transition %v", s.events)
+			}
+			if len(s.f.notes) != 1 || !strings.Contains(s.f.notes[0], "Backup") {
+				t.Fatalf("notes %v; want one server-change event", s.f.notes)
+			}
+			assertFastAssignments(t, s.f.cfg)
+		})
+	}
 	for _, when := range []string{"restart", "settle", "main probe"} {
 		t.Run("manual selection after "+when, func(t *testing.T) {
 			s := newFastFixture(t)
