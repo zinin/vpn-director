@@ -272,7 +272,7 @@ func TestPublishRefresh_MergesWithTheFileAsItIsThen(t *testing.T) {
 func TestPublishRefresh_ARotatedKeyIsANewServer(t *testing.T) {
 	m := &memStore{subs: []Subscription{alphaWith(reality("DE", "s.example", "aa11", "203.0.113.10"))}}
 	m.cfg.Xray.ActiveServer = &ActiveServer{Subscription: "0a1b2c3d", Name: "DE", Address: "de.example", Port: 443, Seq: 3}
-	rotated := reality("DE 2", "s.example", "aa11", "203.0.113.10")
+	rotated := reality("DE", "s.example", "aa11", "203.0.113.10")
 	rotated.Outbound = json.RawMessage(strings.Replace(string(rotated.Outbound), "pk-1", "pk-2", 1))
 
 	res, err := PublishRefresh(m.update, m.files(), "0a1b2c3d", alphaLink, []Server{rotated}, t0.Add(time.Hour))

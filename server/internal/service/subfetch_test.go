@@ -276,6 +276,11 @@ func TestImportFromBody(t *testing.T) {
 	}
 }
 
+// fetchServers is fetchImport for the wave: the servers whose hosts resolved.
+func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel func() *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
+	return resolvedServers(fetchImport(ctx, rawURL, wan, tunnel, wanLookup, tunnelLookup))
+}
+
 func TestFetchServers_WANSuccessDoesNotUseTunnelLookup(t *testing.T) {
 	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443#Oslo"))
 	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

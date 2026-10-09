@@ -135,11 +135,6 @@ func lazyTunnel(ctx context.Context, cfgSvc ConfigStore, vpnSvc VPNDirector, tab
 	return client, lookup
 }
 
-// fetchServers is fetchImport for the wave: the servers whose hosts resolved.
-func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel func() *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) ([]vpnconfig.Server, error) {
-	return resolvedServers(fetchImport(ctx, rawURL, wan, tunnel, wanLookup, tunnelLookup))
-}
-
 // fetchImport GETs via wan, then tunnel. A body the tunnel fetched resolves
 // over the tunnel. One the WAN fetched resolves each host with the WAN lookup,
 // and with the tunnel's for a host the WAN resolver does not answer: one WAN

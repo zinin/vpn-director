@@ -284,6 +284,35 @@ func TestRefreshRound_AStopEndsTheDownloadsAndRecordsNothing(t *testing.T) {
 	}
 }
 
+// A stop that lands while the publication, or the record of a failed
+// download, waits for the config lock writes nothing, and the round did not
+// publish: StartRefresh looks again RefreshRetry later, not an interval.
+func TestRefreshRound_AStopWhileAWriteWaitsForTheLockPublishesNothing(t *testing.T) {
+	for name, fetch := range map[string]func(context.Context, string) ([]vpnconfig.Server, error){
+		"a publication": serveList(realityAt("DE 9GB", "de.example", "bb22", "203.0.113.10")),
+		"an error record": func(context.Context, string) ([]vpnconfig.Server, error) {
+			return nil, errors.New("download failed: HTTP 403")
+		},
+	} {
+		f, w, saves := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
+		var stopped atomic.Bool
+		w.Stopped = stopped.Load
+		w.FetchList = fetch
+		update := w.UpdateVPN
+		w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+			stopped.Store(true) // the stop lands while the write waits for the lock
+			return update(fn)
+		}
+
+		if w.refreshRound(context.Background()) {
+			t.Errorf("%s: the round counts as published", name)
+		}
+		if saves.Load() != 0 || f.subs[0].Error != "" {
+			t.Errorf("%s: writes %d, error %q", name, saves.Load(), f.subs[0].Error)
+		}
+	}
+}
+
 func TestRefreshRound_AFailedDownloadIsRecordedOnce(t *testing.T) {
 	f, w, saves := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
 	w.FetchList = func(context.Context, string) ([]vpnconfig.Server, error) {

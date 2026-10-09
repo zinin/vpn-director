@@ -71,8 +71,8 @@ func (w *Watch) refreshAfter(d time.Duration) <-chan time.Time {
 }
 
 // refreshRound runs one round and reports whether it published; one that
-// stood down, whose downloads a stop or the gate cut short, or that a
-// shutdown cut short, returns false.
+// stood down, whose downloads or publication a stop or the gate cut short, or
+// that a shutdown cut short, returns false.
 func (w *Watch) refreshRound(ctx context.Context) bool {
 	subs, err := w.refreshTargets()
 	if err != nil {
@@ -104,7 +104,10 @@ func (w *Watch) refreshRound(ctx context.Context) bool {
 		if ctx.Err() != nil {
 			return false
 		}
-		w.publishList(ctx, s, results[i])
+		if err := w.publishList(ctx, s, results[i]); err != nil {
+			slog.Info("Periodic subscription refresh dropped the downloads it had not published", "reason", err.Error())
+			return false
+		}
 	}
 	return true
 }
@@ -235,9 +238,13 @@ func (w *Watch) refreshScope(ctx context.Context) (context.Context, func() error
 }
 
 // publishList publishes one subscription's download, or records why it did
-// not arrive (vpnconfig.RecordSubscriptionError writes an error once). Its
-// caller holds tickMu and mu.
-func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l listed) {
+// not arrive (vpnconfig.RecordSubscriptionError writes an error once). It
+// returns the refusal of a stop or the gate (errStopped,
+// watchcompat.ErrIncompatible) that kept its write - the publication or the
+// error record - from happening, and nil otherwise, a write a shutdown cut
+// short included: the round checks ctx before the next one. Its caller holds
+// tickMu and mu.
+func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l listed) error {
 	update, files := w.updateFor(ctx), w.files(ctx)
 	err := l.err
 	if err == nil {
@@ -246,17 +253,19 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 		case perr == nil:
 			w.followActiveRename(s.ID, res.Followed)
 			logPublished(s, res)
-			return
+			return nil
 		case errors.Is(perr, vpnconfig.ErrNoServerResolved):
 			err = perr
 		case errors.Is(perr, vpnconfig.ErrSubscriptionGone):
 			slog.Info("Periodic refresh dropped; the subscription was deleted or relinked while it downloaded", "subscription", s.Name)
-			return
-		case errors.Is(perr, errStopped), errors.Is(perr, watchcompat.ErrIncompatible), ctx.Err() != nil:
-			return
+			return nil
+		case errors.Is(perr, errStopped), errors.Is(perr, watchcompat.ErrIncompatible):
+			return perr
+		case ctx.Err() != nil:
+			return nil
 		default:
 			slog.Warn("Failed to publish the periodically refreshed subscription", "subscription", s.Name, watchErrorAttr(perr))
-			return
+			return nil
 		}
 	}
 	// A *url.Error carries the whole subscription URL, token included.
@@ -269,12 +278,15 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 		slog.Warn("Periodic subscription refresh failed", "subscription", s.Name, watchErrorAttr(err))
 	}
 	rerr := vpnconfig.RecordSubscriptionError(update, files, s.ID, s.URL, s.Refreshed, msg)
+	if errors.Is(rerr, errStopped) || errors.Is(rerr, watchcompat.ErrIncompatible) {
+		return rerr
+	}
 	// watchd's shutdown can end the record while it waits for the config lock,
 	// as it ends a publication: that is no failure to record.
-	if rerr != nil && !errors.Is(rerr, errStopped) && !errors.Is(rerr, watchcompat.ErrIncompatible) &&
-		!errors.Is(rerr, vpnconfig.ErrSubscriptionGone) && ctx.Err() == nil {
+	if rerr != nil && !errors.Is(rerr, vpnconfig.ErrSubscriptionGone) && ctx.Err() == nil {
 		slog.Warn("Failed to record why the subscription did not refresh", "subscription", s.Name, watchErrorAttr(rerr))
 	}
+	return nil
 }
 
 // followActiveRename moves what the watch remembers of the active server to

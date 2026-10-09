@@ -172,11 +172,11 @@ config-lock update per subscription (`vpnconfig.PublishRefresh`). It applies and
 `vpnconfig.MergeRefresh` merges the download with the file as it is under the lock. A server's
 identity (`vpnconfig.ServerIdentity`) is its stored outbound without the REALITY `serverName`,
 `shortId` and `spiderX` that 3x-ui and Marzban pick at random for every download. A fresh server
-pairs with the first stored server of its identity not yet paired, in list order, and stays that
-stored record under the fresh name - so its endpoint key, and its monitor status, survive; its
-addresses stay too when the fresh
-ones are the same set or did not resolve this time. A merge equal to the file, with no error
-recorded, writes nothing at all, `refreshed` included; anything else writes the list, `refreshed`,
+pairs with the first stored server of its identity not yet paired, in list order, and
+stays that stored record under the fresh name - so its endpoint key, and its monitor
+status, survive; its addresses stay too when the fresh ones are the same set or did
+not resolve this time. A merge equal to the file, with no error recorded, writes
+nothing at all, `refreshed` included; anything else writes the list, `refreshed`,
 a cleared error and `xray.servers` once. `active_server`, `preferred_server` and
 `pending_restore.active` follow a renamed server in that write, `seq` unchanged: a rename is no
 selection, and `sameRestoreActive` compares the records whole. A download that fails, or a merge
