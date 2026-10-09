@@ -128,6 +128,16 @@ func listen(ctx context.Context, path string, dial func(context.Context, string,
 	return listenWithPublication(ctx, path, dial, os.Chmod, os.Link)
 }
 
+// ListenDev is Listen for --dev, without the check of the socket's directory:
+// that directory is in the developer's checkout, whose modes follow the
+// developer's umask - group writable under 0002.
+func ListenDev(ctx context.Context, path string) (net.Listener, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return acquireSocket(ctx, path, (&net.Dialer{}).DialContext, os.Chmod, os.Link)
+}
+
 // OwnedDir creates dir with perm when it is missing and refuses it unless it
 // is a real directory of this user that group and others cannot write to -
 // with private, cannot use at all. Another user able to write there could
@@ -176,6 +186,12 @@ func listenWithPublication(ctx context.Context, path string, dial func(context.C
 		slog.Error("watchd refuses its socket directory", "error", err)
 		return nil, err
 	}
+	return acquireSocket(ctx, path, dial, chmod, link)
+}
+
+// acquireSocket takes the instance lock and publishes the mode-0600 socket at
+// path: listenWithPublication after its directory check.
+func acquireSocket(ctx context.Context, path string, dial func(context.Context, string, string) (net.Conn, error), chmod func(string, os.FileMode) error, link func(string, string) error) (net.Listener, error) {
 	lock, err := os.OpenFile(path+".lock", os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0600)
 	if err != nil {
 		return nil, err

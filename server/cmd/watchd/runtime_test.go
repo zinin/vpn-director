@@ -82,7 +82,7 @@ func startRuntime(t *testing.T, ctx context.Context, cancel context.CancelFunc, 
 	t.Helper()
 	done := make(chan error, 1)
 	go func() {
-		done <- runRuntime(ctx, path, build)
+		done <- runRuntime(ctx, watchdapi.Listen, path, build)
 		close(done)
 	}()
 	t.Cleanup(func() {
@@ -166,7 +166,7 @@ func TestRuntime_OwnershipBeforeEverySideEffect(t *testing.T) {
 		t.Helper()
 		duplicateCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer stop()
-		err := runRuntime(duplicateCtx, p.WatchdSocket, func() (runtimeDeps, error) {
+		err := runRuntime(duplicateCtx, watchdapi.Listen, p.WatchdSocket, func() (runtimeDeps, error) {
 			buildCalls.Add(1)
 			proberCleanup.Add(1)
 			queueWrites.Add(1)
@@ -231,7 +231,7 @@ func TestRuntime_DuplicateLeavesThePrimaryAnswering(t *testing.T) {
 	var builds atomic.Int64
 	duplicateCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer stop()
-	err = runRuntime(duplicateCtx, p.WatchdSocket, func() (runtimeDeps, error) {
+	err = runRuntime(duplicateCtx, watchdapi.Listen, p.WatchdSocket, func() (runtimeDeps, error) {
 		builds.Add(1)
 		return runtimeDeps{Monitor: duplicate, Watch: &subwatch.Watch{}, Queue: q}, nil
 	})
@@ -260,7 +260,7 @@ func TestRuntime_FailedOrCancelledAcquisitionSkipsBuild(t *testing.T) {
 			t.Fatal(err)
 		}
 		var builds atomic.Int64
-		err := runRuntime(context.Background(), filepath.Join(parent, "watchd.sock"), func() (runtimeDeps, error) {
+		err := runRuntime(context.Background(), watchdapi.Listen, filepath.Join(parent, "watchd.sock"), func() (runtimeDeps, error) {
 			builds.Add(1)
 			return runtimeDeps{}, errors.New("a failed acquisition must not build")
 		})
@@ -276,7 +276,7 @@ func TestRuntime_FailedOrCancelledAcquisitionSkipsBuild(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		var builds atomic.Int64
-		err := runRuntime(ctx, daemonSocketPath(t), func() (runtimeDeps, error) {
+		err := runRuntime(ctx, watchdapi.Listen, daemonSocketPath(t), func() (runtimeDeps, error) {
 			builds.Add(1)
 			return runtimeDeps{}, errors.New("a cancelled startup must not build")
 		})
@@ -311,7 +311,7 @@ func TestRuntime_ListenerFailureCancelsWorkersAndWaitsForMonitorShutdown(t *test
 		})
 		result := make(chan error, 1)
 		go func() {
-			result <- runRuntime(context.Background(), p.WatchdSocket, func() (runtimeDeps, error) {
+			result <- runRuntime(context.Background(), watchdapi.Listen, p.WatchdSocket, func() (runtimeDeps, error) {
 				return runtimeDeps{Monitor: m, Watch: &subwatch.Watch{}, Queue: q}, nil
 			})
 		}()
@@ -355,7 +355,7 @@ func TestRuntime_ListenerFailureCancelsWorkersAndWaitsForMonitorShutdown(t *test
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
-		err := runRuntime(ctx, p.WatchdSocket, func() (runtimeDeps, error) {
+		err := runRuntime(ctx, watchdapi.Listen, p.WatchdSocket, func() (runtimeDeps, error) {
 			return runtimeDeps{Monitor: m, Watch: &subwatch.Watch{}, Queue: q}, nil
 		})
 		if err == nil || ctx.Err() != nil {
@@ -1543,7 +1543,7 @@ func TestPublishSubscriptionHealth_RuntimeDrainsBeforeUnlock(t *testing.T) {
 		t.Helper()
 		duplicateCtx, stop := context.WithTimeout(context.Background(), 500*time.Millisecond)
 		defer stop()
-		err := runRuntime(duplicateCtx, p.WatchdSocket, func() (runtimeDeps, error) {
+		err := runRuntime(duplicateCtx, watchdapi.Listen, p.WatchdSocket, func() (runtimeDeps, error) {
 			duplicateBuilds.Add(1)
 			return runtimeDeps{}, errors.New("duplicate must not initialize a health publisher")
 		})

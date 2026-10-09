@@ -98,7 +98,13 @@ func run() int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if err := runRuntime(ctx, p.WatchdSocket, func() (runtimeDeps, error) {
+	// The router's runtime directory must be root's alone; a checkout's
+	// follows its developer's umask.
+	listen := watchdapi.Listen
+	if *devFlag {
+		listen = watchdapi.ListenDev
+	}
+	if err := runRuntime(ctx, listen, p.WatchdSocket, func() (runtimeDeps, error) {
 		logger.StartRotation(ctx, p.RotatedLogs(), logging.DefaultMaxSize, time.Minute)
 		scriptsDir := filepath.Dir(*configPath)
 		configSvc := service.NewConfigService(scriptsDir, filepath.Join(scriptsDir, "data"), *configPath)

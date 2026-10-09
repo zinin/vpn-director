@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"net"
 	"sync"
 
 	"github.com/zinin/vpn-director/server/internal/notifications"
@@ -29,8 +30,10 @@ type runtimeError struct{ cause error }
 func (*runtimeError) Error() string   { return "initialize the watchd runtime" }
 func (e *runtimeError) Unwrap() error { return e.cause }
 
-func runRuntime(ctx context.Context, socket string, build func() (runtimeDeps, error)) error {
-	listener, err := watchdapi.Listen(ctx, socket)
+// runRuntime serves the socket listen acquires: watchdapi.Listen, or
+// watchdapi.ListenDev in --dev.
+func runRuntime(ctx context.Context, listen func(context.Context, string) (net.Listener, error), socket string, build func() (runtimeDeps, error)) error {
+	listener, err := listen(ctx, socket)
 	if err != nil {
 		return &socketError{cause: err}
 	}

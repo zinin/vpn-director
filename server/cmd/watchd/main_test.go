@@ -709,6 +709,83 @@ func TestRuntime_WatchdOpensTheQueueOnceTheDataPathResolves(t *testing.T) {
 	}
 }
 
+// A checkout follows its developer's umask: under 0002 testdata/dev is group
+// writable, and dev mode still serves its socket there. The router's runtime
+// directory stays checked (TestListen_RefusesAnUntrustedSocketDirectory).
+func TestRuntime_WatchdDevServesAGroupWritableCheckout(t *testing.T) {
+	root := filepath.Dir(daemonSocketPath(t))
+	dev := filepath.Join(root, "testdata", "dev")
+	if err := os.MkdirAll(dev, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dev, 0775); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dev, "vpn-director.json")
+	if err := os.WriteFile(configPath, []byte(`{"monitor":{"enabled":false},"xray":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	args, err := json.Marshal([]string{"--dev", "--config", configPath, "--platform", "keenetic"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	processCtx, kill := context.WithTimeout(context.Background(), 10*time.Second)
+	defer kill()
+	// The startup test's helper branch runs watchd's main with these arguments.
+	cmd := exec.CommandContext(processCtx, os.Args[0], "-test.run=^TestRuntime_WatchdStartupUsesResolvedDataDir$")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "VPD_TASK8_WATCHD_MAIN="+string(args), "VPD_PLATFORM=invalid-platform")
+	var output runtimeLog
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait(); close(done) }()
+	t.Cleanup(func() {
+		kill()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("owned startup helper did not exit")
+		}
+	})
+	socket := filepath.Join(dev, "watchd.sock")
+	client := watchdapi.NewClient(socket)
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		request, stop := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		_, err = client.Monitor(request)
+		stop()
+		if err == nil {
+			break
+		}
+		select {
+		case exitErr := <-done:
+			t.Fatalf("dev watchd exited before its API: %v output=%s", exitErr, output.String())
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("dev watchd did not expose its API: %v output=%s", err, output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if info, err := os.Lstat(socket); err != nil || info.Mode()&os.ModeSocket == 0 || info.Mode().Perm() != 0600 {
+		t.Fatalf("dev socket %v, %v; want a mode-0600 socket", info, err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SIGTERM did not drain dev watchd: %v output=%s", err, output.String())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("dev watchd did not stop")
+	}
+}
+
 func TestRuntime_WatchdBindsSelectedShellConfig(t *testing.T) {
 	if raw := os.Getenv("VPD_TASK8_CONFIG_ARGS"); raw != "" {
 		var args []string

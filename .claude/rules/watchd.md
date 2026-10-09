@@ -260,7 +260,7 @@ while checks are paused.
 
 watchd refuses to start when the socket's directory (`/tmp/vpn-director`) is a symlink, is not
 owned by root, or is writable by group or others, and logs why; the prober directory must also
-be a root-owned `0700` directory.
+be a root-owned `0700` directory. `--dev` skips the socket directory check (see Dev mode).
 
 Each client request is bounded by 2 seconds. Notification POST bodies are capped at 1 MiB
 (413 on oversize); responses are bounded by 16 MiB, pending pages by 100 messages, cursors by
@@ -284,9 +284,11 @@ read at startup, and the first refresh takes the entries of keys still in the se
 `cd server && go run ./cmd/watchd --dev` uses `testdata/dev` paths (socket
 `testdata/dev/watchd.sock`), `FakeLauncher` and a mock shell executor. The fake answer follows
 from the first byte of each key: mostly alive, some dead, a few refused. Router bot attestation
-is bypassed in dev; the watch and durable queue still run and write dev config/data. The Web UI
-and bot in `--dev` read that socket. Subscriptions go in `testdata/dev/data/subscriptions/`;
-`testdata/substore/` supplies synthetic examples.
+is bypassed in dev, and so is the socket directory's owner/mode check (`watchdapi.ListenDev`): a
+checkout follows its developer's umask, group writable under 0002. The watch and durable queue
+still run and write dev config/data. The Web UI and bot in `--dev` read that socket.
+Subscriptions go in `testdata/dev/data/subscriptions/`; `testdata/substore/` supplies synthetic
+examples.
 
 Use synthetic provider endpoints/credentials and RFC1918 examples for LAN failover clients.
 Documentation-range addresses are suitable remote examples, not eligible Tunnel Director LAN
