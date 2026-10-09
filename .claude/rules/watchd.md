@@ -258,11 +258,17 @@ while checks are paused.
 | `GET /v1/notifications/pending?cursor=...` | Ordered per-chat events and `next_cursor` |
 | `POST /v1/notifications/ack` | Idempotent durable progress for `chat_id`/`event_id` |
 
-watchd refuses to start when the socket's directory (`/tmp/vpn-director`) is a symlink, is not
-owned by root, or is writable by group or others, and logs why; the prober directory must also
-be a root-owned `0700` directory. `--dev` skips the socket directory check (see Dev mode).
-`vpn-director.sh stop`, which creates that directory for its marker when it is missing, makes it
-`0755` whatever the caller's umask.
+watchd refuses to start when the socket's directory (`/tmp/vpn-director`) is a symlink or is not
+owned by root, and logs why. One of root's own that group or others can write to loses that write
+permission instead, with a WARN in the log: the stop of an older release created it with its
+caller's umask, 0777 under Asuswrt-Merlin's umask 0, and a refusal kept watchd - the first update
+to this release among it - from starting until the router rebooted. Nothing planted there while it
+was writable redirects a write: watchd opens its lock without following a symlink and writes only
+through names it creates exclusively, then renames. The prober directory must be a root-owned
+`0700` directory, and a looser one is refused, not tightened: the prober's config, with every
+server's credentials, is staged there under a fixed name. `--dev` skips the socket directory
+check (see Dev mode). `vpn-director.sh stop`, which creates that directory for its marker when it
+is missing, makes it `0755` whatever the caller's umask.
 
 Each client request is bounded by 2 seconds. Notification POST bodies are capped at 1 MiB
 (413 on oversize); responses are bounded by 16 MiB, pending pages by 100 messages, cursors by

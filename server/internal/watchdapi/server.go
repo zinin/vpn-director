@@ -139,10 +139,19 @@ func ListenDev(ctx context.Context, path string) (net.Listener, error) {
 }
 
 // OwnedDir creates dir with perm when it is missing and refuses it unless it
-// is a real directory of this user that group and others cannot write to -
-// with private, cannot use at all. Another user able to write there could
-// replace the socket after publication or plant files root then writes to.
+// is a real directory of this user. Another user able to write there could
+// replace the socket after publication or plant files root then writes to, so
+// group and others may not write to it - with private, not use it at all.
 // The error names only the directory and the check it failed.
+//
+// A shared directory of this user that group or others can write to loses
+// that write permission instead of being refused: the stop of an older
+// release created /tmp/vpn-director with its caller's umask, 0777 under
+// Asuswrt-Merlin's umask 0, and a refusal kept watchd from starting until the
+// router rebooted. Nothing planted there meanwhile redirects a write: watchd
+// opens its lock without following a symlink and writes only through names
+// it creates exclusively, then renames. A private directory is still refused:
+// the prober's config is staged in it under a fixed name.
 func OwnedDir(dir string, perm os.FileMode, private bool) error {
 	if err := os.MkdirAll(dir, perm); err != nil {
 		return err
@@ -171,9 +180,43 @@ func OwnedDir(dir string, perm os.FileMode, private bool) error {
 	if private {
 		mask = 0077
 	}
-	if info.Mode().Perm()&mask != 0 {
+	if info.Mode().Perm()&mask == 0 {
+		return nil
+	}
+	if private {
 		return refuse(fmt.Sprintf("mode %04o", info.Mode().Perm()))
 	}
+	return tightenDir(dir, info, refuse)
+}
+
+// tightenDir takes group and other write off dir, the directory info
+// describes, through a descriptor that cannot follow a symlink put in its
+// place, and keeps the rest of its mode.
+func tightenDir(dir string, info os.FileInfo, refuse func(string) error) error {
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(info, opened) {
+		return refuse("replaced")
+	}
+	if err := f.Chmod(opened.Mode() &^ 0022); err != nil {
+		return err
+	}
+	now, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if now.Mode().Perm()&0022 != 0 {
+		return refuse(fmt.Sprintf("mode %04o", now.Mode().Perm()))
+	}
+	slog.Warn("watchd took group and other write off its directory", "path", dir,
+		"was", fmt.Sprintf("%04o", opened.Mode().Perm()), "now", fmt.Sprintf("%04o", now.Mode().Perm()))
 	return nil
 }
 

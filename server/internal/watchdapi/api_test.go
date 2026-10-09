@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -664,8 +665,7 @@ func TestListen_FailedListenReleasesStableLockAndCanRestart(t *testing.T) {
 
 // Another user able to write to the socket's directory could replace the
 // socket after publication. Listen refuses a directory that is a symlink or
-// that group or others can write to, before it creates anything there, and
-// creates a missing one.
+// another user's, before it creates anything there, and creates a missing one.
 func TestListen_RefusesAnUntrustedSocketDirectory(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -679,10 +679,6 @@ func TestListen_RefusesAnUntrustedSocketDirectory(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, "symlink"},
-		{"group writable", func(t *testing.T, dir string) { mkdirMode(t, dir, 0775) }, "mode 0775"},
-		{"other writable", func(t *testing.T, dir string) { mkdirMode(t, dir, 0757) }, "mode 0757"},
-		{"world writable", func(t *testing.T, dir string) { mkdirMode(t, dir, 0777) }, "mode 0777"},
-		{"shared like /tmp", func(t *testing.T, dir string) { mkdirMode(t, dir, 0777|os.ModeSticky) }, "mode 0777"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := filepath.Join(filepath.Dir(ownedSocketPath(t)), "run")
@@ -722,6 +718,59 @@ func TestListen_RefusesAnUntrustedSocketDirectory(t *testing.T) {
 		var pe *os.PathError
 		if err := OwnedDir("/", 0755, false); !errors.As(err, &pe) || pe.Err.Error() != fmt.Sprintf("owner uid %d", uid) {
 			t.Fatalf("OwnedDir(/) = %v, want the owner refused", err)
+		}
+	})
+}
+
+// Asuswrt-Merlin runs its scripts with umask 0, so the stop of an older release
+// left /tmp/vpn-director 0777 until the router rebooted, and refusing it kept
+// the first update from starting watchd. Listen takes group and other write off
+// a directory of its own instead, keeps the rest of its mode and logs the
+// change; the prober's private directory is still refused, not tightened.
+func TestListen_TightensItsOwnLooseSocketDirectory(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		mode, want os.FileMode
+	}{
+		{"group writable", 0775, 0755},
+		{"other writable", 0757, 0755},
+		{"world writable", 0777, 0755},
+		{"group only", 0770, 0750},
+		{"shared like /tmp", 0777 | os.ModeSticky, 0755 | os.ModeSticky},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs strings.Builder
+			oldLogger := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(oldLogger) })
+			dir := filepath.Join(filepath.Dir(ownedSocketPath(t)), "run")
+			mkdirMode(t, dir, tc.mode)
+			listener, err := Listen(context.Background(), filepath.Join(dir, "watchd.sock"))
+			if err != nil {
+				t.Fatal("own socket directory refused:", err)
+			}
+			listener.Close()
+			info, err := os.Lstat(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := info.Mode() & (os.ModePerm | os.ModeSticky); got != tc.want {
+				t.Fatalf("directory mode %v, want %v", got, tc.want)
+			}
+			if line := logs.String(); !strings.Contains(line, "level=WARN") || !strings.Contains(line, fmt.Sprintf("was=%04o", tc.mode.Perm())) {
+				t.Fatalf("log %q, want a WARN naming the old mode", line)
+			}
+		})
+	}
+	t.Run("private directory is refused, not tightened", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "probe")
+		mkdirMode(t, dir, 0777)
+		var pe *os.PathError
+		if err := OwnedDir(dir, 0700, true); !errors.As(err, &pe) || pe.Err.Error() != "mode 0777" {
+			t.Fatalf("OwnedDir(private) = %v, want the mode refused", err)
+		}
+		if info, err := os.Lstat(dir); err != nil || info.Mode().Perm() != 0777 {
+			t.Fatalf("refused private directory changed: %v, %v", info, err)
 		}
 	})
 }
