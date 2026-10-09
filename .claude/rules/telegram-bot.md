@@ -119,7 +119,7 @@ server/
 | `/xray` | `XrayHandler.HandleXray` | Quick server switch (see below) |
 | `/servers` | `ServersHandler.HandleServers` | Server list (paginated) |
 | `/import [url] [name]` | `ImportHandler.HandleImport` | Add a subscription, or refresh the one saved with that link; alone, refresh every subscription (a body over 1 MiB is refused); reports what it skipped and why |
-| `/subs` | `SubsHandler.HandleSubs` | Subscriptions with refresh, rename and delete buttons, each line saying when its list last changed (`changed 2 h ago`); a rename takes the chat's next message, ahead of the wizard and the other prompts, and any command, any button outside `/subs` or 5 minutes end it |
+| `/subs` | `SubsHandler.HandleSubs` | Subscriptions with refresh, rename and delete buttons, each line saying when its list was last written (`changed 2 h ago`: a change, a manual refresh or a cleared error); a rename takes the chat's next message, ahead of the wizard and the other prompts, and any command, any button outside `/subs` or 5 minutes end it |
 | `/cancel` | `SubsHandler.HandleCancel` | Ends a rename that waits for its name |
 | `/clients` | `ClientsHandler.HandleClients` | LAN clients: pause, resume, move (🔀) and remove, and add |
 | `/configure` | `WizardHandler.HandleConfigure` | Configuration wizard |
