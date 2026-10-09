@@ -23,10 +23,12 @@ func NewServersHandler(deps *Deps) *ServersHandler {
 	return &ServersHandler{deps: deps}
 }
 
-// serverLine is one server on a /servers page: its subscription's name and its
-// number within that subscription.
+// serverLine is one server on a /servers page: its subscription's name, id
+// and size, and its number within that subscription.
 type serverLine struct {
 	sub    string
+	subID  string
+	total  int
 	number int
 	server vpnconfig.Server
 }
@@ -36,7 +38,7 @@ func serverLines(subs []vpnconfig.Subscription) []serverLine {
 	var lines []serverLine
 	for _, sub := range subs {
 		for i, s := range sub.Servers {
-			lines = append(lines, serverLine{sub: sub.Name, number: i + 1, server: s})
+			lines = append(lines, serverLine{sub: sub.Name, subID: sub.ID, total: len(sub.Servers), number: i + 1, server: s})
 		}
 	}
 	return lines
@@ -54,7 +56,7 @@ func (h *ServersHandler) HandleServers(msg *tgbotapi.Message) {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2("No servers. Use /import to add a subscription."))
 		return
 	}
-	text, keyboard := buildServersPage(lines, len(subs), 0)
+	text, keyboard := buildServersPage(lines, len(subs), 0, monitorHealth(h.deps.Monitor, subs))
 	h.deps.Sender.SendWithKeyboard(msg.Chat.ID, text, keyboard)
 }
 
@@ -81,7 +83,7 @@ func (h *ServersHandler) HandleCallback(cb *tgbotapi.CallbackQuery) {
 	if len(lines) == 0 {
 		return
 	}
-	text, keyboard := buildServersPage(lines, len(subs), page)
+	text, keyboard := buildServersPage(lines, len(subs), page, monitorHealth(h.deps.Monitor, subs))
 	h.deps.Sender.EditMessage(cb.Message.Chat.ID, cb.Message.MessageID, text, keyboard)
 }
 
@@ -136,7 +138,9 @@ func groupServersByCountry(servers []vpnconfig.Server) string {
 
 // buildServersPage builds one page of the list, a header wherever a
 // subscription starts and at the top of the page, with the navigation keyboard.
-func buildServersPage(lines []serverLine, subCount, page int) (string, tgbotapi.InlineKeyboardMarkup) {
+// With the monitor's health each line starts with the server's status and each
+// subscription's header counts its live servers.
+func buildServersPage(lines []serverLine, subCount, page int, h health) (string, tgbotapi.InlineKeyboardMarkup) {
 	if len(lines) == 0 {
 		return "No servers available\\.", tgbotapi.NewInlineKeyboardMarkup()
 	}
@@ -149,19 +153,32 @@ func buildServersPage(lines []serverLine, subCount, page int) (string, tgbotapi.
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("🖥 *Servers* \\(%d\\) in %d subscriptions, page %d/%d:\n",
 		len(lines), subCount, page+1, totalPages))
+	if note := h.header(); note != "" {
+		sb.WriteString(telegram.EscapeMarkdownV2(note) + "\n")
+	}
 
 	for i := start; i < end; i++ {
 		l := lines[i]
 		if i == start || l.sub != lines[i-1].sub {
-			sb.WriteString("\n*" + telegram.EscapeMarkdownV2(l.sub) + "*\n")
+			sb.WriteString("\n*" + telegram.EscapeMarkdownV2(l.sub) + "*")
+			if h.ok {
+				sb.WriteString(telegram.EscapeMarkdownV2(fmt.Sprintf(" — %d/%d живы", h.alive[l.subID], l.total)))
+			}
+			sb.WriteString("\n")
 		}
 		s := l.server
-		sb.WriteString(fmt.Sprintf("%d\\. %s — %s \\(%s\\) · %s\n",
+		prefix, suffix := "", ""
+		if hs, ok := h.of(l.subID, l.number-1); ok {
+			prefix, suffix = mark(hs)+" ", telegram.EscapeMarkdownV2(latency(hs))
+		}
+		sb.WriteString(fmt.Sprintf("%s%d\\. %s — %s \\(%s\\) · %s%s\n",
+			prefix,
 			l.number,
 			telegram.EscapeMarkdownV2(s.Name),
 			telegram.EscapeMarkdownV2(s.Address),
 			telegram.EscapeMarkdownV2(strings.Join(s.IPs, ", ")),
-			telegram.EscapeMarkdownV2(s.Label())))
+			telegram.EscapeMarkdownV2(s.Label()),
+			suffix))
 	}
 
 	// Navigation buttons

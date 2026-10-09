@@ -1,4 +1,4 @@
-.PHONY: web web-embed build-webui build-webui-arm64 build-webui-arm build-webui-mipsle build-bot build-bot-arm64 build-bot-arm build-bot-mipsle build-all clean
+.PHONY: web web-embed build-webui build-webui-arm64 build-webui-arm build-webui-mipsle build-bot build-bot-arm64 build-bot-arm build-bot-mipsle build-watchd build-watchd-arm64 build-watchd-arm build-watchd-mipsle build-all clean
 
 # Build Vue SPA
 web:
@@ -36,8 +36,21 @@ build-bot-arm:
 build-bot-mipsle:
 	make -C server build-mipsle
 
+# Build the server monitor (no SPA to embed)
+build-watchd:
+	make -C server build-watchd
+
+build-watchd-arm64:
+	make -C server build-watchd-arm64
+
+build-watchd-arm:
+	make -C server build-watchd-arm
+
+build-watchd-mipsle:
+	make -C server build-watchd-mipsle
+
 # Build all
-build-all: build-webui-arm64 build-webui-arm build-webui-mipsle build-bot-arm64 build-bot-arm build-bot-mipsle
+build-all: build-webui-arm64 build-webui-arm build-webui-mipsle build-bot-arm64 build-bot-arm build-bot-mipsle build-watchd-arm64 build-watchd-arm build-watchd-mipsle
 
 clean:
 	rm -rf web/dist server/cmd/webui/web/dist

@@ -1,0 +1,94 @@
+#!/bin/sh
+
+# Note: We don't source rc.func because it calls `pidof $PROCS` with the full
+# path stored in $PROCS, but BusyBox pidof matches by basename only. Running
+# the script via rc.func would always report "failed" after ~10s even though
+# the process started successfully. We also use `nohup` to detach the daemon
+# from the controlling terminal so it survives an SSH logout when the script
+# is invoked manually. (`setsid` is not provided by BusyBox 1.25 on Merlin.)
+PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENABLED=yes
+DESC="VPN Director server monitor"
+WATCHD_PATH="/opt/vpn-director/vpn-director-watchd"
+WATCHD_NAME="vpn-director-watchd"
+WATCHD_CONFIG="/opt/vpn-director/vpn-director.json"
+LOGTAG="S98vpn-director-watchd"
+# Seconds stop waits before SIGKILL. watchd lets an automatic apply or Xray
+# process restart that is already running finish before it exits: ApplyTimeout
+# (5 minutes), the executor's 10-second kill grace and a margin to drain. A
+# watchd killed sooner leaves that vpn-director.sh running on its own, holding
+# the VPN Director lock, while stop reports watchd stopped.
+STOP_TIMEOUT=320
+
+start() {
+    [ "$ENABLED" != "yes" ] && return 0
+    if [ ! -x "$WATCHD_PATH" ]; then
+        message="Cannot start monitoring and automatic failover: $WATCHD_PATH is missing or not executable. An existing watchd may still be running; runtime state is unconfirmed. Reinstall VPN Director to restore it, then run $0 start."
+        echo "$message"
+        logger -t "$LOGTAG" "$message"
+        return 0
+    fi
+    echo "Starting $DESC..."
+    if pidof "$WATCHD_NAME" >/dev/null 2>&1; then
+        echo "$DESC is already running; watchd owns monitoring and automatic failover"
+        return 0
+    fi
+    nohup "$WATCHD_PATH" --config "$WATCHD_CONFIG" </dev/null >/dev/null 2>&1 &
+    sleep 2
+    if pidof "$WATCHD_NAME" >/dev/null 2>&1; then
+        echo "$DESC started; watchd owns monitoring and automatic failover (automation waits for bot compatibility)"
+        logger -t "$LOGTAG" "Started $DESC; watchd owns monitoring and automatic failover"
+    else
+        echo "Failed to start $DESC"
+        echo "Monitoring and automatic failover are unavailable. Repair the error in /tmp/vpn-director-watchd.log for $WATCHD_PATH and $WATCHD_CONFIG, then run $0 start."
+        logger -t "$LOGTAG" "Failed to start $DESC; monitoring and automatic failover are unavailable; repair using /tmp/vpn-director-watchd.log"
+        return 1
+    fi
+}
+
+stop() {
+    echo "Stopping $DESC..."
+    if ! pidof "$WATCHD_NAME" >/dev/null 2>&1; then
+        echo "$DESC is not running"
+        return 0
+    fi
+    killall "$WATCHD_NAME" 2>/dev/null
+    count=0
+    while pidof "$WATCHD_NAME" >/dev/null 2>&1 && [ "$count" -lt "$STOP_TIMEOUT" ]; do
+        if [ "$count" -eq 10 ]; then
+            echo "Still waiting for $DESC to exit: an automatic apply or Xray restart may be finishing (up to ${STOP_TIMEOUT}s)"
+        fi
+        sleep 1
+        count=$((count + 1))
+    done
+    if pidof "$WATCHD_NAME" >/dev/null 2>&1; then
+        echo "Force killing $DESC..."
+        killall -9 "$WATCHD_NAME" 2>/dev/null
+        sleep 1
+    fi
+    if pidof "$WATCHD_NAME" >/dev/null 2>&1; then
+        echo "Failed to stop $DESC"
+        logger -t "$LOGTAG" "Failed to stop $DESC"
+        return 1
+    fi
+    echo "$DESC stopped"
+    return 0
+}
+
+check() {
+    if pidof "$WATCHD_NAME" >/dev/null 2>&1; then
+        echo "$DESC is running"
+        return 0
+    fi
+    echo "$DESC is not running"
+    return 1
+}
+
+case "$1" in
+    start)   start ;;
+    stop)    stop ;;
+    restart) stop && start ;;
+    kill)    killall -9 "$WATCHD_NAME" 2>/dev/null ;;
+    check)   check ;;
+    *)       echo "Usage: $0 {start|stop|restart|kill|check}" ;;
+esac

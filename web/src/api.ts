@@ -12,6 +12,7 @@ import type {
   PlatformInfo,
   RefreshResponse,
   Server,
+  MonitorResponse,
   ServersResponse,
   StatusResponse,
   SubscriptionResult,
@@ -20,6 +21,7 @@ import type {
   UpdateStartResponse,
   UpdateStatusResponse,
   VersionResponse,
+  WatchResponse,
 } from './types'
 
 const api = axios.create({
@@ -96,6 +98,20 @@ export default {
     api.post<OkResponse>('/api/subscriptions/rename', { name }, { params: { id } }),
   deleteSubscription: (id: string) =>
     api.delete<DeleteSubscriptionResponse>('/api/subscriptions', { params: { id } }),
+
+  // Server monitor
+  getMonitor: () =>
+    api.get<MonitorResponse>('/api/monitor', { timeout: 8000 }),
+  // One server as the page shows it - the router answers 409 when the list
+  // changed since - or, with no server, every server.
+  checkServer: (subscription: string, index: number, fingerprint: string) =>
+    api.post<{ queued: number }>('/api/monitor/check', { subscription, index, fingerprint }, { timeout: 8000 }),
+  checkAllServers: () =>
+    api.post<{ queued: number }>('/api/monitor/check', {}, { timeout: 8000 }),
+
+  // Subscription automation
+  getWatch: () =>
+    api.get<WatchResponse>('/api/watch', { timeout: 8000 }),
 
   // Clients
   getClients: () =>

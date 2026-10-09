@@ -13,14 +13,14 @@ import (
 	"github.com/zinin/vpn-director/server/internal/chatstore"
 	"github.com/zinin/vpn-director/server/internal/config"
 	"github.com/zinin/vpn-director/server/internal/handler"
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/paths"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/startup"
-	"github.com/zinin/vpn-director/server/internal/subwatch"
 	"github.com/zinin/vpn-director/server/internal/telegram"
 	"github.com/zinin/vpn-director/server/internal/updateflow"
 	"github.com/zinin/vpn-director/server/internal/updater"
-	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 	"github.com/zinin/vpn-director/server/internal/wizard"
 )
 
@@ -31,19 +31,18 @@ type Bot struct {
 	router *Router
 	mu     sync.Mutex
 	sender telegram.MessageSender
-	// outbox holds the watch's notifications until a path to Telegram carries
-	// them; pathLive says whether the path manager has one (nil: always).
-	outbox      outbox
-	pathLive    func() bool
-	devMode     bool
-	executor    service.ShellExecutor
-	updater     updater.Updater
-	chatStore   *chatstore.Store
-	pathManager *PathManager
-	subWatch    *subwatch.Watch
-	httpClient  *http.Client
-	endpoint    string
-	wire        func(*tgbotapi.BotAPI)
+	// pathLive reports whether the path manager can reach Telegram (nil: always).
+	pathLive        func() bool
+	notificationAPI watchdapi.NotificationAPI
+	notifications   notificationReceiver
+	devMode         bool
+	executor        service.ShellExecutor
+	updater         updater.Updater
+	chatStore       *chatstore.Store
+	pathManager     *PathManager
+	httpClient      *http.Client
+	endpoint        string
+	wire            func(*tgbotapi.BotAPI)
 	// apiBase is empty in production and set only by tests, where one local
 	// server answers both the path probe and the Telegram API, as one host
 	// does in production.
@@ -101,6 +100,13 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	logSvc := service.NewLogService(b.executor)
 
 	b.auth = NewAuth(cfg.AllowedUsers)
+	if b.notificationAPI == nil {
+		b.notificationAPI = watchdapi.NewClient(p.WatchdSocket)
+	}
+	if err := b.syncRecipients(ctx); err != nil && ctx.Err() == nil {
+		slog.Warn("Watch notification recipients will retry synchronization")
+	}
+	go b.receiveNotifications(ctx)
 
 	if b.devMode {
 		b.httpClient = &http.Client{}
@@ -113,37 +119,11 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		})
 		pm.SelectOnce(ctx)
 		b.pathManager = pm
-		b.pathLive = func() bool { return pm.Current().kind != kindNone }
+		b.mu.Lock()
+		b.pathLive = func() bool { return pm.Current().Kind != netpath.KindNone }
+		b.mu.Unlock()
 		b.httpClient = NewPathClient(pm)
 		go pm.Start(ctx)
-		sw := &subwatch.Watch{
-			LoadVPN:           configSvc.LoadVPNConfig,
-			LoadPlatform:      vpnSvc.Platform,
-			UpdateVPN:         configSvc.UpdateVPNConfig,
-			Apply:             vpnSvc.ApplyUnlessStopped,
-			RestartXray:       vpnSvc.RestartXrayProcessUnlessStopped,
-			LoadSubscriptions: configSvc.LoadSubscriptions,
-			SaveSubscription:  configSvc.SaveSubscription,
-			Reachable:         reachTCP4(nil),
-			Generate: func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
-				cfg, err := configSvc.LoadVPNConfig()
-				if err != nil {
-					return false, 0, err
-				}
-				ports := service.InboundPorts{}
-				ports.TProxy, ports.Socks = vpnconfig.XrayInboundPorts(cfg)
-				return service.GenerateAndRecordWalkedServer(configSvc, xraySvc, subwatch.ServerForDial(s), s, ports, guard)
-			},
-			Fetch: func(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
-				return b.fetchSub(ctx, rawURL, configSvc, vpnSvc)
-			},
-			Notify:        b.notifyActiveChats,
-			FallbackReady: failoverTunnelReady,
-			TPROXYReady:   tproxyRulesReady,
-			Stopped:       vpnDirectorStopped,
-		}
-		b.subWatch = sw
-		go sw.Start(ctx)
 	}
 
 	b.endpoint = tgbotapi.APIEndpoint
@@ -155,6 +135,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 		sender := telegram.NewSender(api)
 		b.api = api
 		b.setSender(sender)
+		watchClient := watchdapi.NewClient(p.WatchdSocket)
 		deps := &handler.Deps{
 			Sender:      sender,
 			Config:      configSvc,
@@ -168,6 +149,8 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 			Commit:      commit,
 			BuildDate:   buildDate,
 			DevMode:     b.devMode,
+			Monitor:     watchClient,
+			Watch:       watchClient,
 		}
 		if pm := b.pathManager; pm != nil {
 			deps.TelegramPath = func() string { return pm.Current().String() }
@@ -192,9 +175,7 @@ func New(ctx context.Context, cfg *config.Config, p paths.Paths, version, versio
 	return b, nil
 }
 
-// Connect authorizes with Telegram and wires handlers. The subscription
-// watch (and PathManager) already run; a failed getMe must not tear them
-// down, or recovery waits on the connection it should repair.
+// Connect wires Telegram handlers without restarting background automation.
 func (b *Bot) Connect(cfg *config.Config) error {
 	if b.api != nil {
 		return nil
@@ -214,52 +195,11 @@ func (b *Bot) Connect(cfg *config.Config) error {
 	return nil
 }
 
-// setSender publishes the sender and delivers what the watch said before
-// Telegram was connected.
+// setSender publishes the sender for the watchd notification receiver.
 func (b *Bot) setSender(s telegram.MessageSender) {
 	b.mu.Lock()
 	b.sender = s
 	b.mu.Unlock()
-	b.flushNotifications()
-}
-
-// notifyActiveChats sends msg to every active chat whose user is still in
-// allowed_users, once per ChatID: one person who renamed their handle is two
-// chatstore records with one ChatID. The message goes through the outbox: it
-// waits there while Telegram is not connected yet or no path reaches it, and
-// behind any older message of the same chat.
-func (b *Bot) notifyActiveChats(msg string) {
-	b.mu.Lock()
-	store := b.chatStore
-	auth := b.auth
-	b.mu.Unlock()
-	b.outbox.add(activeChats(store, auth), msg)
-	b.flushNotifications()
-}
-
-// activeChats is every active chat whose user is still in allowed_users, each
-// ChatID once.
-func activeChats(store *chatstore.Store, auth *Auth) []int64 {
-	if store == nil {
-		return nil
-	}
-	users, err := store.GetActiveUsers()
-	if err != nil {
-		return nil
-	}
-	var chats []int64
-	seen := make(map[int64]struct{}, len(users))
-	for _, u := range users {
-		if auth == nil || !auth.IsAuthorized(u.Username) {
-			continue
-		}
-		if _, dup := seen[u.ChatID]; dup {
-			continue
-		}
-		seen[u.ChatID] = struct{}{}
-		chats = append(chats, u.ChatID)
-	}
-	return chats
 }
 
 // RegisterCommands registers bot commands with Telegram
@@ -296,10 +236,6 @@ func (b *Bot) Run(ctx context.Context) {
 	if b.pathManager != nil {
 		go b.pathManager.Start(ctx)
 	}
-	if b.subWatch != nil {
-		go b.subWatch.Start(ctx)
-	}
-	go b.retryNotifications(ctx, outboxRetryEvery)
 	// b.chatStore is a typed nil in dev mode; assigning it straight into the
 	// interface would hand CheckAndSendNotify a non-nil interface over a nil
 	// pointer and panic on the first call.
@@ -308,7 +244,7 @@ func (b *Bot) Run(ctx context.Context) {
 		store = b.chatStore
 	}
 	// Check for pending update notification before starting polling
-	if err := startup.CheckAndSendNotify(b.sender, store, startup.DefaultNotifyFile, startup.DefaultUpdateDir, b.version); err != nil {
+	if err := startup.CheckAndSendNotify(b.Sender(), store, startup.DefaultNotifyFile, startup.DefaultUpdateDir, b.version); err != nil {
 		slog.Warn("Failed to send update notification", "error", err)
 	}
 
@@ -335,14 +271,17 @@ func (b *Bot) Run(ctx context.Context) {
 					continue
 				}
 				username := msg.From.UserName
-				if !b.auth.IsAuthorized(username) {
+				if !b.Auth().IsAuthorized(username) {
 					slog.Warn("Unauthorized access attempt", "username", username)
-					b.sender.SendPlain(msg.Chat.ID, "Access denied")
+					b.Sender().SendPlain(msg.Chat.ID, "Access denied")
 					continue
 				}
 				// Record interaction for update notifications
 				if b.chatStore != nil {
 					_ = b.chatStore.RecordInteraction(username, msg.Chat.ID)
+					if err := b.syncRecipientsIfChanged(ctx); err != nil && ctx.Err() == nil {
+						slog.Warn("Watch notification recipients will retry synchronization")
+					}
 				}
 				// Log command without arguments for sensitive commands (import may contain tokens)
 				slog.Info("Command received", "username", username, "command", sanitizeLogMessage(msg))
@@ -354,9 +293,9 @@ func (b *Bot) Run(ctx context.Context) {
 					continue
 				}
 				// Acknowledge callback to prevent UI spinner hanging
-				b.sender.AckCallback(cb.ID)
+				b.Sender().AckCallback(cb.ID)
 				username := cb.From.UserName
-				if !b.auth.IsAuthorized(username) {
+				if !b.Auth().IsAuthorized(username) {
 					slog.Warn("Unauthorized callback", "username", username)
 					continue
 				}
@@ -364,6 +303,9 @@ func (b *Bot) Run(ctx context.Context) {
 				// Note: cb.Message can be nil for inline callbacks, so check before accessing
 				if b.chatStore != nil && cb.Message != nil {
 					_ = b.chatStore.RecordInteraction(username, cb.Message.Chat.ID)
+					if err := b.syncRecipientsIfChanged(ctx); err != nil && ctx.Err() == nil {
+						slog.Warn("Watch notification recipients will retry synchronization")
+					}
 				}
 				slog.Info("Callback received", "username", username, "data", cb.Data)
 				b.router.RouteCallback(cb)
@@ -388,6 +330,8 @@ func sanitizeLogMessage(msg *tgbotapi.Message) string {
 
 // Auth returns the authorization handler (for update checker).
 func (b *Bot) Auth() *Auth {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	return b.auth
 }
 

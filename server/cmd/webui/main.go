@@ -24,6 +24,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/updateflow"
 	"github.com/zinin/vpn-director/server/internal/updater"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 	"github.com/zinin/vpn-director/server/internal/webapi"
 )
 
@@ -187,6 +188,7 @@ func main() {
 	upd := updater.NewForDaemon(updater.DaemonWebUI)
 	upd.SetPlatform(plat.Name)
 	updateFlow := updateflow.New(upd, Version, *devFlag)
+	watchClient := watchdapi.NewClient(p.WatchdSocket)
 
 	deps := &webapi.Deps{
 		Config:  configSvc,
@@ -195,12 +197,15 @@ func main() {
 		Network: networkSvc,
 		Logs:    logSvc,
 		LogPaths: map[string]string{
-			"bot":   p.BotLogPath,
-			"vpn":   p.VPNLogPath,
-			"xray":  p.XrayLogPath,
-			"webui": p.WebUILogPath,
+			"bot":    p.BotLogPath,
+			"vpn":    p.VPNLogPath,
+			"xray":   p.XrayLogPath,
+			"webui":  p.WebUILogPath,
+			"watchd": p.WatchdLogPath,
 		},
 		Update:  updateFlow,
+		Monitor: watchClient,
+		Watch:   watchClient,
 		Shadow:  shadowAuth,
 		JWT:     jwtSvc,
 		Version: Version,

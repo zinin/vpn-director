@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -38,6 +39,9 @@ const (
 // ReturnCheck - after a failed return, ReturnRetry and longer. After
 // ReturnFailsMax failed attempts in a row the returns stop.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
+	if w.mutationEnded(ctx) {
+		return
+	}
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
 		// A return clears preferred_server too; its backoff ends once it has held.
 		if w.lastReturn.IsZero() || w.Now().Sub(w.lastReturn) >= ReturnHold {
@@ -66,8 +70,11 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	}
 	w.returnNotBefore = now.Add(ReturnCheck)
 	subs, err := w.loadSubscriptions()
+	if w.mutationEnded(ctx) {
+		return
+	}
 	if err != nil {
-		slog.Warn("Failed to read the subscriptions for the return to the preferred server", "error", err)
+		slog.Warn("Failed to read the subscriptions for the return to the preferred server", watchErrorAttr(err))
 		return
 	}
 	servers := vpnconfig.AllServers(subs)
@@ -78,11 +85,11 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	// A server no TCP dial can see is returned to without one: the attempt
 	// itself is then the only check there is, and a failed one backs the next
 	// off as any other does.
-	candidates := dialable(perAddress(servers[i : i+1]))
+	candidates := dialable(endpoint.PerAddress(servers[i : i+1]))
 	if tcpChecked(servers[i]) {
 		candidates = w.reachable(ctx, candidates)
 	}
-	if len(candidates) == 0 || ctx.Err() != nil || w.stopped() {
+	if len(candidates) == 0 || ctx.Err() != nil || w.mutationEnded(ctx) {
 		return
 	}
 	w.tryReturn(ctx, cfg, subs, servers, candidates)
@@ -117,6 +124,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		slog.Info("Return to the preferred server put off; no way back to the server that runs now", "server", before.Name)
 		return
 	}
+	w.setStatusAction("returning")
 	slog.Info("Returning to the preferred server", "server", candidates[0].Name, "from", before.Name)
 	for _, c := range candidates {
 		live, ended, gone := sw.to(ctx, c, true)
@@ -130,7 +138,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		if live {
 			// A stop or a selection can land while the probe waits; the walk
 			// makes the same look before it announces.
-			if w.stopped() || endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
+			if w.mutationEnded(ctx) || w.endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
 				return
 			}
 			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
@@ -139,6 +147,9 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			w.notify(noteReturned, fmt.Sprintf(msgReturned, label(names, c.Subscription, c.Name)))
 			return
 		}
+	}
+	if w.mutationEnded(ctx) {
+		return
 	}
 	w.backOffReturn()
 	if !sw.wrote {
@@ -177,26 +188,27 @@ type switcher struct {
 // Nothing was written for it, and nobody else wrote either, so the way back
 // stays open - and is not held to that check itself: it is the server that
 // ran. live is a probe that passed; ended is a write the guard refused for a
-// stop or a newer selection, a restart a stop skipped, or a context or stop
-// that ended the attempt, after which nothing more may be written.
+// stop or a newer selection, a restart a stop skipped, or a stop or a cancelled
+// tick that ended the attempt, after which nothing more may be written. A
+// timeout of the switch's own while the tick runs is a failed switch.
 func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended, gone bool) {
 	w := s.w
-	if ctx.Err() != nil || w.stopped() {
+	if ctx.Err() != nil || w.mutationEnded(ctx) {
 		return false, true, false
 	}
 	sub, link := "", ""
 	if holds {
 		sub, link = c.Subscription, s.links[c.Subscription]
 	}
-	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq))
-	if endsWalk(err) {
+	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq, ctx))
+	if w.endsWalk(err) {
 		return false, true, false
 	}
 	if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
 		return false, false, true
 	}
 	if !generated {
-		slog.Warn("Generating Xray config for server failed", "server", c.Name, "error", err)
+		slog.Warn("Generating Xray config for server failed", "server", c.Name, watchErrorAttr(err))
 		return false, false, false
 	}
 	s.wrote = true
@@ -204,24 +216,26 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		s.lastRecorded = serverID(c)
 	}
 	s.seq = seq
-	if ctx.Err() != nil {
+	if w.mutationEnded(ctx) {
 		return false, true, false
 	}
 	if err := w.restartXray(); err != nil {
-		if errors.Is(err, errStopped) {
+		if w.endsWalk(err) || w.mutationEnded(ctx) {
 			return false, true, false
 		}
-		slog.Warn("Xray restart failed", "server", c.Name, "error", err)
+		slog.Warn("Xray restart failed", "server", c.Name, watchErrorAttr(err))
 		return false, false, false
 	}
 	w.AfterRestart(SettleAfterRestart)
-	if err := w.Probe(ctx, s.socks); err != nil {
-		// A probe a cancelled context or a stop cut short says nothing about
-		// the server.
-		if ctx.Err() != nil || w.stopped() {
-			return false, true, false
-		}
-		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, "error", err)
+	if w.mutationEnded(ctx) {
+		return false, true, false
+	}
+	err = w.Probe(ctx, s.socks)
+	if w.mutationEnded(ctx) {
+		return false, true, false
+	}
+	if err != nil {
+		slog.Info("Server probe failed", "server", c.Name, "ips", c.IPs, watchErrorAttr(err))
 		return false, false, false
 	}
 	return true, false, false
@@ -237,7 +251,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, last *vpnconfig.Server) []vpnconfig.Server {
 	var copies []vpnconfig.Server
 	if j := chosenIndex(servers, before); j >= 0 {
-		copies = perAddress(servers[j : j+1])
+		copies = endpoint.PerAddress(servers[j : j+1])
 	}
 	if last == nil {
 		return copies

@@ -11,7 +11,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/endpoint"
+	"github.com/zinin/vpn-director/server/internal/monitor"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 // subOf is a subscription whose servers carry the given names, one address each.
@@ -453,5 +456,397 @@ func TestWave_AStaticListArmsTheWatch(t *testing.T) {
 
 	if f.cfg.Xray.Failover == nil {
 		t.Fatal("a static list did not arm the watch")
+	}
+}
+
+type healthWalkFixture struct {
+	f         *fake
+	w         *Watch
+	h         *fastHealth
+	live      map[string]bool
+	generated []vpnconfig.Server
+	attempts  []string
+	events    []string
+}
+
+func newHealthWalkFixture(t *testing.T, subs ...vpnconfig.Subscription) *healthWalkFixture {
+	t.Helper()
+	r := &healthWalkFixture{f: waveFake(subs...), live: make(map[string]bool)}
+	r.f.plat = connected("ovpnc2")
+	r.f.cfg.Advanced = map[string]interface{}{"xray": map[string]interface{}{"tproxy_port": float64(22345), "socks_port": float64(22346)}}
+	r.h = &fastHealth{cached: orderTestEvidence(r.f.now, nil), invalid: make(map[string]bool)}
+	r.w = runningWatch(r.f.watch())
+	r.w.Health = r.h
+	r.w.Fetch = fetchFrom(subs)
+	r.w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		r.attempts = append(r.attempts, s.Name)
+		if err := r.f.checkGuard(guard); err != nil {
+			return false, r.f.seq(), err
+		}
+		r.generated = append(r.generated, s)
+		r.events = append(r.events, "generate "+s.Name+"@"+dialIP(s))
+		vpnconfig.RecordWalkedServer(r.f.cfg, s)
+		return true, r.f.seq(), nil
+	}
+	r.w.RestartXray = func() error {
+		r.events = append(r.events, "restart")
+		return nil
+	}
+	r.w.AfterRestart = func(delay time.Duration) {
+		if delay != 3*time.Second {
+			t.Errorf("settle %v, want 3 seconds before the main probe", delay)
+		}
+		r.events = append(r.events, "settle")
+	}
+	r.w.Probe = func(ctx context.Context, port int) error {
+		if ctx.Err() != nil || port != 22346 {
+			t.Errorf("main probe context %v, SOCKS port %d, want 22346", ctx.Err(), port)
+		}
+		name := r.f.cfg.Xray.ActiveServer.Name
+		r.events = append(r.events, "probe "+name)
+		if len(r.generated) > 0 && r.live[name] {
+			return nil
+		}
+		return errProbe
+	}
+	return r
+}
+
+func (r *healthWalkFixture) tick() {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	r.w.Tick(ctx)
+}
+
+func (r *healthWalkFixture) setHealth(statuses map[string]watchdapi.Status) {
+	states := make(map[string]watchdapi.Status)
+	for _, s := range endpoint.PerAddress(vpnconfig.AllServers(cloneSubs(r.f.subs))) {
+		if status, ok := statuses[s.Name]; ok {
+			states[endpoint.Key(s)] = status
+		}
+	}
+	r.h.mu.Lock()
+	defer r.h.mu.Unlock()
+	r.h.cached = orderTestEvidence(r.f.now, states)
+	r.h.fresh = copyFastEvidence(r.h.cached, nil)
+}
+
+func TestWalk_AllCurrentRejectedEndsWave(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		written    bool
+		wantEvents []string
+		wantWrites []string
+		wantSeq    int
+	}{
+		{
+			name:       "all rejected before generation",
+			wantEvents: []string{"probe Preferred"},
+		},
+		{
+			name:    "written failed candidate leaves only rejected remaining",
+			written: true,
+			wantEvents: []string{
+				"probe Preferred",
+				"generate Candidate@203.0.113.11", "restart", "settle", "probe Candidate",
+				"generate Preferred@203.0.113.10", "restart",
+			},
+			wantWrites: []string{"Candidate@203.0.113.11", "Preferred@203.0.113.10"},
+			wantSeq:    2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Candidate", "Last")
+			r := newHealthWalkFixture(t, sub)
+			statuses := map[string]watchdapi.Status{
+				"Preferred": watchdapi.StatusRejected, "Candidate": watchdapi.StatusRejected,
+				"Last": watchdapi.StatusRejected,
+			}
+			if tc.written {
+				statuses["Candidate"] = watchdapi.StatusAlive
+			}
+			r.setHealth(statuses)
+			before, err := cloneCfg(r.f.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			probe := r.w.Probe
+			failedWritten := false
+			r.w.Probe = func(ctx context.Context, port int) error {
+				err := probe(ctx, port)
+				if r.f.cfg.Xray.ActiveServer.Name == "Candidate" {
+					failedWritten = len(r.generated) == 1 && r.f.seq() == 1 && err != nil
+					r.setHealth(map[string]watchdapi.Status{
+						"Preferred": watchdapi.StatusRejected, "Candidate": watchdapi.StatusRejected,
+						"Last": watchdapi.StatusRejected,
+					})
+				}
+				return err
+			}
+
+			r.tick()
+
+			writes := healthLabels(r.generated)
+			if failedWritten != tc.written || !reflect.DeepEqual(r.events, tc.wantEvents) ||
+				len(writes) != len(tc.wantWrites) || len(writes) > 0 && !reflect.DeepEqual(writes, tc.wantWrites) {
+				t.Fatalf("written failed candidate=%t, events %v, writes %v; want %t / %v / %v", failedWritten, r.events, writes, tc.written, tc.wantEvents, tc.wantWrites)
+			}
+			if r.f.applies != 0 || r.f.cfg.Xray.PendingRestore != nil || r.w.lastPicked != nil ||
+				!reflect.DeepEqual(r.f.cfg.Xray.Failover, before.Xray.Failover) ||
+				!reflect.DeepEqual(r.f.cfg.Xray.Clients, before.Xray.Clients) ||
+				!reflect.DeepEqual(r.f.cfg.PausedClients, before.PausedClients) ||
+				!reflect.DeepEqual(r.f.cfg.TunnelDirector, before.TunnelDirector) {
+				t.Fatalf("empty rejected wave changed client/recovery intent: config=%+v applies=%d picked=%+v", r.f.cfg, r.f.applies, r.w.lastPicked)
+			}
+			wantActive := &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "Preferred", Address: "preferred.example", Port: 443, Seq: tc.wantSeq}
+			wantConfig := before
+			wantConfig.Xray.ActiveServer = wantActive
+			if !reflect.DeepEqual(r.f.cfg, wantConfig) {
+				t.Fatalf("empty wave config %+v, want original choice and unchanged client intent %+v", r.f.cfg, wantConfig)
+			}
+			if countNotes(r.f.notes, "LAN clients back on Xray") != 0 || countNotes(r.f.notes, "selected server") != 0 ||
+				countNotes(r.f.notes, "Xray back on the preferred server") != 0 {
+				t.Fatalf("empty wave announced a successful main probe or restore: %v", r.f.notes)
+			}
+		})
+	}
+}
+
+func TestWalk_HealthyFirstStillProbesMain(t *testing.T) {
+	t.Run("cached alive still needs each main HTTPS probe", func(t *testing.T) {
+		sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Unknown", "Dead", "Alive1", "Alive2", "Rejected")
+		sub.Servers[3].IPs = []string{"203.0.113.13", "203.0.113.33"}
+		r := newHealthWalkFixture(t, sub)
+		r.setHealth(map[string]watchdapi.Status{
+			"Alive1": watchdapi.StatusAlive, "Alive2": watchdapi.StatusAlive,
+			"Dead": watchdapi.StatusDead, "Rejected": watchdapi.StatusRejected,
+		})
+		st := r.h.cached.Endpoints[endpoint.Keys(sub.Servers[3])[0]]
+		st.LatencyMS = 900
+		r.h.cached.Endpoints[endpoint.Keys(sub.Servers[3])[0]] = st
+		st = r.h.cached.Endpoints[endpoint.Key(sub.Servers[4])]
+		st.LatencyMS = 1
+		r.h.cached.Endpoints[endpoint.Key(sub.Servers[4])] = st
+		r.live["Unknown"] = true
+
+		r.tick()
+
+		want := []string{
+			"probe Preferred",
+			"generate Alive1@203.0.113.13", "restart", "settle", "probe Alive1",
+			"generate Alive1@203.0.113.33", "restart", "settle", "probe Alive1",
+			"generate Alive2@203.0.113.14", "restart", "settle", "probe Alive2",
+			"generate Preferred@203.0.113.10", "restart", "settle", "probe Preferred",
+			"generate Unknown@203.0.113.11", "restart", "settle", "probe Unknown",
+		}
+		if !reflect.DeepEqual(r.events, want) {
+			t.Fatalf("main process transitions %v, want %v", r.events, want)
+		}
+		wantActive := &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "Unknown", Address: "unknown.example", Port: 443, Seq: 5}
+		wantPreferred := &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "Preferred", Address: "preferred.example", Port: 443}
+		if !reflect.DeepEqual(r.f.cfg.Xray.ActiveServer, wantActive) || !reflect.DeepEqual(r.f.cfg.Xray.PreferredServer, wantPreferred) {
+			t.Fatalf("active %+v, preferred %+v; the health order must not replace the user's choice", r.f.cfg.Xray.ActiveServer, r.f.cfg.Xray.PreferredServer)
+		}
+		if r.f.cfg.Xray.Failover != nil || r.f.cfg.Xray.PendingRestore != nil || !contains(r.f.cfg.Xray.Clients, "192.168.1.8") ||
+			contains(r.f.cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+			t.Fatal("the failed cached-alive probes did not continue to the live main-probed server and restore its clients")
+		}
+		if countNotes(r.f.notes, "LAN clients back on Xray; server Alpha / Unknown") != 1 {
+			t.Fatalf("notes %v; only the main-probed server may be announced", r.f.notes)
+		}
+	})
+
+	for _, tc := range []struct {
+		name     string
+		state    watchdapi.State
+		absent   bool
+		disabled bool
+		stale    string
+	}{
+		{name: "unavailable health", state: watchdapi.StateOK, absent: true},
+		{name: "disabled setting with cached ok", state: watchdapi.StateOK, disabled: true},
+		{name: "WAN down", state: watchdapi.StateWANDown},
+		{name: "prober error", state: watchdapi.StateProberError},
+		{name: "no Xray", state: watchdapi.StateNoXray},
+		{name: "monitor disabled", state: watchdapi.StateDisabled},
+		{name: "monitor stopped", state: watchdapi.StateStopped},
+		{name: "monitor not running", state: watchdapi.StateNotRunning},
+		{name: "stale rejected is eligible again", state: watchdapi.StateOK, stale: "Preferred"},
+		{name: "stale alive preserves original order", state: watchdapi.StateOK, stale: "Healthy"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Healthy", "Unknown")
+			r := newHealthWalkFixture(t, sub)
+			r.setHealth(map[string]watchdapi.Status{"Preferred": watchdapi.StatusRejected, "Healthy": watchdapi.StatusAlive})
+			r.h.cached.State = tc.state
+			if tc.absent {
+				r.w.Health = nil
+			}
+			if tc.disabled {
+				enabled := false
+				r.f.cfg.Monitor = &vpnconfig.MonitorConfig{Enabled: &enabled}
+			}
+			for _, s := range sub.Servers {
+				if s.Name == tc.stale {
+					r.h.invalidate(endpoint.Key(s))
+				}
+			}
+			r.live["Preferred"] = true
+
+			r.tick()
+
+			if got := healthLabels(r.generated); !reflect.DeepEqual(got, []string{"Preferred@203.0.113.10"}) {
+				t.Fatalf("unusable evidence changed legacy order: %v", got)
+			}
+			want := []string{"probe Preferred", "generate Preferred@203.0.113.10", "restart", "settle", "probe Preferred"}
+			if !reflect.DeepEqual(r.events, want) || r.f.cfg.Xray.Failover != nil {
+				t.Fatalf("events %v, failover %+v; a stale rejection must not suppress the main check", r.events, r.f.cfg.Xray.Failover)
+			}
+		})
+	}
+
+	for _, change := range []string{"late rejection", "alive becomes dead", "new generation", "global failure", "stale rejection"} {
+		t.Run("remaining keys after "+change, func(t *testing.T) {
+			sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Alive1", "Alive2", "Unknown", "Rejected")
+			r := newHealthWalkFixture(t, sub)
+			statuses := map[string]watchdapi.Status{
+				"Preferred": watchdapi.StatusRejected, "Alive1": watchdapi.StatusAlive,
+				"Alive2": watchdapi.StatusAlive, "Rejected": watchdapi.StatusRejected,
+			}
+			if change == "alive becomes dead" {
+				delete(statuses, "Preferred")
+			}
+			r.setHealth(statuses)
+			live := "Preferred"
+			if change == "late rejection" {
+				live = "Unknown"
+			}
+			r.live[live] = true
+			r.h.validate = func(e monitor.Evidence, keys []string) error {
+				r.h.mu.Lock()
+				defer r.h.mu.Unlock()
+				for _, key := range keys {
+					if e.Endpoints[key] != r.h.cached.Endpoints[key] {
+						return errors.New("synthetic generation changed")
+					}
+				}
+				return nil
+			}
+			probe := r.w.Probe
+			changed := false
+			r.w.Probe = func(ctx context.Context, port int) error {
+				err := probe(ctx, port)
+				if r.f.cfg.Xray.ActiveServer.Name == "Alive1" && !changed {
+					changed = true
+					switch change {
+					case "late rejection":
+						r.setHealth(map[string]watchdapi.Status{
+							"Preferred": watchdapi.StatusRejected, "Alive1": watchdapi.StatusAlive,
+							"Alive2": watchdapi.StatusRejected, "Unknown": watchdapi.StatusAlive, "Rejected": watchdapi.StatusRejected,
+						})
+					case "alive becomes dead":
+						r.setHealth(map[string]watchdapi.Status{
+							"Alive1": watchdapi.StatusAlive, "Alive2": watchdapi.StatusDead, "Rejected": watchdapi.StatusRejected,
+						})
+					case "new generation":
+						r.setHealth(map[string]watchdapi.Status{
+							"Preferred": watchdapi.StatusAlive, "Alive1": watchdapi.StatusAlive,
+							"Alive2": watchdapi.StatusDead, "Rejected": watchdapi.StatusRejected,
+						})
+						for key, st := range r.h.cached.Endpoints {
+							st.CheckedAt = r.f.now.Add(time.Second)
+							r.h.cached.Endpoints[key] = st
+						}
+					case "global failure":
+						r.h.cached.State = watchdapi.StateProberError
+					case "stale rejection":
+						r.h.invalidate(endpoint.Key(sub.Servers[0]))
+					}
+				}
+				return err
+			}
+
+			r.tick()
+
+			want := []string{"Alive1@203.0.113.11", "Preferred@203.0.113.10"}
+			if change == "late rejection" {
+				want = []string{"Alive1@203.0.113.11", "Unknown@203.0.113.13"}
+			}
+			if got := healthLabels(r.generated); !changed || !reflect.DeepEqual(got, want) {
+				t.Fatalf("generation change reached %v, writes %v, want %v without retrying tried keys", changed, got, want)
+			}
+			if r.f.cfg.Xray.Failover != nil || r.f.cfg.Xray.ActiveServer.Name != live {
+				t.Fatalf("active %+v, failover %+v; remaining evidence must be reread before the next generation", r.f.cfg.Xray.ActiveServer, r.f.cfg.Xray.Failover)
+			}
+		})
+	}
+
+	for _, refused := range []bool{false, true} {
+		t.Run(fmt.Sprintf("endpoint alias first generation refused=%v", refused), func(t *testing.T) {
+			first := fastServer("Alias1", "alias.example", "198.51.100.20")
+			second := first
+			second.Name = "Alias2"
+			sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Last")
+			sub.Servers = []vpnconfig.Server{sub.Servers[0], first, second, sub.Servers[1]}
+			r := newHealthWalkFixture(t, sub)
+			r.setHealth(map[string]watchdapi.Status{"Alias1": watchdapi.StatusAlive, "Alias2": watchdapi.StatusAlive})
+			r.live["Last"] = true
+			generate := r.w.Generate
+			var attempts []string
+			r.w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				attempts = append(attempts, s.Name)
+				if refused && s.Name == "Alias1" {
+					return false, r.f.seq(), errors.New("synthetic generator refusal")
+				}
+				return generate(s, guard)
+			}
+
+			r.tick()
+
+			wantAttempts := []string{"Alias1", "Preferred", "Last"}
+			wantWritten := []string{"Alias1@198.51.100.20", "Preferred@203.0.113.10", "Last@203.0.113.11"}
+			if refused {
+				wantAttempts = []string{"Alias1", "Alias2", "Preferred", "Last"}
+				wantWritten[0] = "Alias2@198.51.100.20"
+			}
+			if !reflect.DeepEqual(attempts, wantAttempts) || !reflect.DeepEqual(healthLabels(r.generated), wantWritten) {
+				t.Fatalf("attempts %v, writes %v, want %v / %v; only a written DialKey is tried", attempts, healthLabels(r.generated), wantAttempts, wantWritten)
+			}
+		})
+	}
+
+	for _, mutation := range []string{"same server selection", "stop"} {
+		t.Run("guard after health ordering and "+mutation, func(t *testing.T) {
+			sub := subOf("aaaaaaaa", "Alpha", "", "Preferred", "Healthy")
+			r := newHealthWalkFixture(t, sub)
+			r.setHealth(map[string]watchdapi.Status{"Healthy": watchdapi.StatusAlive})
+			var stopped atomic.Bool
+			r.w.Stopped = stopped.Load
+			generate := r.w.Generate
+			r.w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				if mutation == "stop" {
+					stopped.Store(true)
+				} else {
+					chosen := sub.Servers[0]
+					chosen.Subscription = sub.ID
+					r.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(r.f.cfg.Xray.ActiveServer, chosen)
+				}
+				return generate(s, guard)
+			}
+
+			r.tick()
+
+			if !reflect.DeepEqual(r.attempts, []string{"Healthy"}) || len(r.generated) != 0 ||
+				!reflect.DeepEqual(r.events, []string{"probe Preferred"}) || len(r.f.notes) != 0 || r.w.importRetry != 0 {
+				t.Fatalf("attempts %v, writes %v, events %v, notes %v, retry %v; health ordering must not bypass the lock guard", r.attempts, healthLabels(r.generated), r.events, r.f.notes, r.w.importRetry)
+			}
+			wantSeq := 0
+			if mutation == "same server selection" {
+				wantSeq = 1
+			}
+			if a := r.f.cfg.Xray.ActiveServer; a.Name != "Preferred" || a.Seq != wantSeq || r.f.cfg.Xray.Failover == nil {
+				t.Fatalf("active %+v, failover %+v; the newer choice/stop must stand", a, r.f.cfg.Xray.Failover)
+			}
+		})
 	}
 }

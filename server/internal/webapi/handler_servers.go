@@ -19,6 +19,9 @@ type serverView struct {
 	Port     int      `json:"port"`
 	IPs      []string `json:"ips"`
 	Protocol string   `json:"protocol"`
+	// Fingerprint matches the server with its row of GET /api/monitor
+	// (vpnconfig.ServerFingerprint).
+	Fingerprint string `json:"fingerprint"`
 }
 
 // subscriptionServers is one subscription's servers as the Servers tab shows them.
@@ -58,7 +61,9 @@ func handleListServers(deps *Deps) http.HandlerFunc {
 				if ips == nil {
 					ips = []string{}
 				}
-				views = append(views, serverView{Name: s.Name, Address: s.Address, Port: s.Port, IPs: ips, Protocol: s.Label()})
+				s.Subscription = sub.ID
+				views = append(views, serverView{Name: s.Name, Address: s.Address, Port: s.Port, IPs: ips,
+					Protocol: s.Label(), Fingerprint: vpnconfig.ServerFingerprint(s)})
 			}
 			groups = append(groups, subscriptionServers{ID: sub.ID, Name: sub.Name, Servers: views})
 		}

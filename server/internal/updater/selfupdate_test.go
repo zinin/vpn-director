@@ -176,7 +176,9 @@ func newStep2Fixture(t *testing.T, onRequest func(path, lockFile string)) *step2
 				{"url": "%[1]s/repos/zinin/vpn-director/releases/assets/301", "id": 301, "name": "telegram-bot-arm64",
 				 "browser_download_url": "%[1]s/zinin/vpn-director/releases/download/v1.2.4/telegram-bot-arm64"},
 				{"url": "%[1]s/repos/zinin/vpn-director/releases/assets/302", "id": 302, "name": "webui-arm64",
-				 "browser_download_url": "%[1]s/zinin/vpn-director/releases/download/v1.2.4/webui-arm64"}]}`, server.URL)
+				 "browser_download_url": "%[1]s/zinin/vpn-director/releases/download/v1.2.4/webui-arm64"},
+				{"url": "%[1]s/repos/zinin/vpn-director/releases/assets/303", "id": 303, "name": "vpn-director-watchd-arm64",
+				 "browser_download_url": "%[1]s/zinin/vpn-director/releases/download/v1.2.4/vpn-director-watchd-arm64"}]}`, server.URL)
 		case strings.HasPrefix(r.URL.Path, "/repos/zinin/vpn-director/releases/assets/"):
 			// The API sends the file from the CDN, /assets/ here, to a request
 			// that asks for it, and describes the asset to any other.

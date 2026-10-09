@@ -21,16 +21,25 @@ INIT_DIR="/opt/etc/init.d"
 
 # Daemon table: "name|binary|init script" entries separated by spaces. The
 # loops below rely on word splitting, so no field may contain a space.
-DAEMONS="telegram-bot|/opt/vpn-director/telegram-bot|S98telegram-bot webui|/opt/vpn-director/webui|S98vpn-director-webui"
+DAEMONS="telegram-bot|/opt/vpn-director/telegram-bot|S98telegram-bot vpn-director-watchd|/opt/vpn-director/vpn-director-watchd|S98vpn-director-watchd webui|/opt/vpn-director/webui|S98vpn-director-webui"
+
+# Init scripts of the daemons the release introduces (Daemon.StartWhenNew),
+# separated by spaces as in DAEMONS: step 1 starts one whose binary is absent.
+START_WHEN_NEW="S98vpn-director-watchd"
 
 # File table: "src|dst|mode" entries separated by spaces, src relative to
 # FILES_DIR, mode "x" for executable or "-" for data. Word splitting again, so
 # no field may contain a space; the manifest parser guarantees that.
-FILES="opt/vpn-director/vpn-director.sh|/opt/vpn-director/vpn-director.sh|x opt/vpn-director/lib/common.sh|/opt/vpn-director/lib/common.sh|x opt/vpn-director/vpn-director.json.template|/opt/vpn-director/vpn-director.json.template|- opt/etc/init.d/S99vpn-director|/opt/etc/init.d/S99vpn-director|x opt/etc/init.d/S98telegram-bot|/opt/etc/init.d/S98telegram-bot|x opt/etc/init.d/S98vpn-director-webui|/opt/etc/init.d/S98vpn-director-webui|x jffs/scripts/firewall-start|/jffs/scripts/firewall-start|x"
+FILES="opt/vpn-director/vpn-director.sh|/opt/vpn-director/vpn-director.sh|x opt/vpn-director/lib/common.sh|/opt/vpn-director/lib/common.sh|x opt/vpn-director/vpn-director.json.template|/opt/vpn-director/vpn-director.json.template|- opt/etc/init.d/S99vpn-director|/opt/etc/init.d/S99vpn-director|x opt/etc/init.d/S98telegram-bot|/opt/etc/init.d/S98telegram-bot|x opt/etc/init.d/S98vpn-director-watchd|/opt/etc/init.d/S98vpn-director-watchd|x opt/etc/init.d/S98vpn-director-webui|/opt/etc/init.d/S98vpn-director-webui|x jffs/scripts/firewall-start|/jffs/scripts/firewall-start|x"
 
 # Init scripts of the daemons that were running when the update started. The
 # EXIT trap reads it, so it must exist before anything can fail.
 RUNNING_INITS=""
+START_INITS=""
+NEW_INITS=""
+STARTED_NEW_INITS=""
+NEW_BINARIES=""
+TOUCHED_NEW_BINARIES=""
 
 # Whether fd 9 (the vpn-director lock) is open. Read by release_apply_lock,
 # which the EXIT trap calls, so it must exist before anything can fail.
@@ -66,7 +75,120 @@ EOF
 # was stopped beforehand stays stopped. Returns non-zero when any start
 # failed, so the caller can tell a complete restart from a partial one.
 start_running() {
-    start_except ""
+    start_except "" "$RUNNING_INITS"
+}
+
+# An init script can fail after launching its process, so record attempts too.
+start_init() {
+    for new_init in $NEW_INITS; do
+        if [ "$new_init" = "$1" ]; then
+            STARTED_NEW_INITS="$STARTED_NEW_INITS $1"
+            break
+        fi
+    done
+    log "Starting $1"
+    "$INIT_DIR/$1" start
+}
+
+# Cleanup matches argv[0] literally, followed by arguments or end of command.
+daemon_argv0_pattern() {
+    daemon_escaped=$(printf '%s\n' "$1" | sed 's/[][\\.^$*+?(){}|]/\\&/g') || return 1
+    printf '^%s([[:space:]]|$)\n' "$daemon_escaped"
+}
+
+# Undo new-daemon starts without changing the original recovery list.
+stop_new() {
+    for entry in $DAEMONS; do
+        name="${entry%%|*}"
+        rest="${entry#*|}"
+        bin="${rest%%|*}"
+        init="${rest##*|}"
+        for started in $STARTED_NEW_INITS; do
+            [ "$started" = "$init" ] || continue
+            if have_cmd monit; then
+                monit unmonitor "$name" 2>/dev/null || log "WARNING: could not unmonitor $name"
+            fi
+            log "Stopping new daemon $init"
+            "$INIT_DIR/$init" stop || log "WARNING: $init stop returned non-zero"
+            if ! new_process_pattern=$(daemon_argv0_pattern "$bin"); then
+                first_copy_error "$bin" "cannot build process pattern"
+                break
+            fi
+            if pgrep -f "$new_process_pattern" >/dev/null 2>&1; then
+                # The process may exit between pgrep and pkill.
+                pkill -9 -f "$new_process_pattern" || true
+            fi
+            break
+        done
+    done
+    STARTED_NEW_INITS=""
+}
+
+# Cleanup refusal must remain visible even when update.log is gone.
+first_copy_error() {
+    log "ERROR: first-install cleanup incomplete for $1: $2; manual recovery required"
+    printf 'ERROR: first-install cleanup incomplete for %s: %s; manual recovery required\n' "$1" "$2" >&2
+}
+
+# A kill may take a moment to become visible to pgrep; wait at most five seconds.
+first_copy_stopped() {
+    if ! first_process_pattern=$(daemon_argv0_pattern "$1"); then
+        first_copy_error "$1" "cannot build process pattern"
+        return 1
+    fi
+    first_waited=0
+    while :; do
+        if pgrep -f "$first_process_pattern" >/dev/null 2>&1; then
+            if [ "$first_waited" -ge 5 ]; then
+                first_copy_error "$1" "daemon still running"
+                return 1
+            fi
+            if ! sleep 1; then
+                first_copy_error "$1" "cannot wait for daemon exit"
+                return 1
+            fi
+            first_waited=$((first_waited + 1))
+        else
+            first_status=$?
+            [ "$first_status" -eq 1 ] && return 0
+            first_copy_error "$1" "cannot confirm daemon exit"
+            return 1
+        fi
+    done
+}
+
+# Undo only reached first binary copies, never existing binaries or init scripts.
+discard_first_copies() {
+    first_cleanup_rc=0
+    for first_entry in $DAEMONS; do
+        first_rest="${first_entry#*|}"
+        first_bin="${first_rest%%|*}"
+        for first_absent in $NEW_BINARIES; do
+            [ "$first_absent" = "$first_bin" ] || continue
+            for first_touched in $TOUCHED_NEW_BINARIES; do
+                [ "$first_touched" = "$first_bin" ] || continue
+                if ! first_copy_stopped "$first_bin"; then
+                    first_cleanup_rc=1
+                elif [ -L "$first_bin" ] || { [ -e "$first_bin" ] && [ ! -f "$first_bin" ]; }; then
+                    first_copy_error "$first_bin" "destination is not an owned regular binary"
+                    first_cleanup_rc=1
+                elif rm -f "$first_bin"; then
+                    if [ -e "$first_bin" ] || [ -L "$first_bin" ]; then
+                        first_copy_error "$first_bin" "destination remains after unlink"
+                        first_cleanup_rc=1
+                    else
+                        log "Removed unfinished first binary copy $first_bin"
+                    fi
+                else
+                    first_copy_error "$first_bin" "unlink failed"
+                    first_cleanup_rc=1
+                fi
+                break
+            done
+            break
+        done
+    done
+    return "$first_cleanup_rc"
 }
 
 # The bot reads notify.json on startup and, on status=ok, deletes the whole
@@ -75,12 +197,13 @@ start_running() {
 start_except() {
     skip=$1
     rc=0
-    for init in $RUNNING_INITS; do
+    for init in ${2-$START_INITS}; do
         [ -n "$skip" ] && [ "$init" = "$skip" ] && continue
-        log "Starting $init"
-        if ! "$INIT_DIR/$init" start; then
+        if ! start_init "$init"; then
             log "WARNING: $init start failed"
             rc=1
+            # Success stops at the first failure; recovery tries every original.
+            [ "$#" -lt 2 ] && return "$rc"
         fi
     done
     return $rc
@@ -89,25 +212,24 @@ start_except() {
 start_if_listed() {
     want=$1
     [ -n "$want" ] || return 0
-    for init in $RUNNING_INITS; do
+    for init in $START_INITS; do
         if [ "$init" = "$want" ]; then
-            log "Starting $init"
-            "$INIT_DIR/$init" start
+            start_init "$init"
             return $?
         fi
     done
     return 0
 }
 
-# Restore monit only for daemons that were running. Remonitoring a stopped
-# one would start it, against "a daemon that was stopped stays stopped".
+# Restore monit for the selected list, defaulting to original-running daemons.
+# Remonitoring an existing stopped daemon would start it.
 remonitor_running() {
     have_cmd monit || return 0
     for entry in $DAEMONS; do
         name="${entry%%|*}"
         rest="${entry#*|}"
         init="${rest##*|}"
-        for r in $RUNNING_INITS; do
+        for r in ${1-$RUNNING_INITS}; do
             if [ "$r" = "$init" ]; then
                 log "Re-monitoring $name in monit"
                 monit monitor "$name" 2>/dev/null || true
@@ -140,6 +262,8 @@ on_exit() {
         exit 0
     fi
     log "ERROR: update failed with exit code $code"
+    stop_new
+    discard_first_copies || log "ERROR: first-install cleanup incomplete; manual recovery required"
     release_apply_lock
     # Before the daemons come back: the bot reads notify.json once, on
     # startup. Started first, it finds no file, and there is no second look in
@@ -158,7 +282,7 @@ trap on_exit EXIT
 # Every stop and every restart below is decided by pgrep. Without it the
 # shell's 127 would read as "this daemon is not running": nothing would be
 # stopped, the copies would land under live processes and the update would
-# report success while both daemons kept running the old code. Refuse
+# report success while the daemons kept running the old code. Refuse
 # instead - RUNNING_INITS is still empty, so the trap stops nothing, starts
 # nothing and reports the failure.
 if ! have_cmd pgrep; then
@@ -178,7 +302,12 @@ mv -f "$LOCK_FILE.new" "$LOCK_FILE"
 log "Starting update from $OLD_VERSION to $NEW_VERSION (initiator: $INITIATOR)"
 
 # 1. Remember which daemons are running. Matching the full binary path keeps
-#    pgrep off unrelated processes.
+#    pgrep off unrelated processes. A daemon whose binary is not there at all
+#    and that this release introduces (START_WHEN_NEW) is new: nothing ran it,
+#    and nobody stopped it either, so it starts once the copy has succeeded.
+#    Any other absent daemon - an optional download that failed, a binary the
+#    owner removed - is installed like every daemon and stays stopped.
+NEW_INITS=""
 for entry in $DAEMONS; do
     name="${entry%%|*}"
     rest="${entry#*|}"
@@ -187,6 +316,24 @@ for entry in $DAEMONS; do
     if pgrep -f "$bin" >/dev/null 2>&1; then
         RUNNING_INITS="$RUNNING_INITS $init"
         log "$name is running"
+    elif [ "$?" -ne 1 ]; then
+        log "ERROR: cannot determine whether $name is running"
+        exit 1
+    elif [ ! -e "$bin" ] && [ ! -L "$bin" ]; then
+        introduced=0
+        for listed in $START_WHEN_NEW; do
+            if [ "$listed" = "$init" ]; then
+                introduced=1
+                break
+            fi
+        done
+        if [ "$introduced" = "1" ]; then
+            NEW_INITS="$NEW_INITS $init"
+            NEW_BINARIES="$NEW_BINARIES $bin"
+            log "$name is new, it starts after the update"
+        else
+            log "$name is not installed, it stays stopped after the update"
+        fi
     else
         log "$name is not running, it stays stopped after the update"
     fi
@@ -256,7 +403,15 @@ for entry in $FILES; do
 done
 for entry in $DAEMONS; do
     rest="${entry#*|}"
-    cp -f "$FILES_DIR/${entry%%|*}" "${rest%%|*}"
+    bin="${rest%%|*}"
+    for absent_bin in $NEW_BINARIES; do
+        if [ "$absent_bin" = "$bin" ]; then
+            # A failing cp may already have created a partial destination.
+            TOUCHED_NEW_BINARIES="$TOUCHED_NEW_BINARIES $bin"
+            break
+        fi
+    done
+    cp -f "$FILES_DIR/${entry%%|*}" "$bin"
 done
 
 # 5. Set permissions of the daemon binaries (script files got theirs above)
@@ -266,9 +421,12 @@ for entry in $DAEMONS; do
     chmod +x "${rest%%|*}"
 done
 
+# New daemons join only the success-start list; recovery keeps the originals.
+START_INITS="$RUNNING_INITS$NEW_INITS"
+
 # Drop the payload copies. notify.json and update.log stay; the bot removes
 # the directory after a successful notify. A Web UI-only router has no bot
-# to do that, and leaving two binaries in tmpfs until reboot is waste.
+# to do that, and leaving the binaries in tmpfs until reboot is waste.
 rm -rf "$FILES_DIR"
 
 # The scripts are in place, so nothing needs the lock any more. Release it
@@ -290,13 +448,8 @@ done
 #    start the bot. A failed Web UI start must rewrite notify.json before the
 #    bot can send "Update complete" and delete the directory.
 if ! start_except "$NOTIFY_INIT"; then
-    trap - EXIT
-    set +e
     log "ERROR: a daemon failed to start, the update is not complete"
     write_notify failed
-    start_if_listed "$NOTIFY_INIT" || true
-    remonitor_running
-    rm -f "$LOCK_FILE"
     exit 1
 fi
 
@@ -304,12 +457,8 @@ log "Creating notify file"
 write_notify ok
 
 if ! start_if_listed "$NOTIFY_INIT"; then
-    trap - EXIT
-    set +e
     log "ERROR: a daemon failed to start, the update is not complete"
     write_notify failed
-    remonitor_running
-    rm -f "$LOCK_FILE"
     exit 1
 fi
 
@@ -317,7 +466,7 @@ fi
 #    still stopped lets monit start it on its own check interval, and a bot
 #    started before notify.json exists reads no result: CheckAndSendNotify
 #    runs at startup only, so the outcome would wait for the next restart.
-remonitor_running
+remonitor_running "$START_INITS"
 
 # 8. Drop the lock only after every start attempt. While it names this
 #    script, the other daemon will not treat the update as finished.

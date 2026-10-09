@@ -23,9 +23,10 @@ func (h *StatusHandler) HandleStatus(msg *tgbotapi.Message) {
 	output, err := h.deps.VPN.Status()
 	if err != nil {
 		h.deps.Sender.Send(msg.Chat.ID, telegram.EscapeMarkdownV2(fmt.Sprintf("Error: %v", err)))
-		return
+	} else {
+		h.deps.Sender.SendCodeBlock(msg.Chat.ID, "📊 *VPN Director Status*:", output)
 	}
-	h.deps.Sender.SendCodeBlock(msg.Chat.ID, "📊 *VPN Director Status*:", output)
+	h.deps.Sender.SendPlain(msg.Chat.ID, automationStatus(h.deps.Monitor, h.deps.Watch))
 }
 
 // HandleRestart handles /restart command

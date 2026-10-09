@@ -1,4 +1,4 @@
-package bot
+package service
 
 import (
 	"context"
@@ -13,13 +13,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/zinin/vpn-director/server/internal/service"
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
 	"github.com/zinin/vpn-director/server/internal/subscription"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
-const maxSubscriptionBody = 1 << 20
+const defaultTunnelTablesPath = "/tmp/tunnel_director/tun_dir_tables"
 
 // errNoResolved is a subscription that decoded and whose hostnames went
 // unanswered - the one download failure worth retrying over the other path.
@@ -43,26 +43,34 @@ func getSubscription(ctx context.Context, client *http.Client, rawURL string) ([
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	// One byte past the cap tells a truncated list from one that fits exactly.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxSubscriptionBody+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxSubscriptionBody+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(body) > maxSubscriptionBody {
+	if len(body) > MaxSubscriptionBody {
 		return nil, fmt.Errorf("subscription exceeds 1 MiB")
 	}
 	return body, nil
 }
 
-func (b *Bot) fetchSub(ctx context.Context, rawURL string, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) ([]vpnconfig.Server, error) {
+// SubscriptionFetcher downloads and resolves subscriptions over WAN with a tunnel fallback.
+type SubscriptionFetcher struct {
+	Store      ConfigStore
+	VPN        VPNDirector
+	TablesPath string
+}
+
+// Fetch downloads an HTTPS subscription and resolves its servers within ctx.
+func (f SubscriptionFetcher) Fetch(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
 	if u, err := url.Parse(rawURL); err != nil || u.Scheme != "https" {
-		return nil, fmt.Errorf("%w: use an https:// link", service.ErrSubscriptionURL)
+		return nil, fmt.Errorf("%w: use an https:// link", ErrSubscriptionURL)
 	}
 	wan := ssrf.NewClient(10 * time.Second)
 	// IPv4 only and bound to ctx: an AF_UNSPEC lookup of every hostname in the
 	// subscription can hold a watch tick for minutes on this router, and a stop
 	// has to be able to end it.
 	wanLookup := subscription.LookupIPv4(ctx)
-	tunnel, tunnelLookup := lazyTunnel(ctx, cfgSvc, vpnSvc)
+	tunnel, tunnelLookup := lazyTunnel(ctx, f.Store, f.VPN, f.TablesPath)
 	return fetchServers(ctx, rawURL, wan, tunnel, wanLookup, tunnelLookup)
 }
 
@@ -73,8 +81,8 @@ var errNoTunnel = errors.New("no tunnel to look the host up over")
 // asks for it, and once: finding it runs vpn-director.sh platform, and a wave
 // of the watch fetches every subscription at once, mostly over a WAN that
 // serves them all. client answers nil, and lookup an error, without a tunnel.
-func lazyTunnel(ctx context.Context, cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) (client func() *http.Client, lookup func(host string) ([]net.IP, error)) {
-	find := sync.OnceValues(func() (Path, *http.Client) { return subscriptionTunnel(cfgSvc, vpnSvc) })
+func lazyTunnel(ctx context.Context, cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath string) (client func() *http.Client, lookup func(host string) ([]net.IP, error)) {
+	find := sync.OnceValues(func() (netpath.Path, *http.Client) { return subscriptionTunnel(cfgSvc, vpnSvc, tablesPath) })
 	client = func() *http.Client {
 		_, c := find()
 		return c
@@ -87,7 +95,7 @@ func lazyTunnel(ctx context.Context, cfgSvc service.ConfigStore, vpnSvc service.
 		if c == nil {
 			return nil, errNoTunnel
 		}
-		return lookupIPv4OnPath(ctx, p, host)
+		return netpath.LookupIPv4(ctx, p, host)
 	}
 	return client, lookup
 }
@@ -101,7 +109,7 @@ func lazyTunnel(ctx context.Context, cfgSvc service.ConfigStore, vpnSvc service.
 // that is not the subscription: the fetch returns the daemons' "resolving the
 // servers took longer than the deadline" when its deadline ended it, and the
 // context's error when it was cancelled - never a list cut short. A download
-// that failed reads as the daemons' own (service.DownloadError): the watch
+// that failed reads as the daemons' own (DownloadError): the watch
 // records it in the subscription's error, which the Web UI and /subs show.
 // tunnel is asked for the tunnel's client only once the WAN falls short, and
 // answers nil when there is none.
@@ -123,7 +131,7 @@ func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel f
 		}
 		slog.Debug("Subscription hostnames did not resolve over the WAN, trying the tunnel", "error", rerr)
 	} else {
-		err = service.NewDownloadError(err)
+		err = NewDownloadError(err)
 		// An ended context leaves the tunnel nothing to try, and finding the tunnel runs vpn-director.sh platform.
 		if ctx.Err() != nil || tunnel() == nil {
 			return nil, err
@@ -132,7 +140,7 @@ func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel f
 	}
 	body, err = getSubscription(ctx, tunnel(), rawURL)
 	if err != nil {
-		return nil, service.NewDownloadError(err)
+		return nil, NewDownloadError(err)
 	}
 	servers, err := serversFromSubscriptionLookup(body, tunnelLookup)
 	if cerr := ctx.Err(); cerr != nil {
@@ -146,7 +154,7 @@ func fetchServers(ctx context.Context, rawURL string, wan *http.Client, tunnel f
 // cancelled - a stop or a shutdown.
 func cutShort(err error) error {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &service.DownloadError{Err: service.ErrResolutionCutShort}
+		return &DownloadError{Err: ErrResolutionCutShort}
 	}
 	return err
 }
@@ -194,13 +202,13 @@ func serversFromSubscriptionLookup(body []byte, lookup func(host string) ([]net.
 	return result.Servers, nil
 }
 
-func subscriptionTunnel(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) (Path, *http.Client) {
+func subscriptionTunnel(cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath string) (netpath.Path, *http.Client) {
 	if cfgSvc == nil || vpnSvc == nil {
-		return Path{}, nil
+		return netpath.Path{}, nil
 	}
 	cfg, err := cfgSvc.LoadVPNConfig()
 	if err != nil || cfg == nil {
-		return Path{}, nil
+		return netpath.Path{}, nil
 	}
 	plat, platErr := vpnSvc.Platform()
 	if platErr != nil {
@@ -210,11 +218,15 @@ func subscriptionTunnel(cfgSvc service.ConfigStore, vpnSvc service.VPNDirector) 
 	// one the watch gave up on.
 	id := vpnconfig.FailoverTDExit(cfg, plat)
 	if id == "" {
-		return Path{}, nil
+		return netpath.Path{}, nil
 	}
-	p := subscriptionTunnelPath(cfg, plat, id)
+	path := defaultTunnelTablesPath
+	if tablesPath != "" {
+		path = tablesPath
+	}
+	p := netpath.TunnelPath(cfg, plat, id, path)
 	return p, newTunnelHTTPClient(func(ctx context.Context, network, addr string) (net.Conn, error) {
-		return refusePrivatePeer(DialPath(ctx, p, "tcp4", addr))
+		return refusePrivatePeer(netpath.DialPath(ctx, p, "tcp4", addr))
 	})
 }
 
@@ -248,20 +260,4 @@ func refusePrivatePeer(conn net.Conn, err error) (net.Conn, error) {
 		return nil, fmt.Errorf("%w: %s", ssrf.ErrBlockedAddress, remote)
 	}
 	return conn, nil
-}
-
-func subscriptionTunnelPath(cfg *vpnconfig.VPNDirectorConfig, plat vpnconfig.PlatformInfo, id string) Path {
-	var iface string
-	for _, t := range plat.Tunnels {
-		if t.ID == id {
-			iface = t.Iface
-			break
-		}
-	}
-	idxByID := loadTunnelIdxFile(defaultTunnelTablesPath)
-	var mark uint32
-	if idx, ok := idxByID[id]; ok {
-		mark = tunnelMark(idx, markShift(cfg))
-	}
-	return Path{kind: kindTunnel, id: id, iface: iface, mark: mark}
 }

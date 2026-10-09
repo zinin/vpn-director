@@ -221,6 +221,27 @@ a:hover {
   color: #999;
 }
 
+/* Server monitor */
+.health-alive {
+  color: #51cf66;
+}
+
+.health-dead {
+  color: #ff6b6b;
+}
+
+.health-unknown {
+  color: #999;
+}
+
+.health-rejected {
+  color: #f0a020;
+}
+
+.servers-table {
+  overflow-x: auto;
+}
+
 /* Grid layout */
 .grid-2 {
   display: grid;

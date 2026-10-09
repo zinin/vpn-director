@@ -1,7 +1,6 @@
 package subwatch
 
 import (
-	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -123,24 +122,5 @@ func TestWalkOrder_MarksEachServerWithItsSubscription(t *testing.T) {
 	}
 	if subs[0].Servers[0].Subscription != "" {
 		t.Fatal("walkOrder changed the subscriptions it read")
-	}
-}
-
-func TestDialKey_OneEndpointUnderTwoNamesIsOneServer(t *testing.T) {
-	ob := json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"de.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"tls"}}`)
-	a := vpnconfig.Server{Name: "Germany-1", Address: "de.example", Port: 443, IPs: []string{"192.0.2.1"}, Outbound: ob}
-	b := a
-	b.Name = "Germany-2"
-	c := a
-	c.IPs = []string{"192.0.2.2"}
-
-	if dialKey(a) != dialKey(b) {
-		t.Fatal("two names on one endpoint dial differently")
-	}
-	if dialKey(a) == dialKey(c) {
-		t.Fatal("two addresses dial alike")
-	}
-	if dialKey(vpnconfig.Server{Name: "Legacy", Address: "l.example", Port: 443}) != "" {
-		t.Fatal("a record without an outbound has a key")
 	}
 }

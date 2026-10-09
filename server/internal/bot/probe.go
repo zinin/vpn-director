@@ -7,15 +7,23 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/zinin/vpn-director/server/internal/netpath"
 )
 
 const probeTimeout = 8 * time.Second
 
 func probePath(ctx context.Context, apiBase, token string, p Path) error {
+	return probePathWith(ctx, apiBase, token, p, netpath.DialPath)
+}
+
+func probePathWith(ctx context.Context, apiBase, token string, p Path, dial func(context.Context, Path, string, string) (net.Conn, error)) error {
+	if dial == nil {
+		dial = netpath.DialPath
+	}
 	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	// Transport dials with context.WithoutCancel(req.Context()), which drops
-	// the deadline. Put it back so DialPath splits the 8s probe, not 30s.
+	// Transport drops the request deadline; restore it so dialing splits 8s, not 30s.
 	deadline, hasDeadline := ctx.Deadline()
 	client := &http.Client{
 		Timeout: probeTimeout,
@@ -27,7 +35,7 @@ func probePath(ctx context.Context, apiBase, token string, p Path) error {
 					ctx, cancel = context.WithDeadline(ctx, deadline)
 					defer cancel()
 				}
-				return DialPath(ctx, p, network, addr)
+				return dial(ctx, p, network, addr)
 			},
 			ForceAttemptHTTP2: true,
 		},

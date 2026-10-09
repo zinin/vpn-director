@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -11,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -430,160 +433,6 @@ func TestTick_StagedPickNotifiesPickedNotRestored(t *testing.T) {
 	}
 }
 
-func TestServerForDial_UsesResolvedIPKeepsHostnameSNI(t *testing.T) {
-	s := ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls"})
-	if s.Address != "203.0.113.50" {
-		t.Fatalf("address %q", s.Address)
-	}
-	if s.SNI != "oslo.example" {
-		t.Fatalf("sni %q", s.SNI)
-	}
-	s = ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "tls", SNI: "cdn.example"})
-	if s.SNI != "cdn.example" {
-		t.Fatalf("explicit sni %q", s.SNI)
-	}
-}
-
-// REALITY's server name is the site the handshake borrows, never the proxy's
-// own host. An entry without one cannot connect - the Web UI and /xray refuse
-// it - and the hostname must not make it look complete to the walk.
-func TestServerForDial_LeavesARealitySNIEmpty(t *testing.T) {
-	s := ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"203.0.113.50"}, Security: "reality"})
-	if s.Address != "203.0.113.50" {
-		t.Fatalf("address %q", s.Address)
-	}
-	if s.SNI != "" {
-		t.Fatalf("sni %q; a REALITY entry without one must stay without one", s.SNI)
-	}
-}
-
-// A stored outbound gets the IP in its own address slot, whatever the
-// protocol keeps it in; the record and the outbound agree on the address.
-func TestServerForDial_WritesTheIPIntoTheOutbound(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		outbound string
-		path     []string
-	}{
-		{"vless vnext", `{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443,"users":[{"id":"u"}]}]}}`, []string{"settings", "vnext", "0", "address"}},
-		{"vless flat", `{"protocol":"vless","settings":{"address":"oslo.example","port":443,"id":"u"}}`, []string{"settings", "address"}},
-		{"trojan", `{"protocol":"trojan","settings":{"servers":[{"address":"oslo.example","port":443,"password":"p"}]}}`, []string{"settings", "servers", "0", "address"}},
-		{"shadowsocks", `{"protocol":"shadowsocks","settings":{"servers":[{"address":"oslo.example","port":8388,"method":"aes-256-gcm","password":"p"}]}}`, []string{"settings", "servers", "0", "address"}},
-		{"hysteria", `{"protocol":"hysteria","settings":{"version":2,"address":"oslo.example","port":443}}`, []string{"settings", "address"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			s := ServerForDial(vpnconfig.Server{Address: "oslo.example", IPs: []string{"", "203.0.113.50"}, Outbound: json.RawMessage(tc.outbound)})
-			if s.Address != "203.0.113.50" {
-				t.Fatalf("address %q", s.Address)
-			}
-			var ob interface{}
-			if err := json.Unmarshal(s.Outbound, &ob); err != nil {
-				t.Fatal(err)
-			}
-			v := ob
-			for _, key := range tc.path {
-				switch node := v.(type) {
-				case map[string]interface{}:
-					v = node[key]
-				case []interface{}:
-					v = node[0]
-				}
-			}
-			if v != "203.0.113.50" {
-				t.Fatalf("outbound %s", s.Outbound)
-			}
-		})
-	}
-}
-
-// Dialing an IP must not change the name the server is reached by: an empty
-// TLS server name gets the hostname, and so does the Host of a transport
-// without security; with TLS Xray takes that Host from the server name, and
-// an explicit value stays.
-func TestServerForDial_KeepsTheHostnameWhereTheSourceLeftItToTheAddress(t *testing.T) {
-	dial := func(address, outbound string) map[string]interface{} {
-		t.Helper()
-		s := ServerForDial(vpnconfig.Server{Address: address, IPs: []string{"203.0.113.50"}, Outbound: json.RawMessage(outbound)})
-		var ob map[string]interface{}
-		if err := json.Unmarshal(s.Outbound, &ob); err != nil {
-			t.Fatal(err)
-		}
-		return ob["streamSettings"].(map[string]interface{})
-	}
-	ss := dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"ws","security":"tls","wsSettings":{"path":"/ws"}}}`)
-	if tls := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "cdn.example" {
-		t.Fatalf("tls %v", tls)
-	}
-	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
-		t.Fatalf("ws %v; with TLS the Host follows the server name", ws)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"httpupgrade","security":"none"}}`)
-	if hu := ss["httpupgradeSettings"].(map[string]interface{}); hu["host"] != "cdn.example" {
-		t.Fatalf("httpupgrade %v", hu)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"ws","wsSettings":{"headers":{"Host":"front.example"}}}}`)
-	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
-		t.Fatalf("ws %v; a Host header the source set stays the Host", ws)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"ws","wsSettings":{"headers":{"host":"front.example"}}}}`)
-	if ws := ss["wsSettings"].(map[string]interface{}); ws["host"] != nil {
-		t.Fatalf("ws %v; Xray takes a host header in any case, so it stays the Host", ws)
-	}
-	ss = dial("cdn.example", `{"protocol":"trojan","settings":{"servers":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"tcp","security":"tls","tlsSettings":{"serverName":"sni.example"}}}`)
-	if tls := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "sni.example" {
-		t.Fatalf("tls %v; an explicit server name stays", tls)
-	}
-	ss = dial("198.51.100.7", `{"protocol":"trojan","settings":{"servers":[{"address":"198.51.100.7","port":443}]},"streamSettings":{"network":"tcp","security":"tls"}}`)
-	if _, ok := ss["tlsSettings"]; ok {
-		t.Fatalf("stream %v; an IP source has no hostname to keep", ss)
-	}
-	ss = dial("oslo.example", `{"protocol":"vless","settings":{"vnext":[{"address":"oslo.example","port":443}]},"streamSettings":{"network":"xhttp","security":"reality","realitySettings":{"serverName":"www.example.org"}}}`)
-	if _, ok := ss["xhttpSettings"]; ok {
-		t.Fatalf("stream %v; REALITY gives xhttp its Host", ss)
-	}
-	// Xray reads xhttpSettings over splithttpSettings and drops the other, so
-	// the Host goes into the one the record has.
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"splithttp","splithttpSettings":{"path":"/secret","mode":"packet-up"}}}`)
-	if splithttp, _ := ss["splithttpSettings"].(map[string]interface{}); splithttp["host"] != "cdn.example" || splithttp["path"] != "/secret" {
-		t.Fatalf("splithttp %v", splithttp)
-	}
-	if _, ok := ss["xhttpSettings"]; ok {
-		t.Fatalf("stream %v; a new xhttpSettings would replace the splithttpSettings", ss)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/a"},"splithttpSettings":{"path":"/b"}}}`)
-	if xhttp, _ := ss["xhttpSettings"].(map[string]interface{}); xhttp["host"] != "cdn.example" {
-		t.Fatalf("xhttp %v", xhttp)
-	}
-	if splithttp, _ := ss["splithttpSettings"].(map[string]interface{}); splithttp["host"] != nil {
-		t.Fatalf("splithttp %v; Xray reads the xhttpSettings", splithttp)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"xhttp","security":"none"}}`)
-	if xhttp, _ := ss["xhttpSettings"].(map[string]interface{}); xhttp["host"] != "cdn.example" {
-		t.Fatalf("stream %v", ss)
-	}
-	// A cleartext gRPC stream takes its :authority from the address when
-	// grpcSettings names none; with TLS, Xray takes the server name.
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc"}}}`)
-	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "cdn.example" || grpc["serviceName"] != "svc" {
-		t.Fatalf("grpc %v", grpc)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none","grpcSettings":{"serviceName":"svc","authority":"front.example"}}}`)
-	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "front.example" {
-		t.Fatalf("grpc %v; an explicit authority stays", grpc)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":443}]},"streamSettings":{"network":"grpc","security":"tls","grpcSettings":{"serviceName":"svc"}}}`)
-	if tls, _ := ss["tlsSettings"].(map[string]interface{}); tls["serverName"] != "cdn.example" {
-		t.Fatalf("tls %v", tls)
-	}
-	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != nil {
-		t.Fatalf("grpc %v; with TLS the authority follows the server name", grpc)
-	}
-	ss = dial("cdn.example", `{"protocol":"vless","settings":{"vnext":[{"address":"cdn.example","port":80}]},"streamSettings":{"network":"grpc","security":"none"}}`)
-	if grpc, _ := ss["grpcSettings"].(map[string]interface{}); grpc["authority"] != "cdn.example" {
-		t.Fatalf("stream %v", ss)
-	}
-}
-
 // An endpoint ban takes an address, not the name: a provider's host can resolve
 // to one the router cannot reach and another it can. The walk dialed only the
 // first, and a server whose first address was banned was rejected whole.
@@ -601,7 +450,7 @@ func TestTick_WalkTriesEveryAddressOfAServer(t *testing.T) {
 		if err := f.checkGuard(guard); err != nil {
 			return false, f.seq(), err
 		}
-		current = ServerForDial(s).Address
+		current = endpoint.ServerForDial(s).Address
 		dialed = append(dialed, current)
 		return true, f.seq(), nil
 	}
@@ -1459,6 +1308,86 @@ func TestTick_ARestoreLeftPendingIsFinishedWithoutASubscription(t *testing.T) {
 	}
 }
 
+func TestPendingRestore_WrittenWithFailoverRemoval(t *testing.T) {
+	s := newRecoverySystem(t)
+	s.subs = []vpnconfig.Subscription{{ID: "alpha", Name: "Alpha", URL: "https://example.org/sub/synthetic-subscription-link", Servers: []vpnconfig.Server{{
+		Subscription: "alpha", Name: "Oslo", Address: "example.com", Port: 443,
+		UUID: "synthetic-uuid", PublicKey: "synthetic-key", ShortID: "synthetic-short-id",
+		Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"example.com","port":443,"users":[{"id":"synthetic-outbound-user"}]}]}}`),
+	}}}}
+	w := s.watch()
+	dropWrites, stageApplies, dropApplies := 0, 0, 0
+	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		return s.store.UpdateVPNConfig(func(current *vpnconfig.VPNDirectorConfig) error {
+			hadFailover := current.Xray.Failover != nil
+			if err := fn(current); err != nil {
+				return err
+			}
+			if hadFailover && current.Xray.Failover == nil {
+				dropWrites++
+				want := &recoveryIntent{
+					Snapshot: &vpnconfig.XrayFailover{Tunnel: "ovpnc2", Clients: []string{"192.168.1.8", "192.168.1.3"}, Added: []string{"192.168.1.8"}, Committed: true},
+					Restored: []string{"192.168.1.8", "192.168.1.3"},
+					Active:   &vpnconfig.ActiveServer{Name: "Oslo", Address: "example.com", Port: 443, Subscription: "alpha", Seq: 7},
+				}
+				if got := recoveryIntentForConfig(t, current); !reflect.DeepEqual(got, want) {
+					t.Fatalf("pending restore inside failover-removal transaction = %+v, want %+v", got, want)
+				}
+				if stageApplies == 0 {
+					t.Fatal("fallback membership was removed before the staged Xray apply")
+				}
+				raw, err := json.Marshal(current)
+				if err != nil {
+					return err
+				}
+				var doc struct {
+					Xray struct {
+						PendingRestore json.RawMessage `json:"pending_restore"`
+					} `json:"xray"`
+				}
+				if err := json.Unmarshal(raw, &doc); err != nil {
+					return err
+				}
+				var fields map[string]json.RawMessage
+				if err := json.Unmarshal(doc.Xray.PendingRestore, &fields); err != nil {
+					return err
+				}
+				if len(fields) != 3 {
+					t.Fatal("pending restore must contain only snapshot, restored and active metadata")
+				}
+				for _, secret := range []string{"synthetic-uuid", "synthetic-key", "synthetic-short-id", "synthetic-outbound-user", "https://example.org/sub/synthetic-subscription-link"} {
+					if strings.Contains(string(doc.Xray.PendingRestore), secret) {
+						t.Fatal("pending restore persisted server credentials instead of routing snapshot and active identity")
+					}
+				}
+			}
+			return nil
+		})
+	}
+	w.Apply = func() error {
+		s.applies++
+		cfg, pending, _ := s.read(t)
+		if cfg.Xray.Failover != nil {
+			stageApplies++
+			if !contains(cfg.Xray.Clients, "192.168.1.8") || !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") {
+				t.Fatal("stage Apply must retain both Xray and fallback membership")
+			}
+			return nil
+		}
+		dropApplies++
+		if pending == nil || contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.8") || !contains(cfg.TunnelDirector.Tunnels["ovpnc2"].Clients, "192.168.1.3") {
+			t.Fatal("final Apply must see durable intent, removed appended membership and preserved overlap")
+		}
+		return errApply
+	}
+
+	w.Tick(context.Background())
+	cfg, pending, _ := s.read(t)
+	if dropWrites != 1 || stageApplies == 0 || dropApplies != 1 || cfg.Xray.Failover != nil || pending == nil || len(s.notes) != 0 {
+		t.Fatalf("failed final Apply: drop writes %d, stage applies %d, drop applies %d, failover %+v, pending %+v, notes %v", dropWrites, stageApplies, dropApplies, cfg.Xray.Failover, pending, s.notes)
+	}
+}
+
 func TestTick_TunnelGoneAtMoveSkipsApplyAndNotify(t *testing.T) {
 	f := &fake{
 		cfg:      baseCfg(),
@@ -2036,6 +1965,87 @@ func TestTick_WalkContinuesPastACandidateWhoseRecordWasNotSaved(t *testing.T) {
 	}
 	if f.cfg.Xray.Failover != nil {
 		t.Fatal("the live Extra must restore the clients")
+	}
+}
+
+// Xray's config test of a candidate can time out on its own deadline, and its
+// error then wraps context.DeadlineExceeded. While the tick runs that is the
+// candidate's failure, and the walk goes on to the next one; the same error
+// once a stop has cancelled the tick ends the walk.
+func TestTick_WalkContextErrorEndsTheWalkOnlyWithTheTick(t *testing.T) {
+	defer func(poll time.Duration) { stopPoll = poll }(stopPoll)
+	stopPoll = time.Millisecond
+	for _, tc := range []struct {
+		name string
+		stop bool
+		want []string
+	}{
+		{"live tick", false, []string{"Backup", "Extra"}},
+		{"stopped tick", true, []string{"Backup"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fake{
+				cfg:  failedOverCfg(),
+				plat: vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{{ID: "ovpnc2", Iface: "tun12", Connected: true}}},
+				now:  time.Unix(1_700_000_000, 0),
+			}
+			f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
+			var stopped atomic.Bool
+			generated, restarts := []string{}, 0
+			w := runningWatch(f.watch())
+			w.Stopped = stopped.Load
+			w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) {
+				return []vpnconfig.Server{
+					{Name: "Backup", Address: "backup.example", Port: 443},
+					{Name: "Extra", Address: "extra.example", Port: 443},
+				}, nil
+			}
+			w.Generate = func(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				if err := f.checkGuard(guard); err != nil {
+					return false, f.seq(), err
+				}
+				generated = append(generated, s.Name)
+				if s.Name != "Backup" {
+					f.cfg.Xray.ActiveServer = vpnconfig.NewActiveServer(s)
+					return true, f.seq(), nil
+				}
+				if tc.stop {
+					stopped.Store(true)
+					select {
+					case <-w.mutationContext.Done():
+					case <-time.After(5 * time.Second):
+						t.Error("the stop did not cancel the tick")
+					}
+				}
+				return false, f.seq(), fmt.Errorf("xray config test timed out after 15s: %w", context.DeadlineExceeded)
+			}
+			w.RestartXray = func() error {
+				restarts++
+				return nil
+			}
+			w.AfterRestart = func(time.Duration) {}
+			w.Probe = func(context.Context, int) error {
+				if len(generated) > 0 && generated[len(generated)-1] == "Extra" {
+					return nil
+				}
+				return errProbe
+			}
+
+			w.Tick(context.Background())
+
+			if !reflect.DeepEqual(generated, tc.want) {
+				t.Fatalf("generated %v, want %v", generated, tc.want)
+			}
+			if tc.stop {
+				if restarts != 0 || f.cfg.Xray.Failover == nil {
+					t.Fatalf("restarts %d, failover %+v; a stopped walk restarts and restores nothing", restarts, f.cfg.Xray.Failover)
+				}
+				return
+			}
+			if f.cfg.Xray.Failover != nil {
+				t.Fatal("the live Extra must restore the clients")
+			}
+		})
 	}
 }
 
@@ -3247,19 +3257,19 @@ func TestTick_RestoreApplyAndWriteBackFailureRetriesApplyBeforeProbe(t *testing.
 		probes++
 		return nil
 	}
-	// Fail only the write-back: the update right after the one that restored.
-	updates, restoredAt := 0, 0
+	// Fail routing reinstatement, not the metadata-only final clear.
 	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
-		updates++
-		if restoredAt != 0 && updates == restoredAt+1 {
-			return errors.New("config lock timeout")
-		}
-		if err := fn(f.cfg); err != nil {
+		current, err := cloneCfg(f.cfg)
+		if err != nil {
 			return err
 		}
-		if restoredAt == 0 && f.cfg.Xray.Failover == nil {
-			restoredAt = updates
+		if err := fn(current); err != nil {
+			return err
 		}
+		if f.cfg.Xray.Failover == nil && current.Xray.Failover != nil {
+			return errors.New("config lock timeout")
+		}
+		*f.cfg = *current
 		return nil
 	}
 
@@ -4212,5 +4222,69 @@ func TestTick_ANewEpisodeGivesItsFallbackTimeBeforeMovingOn(t *testing.T) {
 	tickFor(w, f, ImportRetry-time.Minute)
 	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "ovpnc2" {
 		t.Fatalf("failover %+v; the new episode's fallback got no time", f.cfg.Xray.Failover)
+	}
+}
+
+func TestFast_PendingRestorePrecedesNewAttempt(t *testing.T) {
+	for _, state := range []string{"ready recovery", "unready recovery", "deleted tunnel while unarmed", "stopped recovery"} {
+		t.Run(state, func(t *testing.T) {
+			s := newRecoverySystem(t)
+			s.seedPending(t)
+			if state == "unready recovery" || state == "deleted tunnel while unarmed" {
+				s.setReady(t, false)
+			}
+			if state == "deleted tunnel while unarmed" {
+				if err := s.store.UpdateVPNConfig(func(cfg *vpnconfig.VPNDirectorConfig) error {
+					delete(cfg.TunnelDirector.Tunnels, "ovpnc2")
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				s.probeErr = errProbe
+				s.subs = nil
+			} else {
+				active := fastServer("Oslo", "example.com", "203.0.113.10")
+				s.subs = []vpnconfig.Subscription{{ID: "alpha", Name: "Alpha", URL: "https://alpha.example/list", Servers: []vpnconfig.Server{active}}}
+			}
+			if state == "stopped recovery" {
+				if err := os.WriteFile(s.readiness.StoppedPath, nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			w := s.watch()
+			health := newFastFixture(t).h
+			w.Health = health
+			wan, generated, restarted := 0, 0, 0
+			w.WANUp = func(context.Context) bool { wan++; return true }
+			w.Generate = func(vpnconfig.Server, func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				generated++
+				return false, 7, errProbe
+			}
+			w.RestartXray = func() error { restarted++; return nil }
+			w.Tick(context.Background())
+			cfg, pending, _ := s.read(t)
+			if len(health.requests()) != 0 || wan != 0 || generated != 0 || restarted != 0 || s.probes != 0 {
+				t.Fatalf("recovery %s started a new fast attempt: checks %d, WAN %d, generate %d, restart %d, probe %d", state, len(health.requests()), wan, generated, restarted, s.probes)
+			}
+			if cfg.Xray.ActiveServer.Name != "Oslo" || cfg.Xray.ActiveServer.Seq != 7 {
+				t.Fatalf("recovery changed the selected identity/sequence: %+v", cfg.Xray.ActiveServer)
+			}
+			switch state {
+			case "ready recovery":
+				assertRecoveryFinished(t, s)
+			case "unready recovery":
+				if pending != nil || !vpnconfig.FailoverCommitted(cfg) || contains(cfg.Xray.Clients, "192.168.1.8") {
+					t.Fatalf("unready recovery lost the guarded fallback: failover %+v, pending %+v, clients %v", cfg.Xray.Failover, pending, cfg.Xray.Clients)
+				}
+			case "deleted tunnel while unarmed":
+				if pending == nil || cfg.Xray.Failover != nil || len(s.notes) != 0 {
+					t.Fatalf("deleted tunnel recovery must retain intent, not invent a fast fallback: pending %+v, failover %+v, notes %v", pending, cfg.Xray.Failover, s.notes)
+				}
+			case "stopped recovery":
+				if pending == nil || s.applies != 0 || len(s.notes) != 0 {
+					t.Fatalf("stopped recovery mutated intent: pending %+v, apply %d, notes %v", pending, s.applies, s.notes)
+				}
+			}
+		})
 	}
 }

@@ -826,7 +826,7 @@ func TestCopyExecutable_LeavesNoPartialFileBehind(t *testing.T) {
 
 // Step 2 is its own daemon's binary of the release it installs, so that asset
 // is one the release need not carry at all: a release that ships only the
-// other daemon's still installs.
+// other daemons' still installs.
 func TestDownloadBinaries_NeedsNoAssetForTheDaemonItIs(t *testing.T) {
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("binary of " + strings.TrimPrefix(r.URL.Path, "/")))
@@ -842,6 +842,7 @@ func TestDownloadBinaries_NeedsNoAssetForTheDaemonItIs(t *testing.T) {
 		daemon: DaemonWebUI, selfBinary: self}
 	release := &Release{TagName: "v1.0.0", Assets: []Asset{
 		{Name: DaemonBot + "-arm64", DownloadURL: server.URL + "/" + DaemonBot + "-arm64"},
+		{Name: DaemonWatchd + "-arm64", DownloadURL: server.URL + "/" + DaemonWatchd + "-arm64"},
 	}}
 
 	if err := s.downloadBinaries(context.Background(), release); err != nil {

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -103,7 +104,7 @@ func TestPathManager_PlatformErrorSkipsTunnels(t *testing.T) {
 		},
 		Listening: func(int) bool { return false },
 		Probe: func(ctx context.Context, p Path) error {
-			if p.kind == kindTunnel {
+			if p.Kind == netpath.KindTunnel {
 				t.Fatal("must not probe tunnels when platform fails")
 			}
 			return errors.New("dead")
@@ -122,7 +123,7 @@ func TestPathManager_ReportFailureNoopIfStale(t *testing.T) {
 	if m.Current().String() != "direct" {
 		t.Fatal(m.Current())
 	}
-	m.ReportFailure(Path{kind: kindTunnel, id: "ovpnc2"})
+	m.ReportFailure(Path{Kind: netpath.KindTunnel, ID: "ovpnc2"})
 	time.Sleep(50 * time.Millisecond)
 	if m.Current().String() != "direct" {
 		t.Fatalf("stale failure flapped to %s", m.Current())
@@ -157,7 +158,7 @@ func TestPathManager_TunnelPathGetsAppliedMark(t *testing.T) {
 			return map[string]int{"ovpnc2": 0}
 		},
 		Probe: func(ctx context.Context, p Path) error {
-			if p.kind == kindTunnel && p.mark == 0x10000 {
+			if p.Kind == netpath.KindTunnel && p.Mark == 0x10000 {
 				return nil
 			}
 			return errors.New("dead")
@@ -165,8 +166,8 @@ func TestPathManager_TunnelPathGetsAppliedMark(t *testing.T) {
 		Interval: time.Hour,
 	})
 	m.SelectOnce(context.Background())
-	if m.Current().String() != "tunnel:ovpnc2" || m.Current().mark != 0x10000 {
-		t.Fatalf("%s mark=0x%x", m.Current(), m.Current().mark)
+	if m.Current().String() != "tunnel:ovpnc2" || m.Current().Mark != 0x10000 {
+		t.Fatalf("%s mark=0x%x", m.Current(), m.Current().Mark)
 	}
 }
 
@@ -244,21 +245,21 @@ func TestPathManager_RefreshesSOCKSPortWithoutDropping(t *testing.T) {
 		LoadPlatform: func() (vpnconfig.PlatformInfo, error) { return vpnconfig.PlatformInfo{}, nil },
 		Listening:    func(int) bool { return true },
 		Probe: func(ctx context.Context, p Path) error {
-			if p.kind == kindDirect {
+			if p.Kind == netpath.KindDirect {
 				return errors.New("dead")
 			}
 			mu.Lock()
 			live := livePort
 			mu.Unlock()
-			if p.kind == kindSOCKS && p.socksPort == live {
+			if p.Kind == netpath.KindSOCKS && p.SOCKSPort == live {
 				return nil
 			}
 			return errors.New("dead")
 		},
 	})
 	m.SelectOnce(context.Background())
-	if m.Current().kind != kindSOCKS || m.Current().socksPort != 12346 {
-		t.Fatalf("first: %s port=%d", m.Current(), m.Current().socksPort)
+	if m.Current().Kind != netpath.KindSOCKS || m.Current().SOCKSPort != 12346 {
+		t.Fatalf("first: %s port=%d", m.Current(), m.Current().SOCKSPort)
 	}
 	n := 0
 	m.RegisterIdleCloser(func(Path) { n++ })
@@ -268,8 +269,8 @@ func TestPathManager_RefreshesSOCKSPortWithoutDropping(t *testing.T) {
 	mu.Unlock()
 	m.SelectOnce(context.Background())
 	cur := m.Current()
-	if cur.kind != kindSOCKS || cur.socksPort != 23456 {
-		t.Fatalf("after port change: %s port=%d", cur, cur.socksPort)
+	if cur.Kind != netpath.KindSOCKS || cur.SOCKSPort != 23456 {
+		t.Fatalf("after port change: %s port=%d", cur, cur.SOCKSPort)
 	}
 	if n != 1 {
 		t.Fatalf("param change must retire connections: closers=%d", n)
@@ -291,21 +292,21 @@ func TestPathManager_RefreshesTunnelIfaceWithoutDropping(t *testing.T) {
 		},
 		Listening: func(int) bool { return false },
 		Probe: func(ctx context.Context, p Path) error {
-			if p.kind != kindTunnel {
+			if p.Kind != netpath.KindTunnel {
 				return errors.New("dead")
 			}
 			mu.Lock()
 			live := liveIface
 			mu.Unlock()
-			if p.iface == live {
+			if p.Iface == live {
 				return nil
 			}
 			return errors.New("dead")
 		},
 	})
 	m.SelectOnce(context.Background())
-	if m.Current().String() != "tunnel:ovpnc2" || m.Current().iface != "tun12" {
-		t.Fatalf("first: %s iface=%q", m.Current(), m.Current().iface)
+	if m.Current().String() != "tunnel:ovpnc2" || m.Current().Iface != "tun12" {
+		t.Fatalf("first: %s iface=%q", m.Current(), m.Current().Iface)
 	}
 	mu.Lock()
 	iface = "tun13"
@@ -313,8 +314,8 @@ func TestPathManager_RefreshesTunnelIfaceWithoutDropping(t *testing.T) {
 	mu.Unlock()
 	m.SelectOnce(context.Background())
 	cur := m.Current()
-	if cur.String() != "tunnel:ovpnc2" || cur.iface != "tun13" {
-		t.Fatalf("after iface change: %s iface=%q", cur, cur.iface)
+	if cur.String() != "tunnel:ovpnc2" || cur.Iface != "tun13" {
+		t.Fatalf("after iface change: %s iface=%q", cur, cur.Iface)
 	}
 }
 

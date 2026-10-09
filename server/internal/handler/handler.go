@@ -8,6 +8,7 @@ import (
 	"github.com/zinin/vpn-director/server/internal/paths"
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/telegram"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 // Deps holds dependencies for all handlers
@@ -27,6 +28,10 @@ type Deps struct {
 	// TelegramPath is the bot's current Telegram API path, nil when there is
 	// none: dev mode, and the Web UI, which runs no path manager.
 	TelegramPath func() string
+	// Monitor is vpn-director-watchd's server monitor; nil means no marks.
+	Monitor watchdapi.API
+	// Watch is the daemon's independent subscription automation status.
+	Watch watchdapi.WatchAPI
 }
 
 // configUpdateError phrases an UpdateVPNConfig failure the way the bot has

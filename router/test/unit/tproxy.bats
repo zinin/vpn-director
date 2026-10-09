@@ -639,6 +639,63 @@ duplicate_last_rule() {
     grep -q "ipset add TPROXY_BYPASS_NEW 198.51.100.9" /tmp/bats_ipset_calls.log
 }
 
+@test "_tproxy_setup_bypass_ipset: resolves every Wireguard peer hostname without dropping later peers" {
+    export VPD_PLATFORM=keenetic
+    export PATH="$TEST_ROOT/mocks/keenetic:$PATH"
+    export BATS_RCI_FIXTURES="$BATS_TEST_TMPDIR/rci"
+    mkdir -p "$BATS_RCI_FIXTURES/show"
+    jq '.Wireguard1.wireguard.peer[0] as $peer |
+        .Wireguard1.wireguard.peer = [
+            ($peer + {"public-key":"PEER_ONE", "remote":"wg-one.example.test"}),
+            ($peer + {"public-key":"PEER_TWO", "remote":"wg-two.example.test"}),
+            ($peer + {"public-key":"PEER_THREE", "remote":"wg-three.example.test"})
+        ]' "$TEST_ROOT/fixtures/keenetic/rci/show/interface.json" \
+        > "$BATS_RCI_FIXTURES/show/interface.json"
+    load_common
+    jq '.xray.servers = [] | .xray.exclude_ips = []' "$TEST_ROOT/fixtures/vpn-director.json" \
+        > "$BATS_TEST_TMPDIR/vpn-director.json"
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/tproxy.sh" --source-only
+    use_stateful_ipset
+
+    resolve_ip() {
+        printf '%s\n' "$*" >> "$BATS_TEST_TMPDIR/resolver.calls"
+        [[ $# -eq 3 && $1 == -a && $2 == -q ]] || return 1
+        case "$3" in
+            203.0.113.7) printf '203.0.113.7\n' ;;
+            wg-one.example.test)
+                [[ $fail_first -eq 0 ]] || return 1
+                printf '192.0.2.101\n192.0.2.102\n'
+                ;;
+            wg-two.example.test) printf '198.51.100.103\n' ;;
+            wg-three.example.test) printf '203.0.113.104\n' ;;
+            *) return 1 ;;
+        esac
+    }
+    local fail_first
+    for fail_first in 0 1; do
+        : > "$BATS_TEST_TMPDIR/resolver.calls"
+        run _tproxy_setup_bypass_ipset
+        assert_success
+        run cat "$BATS_TEST_TMPDIR/resolver.calls"
+        assert_success
+        assert_output $'-a -q 203.0.113.7\n-a -q wg-one.example.test\n-a -q wg-two.example.test\n-a -q wg-three.example.test'
+        run ipset list TPROXY_BYPASS
+        assert_success
+        if [[ $fail_first -eq 0 ]]; then
+            assert_output $'Name: TPROXY_BYPASS\nType: hash:net\nNumber of entries: 5\nMembers:\n203.0.113.7\n192.0.2.101\n192.0.2.102\n198.51.100.103\n203.0.113.104'
+        else
+            assert_output $'Name: TPROXY_BYPASS\nType: hash:net\nNumber of entries: 3\nMembers:\n203.0.113.7\n198.51.100.103\n203.0.113.104'
+            grep -qF 'Cannot resolve VPN endpoint wg-one.example.test' "$LOG_FILE"
+        fi
+        run ipset list -n TPROXY_BYPASS_NEW
+        assert_failure
+    done
+}
+
 @test "_tproxy_setup_iptables: applies platform extra rules with the configured mark and one jump per LAN interface" {
     load_tproxy_module
     platform_tproxy_extra_rules() { echo "extra $1 $2" >> "$BATS_TEST_TMPDIR/extra.log"; }

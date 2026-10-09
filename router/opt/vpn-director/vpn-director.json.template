@@ -7,6 +7,13 @@
     "jwt_secret": "",
     "log_level": "info"
   },
+  "monitor": {
+    "enabled": true,
+    "interval": "1m",
+    "dead_interval_max": "30m",
+    "concurrency": 8,
+    "log_level": "info"
+  },
   "tunnel_director": {
     "tunnels": {}
   },

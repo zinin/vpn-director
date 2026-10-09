@@ -54,7 +54,7 @@ func xrayHandler(store *subsStore) (*XrayHandler, *recordingSender, *mockXrayGen
 func selectData(sub vpnconfig.Subscription, i int) string {
 	s := sub.Servers[i]
 	s.Subscription = sub.ID
-	return fmt.Sprintf("xray:select:%s:%d:%s", sub.ID, i, serverFingerprint(s))
+	return fmt.Sprintf("xray:select:%s:%d:%s", sub.ID, i, vpnconfig.ServerFingerprint(s))
 }
 
 func TestXray_OneSubscriptionOpensOnItsServers(t *testing.T) {
@@ -87,7 +87,7 @@ func TestXray_SeveralSubscriptionsOpenOnTheSubscriptions(t *testing.T) {
 func TestXray_ASubscriptionIsListedThirtyServersAPage(t *testing.T) {
 	sub := vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha", Servers: servers(62)}
 
-	_, kb := xrayServersPage(sub, 0, true, nil)
+	_, kb := xrayServersPage(sub, 0, true, nil, health{})
 	var data []string
 	for _, row := range kb.InlineKeyboard {
 		for _, b := range row {
@@ -98,7 +98,7 @@ func TestXray_ASubscriptionIsListedThirtyServersAPage(t *testing.T) {
 		t.Fatalf("page 1: %d buttons, tail %v", len(data), data[30:])
 	}
 
-	_, kb = xrayServersPage(sub, 2, false, nil)
+	_, kb = xrayServersPage(sub, 2, false, nil, health{})
 	last := kb.InlineKeyboard[len(kb.InlineKeyboard)-1]
 	if len(last) != 1 || *last[0].CallbackData != "xray:sub:0a1b2c3d:1" {
 		t.Fatalf("page 3 navigation %v", last)
@@ -118,8 +118,8 @@ func TestXray_TheCheckMarksOnlyTheRunningServer(t *testing.T) {
 		{"Beta's", &vpnconfig.ActiveServer{Subscription: "1b2c3d4e", Name: "Germany-1", Address: "de.example.com", Port: 443}, "1. Germany-1", "✓ 1. Germany-1"},
 		{"a record without a subscription", &vpnconfig.ActiveServer{Name: "Germany-1", Address: "de.example.com", Port: 443}, "1. Germany-1", "1. Germany-1"},
 	} {
-		_, alpha := xrayServersPage(subs[0], 0, true, tc.active)
-		_, beta := xrayServersPage(subs[1], 0, true, tc.active)
+		_, alpha := xrayServersPage(subs[0], 0, true, tc.active, health{})
+		_, beta := xrayServersPage(subs[1], 0, true, tc.active, health{})
 		if a, b := alpha.InlineKeyboard[0][0].Text, beta.InlineKeyboard[0][0].Text; a != tc.alpha || b != tc.beta {
 			t.Errorf("%s: Alpha %q, Beta %q", tc.name, a, b)
 		}
@@ -131,7 +131,7 @@ func TestXray_TheCheckMarksOnlyTheRunningServer(t *testing.T) {
 func TestXray_TheFingerprintTellsSubscriptionsApart(t *testing.T) {
 	a, b := twoGermanies()[0].Servers[0], twoGermanies()[1].Servers[0]
 	a.Subscription, b.Subscription = "0a1b2c3d", "1b2c3d4e"
-	if serverFingerprint(a) == serverFingerprint(b) {
+	if vpnconfig.ServerFingerprint(a) == vpnconfig.ServerFingerprint(b) {
 		t.Fatal("one fingerprint for two subscriptions")
 	}
 }
@@ -211,5 +211,131 @@ func TestXray_BackWithNothingLeftClearsTheKeyboard(t *testing.T) {
 	}
 	if !strings.Contains(sender.last(), "/import") || string(kb) != `{"inline_keyboard":[]}` {
 		t.Fatalf("reply %q, keyboard %s", sender.last(), kb)
+	}
+}
+
+func TestXray_TheExistingButtonFingerprintStillWorks(t *testing.T) {
+	store := newSubsStore(twoGermanies()...)
+	h, sender, gen, vpn := xrayHandler(store)
+	_, kb := xrayServersPage(store.subs[0], 0, true, nil, health{})
+	const callback = "xray:select:0a1b2c3d:0:84130acd"
+	if got := *kb.InlineKeyboard[0][0].CallbackData; got != callback {
+		t.Fatalf("callback %q", got)
+	}
+	h.HandleCallback(xrayCallback(callback))
+	if gen.lastServer.Subscription != "0a1b2c3d" || gen.lastServer.Name != "Germany-1" || !vpn.restartCalled {
+		t.Fatalf("generated %+v, restarted %t", gen.lastServer, vpn.restartCalled)
+	}
+	if a := store.cfg.Xray.ActiveServer; a == nil || a.Subscription != "0a1b2c3d" || !strings.Contains(sender.last(), "Alpha / Germany") {
+		t.Fatalf("active %+v, reply %q", a, sender.last())
+	}
+}
+
+func TestXray_MonitorGolden(t *testing.T) {
+	sub := vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha_[x]", Servers: servers(4)}
+	beta := vpnconfig.Subscription{ID: "1b2c3d4e", Name: "Beta", Servers: servers(1)}
+	beta.Servers[0].Port = 100
+	for _, tc := range monitorPageCases(sub) {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, flow := range []struct {
+				name          string
+				subs          []vpnconfig.Subscription
+				callback      string
+				subscriptions bool
+			}{
+				{"single-command", []vpnconfig.Subscription{sub}, "", false},
+				{"multiple-command", []vpnconfig.Subscription{sub, beta}, "", true},
+				{"single-callback", []vpnconfig.Subscription{sub}, "xray:sub:0a1b2c3d:0", false},
+				{"multiple-callback", []vpnconfig.Subscription{sub, beta}, "xray:sub:0a1b2c3d:0", false},
+				{"single-back", []vpnconfig.Subscription{sub}, "xray:subs", false},
+				{"multiple-back", []vpnconfig.Subscription{sub, beta}, "xray:subs", true},
+			} {
+				t.Run(flow.name, func(t *testing.T) {
+					store := newSubsStore(flow.subs...)
+					store.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Subscription: sub.ID, Name: "S1", Address: "a.example.com", Port: 1}
+					sender := &recordingSender{}
+					h := NewXrayHandler(&Deps{Sender: sender, Config: store, Monitor: tc.api})
+					if flow.callback != "" {
+						h.HandleCallback(xrayCallback(flow.callback))
+					} else {
+						h.HandleXray(&tgbotapi.Message{Chat: &tgbotapi.Chat{ID: 123}})
+					}
+					wantText := `Alpha\_\[x\]: выберите сервер`
+					if flow.subscriptions {
+						wantText = "Выберите подписку:"
+					}
+					if tc.note != "" {
+						wantText += "\n" + tc.note
+					}
+					var wantKB tgbotapi.InlineKeyboardMarkup
+					if flow.subscriptions {
+						alphaLabel, betaLabel := "✓ Alpha_[x] (4)", "Beta (1)"
+						if tc.marked {
+							alphaLabel, betaLabel = "✓ Alpha_[x] (1/4)", "Beta (0/1)"
+						}
+						wantKB = tgbotapi.NewInlineKeyboardMarkup(
+							tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(alphaLabel, "xray:sub:0a1b2c3d:0")),
+							tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(betaLabel, "xray:sub:1b2c3d4e:0")),
+						)
+					} else {
+						labels := []string{"✓ 1. S1", "2. S2", "3. S3", "4. S4"}
+						if tc.marked {
+							labels = []string{"✓ 🟢 1. S1 · 142 ms", "🔴 2. S2", "⚪ 3. S3", "⛔ 4. S4"}
+						}
+						wantKB = tgbotapi.NewInlineKeyboardMarkup(
+							tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(labels[0], selectData(sub, 0)), tgbotapi.NewInlineKeyboardButtonData(labels[1], selectData(sub, 1))),
+							tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(labels[2], selectData(sub, 2)), tgbotapi.NewInlineKeyboardButtonData(labels[3], selectData(sub, 3))),
+						)
+						if len(flow.subs) > 1 {
+							wantKB.InlineKeyboard = append(wantKB.InlineKeyboard, tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("« Back", "xray:subs")))
+						}
+					}
+					if got := sender.last(); got != wantText {
+						t.Fatalf("got %q, want %q", got, wantText)
+					}
+					if !reflect.DeepEqual(sender.keyboard, wantKB) {
+						t.Fatalf("keyboard got %+v, want %+v", sender.keyboard, wantKB)
+					}
+					if got := sender.edits; (flow.callback == "" && got != 0) || (flow.callback != "" && got != 1) {
+						t.Fatalf("edits=%d for callback %q", got, flow.callback)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestXray_PaginationRetainsEveryMonitorNote(t *testing.T) {
+	sub := vpnconfig.Subscription{ID: "0a1b2c3d", Name: "Alpha_[x]", Servers: servers(32)}
+	beta := vpnconfig.Subscription{ID: "1b2c3d4e", Name: "Beta", Servers: servers(1)}
+	for _, tc := range monitorPageCases(sub) {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, subs := range [][]vpnconfig.Subscription{{sub}, {sub, beta}} {
+				sender := &recordingSender{}
+				h := NewXrayHandler(&Deps{Sender: sender, Config: newSubsStore(subs...), Monitor: tc.api})
+				h.HandleCallback(xrayCallback("xray:sub:0a1b2c3d:1"))
+				want := `Alpha\_\[x\]: выберите сервер \(стр\. 2/2\)`
+				if tc.note != "" {
+					want += "\n" + tc.note
+				}
+				if got := sender.last(); got != want {
+					t.Fatalf("got %q, want %q", got, want)
+				}
+				labels := []string{"31. S31", "32. S32"}
+				if tc.marked {
+					labels = []string{"⚪ 31. S31", "⛔ 32. S32"}
+				}
+				wantKB := tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData(labels[0], selectData(sub, 30)), tgbotapi.NewInlineKeyboardButtonData(labels[1], selectData(sub, 31))),
+					tgbotapi.NewInlineKeyboardRow(tgbotapi.NewInlineKeyboardButtonData("◀", "xray:sub:0a1b2c3d:0")),
+				)
+				if len(subs) > 1 {
+					wantKB.InlineKeyboard[1] = append(wantKB.InlineKeyboard[1], tgbotapi.NewInlineKeyboardButtonData("« Back", "xray:subs"))
+				}
+				if !reflect.DeepEqual(sender.keyboard, wantKB) {
+					t.Fatalf("keyboard got %+v, want %+v", sender.keyboard, wantKB)
+				}
+			}
+		})
 	}
 }

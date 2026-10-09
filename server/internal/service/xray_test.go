@@ -2,10 +2,13 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -555,4 +558,346 @@ func TestGenerateConfig_WithoutXrayNothingIsTested(t *testing.T) {
 	if content, _ := os.ReadFile(outputPath); string(content) == "previous\n" {
 		t.Fatal("config.json was not replaced")
 	}
+}
+
+// The monitor's prober holds the outbound Generate would write, under a tag of
+// its own, and refuses what Generate refuses.
+func TestOutboundJSON_TagsTheOutboundGenerateWouldWrite(t *testing.T) {
+	stored := vpnconfig.Server{Name: "Oslo", Address: "192.0.2.10", Port: 443,
+		Outbound: json.RawMessage(`{"protocol":"trojan","settings":{"servers":[{"address":"192.0.2.10","port":443,"password":"p"}]},"tag":"proxy-out"}`)}
+	raw, err := OutboundJSON(stored, "m7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ob map[string]interface{}
+	if err := json.Unmarshal(raw, &ob); err != nil {
+		t.Fatal(err)
+	}
+	if ob["tag"] != "m7" || ob["protocol"] != "trojan" {
+		t.Fatalf("outbound %s", raw)
+	}
+
+	legacy := vpnconfig.Server{Name: "Legacy", Address: "192.0.2.11", Port: 443, UUID: "u", Security: "tls", SNI: "l.example"}
+	raw, err = OutboundJSON(legacy, "m8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &ob); err != nil {
+		t.Fatal(err)
+	}
+	if ob["tag"] != "m8" || ob["protocol"] != "vless" {
+		t.Fatalf("legacy outbound %s", raw)
+	}
+
+	refused := vpnconfig.Server{Name: "X", Address: "192.0.2.12", Port: 443,
+		Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"192.0.2.12","port":443,"users":[{"id":"u"}]}]},"streamSettings":{"network":"xhttp","security":"tls","xhttpSettings":{"extra":{"downloadSettings":{}}}}}`)}
+	if _, err := OutboundJSON(refused, "m9"); err == nil || !strings.Contains(err.Error(), "downloadSettings without an address") {
+		t.Fatalf("err %v, want the refusal Generate makes", err)
+	}
+}
+
+// Retagging must preserve the numeric literals the shared validator inspected.
+func TestOutboundJSON_PreservesNumericLiterals(t *testing.T) {
+	for _, tc := range []struct {
+		name, literal string
+		refused       bool
+	}{
+		{name: "decimal packet-up limit", literal: "8192.0"},
+		{name: "integer above 2^53", literal: "9007199254740993"},
+		{name: "small integer packet-up limit", literal: "8192", refused: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := vpnconfig.Server{Name: "Numbers", Address: "numbers.example", Port: 443,
+				Outbound: json.RawMessage(fmt.Sprintf(`{"protocol":"vless","settings":{"vnext":[{"address":"numbers.example","port":443,"users":[{"id":"u","encryption":"none"}]}]},"streamSettings":{"network":"xhttp","security":"none","xhttpSettings":{"path":"/x","mode":"packet-up","extra":{"scMaxEachPostBytes":%s,"numbers":[%s]}}},"tag":"stored"}`, tc.literal, tc.literal))}
+			ob, wantErr := serverOutbound(server)
+			raw, err := OutboundJSON(server, "m10")
+			if tc.refused {
+				if wantErr == nil || !strings.Contains(wantErr.Error(), "scMaxEachPostBytes") {
+					t.Fatalf("shared error %v, want the small packet-up refusal", wantErr)
+				}
+				if err == nil || err.Error() != wantErr.Error() || len(raw) != 0 {
+					t.Fatalf("wrapper error %v, want %v and no outbound", err, wantErr)
+				}
+				return
+			}
+			if wantErr != nil {
+				t.Fatal(wantErr)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantRaw, err := json.Marshal(ob)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want, err := vpnconfig.DecodeOutbound(wantRaw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := vpnconfig.DecodeOutbound(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stream := got["streamSettings"].(map[string]interface{})
+			extra := stream["xhttpSettings"].(map[string]interface{})["extra"].(map[string]interface{})
+			if number, ok := extra["scMaxEachPostBytes"].(json.Number); !ok || number.String() != tc.literal {
+				t.Errorf("packet-up literal %v, want exactly %s", extra["scMaxEachPostBytes"], tc.literal)
+			}
+			if got["tag"] != "m10" {
+				t.Errorf("tag %v, want m10", got["tag"])
+			}
+			delete(got, "tag")
+			delete(want, "tag")
+			if !reflect.DeepEqual(got, want) {
+				t.Error("outbound differs from the marshalled shared outbound beyond its tag")
+			}
+		})
+	}
+}
+
+var _ GuardedXrayGenerator = (*XrayService)(nil)
+
+func assertNoXrayTemps(t *testing.T, outputPath string) {
+	t.Helper()
+	paths, err := filepath.Glob(outputPath + ".*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range paths {
+		if path != outputPath+".template" {
+			t.Errorf("temporary Xray config left behind: %s", filepath.Base(path))
+		}
+	}
+}
+
+func TestGenerateConfigGuarded_RechecksAfterValidation(t *testing.T) {
+	svc, outputPath := testedService(t)
+	validated, checkedAfterValidation := false, false
+	refused := errors.New("automation lost permission during validation")
+	svc.validate = func(path string) error {
+		if path == outputPath {
+			t.Error("validation received the live path rather than the staged config")
+		}
+		content, err := os.ReadFile(outputPath)
+		if err != nil || string(content) != "previous\n" {
+			t.Errorf("live config during validation %q, error %v", content, err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode().Perm() != 0600 {
+			t.Errorf("staged mode %o, want 0600", info.Mode().Perm())
+		}
+		validated = true
+		return nil
+	}
+
+	err := svc.GenerateConfigGuarded(storedVLESS, InboundPorts{}, func() error {
+		if validated {
+			checkedAfterValidation = true
+			return refused
+		}
+		return nil
+	})
+	if !errors.Is(err, refused) {
+		t.Errorf("guarded generation error %v, want the final guard refusal", err)
+	}
+	if !validated || !checkedAfterValidation {
+		t.Errorf("validated %v, checked after validation %v; validation must precede the final guard", validated, checkedAfterValidation)
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil || string(content) != "previous\n" {
+		t.Errorf("live config %q, error %v; a refused publication must leave it unchanged", content, err)
+	}
+	assertNoXrayTemps(t, outputPath)
+}
+
+func TestGenerateConfigGuarded_NilGuardKeepsGenerationSemantics(t *testing.T) {
+	templatePath, outputPath := writeTemplate(t)
+	svc := newTestXrayService(templatePath, outputPath)
+	validations := 0
+	svc.validate = func(path string) error {
+		validations++
+		if path == outputPath {
+			t.Error("the live config was used as the validation input")
+		}
+		return nil
+	}
+	server := vpnconfig.Server{Address: "203.0.113.50", Port: 443, UUID: "synthetic-id", Security: "tls", SNI: "oslo.example"}
+	if err := svc.GenerateConfigGuarded(server, InboundPorts{TProxy: 23456, Socks: 23457}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if validations != 1 {
+		t.Errorf("validations %d, want one before publication", validations)
+	}
+	ports := readInboundPorts(t, outputPath)
+	if ports["tproxy-in"] != 23456 || ports["socks-in"] != 23457 {
+		t.Errorf("ports %v, want the supplied 23456/23457", ports)
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]interface{}
+	if err := json.Unmarshal(content, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := vnextAddress(t, cfg); got != "203.0.113.50" {
+		t.Errorf("dial address %q, want 203.0.113.50", got)
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("live config mode %o, want 0600", info.Mode().Perm())
+	}
+	assertNoXrayTemps(t, outputPath)
+}
+
+func TestGenerateConfigGuarded_ValidationFailureKeepsLiveConfig(t *testing.T) {
+	svc, outputPath := testedService(t)
+	rejected := errors.New("synthetic Xray validation refusal")
+	validations := 0
+	svc.validate = func(string) error {
+		validations++
+		return rejected
+	}
+	if err := svc.GenerateConfigGuarded(storedVLESS, InboundPorts{}, func() error { return nil }); !errors.Is(err, rejected) {
+		t.Errorf("generation error %v, want the validation failure", err)
+	}
+	if validations != 1 {
+		t.Errorf("validations %d, want the staged config to be tested", validations)
+	}
+	content, err := os.ReadFile(outputPath)
+	if err != nil || string(content) != "previous\n" {
+		t.Errorf("live config %q, error %v; validation failure must not publish", content, err)
+	}
+	assertNoXrayTemps(t, outputPath)
+}
+
+func waitForValidation(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if data, err := os.ReadFile(path); err == nil && len(data) > 0 {
+			if !strings.HasPrefix(string(data), "run -test -format json -c ") {
+				t.Fatalf("unexpected Xray validation command: %s", data)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("the staged Xray validation never started")
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestContextExecutor_ShutdownCancelsXrayValidation(t *testing.T) {
+	root, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dir := t.TempDir()
+	started := filepath.Join(dir, "validated")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" > \"$VALIDATION_STARTED\"\nexec /bin/sleep 60\n"
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("VALIDATION_STARTED", started)
+	template, output := writeTemplate(t)
+	if err := os.WriteFile(output, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	configDir := t.TempDir()
+	store := NewConfigService(configDir, filepath.Join(configDir, "data"))
+	before := []byte(`{"xray":{"active_server":{"name":"previous","address":"192.0.2.10","port":443,"subscription":"0a1b2c3d","seq":7}}}`)
+	if err := os.WriteFile(store.ConfigPath(), before, 0600); err != nil {
+		t.Fatal(err)
+	}
+	xray := NewXrayServiceForContext(root, template, output)
+	type generationResult struct {
+		generated bool
+		err       error
+	}
+	done := make(chan generationResult, 1)
+	go func() {
+		generated, _, err := GenerateAndRecordGuardedWalkedServer(store, xray, storedVLESS, storedVLESS, InboundPorts{}, nil)
+		done <- generationResult{generated, err}
+	}()
+	waitForValidation(t, started)
+	cancel()
+	select {
+	case result := <-done:
+		if result.generated || !errors.Is(result.err, context.Canceled) {
+			t.Errorf("canceled validation published a selection: generated=%v error=%v", result.generated, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon shutdown waited for the 15-second Xray validation timeout")
+	}
+	if raw, err := os.ReadFile(output); err != nil || string(raw) != "previous\n" {
+		t.Errorf("canceled validation replaced the live Xray config: %q, %v", raw, err)
+	}
+	if raw, err := os.ReadFile(store.ConfigPath()); err != nil || string(raw) != string(before) {
+		t.Errorf("canceled validation recorded a new active server: %q, %v", raw, err)
+	}
+	assertNoXrayTemps(t, output)
+	if err := store.UpdateVPNConfig(func(*vpnconfig.VPNDirectorConfig) error { return nil }); err != nil {
+		t.Fatal("shutdown retained the config lock:", err)
+	}
+}
+
+func TestContextExecutor_CancellationBeforeRenameKeepsLiveConfig(t *testing.T) {
+	for _, phase := range []string{"before_generation_without_xray", "after_validation"} {
+		t.Run(phase, func(t *testing.T) {
+			root, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			t.Setenv("PATH", t.TempDir())
+			template, output := writeTemplate(t)
+			if err := os.WriteFile(output, []byte("previous\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			xray := NewXrayServiceForContext(root, template, output)
+			if phase == "after_validation" {
+				xray.validate = func(string) error { cancel(); return nil }
+			} else {
+				cancel()
+			}
+			if err := xray.GenerateConfig(storedVLESS); !errors.Is(err, context.Canceled) {
+				t.Errorf("canceled generation error=%v, want context cancellation", err)
+			}
+			if raw, err := os.ReadFile(output); err != nil || string(raw) != "previous\n" {
+				t.Errorf("%s published despite root cancellation: %q, %v", phase, raw, err)
+			}
+			assertNoXrayTemps(t, output)
+		})
+	}
+}
+
+func TestContextExecutor_XrayValidationKeepsCommandTimeout(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte("#!/bin/sh\nexec /bin/sleep 60\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	previous := xrayTestTimeout
+	xrayTestTimeout = 80 * time.Millisecond
+	t.Cleanup(func() { xrayTestTimeout = previous })
+	root, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	template, output := writeTemplate(t)
+	if err := os.WriteFile(output, []byte("previous\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	err := NewXrayServiceForContext(root, template, output).GenerateConfig(storedVLESS)
+	if err == nil || !strings.Contains(err.Error(), "timed out") || root.Err() != nil {
+		t.Fatalf("validation lost its per-command timeout: error=%v root=%v", err, root.Err())
+	}
+	if raw, err := os.ReadFile(output); err != nil || string(raw) != "previous\n" {
+		t.Fatal("validation timeout replaced the live config")
+	}
+	assertNoXrayTemps(t, output)
 }

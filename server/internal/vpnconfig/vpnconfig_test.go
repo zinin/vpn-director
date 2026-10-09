@@ -773,3 +773,128 @@ func TestSaveVPNDirectorConfig_DropsTheLinkOfEarlierReleases(t *testing.T) {
 		t.Fatalf("the write lost the config: %s", data)
 	}
 }
+
+// A daemon's write keeps the monitor section - VPNDirectorConfig drops every
+// key it does not know - and a config without one stays without one.
+func TestVPNDirectorConfig_KeepsTheMonitorSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpn-director.json")
+	if err := os.WriteFile(path, []byte(`{"data_dir":"/d","monitor":{"enabled":false,"interval":"2m"},"xray":{},"tunnel_director":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadVPNDirectorConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Monitor == nil || cfg.Monitor.Enabled == nil || *cfg.Monitor.Enabled || cfg.Monitor.Interval != "2m" {
+		t.Fatalf("monitor %+v", cfg.Monitor)
+	}
+	if err := SaveVPNDirectorConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"interval": "2m"`) || !strings.Contains(string(data), `"enabled": false`) {
+		t.Fatalf("saved %s", data)
+	}
+
+	if err := os.WriteFile(path, []byte(`{"data_dir":"/d","xray":{},"tunnel_director":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = LoadVPNDirectorConfig(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveVPNDirectorConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if data, _ := os.ReadFile(path); strings.Contains(string(data), "monitor") {
+		t.Fatalf("a section nobody wrote appeared: %s", data)
+	}
+}
+
+func TestMonitorConfig_ConcurrencySurvivesASave(t *testing.T) {
+	cases := []struct {
+		name        string
+		monitor     string
+		concurrency int
+		present     bool
+	}{
+		{name: "absent", monitor: `{}`},
+		{name: "explicit zero", monitor: `{"concurrency":0}`, present: true},
+		{name: "nonzero", monitor: `{"concurrency":4}`, concurrency: 4, present: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "vpn-director.json")
+			if err := os.WriteFile(path, []byte(`{"monitor":`+tc.monitor+`}`), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadVPNDirectorConfig(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Monitor == nil || cfg.Monitor.Concurrency != tc.concurrency {
+				t.Fatalf("monitor %+v", cfg.Monitor)
+			}
+			if err := SaveVPNDirectorConfig(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var saved struct {
+				Monitor map[string]json.RawMessage `json:"monitor"`
+			}
+			if err := json.Unmarshal(data, &saved); err != nil {
+				t.Fatal(err)
+			}
+			value, present := saved.Monitor["concurrency"]
+			if present != tc.present {
+				t.Fatalf("concurrency present %t, want %t: %s", present, tc.present, data)
+			}
+			if present {
+				var got int
+				if err := json.Unmarshal(value, &got); err != nil {
+					t.Fatal(err)
+				}
+				if got != tc.concurrency {
+					t.Fatalf("concurrency %d, want %d", got, tc.concurrency)
+				}
+			}
+		})
+	}
+}
+
+func TestMonitorConfig_ConstructionKeepsConcurrencyAnInt(t *testing.T) {
+	for _, value := range []int{0, 4} {
+		c := MonitorConfig{Concurrency: value}
+		data, err := json.Marshal(c)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var saved map[string]json.RawMessage
+		if err := json.Unmarshal(data, &saved); err != nil {
+			t.Fatal(err)
+		}
+		_, present := saved["concurrency"]
+		if present != (value != 0) {
+			t.Fatalf("concurrency %d: saved %s", value, data)
+		}
+	}
+}
+
+// The Web UI and the bot name a server by it, so it must stay what /xray has
+// always sent: the first 8 hex digits of sha256("subscription|name|address|port").
+func TestServerFingerprint_IsTheButtonsOwn(t *testing.T) {
+	s := Server{Subscription: "0a1b2c3d", Name: "Germany-1", Address: "de.example.com", Port: 443}
+	if got := ServerFingerprint(s); got != "84130acd" {
+		t.Fatalf("fingerprint %q", got)
+	}
+	twin := s
+	twin.Subscription = "1b2c3d4e"
+	if ServerFingerprint(s) == ServerFingerprint(twin) {
+		t.Fatal("one fingerprint for two subscriptions")
+	}
+}

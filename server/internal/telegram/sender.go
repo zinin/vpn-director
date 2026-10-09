@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"errors"
 	"log/slog"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -33,13 +34,21 @@ func NewSender(api BotAPI) *Sender {
 	return &Sender{api: api}
 }
 
+func senderErrorAttr(err error) slog.Attr {
+	var apiErr *tgbotapi.Error
+	if errors.As(err, &apiErr) && apiErr != nil {
+		return slog.Group("error", "kind", "telegram", "code", apiErr.Code)
+	}
+	return slog.Group("error", "kind", "transport")
+}
+
 // Send sends a MarkdownV2 formatted message
 func (s *Sender) Send(chatID int64, text string) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	msg.ParseMode = "MarkdownV2"
 	_, err := s.api.Send(msg)
 	if err != nil {
-		slog.Error("Failed to send message", "chat_id", chatID, "error", err)
+		slog.Error("Failed to send message", "chat_id", chatID, senderErrorAttr(err))
 	}
 	return err
 }
@@ -49,7 +58,7 @@ func (s *Sender) SendPlain(chatID int64, text string) error {
 	msg := tgbotapi.NewMessage(chatID, text)
 	_, err := s.api.Send(msg)
 	if err != nil {
-		slog.Error("Failed to send message", "chat_id", chatID, "error", err)
+		slog.Error("Failed to send message", "chat_id", chatID, senderErrorAttr(err))
 	}
 	return err
 }
@@ -99,7 +108,7 @@ func (s *Sender) SendWithKeyboard(chatID int64, text string, keyboard tgbotapi.I
 	msg.ReplyMarkup = keyboard
 	_, err := s.api.Send(msg)
 	if err != nil {
-		slog.Error("Failed to send message with keyboard", "chat_id", chatID, "error", err)
+		slog.Error("Failed to send message with keyboard", "chat_id", chatID, senderErrorAttr(err))
 	}
 	return err
 }
@@ -116,7 +125,7 @@ func (s *Sender) EditMessage(chatID int64, msgID int, text string, keyboard tgbo
 	edit.ParseMode = "MarkdownV2"
 	_, err := s.api.Send(edit)
 	if err != nil {
-		slog.Error("Failed to edit message", "msg_id", msgID, "error", err)
+		slog.Error("Failed to edit message", "msg_id", msgID, senderErrorAttr(err))
 	}
 	return err
 }
@@ -125,7 +134,7 @@ func (s *Sender) EditMessage(chatID int64, msgID int, text string, keyboard tgbo
 func (s *Sender) AckCallback(callbackID string) error {
 	_, err := s.api.Request(tgbotapi.NewCallback(callbackID, ""))
 	if err != nil {
-		slog.Error("Failed to acknowledge callback", "error", err)
+		slog.Error("Failed to acknowledge callback", senderErrorAttr(err))
 	}
 	return err
 }

@@ -28,6 +28,9 @@ jobs:
       - name: Build Vue SPA
         run: make web
 
+      - name: Test Vue SPA
+        run: cd web && npm test
+
       - name: Prepare embed
         run: make web-embed
 
@@ -48,6 +51,15 @@ jobs:
 
       - name: Build webui mipsle
         run: make -C server build-webui-mipsle
+
+      - name: Build watchd arm64
+        run: make -C server build-watchd-arm64
+
+      - name: Build watchd arm
+        run: make -C server build-watchd-arm
+
+      - name: Build watchd mipsle
+        run: make -C server build-watchd-mipsle
 
       - name: Move binaries
         run: mkdir -p bin && mv server/bin/* bin/
@@ -70,3 +82,6 @@ jobs:
             bin/webui-arm64
             bin/webui-arm
             bin/webui-mipsle
+            bin/vpn-director-watchd-arm64
+            bin/vpn-director-watchd-arm
+            bin/vpn-director-watchd-mipsle

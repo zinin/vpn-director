@@ -6,10 +6,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/zinin/vpn-director/server/internal/endpoint"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
-// dialIP is the IPv4 address a perAddress copy is dialed at: its one resolved
+// dialIP is the IPv4 address an endpoint.PerAddress copy is dialed at: its one resolved
 // address, or an address that is an IPv4 literal itself. "" when it has none -
 // a hostname nothing resolved - and the copy then has nothing to check.
 func dialIP(c vpnconfig.Server) string {
@@ -107,10 +108,7 @@ func tcpChecked(s vpnconfig.Server) bool {
 // outages the fast rule is for - so when neither accepts, the look says nothing
 // about the server: the WAN itself is down, and a tunnel over it would carry
 // nothing either.
-var reachControls = []vpnconfig.Server{
-	{Address: "1.1.1.1", Port: 443},
-	{Address: "8.8.8.8", Port: 443},
-}
+var reachControls = endpoint.WANControls
 
 // activeServerDown reports whether the server active_server names accepts no
 // TCP connection on any address its subscription lists for it while the WAN
@@ -131,7 +129,7 @@ func (w *Watch) activeServerDown(ctx context.Context, cfg *vpnconfig.VPNDirector
 	if i < 0 || !tcpChecked(servers[i]) {
 		return false
 	}
-	copies := dialable(perAddress(servers[i : i+1]))
+	copies := dialable(endpoint.PerAddress(servers[i : i+1]))
 	if len(copies) == 0 {
 		return false
 	}
