@@ -206,7 +206,13 @@ func (w *Watch) refreshScope(ctx context.Context) (context.Context, func() error
 					return
 				}
 				err := w.mutationRefused()
-				if err == nil {
+				// A context error is no refusal: watchd's CanMutate answers for
+				// the running tick (Context), and a tick that ends is neither a
+				// stop nor a closed gate. ctx itself carries the daemon's
+				// shutdown, and the re-check under tickMu, with no tick
+				// running, still catches a stop or a closed gate before
+				// anything is written.
+				if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					continue
 				}
 				// A refusal that comes once the scope has ended - the downloads

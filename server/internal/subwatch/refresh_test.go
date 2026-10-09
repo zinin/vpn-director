@@ -331,6 +331,49 @@ func TestRefreshRound_AGateThatClosesAndOpensAgainDropsTheDownloads(t *testing.T
 	}
 }
 
+// watchd's CanMutate answers for the running tick, with its context's error
+// once that tick ends. A tick that ends during the downloads is neither a stop
+// nor a closed gate: they run on, and the round publishes them.
+func TestRefreshRound_ATickThatEndsDuringTheDownloadsDropsNothing(t *testing.T) {
+	shortPoll(t)
+	stored := realityAt("DE 10GB", "de.example", "aa11", "203.0.113.10")
+	f, w, saves := refreshRig(alphaOf(stored))
+	var ended atomic.Bool
+	answered := make(chan struct{}, 8)
+	w.CanMutate = func() error {
+		if !ended.Load() {
+			return nil
+		}
+		// Never blocks the poller: a full buffer already holds what the
+		// download waits for.
+		select {
+		case answered <- struct{}{}:
+		default:
+		}
+		return context.Canceled
+	}
+	w.FetchList = func(ctx context.Context, _ string) ([]vpnconfig.Server, error) {
+		ended.Store(true)
+		// A second answer means the poller outlived the first one.
+		for range 2 {
+			select {
+			case <-answered:
+			case <-ctx.Done():
+				return nil, context.Cause(ctx)
+			}
+		}
+		ended.Store(false)
+		return []vpnconfig.Server{realityAt("DE 9GB", "de.example", "bb22", "203.0.113.10")}, nil
+	}
+
+	if !w.refreshRound(context.Background()) {
+		t.Fatal("the round dropped its downloads")
+	}
+	if saves.Load() != 1 || f.subs[0].Servers[0].Name != "DE 9GB" || !bytes.Equal(f.subs[0].Servers[0].Outbound, stored.Outbound) {
+		t.Fatalf("writes %d, servers %+v", saves.Load(), f.subs[0].Servers)
+	}
+}
+
 // The first round a minute after the start, the next one an interval after a
 // round ran, a minute after one that stood down, and a refresh turned off
 // looks again every minute without downloading.
