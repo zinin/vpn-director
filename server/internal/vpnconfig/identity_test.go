@@ -89,6 +89,13 @@ func TestServerIdentity_ARecordWithoutAnOutboundHasNone(t *testing.T) {
 	if id := ServerIdentity(Server{Outbound: json.RawMessage(`not json`)}); id != "" {
 		t.Fatalf("unreadable outbound identity %q", id)
 	}
+	// A file can hold "outbound": null, and an outbound that is no object is
+	// none: DecodeOutbound refuses it too.
+	for _, raw := range []string{`null`, `"x"`, `7`, `[]`} {
+		if id := ServerIdentity(Server{Outbound: json.RawMessage(raw)}); id != "" {
+			t.Errorf("outbound %s identity %q", raw, id)
+		}
+	}
 }
 
 func TestPairServers_EachTakesTheFirstFreeStoredTwin(t *testing.T) {

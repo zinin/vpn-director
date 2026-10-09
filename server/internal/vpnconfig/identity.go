@@ -19,19 +19,22 @@ var realityPicks = []string{"serverName", "shortId", "spiderX"}
 // pick survives into the identity and the decoders' guarded keys need no new
 // name. Everything else stays: address, port, protocol, credentials,
 // transport, and the serverName of plain TLS, which picks the backend on a
-// CDN. A record without an outbound, or with one that does not parse, has no
-// identity: "" pairs with nothing.
+// CDN. A record without an outbound, or with one that does not parse or is no
+// JSON object (null, a string, a number, an array: DecodeOutbound refuses
+// them too), has no identity: "" pairs with nothing.
 func ServerIdentity(s Server) string {
 	if len(s.Outbound) == 0 {
 		return ""
 	}
-	var v interface{}
-	if err := json.Unmarshal(s.Outbound, &v); err != nil {
+	// A null leaves the map nil; a string, a number or an array does not
+	// decode into it at all.
+	var ob map[string]interface{}
+	if err := json.Unmarshal(s.Outbound, &ob); err != nil || ob == nil {
 		return ""
 	}
-	dropRealityPicks(v)
+	dropRealityPicks(ob)
 	// Marshalling a map sorts its keys: key order and whitespace do not count.
-	out, err := json.Marshal(v)
+	out, err := json.Marshal(ob)
 	if err != nil {
 		return ""
 	}
