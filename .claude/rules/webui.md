@@ -169,10 +169,11 @@ its `refreshed`. A refresh, and an add of a saved link, carry `active_server`,
 `preferred_server` and `pending_restore.active` over a server the fresh list
 renamed - the same server by `vpnconfig.ServerIdentity`, its outbound without
 the REALITY picks - without moving `seq`
-(`vpnconfig.RefreshSubscriptionFollowingRenames`): a panel that puts the
-traffic left into every name would otherwise lose the Active mark at each
-refresh. watchd's periodic refresh writes a list only when it changed
-(`watchd.md`), so `refreshed` is when the list last changed. Every write of a
+(`vpnconfig.RefreshSubscriptionFollowingRenames`, `vpnconfig.AddSubscription`):
+a panel that puts the traffic left into every name would otherwise lose the
+Active mark at each refresh. watchd's periodic refresh writes a list only when
+it changed (`watchd.md`), so `refreshed` is when the list was last written: a
+change, a manual refresh or a cleared error. Every write of a
 subscription also deletes the `servers.json`
 of earlier releases (`vpnconfig.RemoveLegacyServers`), and the next config
 write of a daemon drops `xray.subscription_url`, whose Go field is gone. All of

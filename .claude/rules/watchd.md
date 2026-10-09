@@ -183,10 +183,11 @@ that comes out empty, records its error once (`RecordSubscriptionError`) and kee
 Nothing goes to Telegram; the log gives the counts and every record that followed a rename, never a
 link.
 
-A successful probe remembers the active server's identity (`probeOKActive`): Xray dying within
-about 30 s of a rename, before the next successful probe, leaves that episode to the legacy
-confirmation. A stored REALITY pick that the server's admin removes leaves the stored copy dead until
-a manual refresh or the wave, which take fresh copies.
+A successful probe remembers the active server's record (`probeOKActive`: its subscription,
+name, address and port): Xray dying within about 30 s of a rename, before the next successful
+probe, leaves that episode to the legacy confirmation. A stored REALITY pick that the server's
+admin removes leaves the stored copy dead until a manual refresh or the wave, which take fresh
+copies.
 
 ## Durable notifications
 

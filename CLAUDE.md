@@ -146,7 +146,7 @@ shutdown, durable notification and recovery contracts.
 
 **Web UI settings**: the `webui` section of `vpn-director.json` — `port` (8444), `cert_file`, `key_file`, `jwt_secret` (auto-generated when empty), `log_level` (`debug|info|warn|error`).
 
-**Server monitor settings**: the `monitor` section of `vpn-director.json` — `enabled` (true), `interval` (`1m`, a live server's check), `dead_interval_max` (`30m`, the longest pause of a dead one), `concurrency` (8), `log_level`, `subscription_refresh` (`5m`, how often watchd downloads every subscription with a link and writes what changed; `"0"` off, whatever `enabled` says). The daemon rereads it every minute.
+**Server monitor settings**: the `monitor` section of `vpn-director.json` — `enabled` (true), `interval` (`1m`, a live server's check), `dead_interval_max` (`30m`, the longest pause of a dead one), `concurrency` (8), `log_level`, `subscription_refresh` (`5m`, how often watchd downloads every subscription with a link and writes what changed; `"0"` off, whatever `enabled` says; a new value applies once the current wait ends). The daemon rereads it every minute.
 
 ## Shell Conventions
 
