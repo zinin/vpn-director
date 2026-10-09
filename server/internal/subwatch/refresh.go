@@ -269,7 +269,10 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 		slog.Warn("Periodic subscription refresh failed", "subscription", s.Name, watchErrorAttr(err))
 	}
 	rerr := vpnconfig.RecordSubscriptionError(update, files, s.ID, s.URL, s.Refreshed, msg)
-	if rerr != nil && !errors.Is(rerr, errStopped) && !errors.Is(rerr, watchcompat.ErrIncompatible) && !errors.Is(rerr, vpnconfig.ErrSubscriptionGone) {
+	// watchd's shutdown can end the record while it waits for the config lock,
+	// as it ends a publication: that is no failure to record.
+	if rerr != nil && !errors.Is(rerr, errStopped) && !errors.Is(rerr, watchcompat.ErrIncompatible) &&
+		!errors.Is(rerr, vpnconfig.ErrSubscriptionGone) && ctx.Err() == nil {
 		slog.Warn("Failed to record why the subscription did not refresh", "subscription", s.Name, watchErrorAttr(rerr))
 	}
 }

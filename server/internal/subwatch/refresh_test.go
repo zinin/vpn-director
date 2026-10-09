@@ -392,6 +392,32 @@ func TestRefreshRound_AShutdownWritesNothingMore(t *testing.T) {
 	}
 }
 
+// watchd shutting down while a failed download's record waits for the config
+// lock cuts the record short: that is no failure to record, and no WARN.
+func TestRefreshRound_AShutdownThatCutsTheErrorRecordShortLogsNoWarn(t *testing.T) {
+	f, w, saves := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.FetchList = func(context.Context, string) ([]vpnconfig.Server, error) {
+		return nil, errors.New("download failed: HTTP 403")
+	}
+	update := w.UpdateVPN
+	w.UpdateVPN = func(fn func(*vpnconfig.VPNDirectorConfig) error) error {
+		cancel() // the shutdown lands while the record waits for the lock
+		return update(fn)
+	}
+	records := logRecords(t)
+
+	w.refreshRound(ctx)
+
+	if saves.Load() != 0 || f.subs[0].Error != "" {
+		t.Fatalf("writes %d, error %q; a shutdown records nothing", saves.Load(), f.subs[0].Error)
+	}
+	if got := levelsOf(records(), "Failed to record why the subscription did not refresh"); len(got) != 0 {
+		t.Fatalf("logged at %v; a shutdown is no failure to record", got)
+	}
+}
+
 func TestRefreshRound_AGateThatClosesDropsTheDownloads(t *testing.T) {
 	shortPoll(t)
 	f, w, saves := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
