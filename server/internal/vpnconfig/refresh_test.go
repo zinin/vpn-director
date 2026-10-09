@@ -287,3 +287,88 @@ func TestPublishRefresh_ARotatedKeyIsANewServer(t *testing.T) {
 		t.Fatalf("active %+v, want it left as it was", a)
 	}
 }
+
+// apart is m.update on a config whose active_server is fn's own copy: memStore
+// copies the config shallowly, and a config write that fails must leave the
+// record as it was, as it does on disk.
+func (m *memStore) apart(fn func(*VPNDirectorConfig) error) error {
+	return m.update(func(cfg *VPNDirectorConfig) error {
+		if a := cfg.Xray.ActiveServer; a != nil {
+			own := *a
+			cfg.Xray.ActiveServer = &own
+		}
+		return fn(cfg)
+	})
+}
+
+// A config write that fails after the file was written puts the file back:
+// left as written, it would read as unchanged to every later round, and
+// xray.servers and the record would stay behind for good. The next round
+// writes them all together.
+func TestPublishRefresh_AFailedConfigWritePutsTheFileBack(t *testing.T) {
+	stored := alphaWith(reality("DE 10GB", "www.example.com", "aa11", "203.0.113.10"))
+	m := &memStore{subs: []Subscription{stored}, configErr: errors.New("disk full")}
+	m.cfg.Xray.ActiveServer = &ActiveServer{Subscription: "0a1b2c3d", Name: "DE 10GB", Address: "de.example", Port: 443, Seq: 3}
+	listed := []Server{reality("DE 9GB", "example.com", "bb22", "203.0.113.20")}
+
+	res, err := PublishRefresh(m.apart, m.files(), "0a1b2c3d", alphaLink, listed, t0.Add(time.Hour))
+
+	if err == nil || errors.Is(err, ErrServersSaved) || res.Wrote {
+		t.Fatalf("result %+v, err %v; want the config's own error and nothing written", res, err)
+	}
+	if !reflect.DeepEqual(m.subs[0], stored) {
+		t.Fatalf("file %+v, want it put back as it was", m.subs[0])
+	}
+	if a := m.cfg.Xray.ActiveServer; m.cfg.Xray.Servers != nil || a.Name != "DE 10GB" || a.Seq != 3 {
+		t.Fatalf("xray.servers %v, active %+v; want the config untouched", m.cfg.Xray.Servers, a)
+	}
+
+	m.configErr = nil
+	res, err = PublishRefresh(m.apart, m.files(), "0a1b2c3d", alphaLink, listed, t0.Add(time.Hour))
+
+	if err != nil || !res.Wrote {
+		t.Fatalf("result %+v, err %v", res, err)
+	}
+	if s := m.subs[0].Servers; len(s) != 1 || s[0].Name != "DE 9GB" || !reflect.DeepEqual(s[0].IPs, []string{"203.0.113.20"}) {
+		t.Fatalf("servers %+v", s)
+	}
+	if !reflect.DeepEqual(m.cfg.Xray.Servers, []string{"203.0.113.20"}) {
+		t.Fatalf("xray.servers %v", m.cfg.Xray.Servers)
+	}
+	if a := m.cfg.Xray.ActiveServer; a.Name != "DE 9GB" || a.Seq != 3 {
+		t.Fatalf("active %+v", a)
+	}
+	if f := res.Followed; len(f) != 1 || f[0].Record != "active_server" || f[0].From != "DE 10GB" || f[0].To != "DE 9GB" {
+		t.Fatalf("followed %+v", f)
+	}
+}
+
+// A file another writer wrote between the publication and the put-back stands,
+// and the failure says the list is out: a manual refresh moves refreshed, and
+// a rename keeps refreshed and error.
+func TestPublishRefresh_AFileAnotherWriterWroteStays(t *testing.T) {
+	for name, write := range map[string]func(*Subscription){
+		"a refresh": func(s *Subscription) { s.Refreshed = t0.Add(2 * time.Hour) },
+		"a rename":  func(s *Subscription) { s.Name = "Beta" },
+	} {
+		m := &memStore{subs: []Subscription{alphaWith(reality("DE 10GB", "www.example.com", "aa11", "203.0.113.10"))}, configErr: errors.New("disk full")}
+		var theirs Subscription
+		calls := 0
+		update := func(fn func(*VPNDirectorConfig) error) error {
+			if calls++; calls == 2 {
+				write(&m.subs[0]) // the other writer lands between the two updates
+				theirs = m.subs[0]
+			}
+			return m.update(fn)
+		}
+
+		res, err := PublishRefresh(update, m.files(), "0a1b2c3d", alphaLink, []Server{reality("DE 9GB", "example.com", "bb22", "203.0.113.20")}, t0.Add(time.Hour))
+
+		if !errors.Is(err, ErrServersSaved) || !res.Wrote {
+			t.Errorf("%s: result %+v, err %v; want the list out", name, res, err)
+		}
+		if calls != 2 || !reflect.DeepEqual(m.subs[0], theirs) {
+			t.Errorf("%s: %d updates, file %+v; want the other writer's file left as it is", name, calls, m.subs[0])
+		}
+	}
+}

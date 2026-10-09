@@ -111,13 +111,17 @@ type RefreshResult struct {
 // one update, and the records that named a renamed server follow it
 // (followRenames). ErrSubscriptionGone when the subscription was deleted or
 // relinked meanwhile, ErrNoServerResolved when the merge comes out empty;
-// neither writes. A failure after the file was written carries
-// ErrServersSaved.
+// neither writes. A config write that fails after the file was written puts
+// the file back as it was (restoreSubscription): the next round finds the
+// change again and writes the file and the config together. Only when the
+// file cannot be put back - another writer wrote it since, or its own write
+// fails - does the failure carry ErrServersSaved.
 func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, listed []Server, now time.Time) (RefreshResult, error) {
 	if rawURL == "" {
 		return RefreshResult{}, ErrSubscriptionStatic
 	}
 	var res RefreshResult
+	var before, written Subscription
 	saved := false
 	err := update(func(cfg *VPNDirectorConfig) error {
 		res = RefreshResult{}
@@ -138,10 +142,12 @@ func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL str
 		if subs[i].Error == "" && reflect.DeepEqual(m.Servers, stored) {
 			return errNothingToWrite
 		}
+		before = subs[i]
 		sub := subs[i]
 		sub.Servers = m.Servers
 		sub.Refreshed = stamp(now)
 		sub.Error = ""
+		written = sub
 		if err := files.Save(sub); err != nil {
 			return fmt.Errorf("%w: %w", ErrSaveSubscription, err)
 		}
@@ -160,12 +166,46 @@ func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL str
 	case errors.Is(err, errNothingToWrite):
 		return res, nil
 	case saved:
-		res.Wrote, res.Followed = true, nil
+		res.Followed = nil
+		if restoreSubscription(update, files, before, written) {
+			return res, err
+		}
+		res.Wrote = true
 		return res, ServersSaved(err)
 	default:
 		res.Followed = nil
 		return res, err
 	}
+}
+
+// restoreSubscription puts before back in the file of the subscription a
+// publication wrote as written, after the config write of that publication
+// failed. Left as written, the file would read as unchanged to every later
+// round, and xray.servers and the records that named a renamed server would
+// stay behind for good. It takes the lock again through update, under the
+// same guard, and writes no config. A file another writer has written since
+// stands: the subscription is gone or relinked, or its name, refreshed or
+// error is no longer the one written - a rename keeps refreshed and error. It
+// reports whether before was saved.
+func restoreSubscription(update ConfigUpdate, files SubscriptionFiles, before, written Subscription) bool {
+	put := false
+	_ = update(func(*VPNDirectorConfig) error {
+		subs, err := files.Load()
+		if err != nil {
+			return err
+		}
+		i := FindSubscription(subs, written.ID)
+		if i < 0 || subs[i].URL != written.URL || subs[i].Name != written.Name ||
+			!subs[i].Refreshed.Equal(written.Refreshed) || subs[i].Error != "" {
+			return errNothingToWrite
+		}
+		if err := files.Save(before); err != nil {
+			return err
+		}
+		put = true
+		return errNothingToWrite
+	})
+	return put
 }
 
 // followRenames points every record that names a server of subscription id
