@@ -407,7 +407,7 @@ onUnmounted(() => {
             <th>Name</th>
             <th>Host</th>
             <th>Servers</th>
-            <th>Refreshed</th>
+            <th>Changed</th>
             <th>Status</th>
             <th>Actions</th>
           </tr>

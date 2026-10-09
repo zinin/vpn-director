@@ -38,10 +38,10 @@ func TestSubs_ListsEachSubscriptionWithItsButtons(t *testing.T) {
 	h.HandleSubs(chatText("/subs"))
 
 	got := sender.last()
-	if !strings.Contains(got, `Alpha — sub\.example\.com — 32 servers — 2 h ago — OK`) || strings.Contains(got, "token") {
+	if !strings.Contains(got, `Alpha — sub\.example\.com — 32 servers — changed 2 h ago — OK`) || strings.Contains(got, "token") {
 		t.Fatalf("list %q", got)
 	}
-	if !strings.Contains(got, "Beta — static list — 5 servers — 2 h ago — download failed: HTTP 403") {
+	if !strings.Contains(got, "Beta — static list — 5 servers — changed 2 h ago — download failed: HTTP 403") {
 		t.Fatalf("list %q", got)
 	}
 	want := []string{"subs:r:0a1b2c3d", "subs:n:0a1b2c3d", "subs:d:0a1b2c3d", "subs:n:1b2c3d4e", "subs:d:1b2c3d4e"}
@@ -175,5 +175,16 @@ func TestSubs_ADeleteWhoseConfigWriteFailedSaysItDeleted(t *testing.T) {
 			strings.Contains(got, "no longer in any subscription: select another with /xray") != active {
 			t.Errorf("active %v: files %d, messages %q", active, len(store.subs), got)
 		}
+	}
+}
+
+// watchd's periodic refresh writes a list only when it changed: the time a
+// line shows is that of the last change, and the line says so.
+func TestChangedAgo(t *testing.T) {
+	if got := changedAgo(subsNow, subsNow.Add(-2*time.Hour)); got != "changed 2 h ago" {
+		t.Fatalf("got %q", got)
+	}
+	if got := changedAgo(subsNow, time.Time{}); got != "never changed" {
+		t.Fatalf("got %q", got)
 	}
 }

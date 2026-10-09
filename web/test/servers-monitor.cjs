@@ -6,6 +6,10 @@ const ts = require('typescript')
 
 const sourceRoot = path.join(__dirname, '..', 'src')
 const component = fs.readFileSync(path.join(sourceRoot, 'components/ServersTab.vue'), 'utf8')
+// watchd's periodic refresh writes a list only when it changed: the column
+// shows when the list last changed, not when it was last checked.
+assert.match(component, /<th>Changed<\/th>/)
+assert.doesNotMatch(component, /<th>Refreshed<\/th>/)
 const script = component.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
 const exposed = ['groups', 'monitor', 'load', 'loadMonitor', 'healthOf', 'aliveText', 'monitorLine', 'canCheck', 'checkAll', 'checkServer', 'checking']
 const code = ts.transpileModule(script + '\nexport const exposed = {' + exposed.join(',') + ', checkNotice: typeof checkNotice === "undefined" ? undefined : checkNotice}', {
