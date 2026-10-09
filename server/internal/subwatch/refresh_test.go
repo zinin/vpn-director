@@ -374,6 +374,70 @@ func TestRefreshRound_ATickThatEndsDuringTheDownloadsDropsNothing(t *testing.T) 
 	}
 }
 
+// levelsOf is the level of every record of msg, in the order they were logged.
+func levelsOf(records []map[string]any, msg string) []string {
+	var levels []string
+	for _, r := range records {
+		if r["msg"] == msg {
+			levels = append(levels, fmt.Sprint(r["level"]))
+		}
+	}
+	return levels
+}
+
+// A panel that puts the traffic left into every server name renames servers at
+// nearly every round, and watchd's log is cut at 200 KB: a round that only
+// renamed them, and the record that followed, say so at DEBUG.
+func TestRefreshRound_ARenameAloneLogsNothingAtInfo(t *testing.T) {
+	f, w, _ := refreshRig(alphaOf(realityAt("DE 10GB", "de.example", "aa11", "203.0.113.10")))
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "DE 10GB", Address: "de.example", Port: 443, Seq: 7}
+	w.FetchList = serveList(realityAt("DE 9GB", "de.example", "bb22", "203.0.113.10"))
+	records := logRecords(t)
+
+	w.refreshRound(context.Background())
+
+	logged := records()
+	for _, r := range logged {
+		if r["level"] != "DEBUG" {
+			t.Errorf("%q logged at %v; a rename alone logs at DEBUG", r["msg"], r["level"])
+		}
+	}
+	published, followed := levelsOf(logged, "Subscription list published"), levelsOf(logged, "Server record follows its renamed server")
+	if !reflect.DeepEqual(published, []string{"DEBUG"}) || !reflect.DeepEqual(followed, []string{"DEBUG"}) {
+		t.Fatalf("list published at %v, record followed at %v; want each once at DEBUG", published, followed)
+	}
+}
+
+func TestRefreshRound_AnAddedServerIsPublishedAtInfo(t *testing.T) {
+	_, w, _ := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
+	w.FetchList = serveList(realityAt("DE", "de.example", "bb22", "203.0.113.10"), realityAt("FR", "fr.example", "cc33", "203.0.113.20"))
+	records := logRecords(t)
+
+	w.refreshRound(context.Background())
+
+	if got := levelsOf(records(), "Subscription list published"); !reflect.DeepEqual(got, []string{"INFO"}) {
+		t.Fatalf("list published at %v, want once at INFO", got)
+	}
+}
+
+// A list that downloads again unchanged clears the recorded error: that is
+// news, the list is not.
+func TestRefreshRound_AClearedErrorIsNewsAndTheUnchangedListIsNot(t *testing.T) {
+	sub := alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10"))
+	sub.Error = "download failed: HTTP 403"
+	_, w, _ := refreshRig(sub)
+	w.FetchList = serveList(realityAt("DE", "de.example", "bb22", "203.0.113.10"))
+	records := logRecords(t)
+
+	w.refreshRound(context.Background())
+
+	logged := records()
+	again, published := levelsOf(logged, "Subscription downloads again"), levelsOf(logged, "Subscription list published")
+	if !reflect.DeepEqual(again, []string{"INFO"}) || !reflect.DeepEqual(published, []string{"DEBUG"}) {
+		t.Fatalf("downloads again at %v, list published at %v; want INFO and DEBUG", again, published)
+	}
+}
+
 // The first round a minute after the start, the next one an interval after a
 // round ran, a minute after one that stood down, and a refresh turned off
 // looks again every minute without downloading.

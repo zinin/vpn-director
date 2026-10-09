@@ -274,7 +274,13 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 }
 
 // logPublished says what a published round did to subscription s. No link:
-// names and counts only.
+// names and counts only. The list is news at INFO when the round added,
+// removed or readdressed a server: the monitor checks other addresses then. A
+// round that only renamed or reordered the servers, or only cleared an error,
+// logs it at DEBUG, and so does every record that followed a rename. A panel
+// that puts the traffic left into every server name renames them at nearly
+// every round, and watchd's log is cut at 200 KB: at INFO those lines would
+// take the failover history with them.
 func logPublished(s vpnconfig.Subscription, res vpnconfig.RefreshResult) {
 	if !res.Wrote {
 		slog.Debug("Periodic refresh found the subscription unchanged", "subscription", s.Name, "servers", res.Count)
@@ -283,9 +289,13 @@ func logPublished(s vpnconfig.Subscription, res vpnconfig.RefreshResult) {
 	if s.Error != "" {
 		slog.Info("Subscription downloads again", "subscription", s.Name)
 	}
-	slog.Info("Subscription list published", "subscription", s.Name, "servers", res.Count,
+	level := slog.LevelDebug
+	if res.Added > 0 || res.Removed > 0 || res.Readdressed > 0 {
+		level = slog.LevelInfo
+	}
+	slog.Log(context.Background(), level, "Subscription list published", "subscription", s.Name, "servers", res.Count,
 		"added", res.Added, "removed", res.Removed, "renamed", res.Renamed, "readdressed", res.Readdressed)
 	for _, f := range res.Followed {
-		slog.Info("Server record follows its renamed server", "record", f.Record, "from", f.From, "to", f.To)
+		slog.Debug("Server record follows its renamed server", "record", f.Record, "from", f.From, "to", f.To)
 	}
 }

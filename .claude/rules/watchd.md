@@ -181,8 +181,10 @@ a cleared error and `xray.servers` once. `active_server`, `preferred_server` and
 `pending_restore.active` follow a renamed server in that write, `seq` unchanged: a rename is no
 selection, and `sameRestoreActive` compares the records whole. A download that fails, or a merge
 that comes out empty, records its error once (`RecordSubscriptionError`) and keeps the list.
-Nothing goes to Telegram; the log gives the counts and every record that followed a rename, never a
-link.
+Nothing goes to Telegram. The log gives the counts at INFO when a round added, removed or
+readdressed servers. A round that only renamed or reordered them, or only cleared an error, logs
+them at DEBUG, and so does every record that followed a rename: a panel that puts the traffic left
+into every name renames at every round, and watchd's log is cut at 200 KB. No line carries a link.
 
 A successful probe remembers the active server's record (`probeOKActive`: its subscription,
 name, address and port): Xray dying within about 30 s of a rename, before the next successful
