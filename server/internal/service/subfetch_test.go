@@ -20,6 +20,7 @@ import (
 
 	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/ssrf"
+	"github.com/zinin/vpn-director/server/internal/subscription"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 )
 
@@ -806,7 +807,8 @@ func TestFetchImport_NothingResolvedIsAListToo(t *testing.T) {
 // FetchList is listedServers of an import, and the wave's Fetch is
 // resolvedServers of it: the periodic refresh takes every server listed, one
 // whose host did not answer this time without addresses, and the wave only the
-// servers it can dial. A failed download is the error of both.
+// servers it can dial. A failed download is the error of both, and the wave
+// sees the error even beside an import.
 func TestListedServers_ListsTheServersThatDidNotResolve(t *testing.T) {
 	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo\nvless://uuid-2@riga.example.invalid:443#Riga"))
 	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -835,11 +837,100 @@ func TestListedServers_ListsTheServersThatDidNotResolve(t *testing.T) {
 	}
 
 	failed := errors.New("download failed: HTTP 403")
-	if servers, err := listedServers(imp, failed); servers != nil || err != failed {
+	if servers, err := listedServers(subscription.Import{}, failed); servers != nil || err != failed {
 		t.Fatalf("listedServers: %+v, err %v; want the error unchanged", servers, err)
 	}
 	if servers, err := resolvedServers(imp, failed); servers != nil || err != failed {
 		t.Fatalf("resolvedServers: %+v, err %v; want the error unchanged", servers, err)
+	}
+}
+
+// lastTryOver fetches a WAN body of two servers whose hosts answer neither
+// resolver, so the tunnel's own download - served by tun - gets the last try.
+func lastTryOver(t *testing.T, tun http.HandlerFunc) func(context.Context) (subscription.Import, error) {
+	t.Helper()
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo\nvless://uuid-2@riga.example.invalid:443#Riga"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	tunnel := httptest.NewServer(tun)
+	t.Cleanup(tunnel.Close)
+	noAnswer := func(string) ([]net.IP, error) { return nil, errors.New("no answer") }
+	return func(ctx context.Context) (subscription.Import, error) {
+		return fetchImport(ctx, "https://cdn.example/s/token", hostClient(wan), knownTunnel(hostClient(tunnel)), noAnswer, noAnswer)
+	}
+}
+
+// bothUnresolved reports whether listed is the WAN's Oslo and Riga, neither
+// with an address.
+func bothUnresolved(listed []vpnconfig.Server) bool {
+	return len(listed) == 2 && listed[0].Name == "Oslo" && listed[1].Name == "Riga" && len(listed[0].IPs)+len(listed[1].IPs) == 0
+}
+
+// The panel answered over the WAN, and a tunnel download that fails on its
+// last try does not unsay it: the periodic refresh takes the WAN's list, its
+// servers without addresses, and the wave sees the download error it always
+// saw.
+func TestFetchImport_AFailedTunnelDownloadLeavesTheWANList(t *testing.T) {
+	fetch := lastTryOver(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad gateway", http.StatusBadGateway)
+	})
+
+	listed, err := listedServers(fetch(context.Background()))
+	if err != nil || !bothUnresolved(listed) {
+		t.Fatalf("listed %+v, err %v; want Oslo and Riga without addresses", listed, err)
+	}
+	servers, err := resolvedServers(fetch(context.Background()))
+	var de *DownloadError
+	if servers != nil || !errors.As(err, &de) || err.Error() != "download failed: HTTP 502" {
+		t.Fatalf("the wave's fetch: %+v, err %v; want the tunnel's download error", servers, err)
+	}
+}
+
+// A tunnel body that does not decode leaves the WAN's list to the periodic
+// refresh as well, and the wave the decode error.
+func TestFetchImport_ATunnelBodyThatDoesNotDecodeLeavesTheWANList(t *testing.T) {
+	fetch := lastTryOver(t, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "tuic://uuid:pw@203.0.113.10:443#TUIC")
+	})
+
+	listed, err := listedServers(fetch(context.Background()))
+	if err != nil || !bothUnresolved(listed) {
+		t.Fatalf("listed %+v, err %v; want Oslo and Riga without addresses", listed, err)
+	}
+	servers, err := resolvedServers(fetch(context.Background()))
+	if servers != nil || err == nil || err.Error() != "no supported servers" {
+		t.Fatalf("the wave's fetch: %+v, err %v; want the decode error", servers, err)
+	}
+}
+
+// A stop or a shutdown that ends the context while the tunnel's download runs
+// leaves both paths the error and no list: an ended context returns no list
+// anywhere in the fetch.
+func TestFetchImport_AStopDuringTheLastTryLeavesNoList(t *testing.T) {
+	cancels := make(chan context.CancelFunc, 1)
+	release := make(chan struct{})
+	defer close(release)
+	fetch := lastTryOver(t, func(w http.ResponseWriter, r *http.Request) {
+		(<-cancels)() // the stop lands while the tunnel's download runs
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	})
+
+	for name, take := range map[string]func(subscription.Import, error) ([]vpnconfig.Server, error){
+		"the periodic refresh": listedServers,
+		"the wave":             resolvedServers,
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancels <- cancel
+		servers, err := take(fetch(ctx))
+		cancel()
+		if servers != nil || !errors.Is(err, context.Canceled) {
+			t.Errorf("%s: %+v, err %v; want the context's error and no list", name, servers, err)
+		}
 	}
 }
 

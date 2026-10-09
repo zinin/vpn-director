@@ -88,7 +88,10 @@ func (f SubscriptionFetcher) fetch(ctx context.Context, rawURL string) (subscrip
 }
 
 // resolvedServers is what the wave takes from an import: the servers whose
-// hosts resolved, and errNoResolved when none did.
+// hosts resolved, and errNoResolved when none did. The import that comes back
+// beside an error - the WAN's, after the tunnel's last try failed - holds no
+// server the wave could dial, so the wave ignores it and sees the error as it
+// did before.
 func resolvedServers(imp subscription.Import, err error) ([]vpnconfig.Server, error) {
 	if err != nil {
 		return nil, err
@@ -101,9 +104,12 @@ func resolvedServers(imp subscription.Import, err error) ([]vpnconfig.Server, er
 
 // listedServers is what watchd's periodic refresh takes from an import: every
 // server it lists, without addresses where the host did not resolve, and no
-// error when none did.
+// error when none did. It takes the WAN's import that comes back beside the
+// error of a failed last try over the tunnel (fetchImport) as well: the panel
+// answered, its body is still the subscription, and vpnconfig.MergeRefresh
+// keeps the stored addresses of the servers it pairs.
 func listedServers(imp subscription.Import, err error) ([]vpnconfig.Server, error) {
-	if err != nil {
+	if err != nil && len(imp.Listed) == 0 {
 		return nil, err
 	}
 	return imp.Listed, nil
@@ -150,8 +156,15 @@ func lazyTunnel(ctx context.Context, cfgSvc ConfigStore, vpnSvc VPNDirector, tab
 // when there is none. A body none of whose hosts answered, on the WAN resolver
 // or the tunnel's, gets the tunnel's own download as its last try, and comes
 // back without an error if that resolves nothing either: Servers is empty,
-// and Listed still has every server.
+// and Listed still has every server. When that last try fails - the tunnel's
+// download, or a body of its that does not decode - the WAN's import comes
+// back beside the error while the context lives: the panel did answer, and
+// its list is still the subscription to watchd's periodic refresh
+// (listedServers), while the wave sees the error as before (resolvedServers).
 func fetchImport(ctx context.Context, rawURL string, wan *http.Client, tunnel func() *http.Client, wanLookup, tunnelLookup func(host string) ([]net.IP, error)) (subscription.Import, error) {
+	// The WAN's import of a body none of whose hosts answered, kept for a last
+	// try over the tunnel that fails; nil when the WAN download failed.
+	var wanImport *subscription.Import
 	body, err := getSubscription(ctx, wan, rawURL)
 	if err == nil {
 		imp, rerr := importFromBody(body, eitherLookup(ctx, wanLookup, tunnelLookup))
@@ -168,6 +181,7 @@ func fetchImport(ctx context.Context, rawURL string, wan *http.Client, tunnel fu
 			return imp, nil
 		}
 		slog.Debug("Subscription hostnames did not resolve over the WAN, trying the tunnel")
+		wanImport = &imp
 	} else {
 		err = NewDownloadError(err)
 		// An ended context leaves the tunnel nothing to try, and finding the tunnel runs vpn-director.sh platform.
@@ -178,11 +192,19 @@ func fetchImport(ctx context.Context, rawURL string, wan *http.Client, tunnel fu
 	}
 	body, err = getSubscription(ctx, tunnel(), rawURL)
 	if err != nil {
-		return subscription.Import{}, NewDownloadError(err)
+		err = NewDownloadError(err)
+		// An ended context returns no list anywhere in the fetch.
+		if wanImport != nil && ctx.Err() == nil {
+			return *wanImport, err
+		}
+		return subscription.Import{}, err
 	}
 	imp, err := importFromBody(body, tunnelLookup)
 	if cerr := ctx.Err(); cerr != nil {
 		return subscription.Import{}, cutShort(cerr)
+	}
+	if err != nil && wanImport != nil {
+		return *wanImport, err
 	}
 	return imp, err
 }
