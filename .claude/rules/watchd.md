@@ -37,7 +37,7 @@ server/internal/monitor/
 ├── monitor.go                     # the engine: refresh, dispatch, apply, the WAN guard, crashes
 ├── store.go                       # the state file
 ├── wan.go, stamp.go               # WANUp; Stamp, which spares a rebuild when no file changed
-server/internal/watchdapi/         # the socket contract: types, Health, Serve, Client
+server/internal/watchdapi/         # the socket contract: types, Health, Listen, ServeListener, Client
 ```
 
 ## Compatibility and lifecycle
