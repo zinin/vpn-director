@@ -82,6 +82,9 @@ type MonitorConfig struct {
 	DeadIntervalMax string `json:"dead_interval_max,omitempty"`
 	Concurrency     int    `json:"concurrency,omitempty"`
 	LogLevel        string `json:"log_level,omitempty"`
+	// SubscriptionRefresh is how often watchd downloads every subscription
+	// with a link; "0" turns it off (monitor.SubscriptionRefreshFrom).
+	SubscriptionRefresh string `json:"subscription_refresh,omitempty"`
 
 	// concurrencySet distinguishes an explicit JSON zero from an absent key.
 	concurrencySet bool

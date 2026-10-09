@@ -235,12 +235,15 @@ Estimated cost: about 5 KB of traffic per check, so 100 live servers checked eve
     "interval": "1m",
     "dead_interval_max": "30m",
     "concurrency": 8,
+    "subscription_refresh": "5m",
     "log_level": "info"
   }
 }
 ```
 
 The daemon rereads the section every minute; it logs to `/tmp/vpn-director-watchd.log`.
+
+Every `subscription_refresh` (5 minutes by default; `0` turns it off) the daemon downloads every subscription with a link and writes only what changed, so the monitor checks the addresses a provider serves now. A server that did not change keeps its status, and so does one that differs only in the REALITY `sni`, `sid` or `spx` a panel picks at random for each download; a renamed server keeps its Active mark. The refresh waits while the Xray watch handles a failure, and the Changed column of the subscription list shows when a list last changed.
 
 ```bash
 /opt/etc/init.d/S98vpn-director-watchd start

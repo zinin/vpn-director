@@ -898,3 +898,19 @@ func TestServerFingerprint_IsTheButtonsOwn(t *testing.T) {
 		t.Fatal("one fingerprint for two subscriptions")
 	}
 }
+
+// A daemon's config write must not drop the key: the monitor section is
+// rewritten whole.
+func TestMonitorConfig_KeepsTheSubscriptionRefresh(t *testing.T) {
+	var cfg VPNDirectorConfig
+	if err := json.Unmarshal([]byte(`{"monitor":{"subscription_refresh":"7m"}}`), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Monitor == nil || cfg.Monitor.SubscriptionRefresh != "7m" {
+		t.Fatalf("monitor %+v", cfg.Monitor)
+	}
+	out, err := json.Marshal(cfg)
+	if err != nil || !strings.Contains(string(out), `"subscription_refresh":"7m"`) {
+		t.Fatalf("written %s, err %v", out, err)
+	}
+}

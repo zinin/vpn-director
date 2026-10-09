@@ -20,7 +20,28 @@ const (
 	MaxConcurrency     = 32
 	// MaxInterval leaves room for the first dead pause.
 	MaxInterval = time.Duration(1<<63-1) / 2
+	// DefaultSubscriptionRefresh is how often watchd downloads every
+	// subscription with a link when monitor.subscription_refresh is absent,
+	// and MinSubscriptionRefresh the shortest period it takes: the monitor
+	// reads the files once a minute anyway.
+	DefaultSubscriptionRefresh = 5 * time.Minute
+	MinSubscriptionRefresh     = time.Minute
 )
+
+// SubscriptionRefreshFrom resolves monitor.subscription_refresh, the period of
+// watchd's periodic subscription refresh; 0 turns it off. A missing key is the
+// default. A value that does not parse, is negative or is below
+// MinSubscriptionRefresh is the default too, and the warning says so.
+func SubscriptionRefreshFrom(c *vpnconfig.MonitorConfig) (time.Duration, string) {
+	if c == nil || c.SubscriptionRefresh == "" {
+		return DefaultSubscriptionRefresh, ""
+	}
+	d, err := time.ParseDuration(c.SubscriptionRefresh)
+	if err == nil && (d == 0 || d >= MinSubscriptionRefresh) {
+		return d, ""
+	}
+	return DefaultSubscriptionRefresh, fmt.Sprintf("monitor.subscription_refresh %q is neither 0 nor at least %s; using %s", c.SubscriptionRefresh, MinSubscriptionRefresh, DefaultSubscriptionRefresh)
+}
 
 // Settings is the monitor section with its defaults filled in.
 type Settings struct {
@@ -69,6 +90,11 @@ func SettingsFrom(c *vpnconfig.MonitorConfig) (Settings, []string) {
 		} else {
 			s.Concurrency = c.Concurrency
 		}
+	}
+	// The refresh period is watchd's, not the engine's, but it lives in this
+	// section: its warning is logged with the others.
+	if _, warn := SubscriptionRefreshFrom(c); warn != "" {
+		warns = append(warns, warn)
 	}
 	return s, warns
 }

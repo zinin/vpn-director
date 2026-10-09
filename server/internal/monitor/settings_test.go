@@ -115,3 +115,37 @@ func TestSettingsFrom_IntervalMustLeaveRoomForTheFirstDeadPause(t *testing.T) {
 		t.Fatalf("boundary settings=%+v warnings=%v", s, warns)
 	}
 }
+
+func TestSubscriptionRefreshFrom(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  time.Duration
+		warns bool
+	}{
+		{"", 5 * time.Minute, false},
+		{"7m", 7 * time.Minute, false},
+		{"1m", time.Minute, false},
+		{"0", 0, false},
+		{"0s", 0, false},
+		{"30s", 5 * time.Minute, true},
+		{"-5m", 5 * time.Minute, true},
+		{"soon", 5 * time.Minute, true},
+	} {
+		got, warn := SubscriptionRefreshFrom(&vpnconfig.MonitorConfig{SubscriptionRefresh: tc.value})
+		if got != tc.want || (warn != "") != tc.warns {
+			t.Errorf("%q: %s, warning %q", tc.value, got, warn)
+		}
+	}
+	if got, warn := SubscriptionRefreshFrom(nil); got != DefaultSubscriptionRefresh || warn != "" {
+		t.Fatalf("no section: %s, warning %q", got, warn)
+	}
+}
+
+// The monitor's settings reader logs each distinct set of warnings once; the
+// refresh period's warning travels with them.
+func TestSettingsFrom_WarnsAboutASubscriptionRefreshOutOfBounds(t *testing.T) {
+	_, warns := SettingsFrom(&vpnconfig.MonitorConfig{SubscriptionRefresh: "30s"})
+	if len(warns) != 1 || !strings.Contains(warns[0], "monitor.subscription_refresh") || !strings.Contains(warns[0], "using 5m0s") {
+		t.Fatalf("warnings %v", warns)
+	}
+}
