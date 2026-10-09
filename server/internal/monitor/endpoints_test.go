@@ -53,6 +53,34 @@ func TestBuild_OneEndpointPerKey(t *testing.T) {
 	}
 }
 
+// vlessReality is a VLESS REALITY outbound on address with the short id a
+// panel picked for one download.
+func vlessReality(address, sid string) json.RawMessage {
+	return json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"` + address + `","port":443,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"reality","realitySettings":{"serverName":"www.example.com","fingerprint":"chrome","publicKey":"pk-1","shortId":"` + sid + `"}}}`)
+}
+
+// A periodic refresh that finds a server renamed and its short id picked anew
+// keeps the stored outbound: every endpoint keeps its key and the outbound the
+// prober holds, so the monitor keeps its statuses and does not restart it.
+func TestBuild_APeriodicRefreshKeepsEveryEndpoint(t *testing.T) {
+	stored := []vpnconfig.Server{
+		{Name: "DE 10GB", Address: "de.example", Port: 443, IPs: []string{"192.0.2.1", "192.0.2.2"}, Outbound: vlessReality("de.example", "aa11")},
+		{Name: "FR", Address: "fr.example", Port: 443, IPs: []string{"192.0.2.3"}, Outbound: trojan("fr.example")},
+	}
+	listed := []vpnconfig.Server{
+		{Name: "DE 9GB", Address: "de.example", Port: 443, IPs: []string{"192.0.2.2", "192.0.2.1"}, Outbound: vlessReality("de.example", "bb22")},
+		{Name: "FR", Address: "fr.example", Port: 443, Outbound: trojan("fr.example")}, // its host did not answer this time
+	}
+	merged := vpnconfig.MergeRefresh(stored, listed).Servers
+
+	before, _ := Build([]vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Alpha", Servers: stored}}, nil, outboundAsIs)
+	after, _ := Build([]vpnconfig.Subscription{{ID: "0a1b2c3d", Name: "Alpha", Servers: merged}}, nil, outboundAsIs)
+
+	if keysOf(after) != keysOf(before) {
+		t.Fatalf("endpoints %+v, want the keys and outbounds of %+v", after, before)
+	}
+}
+
 // At a rebuild the running server's endpoints are checked first.
 func TestBuild_TheActiveServerComesFirst(t *testing.T) {
 	a := vpnconfig.Server{Name: "Oslo", Address: "a.example", Port: 443, IPs: []string{"192.0.2.1"}, Outbound: trojan("a.example")}
