@@ -107,6 +107,7 @@ func AddSubscription(update ConfigUpdate, files SubscriptionFiles, rawURL, name 
 			i = len(subs)
 			subs = append(subs, sub)
 		}
+		stored := sub.Servers
 		sub.Servers = servers
 		sub.Refreshed = stamp(now)
 		sub.Error = ""
@@ -117,6 +118,11 @@ func AddSubscription(update ConfigUpdate, files SubscriptionFiles, rawURL, name 
 		subs[i] = sub
 		if cfg != nil {
 			cfg.Xray.Servers = SubscriptionIPs(subs)
+			if existed {
+				// A saved link is a refresh a user asked for: the records that
+				// named a server it renamed follow it.
+				followRenames(cfg, sub.ID, stored, servers, pairServers(stored, servers))
+			}
 		}
 		return nil
 	})
@@ -134,8 +140,23 @@ func AddSubscription(update ConfigUpdate, files SubscriptionFiles, rawURL, name 
 // downloaded from rawURL, under update's lock, and clears its error - only
 // while that subscription still exists with that link: ErrSubscriptionGone
 // otherwise, and nothing is written. xray.servers is recomputed in the same
-// update.
+// update. The watch's wave refreshes here: its walk compares the server
+// records within one tick, and they must not change under it.
 func RefreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, servers []Server, now time.Time) (Subscription, error) {
+	return refreshSubscription(update, files, id, rawURL, servers, now, false)
+}
+
+// RefreshSubscriptionFollowingRenames is RefreshSubscription for a refresh a
+// user asked for - the Web UI's and the bot's. It takes the fresh copies as
+// well, and the records that named a server the fresh list renamed follow it
+// (followRenames): a panel that puts the traffic left into every name would
+// otherwise lose the Active mark, and the return to the preferred server, at
+// every refresh.
+func RefreshSubscriptionFollowingRenames(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, servers []Server, now time.Time) (Subscription, error) {
+	return refreshSubscription(update, files, id, rawURL, servers, now, true)
+}
+
+func refreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, servers []Server, now time.Time, follow bool) (Subscription, error) {
 	if rawURL == "" {
 		return Subscription{}, ErrSubscriptionStatic
 	}
@@ -151,6 +172,7 @@ func RefreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawUR
 			return ErrSubscriptionGone
 		}
 		sub = subs[i]
+		stored := sub.Servers
 		sub.Servers = servers
 		sub.Refreshed = stamp(now)
 		sub.Error = ""
@@ -161,6 +183,9 @@ func RefreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawUR
 		subs[i] = sub
 		if cfg != nil {
 			cfg.Xray.Servers = SubscriptionIPs(subs)
+			if follow {
+				followRenames(cfg, id, stored, servers, pairServers(stored, servers))
+			}
 		}
 		return nil
 	})

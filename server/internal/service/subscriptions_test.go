@@ -401,3 +401,30 @@ func TestRenameSubscription_Refusals(t *testing.T) {
 		t.Fatalf("err %v, files %+v", err, store.subs)
 	}
 }
+
+// A refresh from the Web UI or the bot carries the running server's record
+// over the name the panel gave it this time - 3x-ui puts the traffic left
+// into it - keeps its write counter, and stores the fresh copy.
+func TestRefreshSubscription_TheRunningServerFollowsARename(t *testing.T) {
+	link := func(name, sid string) string {
+		return base64.StdEncoding.EncodeToString([]byte("vless://11111111-2222-3333-4444-555555555555@203.0.113.10:443?type=tcp&security=reality&pbk=pk-1&sni=www.example.com&fp=chrome&sid=" + sid + "#" + name))
+	}
+	store := newMemConfigStore()
+	add := AddSubscription(context.Background(), store, subscriptionHost(t, serve(link("DE10GB", "aa11"))), publicLink, "Alpha")
+	if add.Err != nil {
+		t.Fatal(add.Err)
+	}
+	store.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Subscription: add.ID, Name: "DE10GB", Address: "203.0.113.10", Port: 443, Seq: 3}
+
+	res := RefreshSubscription(context.Background(), store, subscriptionHost(t, serve(link("DE9GB", "bb22"))), add.ID)
+
+	if res.Err != nil {
+		t.Fatal(res.Err)
+	}
+	if a := store.cfg.Xray.ActiveServer; a.Name != "DE9GB" || a.Seq != 3 {
+		t.Fatalf("active %+v, want DE9GB with seq 3", a)
+	}
+	if !strings.Contains(string(store.subs[0].Servers[0].Outbound), "bb22") {
+		t.Fatalf("outbound %s, want the fresh copy", store.subs[0].Servers[0].Outbound)
+	}
+}
