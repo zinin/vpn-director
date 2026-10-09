@@ -820,6 +820,22 @@ func TestRuntime_NewWatchUsesSharedReadinessAndCompatibilityGate(t *testing.T) {
 	}
 }
 
+// A permission check after the operation's context ended reports why it ended
+// - the incompatibility a stop poll found, say - not the bare cancellation, so
+// the log names what stopped the watch.
+func TestRuntime_CanMutateReportsWhyTheOperationEnded(t *testing.T) {
+	p := runtimePaths(t)
+	cfg := runtimeConfig(t, p, runtimePending)
+	q := runtimeQueue(t, filepath.Join(p.ScriptsDir, "resolved-data", "watchd-notifications.json"))
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	w := runtimeWatch(t, ctx, p, cfg, q, service.DefaultExecutor())
+	cancel(watchcompat.ErrIncompatible)
+	if err := w.CanMutate(); !errors.Is(err, watchcompat.ErrIncompatible) {
+		t.Fatalf("CanMutate = %v, want the cause the operation ended with", err)
+	}
+}
+
 func TestRuntime_NewWatchGeneratesUnderTheRealConfigLock(t *testing.T) {
 	p := runtimePaths(t)
 	cfg := runtimeConfig(t, p, `{"data_dir":"resolved-data","advanced":{"xray":{"tproxy_port":23456,"socks_port":23457}},"xray":{"active_server":{"name":"old","address":"old.example","port":443,"subscription":"0a1b2c3d","seq":7}}}`)

@@ -1567,3 +1567,35 @@ func fastReadInboundPorts(t *testing.T, path string) service.InboundPorts {
 	}
 	return ports
 }
+
+// A server on an address of the active one dies with it - a rotation or a block
+// takes the address - and its fresh check could not finish inside the shared
+// budget: it is no candidate, and the attempt takes one on another address.
+func TestFast_CandidatesAvoidTheActiveServersAddresses(t *testing.T) {
+	s := newFastFixture(t)
+	active, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	sibling := fastServer("Sibling", "oslo.example", "203.0.113.11")
+	sibling.Outbound = json.RawMessage(strings.Replace(string(sibling.Outbound), "0010", "0011", 1))
+	s.f.subs[0].Servers = []vpnconfig.Server{active, sibling, backup}
+	s.setHealth()
+	siblingKey := endpoint.Keys(sibling)[0]
+	for _, key := range endpoint.Keys(active) {
+		if key == siblingKey {
+			t.Fatal("fixture: the sibling must be an endpoint of its own")
+		}
+	}
+
+	s.w.Tick(context.Background())
+
+	for _, call := range s.h.requests() {
+		for _, key := range call.keys {
+			if key == siblingKey {
+				t.Fatalf("checked %v; a server on an address of the active one is no candidate", call.keys)
+			}
+		}
+	}
+	if s.generateCalls != 1 || s.restarts != 1 || s.f.cfg.Xray.ActiveServer.Name != "Backup" {
+		t.Fatalf("generate %d, restart %d, active %+v; want the switch to the server on another address", s.generateCalls, s.restarts, s.f.cfg.Xray.ActiveServer)
+	}
+	assertFastAssignments(t, s.f.cfg)
+}

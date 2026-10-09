@@ -1371,6 +1371,8 @@ func (w *Watch) cancelOnStop(ctx context.Context) (context.Context, func()) {
 					return
 				}
 				w.mutationFailed.Store(true)
+				// The operation this cuts short reports only that it ended.
+				slog.Info("Watch stopped its tick: automation may not act now", watchErrorAttr(err))
 				cancel(err)
 				return
 			}

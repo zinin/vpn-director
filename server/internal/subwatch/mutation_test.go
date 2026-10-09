@@ -1,9 +1,13 @@
 package subwatch
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -633,5 +637,54 @@ func TestMutation_IncompatibleAndCancellationEndWalkAndReturn(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// A stop or a lost compatibility that ends a tick while it waits is said once
+// in the log, with its kind: the operation it cut short reports only that it
+// ended.
+func TestMutation_PollLogsWhyItEndedTheTick(t *testing.T) {
+	defer func(poll time.Duration) { stopPoll = poll }(stopPoll)
+	stopPoll = time.Millisecond
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	f := &fake{cfg: mutationConfig(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	var incompatible atomic.Bool
+	w.CanMutate = mutationGate(&incompatible)
+	w.Probe = func(ctx context.Context, _ int) error {
+		incompatible.Store(true)
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("the poll did not end the tick")
+		}
+		return ctx.Err()
+	}
+
+	w.Tick(context.Background())
+
+	var kinds []string
+	decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+	for {
+		var record struct {
+			Message string `json:"msg"`
+			Error   struct {
+				Kind string `json:"kind"`
+			} `json:"error"`
+		}
+		if err := decoder.Decode(&record); errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		if record.Message == "Watch stopped its tick: automation may not act now" {
+			kinds = append(kinds, record.Error.Kind)
+		}
+	}
+	if !reflect.DeepEqual(kinds, []string{"incompatible"}) {
+		t.Fatalf("interruption records %v, want one of kind incompatible", kinds)
 	}
 }

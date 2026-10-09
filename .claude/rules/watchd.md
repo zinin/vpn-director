@@ -50,8 +50,14 @@ users are neither executed nor considered. Any root process whose executable or 
 symlink - and when its reply keeps the gate closed, the watchd log names its PID and executable
 path once.
 It recognizes an old executable that was replaced or deleted; checking only the new installed
-path cannot attest the old running process. PID/starttime and executable identity changes
-invalidate cached results. Unreadable or uncertain identities fail closed for automation.
+path cannot attest the old running process. A verified executable is remembered by its identity
+(device, inode, size, mtime): a process running it under a new PID - a restarted bot, or the
+bot's own child between fork and exec - is not run again, and a changed identity is checked
+anew. A process that executes another program or exits while the scan reads it runs no bot code
+and is skipped. Unreadable or uncertain identities fail closed for automation; a refusal that
+runs no executable - a scan that cannot vouch for a process, a bot that starts during the check -
+is logged with its reason once while it keeps the gate closed. A refusal that comes while a tick
+waits ends that tick, and the log says so once (`Watch stopped its tick`, with its kind).
 
 A compatible bot answers `--watchd-capabilities` with
 `{"protocol_version":1,"watch_owner":"watchd"}`. The bot handles this read-only flag before
@@ -106,7 +112,10 @@ but the watch starts no new subscription-driven failover. Paused clients are exc
 
 Every 30 seconds the watch checks HTTPS 204 through the main Xray SOCKS port. After a miss, the
 fast path checks every active endpoint and at most three other distinct, previously live
-connections in hybrid walk order. Fresh checks share one 30-second deadline and the monitor's
+connections in hybrid walk order, none on an address the active server uses: a rotation or a
+block takes the address, so the other names a provider lists on it die with the active one, and
+their dead checks (22 s each) seldom end inside the deadline. Fresh checks share one 30-second
+deadline and the monitor's
 worker pool. Switching requires fresh active-dead/candidate-alive evidence and a working WAN;
 active-dead counts only when the monitor saw the active endpoints die after the main probe last
 succeeded on that same server, so a monitor that cannot reach what main Xray dials (stale stored

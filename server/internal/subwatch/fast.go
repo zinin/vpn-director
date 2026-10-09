@@ -306,6 +306,13 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		chosen = cfg.Xray.ActiveServer
 	}
 	order, _ := walkOrder(subs, chosen)
+	// A rotation or a block takes an address: the other names a provider lists
+	// on an address of the active server die with it, and their dead checks
+	// seldom end inside FastCheckTimeout. None of them is a candidate.
+	activeAddresses := make(map[string]bool)
+	for _, c := range endpoint.PerAddress([]vpnconfig.Server{active}) {
+		activeAddresses[endpoint.ServerForDial(c).Address] = true
+	}
 	var choices []fastChoice
 	for _, s := range endpoint.PerAddress(order) {
 		key := endpoint.Key(s)
@@ -313,6 +320,9 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			continue
 		}
 		seen[key] = true
+		if activeAddresses[endpoint.ServerForDial(s).Address] {
+			continue
+		}
 		if !fastEvidenceStatus(cached, []string{key}, watchdapi.StatusAlive) {
 			continue
 		}

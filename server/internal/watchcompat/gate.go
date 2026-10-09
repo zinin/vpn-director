@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -39,10 +40,12 @@ type Gate struct {
 	BotPath  string
 	ProcRoot string
 
-	mu       sync.Mutex
-	verified []executableTarget
-	cache    map[executableTarget]struct{}
+	mu sync.Mutex
+	// cache holds the executables whose capabilities were verified, by
+	// identity: a process running one runs the verified bytes, whatever its PID.
+	cache    map[executableIdentity]struct{}
 	refused  executableTarget // the last refusal logged; zero once a Check succeeds
+	reported string           // the last refusal without a run logged; empty once a Check succeeds
 	proc     func(context.Context, string, string) ([]executableTarget, error)
 	exec     func(context.Context, string) ([]byte, error)
 }
@@ -53,8 +56,16 @@ func (g *Gate) Check(ctx context.Context) error {
 
 	deny := func() error {
 		g.cache = nil
-		g.verified = nil
 		return ErrIncompatible
+	}
+	// A refusal that runs no executable is named once while it keeps the gate
+	// closed, as a refusing executable is: the owner needs to know what does.
+	report := func(msg string, args ...any) error {
+		if key := msg + fmt.Sprint(args...); key != g.reported {
+			g.reported = key
+			slog.Warn(msg, args...)
+		}
+		return deny()
 	}
 	// A caller that went away is no evidence against what was verified: the
 	// refusal keeps the cache.
@@ -69,21 +80,20 @@ func (g *Gate) Check(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ErrIncompatible
 		}
-		return deny()
-	}
-	if !sameTargets(before, g.verified) {
-		g.cache = nil
+		return report("Bot compatibility check failed; automation stays incompatible", "reason", err.Error())
 	}
 	run := g.exec
 	if run == nil {
 		run = readCapabilities
 	}
-	next := make(map[executableTarget]struct{}, len(before))
+	next := make(map[executableIdentity]struct{}, len(before))
 	for _, target := range before {
 		if ctx.Err() != nil {
 			return ErrIncompatible
 		}
-		if _, ok := g.cache[target]; !ok {
+		_, cached := g.cache[target.identity]
+		_, verified := next[target.identity]
+		if !cached && !verified {
 			body, err := run(ctx, target.path)
 			if err != nil || !compatibleCapabilities(body) {
 				if ctx.Err() != nil {
@@ -99,27 +109,30 @@ func (g *Gate) Check(ctx context.Context) error {
 				return deny()
 			}
 		}
-		next[target] = struct{}{}
+		next[target.identity] = struct{}{}
 	}
-	// Executing capabilities must not bless a replaced file or a reused PID. A
-	// process that exited meanwhile adds no unverified code.
+	// Executing capabilities must not bless a replaced file: a process that
+	// started meanwhile passes only if it runs an executable this check
+	// verified, as the bot's own child does between fork and exec. One that
+	// exited meanwhile adds no unverified code.
 	after, err := g.targets(ctx)
 	if ctx.Err() != nil {
 		return ErrIncompatible
 	}
 	if err != nil {
-		return deny()
+		return report("Bot compatibility check failed; automation stays incompatible", "reason", err.Error())
 	}
-	cache := make(map[executableTarget]struct{}, len(after))
+	cache := make(map[executableIdentity]struct{}, len(after))
 	for _, target := range after {
-		if _, ok := next[target]; !ok {
-			return deny()
+		if _, ok := next[target.identity]; !ok {
+			return report("Bot compatibility refused: a bot process started during the check; automation stays incompatible",
+				"pid", target.pid, "path", executablePath(target))
 		}
-		cache[target] = struct{}{}
+		cache[target.identity] = struct{}{}
 	}
 	g.cache = cache
-	g.verified = after
 	g.refused = executableTarget{}
+	g.reported = ""
 	return nil
 }
 
@@ -141,10 +154,10 @@ func (g *Gate) targets(ctx context.Context) ([]executableTarget, error) {
 		targets = append(targets, executableTarget{path: g.BotPath, identity: identity})
 	} else if errors.Is(err, os.ErrNotExist) {
 		if _, err := os.Lstat(g.BotPath); !errors.Is(err, os.ErrNotExist) {
-			return nil, ErrIncompatible
+			return nil, fmt.Errorf("%w: the installed bot path does not resolve", ErrIncompatible)
 		}
 	} else {
-		return nil, ErrIncompatible
+		return nil, fmt.Errorf("%w: the installed bot cannot be checked", ErrIncompatible)
 	}
 	root := g.ProcRoot
 	if root == "" {
@@ -159,21 +172,12 @@ func (g *Gate) targets(ctx context.Context) ([]executableTarget, error) {
 	}
 	processes, err := read(ctx, root, g.BotPath)
 	if err != nil {
-		return nil, ErrIncompatible
+		if !errors.Is(err, ErrIncompatible) {
+			err = fmt.Errorf("%w: %v", ErrIncompatible, err)
+		}
+		return nil, err
 	}
 	return append(targets, processes...), nil
-}
-
-func sameTargets(a, b []executableTarget) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
 }
 
 func compatibleCapabilities(body []byte) bool {

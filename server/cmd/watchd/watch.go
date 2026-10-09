@@ -42,7 +42,9 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 	}
 	w.CanMutate = func() error {
 		current := operationContext()
-		if err := current.Err(); err != nil {
+		// The cause, not the bare cancellation: a stop poll that found the gate
+		// closed ends the operation with ErrIncompatible, and the log says so.
+		if err := context.Cause(current); err != nil {
 			return err
 		}
 		if gate == nil {
