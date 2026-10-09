@@ -69,6 +69,7 @@ func runRuntime(ctx context.Context, listen func(context.Context, string) (net.L
 	}
 	start(deps.Monitor.Run)
 	start(deps.Watch.Start)
+	start(deps.Watch.StartRefresh)
 	start(deps.Queue.Run)
 	start(func(ctx context.Context) {
 		publishSubscriptionHealth(ctx, healthSubscriptions, deps.Monitor, deps.Queue)

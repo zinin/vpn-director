@@ -1712,3 +1712,30 @@ func TestPublishSubscriptionHealth_RuntimeStoreErrorDoesNotStopWatch(t *testing.
 		}
 	}
 }
+
+// The periodic refresh reads monitor.subscription_refresh before every round:
+// absent is 5 minutes, 0 is off, a value below a minute is the default.
+func TestNewWatch_RefreshFollowsTheMonitorSection(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+	}{
+		{`{"data_dir":"data"}`, 5 * time.Minute},
+		{`{"data_dir":"data","monitor":{"subscription_refresh":"7m"}}`, 7 * time.Minute},
+		{`{"data_dir":"data","monitor":{"subscription_refresh":"0"}}`, 0},
+		{`{"data_dir":"data","monitor":{"subscription_refresh":"30s"}}`, 5 * time.Minute},
+	} {
+		p := runtimePaths(t)
+		cfg := runtimeConfig(t, p, tc.raw)
+		q := runtimeQueue(t, filepath.Join(t.TempDir(), "watchd-notifications.json"))
+		w := runtimeWatch(t, context.Background(), p, cfg, q, runtimeExecutor(func(context.Context, string, ...string) (*shell.Result, error) {
+			return &shell.Result{}, nil
+		}))
+		if w.FetchList == nil || w.RefreshInterval == nil {
+			t.Fatal("newWatch left the periodic refresh unwired")
+		}
+		if got := w.RefreshInterval(); got != tc.want {
+			t.Errorf("%s: interval %s, want %s", tc.raw, got, tc.want)
+		}
+	}
+}

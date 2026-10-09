@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
+	"github.com/zinin/vpn-director/server/internal/monitor"
 	"github.com/zinin/vpn-director/server/internal/netpath"
 	"github.com/zinin/vpn-director/server/internal/notifications"
 	"github.com/zinin/vpn-director/server/internal/paths"
@@ -89,6 +91,24 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 			TablesPath: p.TunnelTables,
 		}
 		return fetcher.Fetch(ctx, url)
+	}
+	w.FetchList = func(ctx context.Context, url string) ([]vpnconfig.Server, error) {
+		fetcher := service.SubscriptionFetcher{
+			Store:      cfg,
+			VPN:        vpn.ForContext(ctx),
+			TablesPath: p.TunnelTables,
+		}
+		return fetcher.FetchList(ctx, url)
+	}
+	// Read before every round, so a change takes effect without a restart. A
+	// config that does not load stands the round down anyway.
+	w.RefreshInterval = func() time.Duration {
+		config, err := cfg.LoadVPNConfig()
+		if err != nil {
+			return monitor.DefaultSubscriptionRefresh
+		}
+		d, _ := monitor.SubscriptionRefreshFrom(config.Monitor)
+		return d
 	}
 	// The watch notifies a change it has made and records the message as sent;
 	// its own checks decide what a stop silences, so an ended tick drops nothing.
