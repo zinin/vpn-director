@@ -71,11 +71,7 @@ func (f SubscriptionFetcher) Fetch(ctx context.Context, rawURL string) ([]vpncon
 // hosts resolved is a list here, not an error: watchd's periodic refresh keeps
 // the addresses it has for them (vpnconfig.MergeRefresh).
 func (f SubscriptionFetcher) FetchList(ctx context.Context, rawURL string) ([]vpnconfig.Server, error) {
-	imp, err := f.fetch(ctx, rawURL)
-	if err != nil {
-		return nil, err
-	}
-	return imp.Listed, nil
+	return listedServers(f.fetch(ctx, rawURL))
 }
 
 func (f SubscriptionFetcher) fetch(ctx context.Context, rawURL string) (subscription.Import, error) {
@@ -101,6 +97,16 @@ func resolvedServers(imp subscription.Import, err error) ([]vpnconfig.Server, er
 		return nil, errNoResolved
 	}
 	return imp.Servers, nil
+}
+
+// listedServers is what watchd's periodic refresh takes from an import: every
+// server it lists, without addresses where the host did not resolve, and no
+// error when none did.
+func listedServers(imp subscription.Import, err error) ([]vpnconfig.Server, error) {
+	if err != nil {
+		return nil, err
+	}
+	return imp.Listed, nil
 }
 
 // errNoTunnel is a lookup over a tunnel that is not there.

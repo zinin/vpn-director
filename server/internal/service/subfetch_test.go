@@ -798,6 +798,46 @@ func TestFetchImport_NothingResolvedIsAListToo(t *testing.T) {
 	}
 }
 
+// FetchList is listedServers of an import, and the wave's Fetch is
+// resolvedServers of it: the periodic refresh takes every server listed, one
+// whose host did not answer this time without addresses, and the wave only the
+// servers it can dial. A failed download is the error of both.
+func TestListedServers_ListsTheServersThatDidNotResolve(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo\nvless://uuid-2@riga.example.invalid:443#Riga"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	imp, err := fetchImport(context.Background(), wan.URL, hostClient(wan), knownTunnel(nil),
+		func(host string) ([]net.IP, error) {
+			if host == "oslo.example.invalid" {
+				return []net.IP{net.ParseIP("203.0.113.50")}, nil
+			}
+			return nil, errors.New("no answer")
+		}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	listed, err := listedServers(imp, nil)
+	if err != nil || len(listed) != 2 || listed[0].Name != "Oslo" || !reflect.DeepEqual(listed[0].IPs, []string{"203.0.113.50"}) ||
+		listed[1].Name != "Riga" || len(listed[1].IPs) != 0 {
+		t.Fatalf("listed %+v, err %v; want Oslo on 203.0.113.50, then Riga without addresses", listed, err)
+	}
+	resolved, err := resolvedServers(imp, nil)
+	if err != nil || len(resolved) != 1 || resolved[0].Name != "Oslo" {
+		t.Fatalf("resolved %+v, err %v; want Oslo alone", resolved, err)
+	}
+
+	failed := errors.New("download failed: HTTP 403")
+	if servers, err := listedServers(imp, failed); servers != nil || err != failed {
+		t.Fatalf("listedServers: %+v, err %v; want the error unchanged", servers, err)
+	}
+	if servers, err := resolvedServers(imp, failed); servers != nil || err != failed {
+		t.Fatalf("resolvedServers: %+v, err %v; want the error unchanged", servers, err)
+	}
+}
+
 func TestSubscriptionFetcher_FetchListRefusesALinkThatIsNotHTTPS(t *testing.T) {
 	if _, err := (SubscriptionFetcher{}).FetchList(context.Background(), "http://sub.example.com/s/t"); !errors.Is(err, ErrSubscriptionURL) {
 		t.Fatalf("err %v, want ErrSubscriptionURL", err)
