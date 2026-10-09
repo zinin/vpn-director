@@ -362,7 +362,9 @@ cmd_stop() {
     # manual apply of a router the user stopped.
     case "$COMPONENT" in
         ""|all)
-            mkdir -p "$(dirname "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}")"
+            # 0755 whatever the caller's umask: this is also watchd's runtime
+            # directory, and watchd refuses one group or others can write to.
+            mkdir -p -m 755 "$(dirname "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}")"
             printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
             ;;
     esac

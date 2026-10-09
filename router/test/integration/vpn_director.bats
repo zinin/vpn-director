@@ -258,6 +258,28 @@ run_stubbed_cli() {
     assert_output $'tproxy_stop after the marker\ntunnel_stop after the marker'
 }
 
+# The marker's directory is also watchd's runtime directory, and watchd refuses
+# one that group or others can write to. Whoever runs stop - the bot, the Web
+# UI, an init script - brings its own umask, so the mode must not follow it.
+@test "vpn-director: stop creates the marker's directory 0755 whatever the umask" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/run/stopped"
+    run bash -c '
+        script=$1
+        shift
+        umask 000
+        source "$script" --source-only "$@"
+        _load_modules
+        acquire_lock() { :; }
+        tproxy_stop() { :; }
+        tunnel_stop() { :; }
+        "cmd_$COMMAND"
+    ' -- "$SCRIPTS_DIR/vpn-director.sh" stop
+    assert_success
+    [ -f "$VPD_STOPPED_FILE" ]
+    run stat -c %a "$BATS_TEST_TMPDIR/run"
+    assert_output "755"
+}
+
 # The subscription watch writes config.json for each server it tries and needs
 # only the process to pick it up. "restart xray" would apply the TPROXY rules
 # again after each one for nothing.

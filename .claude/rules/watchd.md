@@ -261,6 +261,8 @@ while checks are paused.
 watchd refuses to start when the socket's directory (`/tmp/vpn-director`) is a symlink, is not
 owned by root, or is writable by group or others, and logs why; the prober directory must also
 be a root-owned `0700` directory. `--dev` skips the socket directory check (see Dev mode).
+`vpn-director.sh stop`, which creates that directory for its marker when it is missing, makes it
+`0755` whatever the caller's umask.
 
 Each client request is bounded by 2 seconds. Notification POST bodies are capped at 1 MiB
 (413 on oversize); responses are bounded by 16 MiB, pending pages by 100 messages, cursors by
