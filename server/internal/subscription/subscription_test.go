@@ -259,3 +259,29 @@ func TestDecode_KeyCaseDetail(t *testing.T) {
 		t.Fatalf("skipped %+v, want one skip detailed %s", res.Skipped, want)
 	}
 }
+
+// watchd's periodic refresh keeps the addresses it has for a server whose host
+// does not answer this time, so the import lists every server it decoded -
+// those that resolved with their addresses, the others without - in order.
+func TestDecodeAndResolveLookup_ListsEveryServer(t *testing.T) {
+	body := "vless://uuid-1@oslo.example.invalid:443#Oslo\nvless://uuid-2@riga.example.invalid:443#Riga\nvless://uuid-3@bergen.example.invalid:443#Bergen"
+	imp, err := DecodeAndResolveLookup(body, func(host string) ([]net.IP, error) {
+		if host == "riga.example.invalid" {
+			return nil, errors.New("no answer")
+		}
+		return []net.IP{net.ParseIP("203.0.113.50")}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, s := range imp.Listed {
+		names = append(names, s.Name)
+	}
+	if !reflect.DeepEqual(names, []string{"Oslo", "Riga", "Bergen"}) || len(imp.Listed[0].IPs) != 1 || len(imp.Listed[1].IPs) != 0 {
+		t.Fatalf("listed %+v", imp.Listed)
+	}
+	if len(imp.Servers) != 2 || imp.ResolveErrors != 1 {
+		t.Fatalf("servers %+v, resolve errors %d", imp.Servers, imp.ResolveErrors)
+	}
+}

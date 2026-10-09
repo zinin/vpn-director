@@ -12,7 +12,12 @@ import (
 // subscription order and holds only the servers whose address resolved;
 // Parsed counts the servers Decode returned.
 type Import struct {
-	Servers       []vpnconfig.Server
+	Servers []vpnconfig.Server
+	// Listed is every server Decode returned, in subscription order, with its
+	// addresses where they resolved and none where they did not: watchd's
+	// periodic refresh keeps the addresses it has for a server whose host
+	// does not answer this time.
+	Listed        []vpnconfig.Server
 	Total         int
 	Parsed        int
 	Skipped       []Skip
@@ -54,10 +59,12 @@ func DecodeAndResolveLookup(body string, lookup func(host string) ([]net.IP, err
 		ips, err := resolveIPv4(lookup, s.Address)
 		if err != nil {
 			imp.ResolveErrors++
+			imp.Listed = append(imp.Listed, s)
 			continue
 		}
 		s.IPs = ips
 		imp.Servers = append(imp.Servers, s)
+		imp.Listed = append(imp.Listed, s)
 	}
 	return imp, nil
 }

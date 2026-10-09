@@ -257,22 +257,22 @@ func TestNewTunnelHTTPClient_DoesNotFollowRedirects(t *testing.T) {
 	}
 }
 
-func TestServersFromSubscription(t *testing.T) {
-	if _, err := serversFromSubscriptionLookup([]byte("not base64 !!!"), nil); err == nil || err.Error() != "unrecognized subscription format" {
+func TestImportFromBody(t *testing.T) {
+	if _, err := importFromBody([]byte("not base64 !!!"), nil); err == nil || err.Error() != "unrecognized subscription format" {
 		t.Fatalf("err %v, want unrecognized subscription format", err)
 	}
 	// A readable subscription none of whose entries Xray can run.
-	if _, err := serversFromSubscriptionLookup([]byte("tuic://uuid:pw@203.0.113.10:443#TUIC"), nil); err == nil || err.Error() != "no supported servers" {
+	if _, err := importFromBody([]byte("tuic://uuid:pw@203.0.113.10:443#TUIC"), nil); err == nil || err.Error() != "no supported servers" {
 		t.Fatalf("err %v, want no supported servers", err)
 	}
 
 	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@203.0.113.10:443#Oslo"))
-	servers, err := serversFromSubscriptionLookup([]byte(body), nil)
+	imp, err := importFromBody([]byte(body), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(servers) != 1 || servers[0].Name != "Oslo" || !reflect.DeepEqual(servers[0].IPs, []string{"203.0.113.10"}) {
-		t.Fatalf("servers %+v, want Oslo on 203.0.113.10", servers)
+	if len(imp.Servers) != 1 || imp.Servers[0].Name != "Oslo" || !reflect.DeepEqual(imp.Servers[0].IPs, []string{"203.0.113.10"}) {
+		t.Fatalf("servers %+v, want Oslo on 203.0.113.10", imp.Servers)
 	}
 }
 
@@ -748,4 +748,58 @@ func TestSubscriptionFetcher_SharedDeadlinePublishesNoPartialList(t *testing.T) 
 			t.Fatalf("%d platform calls after cancellation, want 0", plat.runs)
 		}
 	})
+}
+
+// The periodic refresh keeps the addresses it has for a server whose host does
+// not answer this time: the fetch lists it, without addresses, beside the
+// servers that resolved.
+func TestFetchImport_ListsEveryServerWhetherItResolvedOrNot(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo\nvless://uuid-2@riga.example.invalid:443#Riga"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+
+	imp, err := fetchImport(context.Background(), wan.URL, hostClient(wan), knownTunnel(nil),
+		func(host string) ([]net.IP, error) {
+			if host == "oslo.example.invalid" {
+				return []net.IP{net.ParseIP("203.0.113.50")}, nil
+			}
+			return nil, errors.New("no answer")
+		}, nil)
+
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(imp.Listed) != 2 || imp.Listed[0].Name != "Oslo" || imp.Listed[1].Name != "Riga" || len(imp.Listed[1].IPs) != 0 {
+		t.Fatalf("listed %+v", imp.Listed)
+	}
+	if len(imp.Servers) != 1 || imp.Servers[0].Name != "Oslo" {
+		t.Fatalf("servers %+v", imp.Servers)
+	}
+}
+
+// A body none of whose hosts resolved is a list to the periodic refresh, and
+// still the error it always was to the wave.
+func TestFetchImport_NothingResolvedIsAListToo(t *testing.T) {
+	body := base64.StdEncoding.EncodeToString([]byte("vless://uuid-1@oslo.example.invalid:443#Oslo"))
+	wan := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(wan.Close)
+	noAnswer := func(string) ([]net.IP, error) { return nil, errors.New("no answer") }
+
+	imp, err := fetchImport(context.Background(), wan.URL, hostClient(wan), knownTunnel(nil), noAnswer, nil)
+	if err != nil || len(imp.Servers) != 0 || len(imp.Listed) != 1 {
+		t.Fatalf("import %+v, err %v", imp, err)
+	}
+	if _, err := fetchServers(context.Background(), wan.URL, hostClient(wan), knownTunnel(nil), noAnswer, nil); !errors.Is(err, errNoResolved) {
+		t.Fatalf("the wave's fetch: %v, want errNoResolved", err)
+	}
+}
+
+func TestSubscriptionFetcher_FetchListRefusesALinkThatIsNotHTTPS(t *testing.T) {
+	if _, err := (SubscriptionFetcher{}).FetchList(context.Background(), "http://sub.example.com/s/t"); !errors.Is(err, ErrSubscriptionURL) {
+		t.Fatalf("err %v, want ErrSubscriptionURL", err)
+	}
 }
