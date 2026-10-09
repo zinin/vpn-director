@@ -106,6 +106,7 @@ type Watch struct {
 	fastOwned         *fastSelection
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
+	failSeq           int       // active_server's write counter when failSince was set: the record that began to fail
 	probeOKAt         time.Time // when the main SOCKS probe last succeeded,
 	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on
 	fastLogged        time.Time // failSince of the episode whose fast attempt was last logged as not switching
@@ -130,6 +131,7 @@ type Watch struct {
 	returnRetry       time.Duration     // wait after the last failed return; zero before any
 	returnFails       int               // returns in a row that failed; at ReturnFailsMax the returns stop
 	lastReturn        time.Time         // when the last return proved live; zero once it held for ReturnHold or a death followed it
+	returnSeq         int               // active_server's write counter the last return left
 	returnDeath       time.Time         // failSince of the last death the returns were settled at
 	lastPicked        *vpnconfig.Server // the copy the walk picked or a return proved, with the address it ran on
 }
@@ -286,6 +288,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		// three more minutes before the watch looks for another fallback.
 		if w.failSince.IsZero() {
 			w.failSince = w.Now()
+			w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 		}
 		w.setStatusAction("fallback")
 		cfg = w.extendFailover(cfg)
@@ -355,6 +358,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	now := w.Now()
 	if w.failSince.IsZero() {
 		w.failSince = now
+		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 	}
 	attempt := w.fastFailover(ctx, cfg)
 	switch attempt.Outcome {

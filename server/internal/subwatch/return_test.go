@@ -658,6 +658,97 @@ func TestTick_ADeathAfterAReturnHeldStartsTheReturnsOver(t *testing.T) {
 	}
 }
 
+// selectServer is what a Web UI or /xray selection of s leaves in the config:
+// s named, the write counter moved on, and no preferred server.
+func selectServer(f *fake, s vpnconfig.Server) {
+	f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(f.cfg.Xray.ActiveServer, s)
+	f.cfg.Xray.PreferredServer = nil
+}
+
+// A selection after a return replaces the server the watch returned to - the
+// same server selected again too: a selection is the user's new choice. A
+// death of the selected server soon after is a new episode, not a failed
+// return, and backs nothing off.
+func TestTick_ADeathSoonAfterASelectionThatFollowedAReturnIsNoFailedReturn(t *testing.T) {
+	for _, choice := range []string{"another server", "the same server"} {
+		t.Run(choice, func(t *testing.T) {
+			r := newReturnRig(returnServers())
+			r.up[osloIP] = true
+			r.live[osloIP] = true
+			r.f.plat = connected("ovpnc2")
+			r.tick() // the return: Oslo runs again
+			selected := returnServers()[1]
+			if choice == "the same server" {
+				selected = returnServers()[0]
+			}
+			selectServer(r.f, selected)
+			ip := dialIP(selected)
+			r.running, r.up[ip], r.live[ip] = ip, true, true
+			r.f.now = r.f.now.Add(ProbeInterval)
+			r.tick()                            // the selected server works
+			r.up[ip], r.live[ip] = false, false // and dies
+			r.f.now = r.f.now.Add(ProbeInterval)
+			tickUntilDead(r.w, r.f)
+			if r.f.cfg.Xray.Failover == nil {
+				t.Fatal("no failover")
+			}
+			if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+				t.Fatalf("returnFails %d, returnRetry %v; the selected server's death is no failed return", r.w.returnFails, r.w.returnRetry)
+			}
+		})
+	}
+}
+
+// A fast switch settles the returns as a confirmed death does. On the
+// RT-AX86U the user selected a server minutes after an automatic return, and
+// when its address was blocked the fast path switched Xray to a live server:
+// the death of the server the watch returned to counts as a failed return, the
+// death of one selected since does not.
+func TestTick_AFastSwitchSoonAfterAReturnCountsOnlyTheReturnedServer(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		selected bool
+		fails    int
+		retry    time.Duration
+	}{
+		{"the returned server dies", false, 1, ReturnRetry},
+		{"a server selected since dies", true, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReturnRig(returnServers())
+			r.up[osloIP] = true
+			r.live[osloIP] = true
+			r.tick() // the return: Oslo runs again
+			dying, live := returnServers()[0], returnServers()[1]
+			if tc.selected {
+				dying, live = live, dying
+				selectServer(r.f, dying)
+				r.running = dialIP(dying)
+			}
+			r.up[dialIP(dying)], r.live[dialIP(dying)] = true, true
+			r.f.now = r.f.now.Add(ProbeInterval)
+			r.tick() // the main probe passes on the server that runs
+			// Its address is blocked, and the monitor saw it die after that probe.
+			r.up[dialIP(dying)], r.live[dialIP(dying)] = false, false
+			r.live[dialIP(live)] = true
+			e := orderTestEvidence(r.f.now.Add(time.Second), map[string]watchdapi.Status{
+				endpoint.Key(dying): watchdapi.StatusDead,
+				endpoint.Key(live):  watchdapi.StatusAlive,
+			})
+			r.w.Health = &fastHealth{cached: e, fresh: copyFastEvidence(e, nil), invalid: make(map[string]bool)}
+			r.w.WANUp = func(context.Context) bool { return true }
+			r.f.now = r.f.now.Add(ProbeInterval)
+			r.tick()
+			if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != live.Name || r.f.cfg.Xray.Failover != nil {
+				t.Fatalf("active %+v, failover %+v; want the fast path's switch to %s", a, r.f.cfg.Xray.Failover, live.Name)
+			}
+			if r.w.returnFails != tc.fails || r.w.returnRetry != tc.retry {
+				t.Fatalf("returnFails %d, returnRetry %v, want %d, %v", r.w.returnFails, r.w.returnRetry, tc.fails, tc.retry)
+			}
+		})
+	}
+}
+
 // With no fallback the later ticks of a death come back to the death branch:
 // the death counts as one failed return, not one per pass.
 func TestTick_ADeathSoonAfterAReturnCountsOnce(t *testing.T) {

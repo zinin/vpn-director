@@ -28,7 +28,7 @@ const (
 	// that accepts TCP and keeps refusing the proxy, a blocked endpoint, would
 	// otherwise cost every Xray client a few dead seconds every ReturnRetryMax
 	// for as long as the block lasts. A new death, a selection or a restart of
-	// the bot starts the returns over.
+	// watchd starts the returns over.
 	ReturnFailsMax = 4
 )
 
@@ -144,6 +144,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
 			w.lastPicked = &c
 			w.lastReturn = w.Now()
+			w.returnSeq = sw.seq
 			w.notify(noteReturned, fmt.Sprintf(msgReturned, label(names, c.Subscription, c.Name)))
 			return
 		}
@@ -279,11 +280,13 @@ func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, l
 
 // returnAfterDeath settles the returns at a death. A death is a new episode,
 // and whatever the returns backed off to is done with - unless it started
-// within ReturnHold of a return: the preferred server has failed again, and
-// the death counts as a failed return, so a server that flaps is not
-// returned to every few minutes.
+// within ReturnHold of a return, on the record that return wrote: the
+// preferred server has failed again, and the death counts as a failed return,
+// so a server that flaps is not returned to every few minutes. A selection
+// since the return wrote another record - the same server selected again
+// too - and the death of the user's new choice starts the returns over.
 func (w *Watch) returnAfterDeath() {
-	if !w.lastReturn.IsZero() && w.failSince.Sub(w.lastReturn) < ReturnHold {
+	if !w.lastReturn.IsZero() && w.failSeq == w.returnSeq && w.failSince.Sub(w.lastReturn) < ReturnHold {
 		slog.Info("The preferred server died soon after the return; counted as a failed return", "after", w.failSince.Sub(w.lastReturn))
 		w.backOffReturn()
 	} else {
@@ -306,7 +309,7 @@ func (w *Watch) backOffReturn() {
 	}
 	w.returnNotBefore = w.Now().Add(w.returnRetry)
 	if w.returnFails >= ReturnFailsMax {
-		slog.Info("Returns to the preferred server stopped after failed attempts; a new death, a selection or a bot restart starts them again", "failed", w.returnFails)
+		slog.Info("Returns to the preferred server stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "failed", w.returnFails)
 		return
 	}
 	slog.Info("Next return attempt backed off", "after", w.returnRetry)
