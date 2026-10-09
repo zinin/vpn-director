@@ -1,6 +1,8 @@
 package wizard
 
 import (
+	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 
@@ -262,5 +264,29 @@ func TestState_PickedIndexTellsSubscriptionsApart(t *testing.T) {
 
 	if got := s.PickedIndex(servers); got != 1 {
 		t.Fatalf("PickedIndex %d, want 1", got)
+	}
+}
+
+// A periodic refresh can rename the pick during the minutes the steps take -
+// 3x-ui puts the traffic left into every name - and the wizard still finds
+// it, in its own subscription only.
+func TestState_PickedIndexFindsAPickARefreshRenamed(t *testing.T) {
+	ob := `{"protocol":"vless","settings":{"vnext":[{"address":"de.example","port":443,"users":[{"id":"u-1"}]}]},"streamSettings":{"security":"reality","realitySettings":{"publicKey":"pk-1","shortId":"aa11","serverName":"www.example.com"}}}`
+	picked := vpnconfig.Server{Subscription: "0a1b2c3d", Name: "DE 10GB", Address: "de.example", Port: 443, Outbound: json.RawMessage(ob)}
+	other := vpnconfig.Server{Subscription: "0a1b2c3d", Name: "FR", Address: "fr.example", Port: 443,
+		Outbound: json.RawMessage(`{"protocol":"trojan","settings":{"servers":[{"address":"fr.example","port":443,"password":"p"}]}}`)}
+	s := NewManager().Start(123)
+	s.PickServer(0, picked)
+	renamed := picked
+	renamed.Name = "DE 9GB"
+	renamed.Outbound = json.RawMessage(strings.Replace(ob, "aa11", "bb22", 1))
+
+	if got := s.PickedIndex([]vpnconfig.Server{other, renamed}); got != 1 {
+		t.Fatalf("PickedIndex %d, want 1", got)
+	}
+	twin := renamed
+	twin.Subscription = "1b2c3d4e"
+	if got := s.PickedIndex([]vpnconfig.Server{other, twin}); got != -1 {
+		t.Fatalf("PickedIndex %d, want -1: another subscription's server is not the pick", got)
 	}
 }
