@@ -238,12 +238,12 @@ func (w *Watch) refreshScope(ctx context.Context) (context.Context, func() error
 }
 
 // publishList publishes one subscription's download, or records why it did
-// not arrive (vpnconfig.RecordSubscriptionError writes an error once). It
-// returns the refusal of a stop or the gate (errStopped,
-// watchcompat.ErrIncompatible) that kept its write - the publication or the
-// error record - from happening, and nil otherwise, a write a shutdown cut
-// short included: the round checks ctx before the next one. Its caller holds
-// tickMu and mu.
+// not arrive (vpnconfig.RecordSubscriptionErrorChanged writes an error once,
+// and the WARN goes with that write alone). It returns the refusal of a stop
+// or the gate (errStopped, watchcompat.ErrIncompatible) that kept its write -
+// the publication or the error record - from happening, and nil otherwise, a
+// write a shutdown cut short included: the round checks ctx before the next
+// one. Its caller holds tickMu and mu.
 func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l listed) error {
 	update, files := w.updateFor(ctx), w.files(ctx)
 	err := l.err
@@ -274,12 +274,15 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 		err = ue.Err
 	}
 	msg := err.Error()
-	if msg != s.Error {
-		slog.Warn("Periodic subscription refresh failed", "subscription", s.Name, watchErrorAttr(err))
-	}
-	rerr := vpnconfig.RecordSubscriptionError(update, files, s.ID, s.URL, s.Refreshed, msg)
+	changed, rerr := vpnconfig.RecordSubscriptionErrorChanged(update, files, s.ID, s.URL, s.Refreshed, msg)
 	if errors.Is(rerr, errStopped) || errors.Is(rerr, watchcompat.ErrIncompatible) {
 		return rerr
+	}
+	// The error is news when it appears or changes in the file, which only the
+	// write under the lock knows: a manual refresh may have recorded the same
+	// error, or cleared it, since the round read s.
+	if changed {
+		slog.Warn("Periodic subscription refresh failed", "subscription", s.Name, watchErrorAttr(err))
 	}
 	// watchd's shutdown can end the record while it waits for the config lock,
 	// as it ends a publication: that is no failure to record.
@@ -332,7 +335,7 @@ func logPublished(s vpnconfig.Subscription, res vpnconfig.RefreshResult) {
 		slog.Debug("Periodic refresh found the subscription unchanged", "subscription", s.Name, "servers", res.Count)
 		return
 	}
-	if s.Error != "" {
+	if res.Cleared {
 		slog.Info("Subscription downloads again", "subscription", s.Name)
 	}
 	level := slog.LevelDebug

@@ -94,6 +94,10 @@ type RefreshResult struct {
 	// Wrote says the subscription file was written: its list changed, or its
 	// error was cleared.
 	Wrote bool
+	// Cleared says the publication cleared an error the file recorded - the
+	// file as it was under the lock, which a manual refresh may have written
+	// since the caller read the subscription.
+	Cleared bool
 	// Count is the servers of the merged list; the rest are MergeRefresh's.
 	Count, Added, Removed, Renamed, Readdressed int
 	// Followed is every record that followed a renamed server.
@@ -142,6 +146,7 @@ func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL str
 		if subs[i].Error == "" && reflect.DeepEqual(m.Servers, stored) {
 			return errNothingToWrite
 		}
+		res.Cleared = subs[i].Error != ""
 		before = subs[i]
 		sub := subs[i]
 		sub.Servers = m.Servers

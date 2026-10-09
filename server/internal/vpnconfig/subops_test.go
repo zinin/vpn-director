@@ -292,6 +292,49 @@ func TestRecordSubscriptionError_ADeletedSubscriptionStaysDeleted(t *testing.T) 
 	}
 }
 
+// watchd's periodic refresh logs an error only when it appears or changes in
+// the file, which only the write under the lock knows: a manual refresh may
+// have recorded the same error, or refreshed the list, meanwhile.
+func TestRecordSubscriptionErrorChanged(t *testing.T) {
+	const link, msg = "https://sub.example.com/s/t", "download failed: HTTP 403"
+	alpha := Subscription{ID: "0a1b2c3d", URL: link, Refreshed: t0, Servers: oslo()}
+	failed, newer, relinked := alpha, alpha, alpha
+	failed.Error = "download failed: HTTP 502"
+	newer.Refreshed = t0.Add(time.Minute)
+	relinked.URL = "https://sub.example.com/s/other"
+	recorded := alpha
+	recorded.Error = msg
+	for _, tc := range []struct {
+		name    string
+		subs    []Subscription
+		changed bool
+		err     error
+		want    string // the file's error afterwards
+	}{
+		{"a new error", []Subscription{alpha}, true, nil, msg},
+		{"a changed error", []Subscription{failed}, true, nil, msg},
+		{"the same error", []Subscription{recorded}, false, nil, msg},
+		{"a newer refresh", []Subscription{newer}, false, nil, ""},
+		{"a relinked subscription", []Subscription{relinked}, false, ErrSubscriptionGone, ""},
+		{"a deleted subscription", nil, false, ErrSubscriptionGone, ""},
+	} {
+		m := &memStore{subs: tc.subs}
+		if !tc.changed {
+			// Any write would fail: none may happen.
+			m.saveErr, m.configErr = errors.New("the file was written"), errors.New("the config was written")
+		}
+
+		changed, err := RecordSubscriptionErrorChanged(m.update, m.files(), "0a1b2c3d", link, t0, msg)
+
+		if changed != tc.changed || !errors.Is(err, tc.err) {
+			t.Errorf("%s: changed %v, err %v; want %v, %v", tc.name, changed, err, tc.changed, tc.err)
+		}
+		if len(m.subs) > 0 && m.subs[0].Error != tc.want {
+			t.Errorf("%s: the file's error %q, want %q", tc.name, m.subs[0].Error, tc.want)
+		}
+	}
+}
+
 func TestRenameSubscription(t *testing.T) {
 	m := &memStore{subs: []Subscription{{ID: "0a1b2c3d", Name: "Alpha"}, {ID: "1b2c3d4e", Name: "Beta"}}}
 

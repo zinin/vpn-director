@@ -318,12 +318,57 @@ func TestRefreshRound_AFailedDownloadIsRecordedOnce(t *testing.T) {
 	w.FetchList = func(context.Context, string) ([]vpnconfig.Server, error) {
 		return nil, errors.New("download failed: HTTP 403")
 	}
+	records := logRecords(t)
 
 	w.refreshRound(context.Background())
 	w.refreshRound(context.Background())
 
 	if f.subs[0].Error != "download failed: HTTP 403" || saves.Load() != 1 || f.subs[0].Servers[0].Name != "DE" {
 		t.Fatalf("error %q, writes %d, servers %+v", f.subs[0].Error, saves.Load(), f.subs[0].Servers)
+	}
+	if got := levelsOf(records(), "Periodic subscription refresh failed"); !reflect.DeepEqual(got, []string{"WARN"}) {
+		t.Fatalf("logged at %v; want one WARN, from the round that recorded the error", got)
+	}
+}
+
+// A manual refresh can record the round's error while the round downloads:
+// the file holds it already, so it is no news, and the round writes nothing.
+func TestRefreshRound_AnErrorAManualRefreshRecordedMeanwhileIsNoNews(t *testing.T) {
+	f, w, saves := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
+	w.FetchList = func(context.Context, string) ([]vpnconfig.Server, error) {
+		f.subs[0].Error = "download failed: HTTP 403" // the manual refresh records it meanwhile
+		return nil, errors.New("download failed: HTTP 403")
+	}
+	records := logRecords(t)
+
+	w.refreshRound(context.Background())
+
+	if got := levelsOf(records(), "Periodic subscription refresh failed"); len(got) != 0 {
+		t.Fatalf("logged at %v; the file holds the error already", got)
+	}
+	if saves.Load() != 0 {
+		t.Fatalf("writes %d, want none", saves.Load())
+	}
+}
+
+// A manual refresh can record an error while the round downloads, and the
+// round's good download clear it: the subscription downloads again, although
+// the round read it without an error.
+func TestRefreshRound_ClearingAnErrorAManualRefreshRecordedMeanwhileIsNews(t *testing.T) {
+	f, w, saves := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
+	w.FetchList = func(context.Context, string) ([]vpnconfig.Server, error) {
+		f.subs[0].Error = "download failed: HTTP 403" // the manual refresh fails meanwhile
+		return []vpnconfig.Server{realityAt("DE", "de.example", "bb22", "203.0.113.10")}, nil
+	}
+	records := logRecords(t)
+
+	w.refreshRound(context.Background())
+
+	if got := levelsOf(records(), "Subscription downloads again"); !reflect.DeepEqual(got, []string{"INFO"}) {
+		t.Fatalf("downloads again at %v, want INFO once", got)
+	}
+	if f.subs[0].Error != "" || saves.Load() != 1 {
+		t.Fatalf("error %q, writes %d; want the error cleared once", f.subs[0].Error, saves.Load())
 	}
 }
 

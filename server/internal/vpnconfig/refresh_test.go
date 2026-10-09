@@ -130,8 +130,8 @@ func TestPublishRefresh_AChangeIsWrittenOnce(t *testing.T) {
 
 	res, err := PublishRefresh(m.update, m.files(), "0a1b2c3d", alphaLink, []Server{reality("DE", "example.com", "bb22", "203.0.113.10"), fr}, t0.Add(time.Hour))
 
-	if err != nil || !res.Wrote || res.Added != 1 || res.Count != 2 {
-		t.Fatalf("result %+v, err %v", res, err)
+	if err != nil || !res.Wrote || res.Added != 1 || res.Count != 2 || res.Cleared {
+		t.Fatalf("result %+v, err %v; the file recorded no error to clear", res, err)
 	}
 	if !reflect.DeepEqual(m.subs[0].Servers, []Server{de, fr}) || !m.subs[0].Refreshed.Equal(t0.Add(time.Hour)) {
 		t.Fatalf("file %+v", m.subs[0])
@@ -152,7 +152,7 @@ func TestPublishRefresh_ClearsARecordedError(t *testing.T) {
 
 	res, err := PublishRefresh(m.update, m.files(), "0a1b2c3d", alphaLink, []Server{reality("DE", "example.com", "bb22", "203.0.113.10")}, t0.Add(time.Hour))
 
-	if err != nil || !res.Wrote || m.subs[0].Error != "" || !m.subs[0].Refreshed.Equal(t0.Add(time.Hour)) {
+	if err != nil || !res.Wrote || !res.Cleared || m.subs[0].Error != "" || !m.subs[0].Refreshed.Equal(t0.Add(time.Hour)) {
 		t.Fatalf("result %+v, err %v, file %+v", res, err, m.subs[0])
 	}
 	if !reflect.DeepEqual(m.subs[0].Servers, []Server{de}) {

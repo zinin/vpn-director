@@ -211,7 +211,17 @@ var errNothingToWrite = errors.New("nothing to write")
 // when msg is recorded already: every wave of the watch fails alike while an
 // outage lasts.
 func RecordSubscriptionError(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, since time.Time, msg string) error {
-	err := update(func(*VPNDirectorConfig) error {
+	_, err := RecordSubscriptionErrorChanged(update, files, id, rawURL, since, msg)
+	return err
+}
+
+// RecordSubscriptionErrorChanged is RecordSubscriptionError that also says
+// whether it wrote msg: changed is true when the subscription's error appeared
+// or changed in the file. watchd's periodic refresh logs an error only then,
+// and only the write under the lock knows: a manual refresh may have recorded
+// the same error, or cleared it, since the caller read the subscription.
+func RecordSubscriptionErrorChanged(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, since time.Time, msg string) (changed bool, err error) {
+	err = update(func(*VPNDirectorConfig) error {
 		subs, err := files.Load()
 		if err != nil {
 			return err
@@ -228,12 +238,13 @@ func RecordSubscriptionError(update ConfigUpdate, files SubscriptionFiles, id, r
 		if err := files.Save(sub); err != nil {
 			return fmt.Errorf("%w: %w", ErrSaveSubscription, err)
 		}
+		changed = true
 		return nil
 	})
 	if errors.Is(err, errNothingToWrite) {
-		return nil
+		return false, nil
 	}
-	return err
+	return changed, err
 }
 
 // RenameSubscription gives subscription id the name name, under update's lock.
