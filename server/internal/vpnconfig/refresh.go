@@ -170,13 +170,13 @@ func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL str
 
 // followRenames points every record that names a server of subscription id
 // the refresh renamed at its new name: active_server, preferred_server and
-// pending_restore.active, together - a restore compares the first and the
-// last whole, and found them different, would discard its intent as
-// superseded by a new selection. A record names the first stored server with
-// its name, address and port; pairs pairs fresh with stored (pairServers).
-// Address and port belong to the identity, so only the name moves, and seq
-// stays: a rename is no selection, and the watch must not take it for one. A
-// record whose server left the list stays as it is.
+// pending_restore.active, together - a restore compares active_server with
+// pending_restore.active whole, and one that found them different would
+// discard its intent as superseded by a new selection. A record names the
+// first stored server with its name, address and port; pairs pairs fresh with
+// stored (pairServers). Address and port belong to the identity, so only the
+// name moves, and seq stays: a rename is no selection, and the watch must not
+// take it for one. A record whose server left the list stays as it is.
 func followRenames(cfg *VPNDirectorConfig, id string, stored, fresh []Server, pairs []int) []RecordRename {
 	renamed := map[int]string{}
 	for fi, si := range pairs {
