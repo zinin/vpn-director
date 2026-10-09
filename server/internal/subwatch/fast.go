@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"reflect"
 	"sync"
@@ -446,6 +447,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			if fastInfrastructure(err) {
 				return finish(err)
 			}
+			slog.Warn("Generating Xray config for server failed", "server", c.server.Name, watchErrorAttr(err))
 			continue
 		}
 		owner.last = &c
@@ -466,6 +468,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			if fastTerminal(restartErr) || fastInfrastructure(restartErr) {
 				return finish(restartErr)
 			}
+			slog.Warn("Xray restart failed", "server", c.server.Name, watchErrorAttr(restartErr))
 			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
@@ -482,8 +485,10 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			if fastTerminal(probeErr) {
 				return finish(probeErr)
 			}
+			slog.Info("Server probe failed", "server", c.server.Name, "ips", c.server.IPs, watchErrorAttr(probeErr))
 			continue
 		}
+		slog.Info("Fast failover switched Xray to a live server", "server", c.server.Name, "ips", c.server.IPs, "from", active.Name)
 		if !w.returnDeath.Equal(w.failSince) {
 			w.returnDeath = w.failSince
 			w.returnAfterDeath()

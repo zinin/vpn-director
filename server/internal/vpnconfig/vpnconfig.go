@@ -200,9 +200,10 @@ func ActiveSeq(a *ActiveServer) int {
 }
 
 // RecordActiveServer names s as the running server, one write on from prev.
-// Every writer of active_server goes through here, so a reader that remembers
-// the counter can tell that something was written even when the name, address
-// and port it reads are the ones it saw before.
+// Every writer of active_server goes through here - configure.sh, the one
+// writer outside Go, moves the counter on the same way - so a reader that
+// remembers the counter can tell that something was written even when the
+// name, address and port it reads are the ones it saw before.
 func RecordActiveServer(prev *ActiveServer, s Server) *ActiveServer {
 	a := NewActiveServer(s)
 	a.Seq = ActiveSeq(prev) + 1

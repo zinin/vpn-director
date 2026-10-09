@@ -317,7 +317,46 @@ write_subscriptions() {
 
     assert_success
     run jq -r '.xray.active_server | keys | join(",")' "$VPD_DIR/vpn-director.json"
-    assert_output "address,name,port,subscription"
+    assert_output "address,name,port,seq,subscription"
+}
+
+# Every writer of active_server moves its write counter on, as
+# vpnconfig.RecordActiveServer does: the subscription watch tells a selection
+# made since its own record by the counter, and a wizard run that set it back
+# to zero let later selections bring it round to a value the watch remembers.
+@test "step_generate_configs: moves the recorded server's write counter on" {
+    load_wizard
+    write_daemon_config
+    jq '.xray.active_server = {"name":"Oslo","address":"oslo.example","port":443,"subscription":"0a1b2c3d","seq":5}' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+    mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.xray.active_server.seq' "$VPD_DIR/vpn-director.json"
+    assert_output "6"
+}
+
+# A first record, or one from before the counter, starts it at one; a value of
+# another type is no counter to move on, and the save goes ahead from zero.
+@test "step_generate_configs: starts the write counter at one without a counter to move on" {
+    load_wizard
+    local before
+    for before in 'del(.xray.active_server)' \
+        '.xray.active_server = {"name":"Oslo","address":"oslo.example","port":443}' \
+        '.xray.active_server = {"name":"Oslo","address":"oslo.example","port":443,"seq":"5"}' \
+        '.xray.active_server = "Oslo"'; do
+        write_daemon_config
+        jq "$before" "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+        mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+        run step_generate_configs
+
+        assert_success
+        run jq -r --arg case "$before" '"\($case): \(.xray.active_server.seq)"' "$VPD_DIR/vpn-director.json"
+        assert_output "$before: 1"
+    done
 }
 
 # An import stores the server's outbound; the wizard writes it into config.json.

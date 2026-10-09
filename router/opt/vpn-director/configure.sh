@@ -559,7 +559,8 @@ step_generate_configs() {
     # subscription routinely puts a dozen names behind one address:port. Only
     # the fields that identify the server to a reader - its subscription, name,
     # address and port; the Web UI serves this file over /api/config, so the
-    # uuid and the REALITY material stay out.
+    # uuid and the REALITY material stay out. The write counter joins them
+    # under the config lock, below.
     xray_active_server_json=$(printf '%s' "$SELECTED_SERVER_JSON" \
         | jq -c --arg sub "${SELECTED_SUBSCRIPTION_ID:-}" \
             '{name: (.name // ""), address: (.address // ""), port: (.port // 0)}
@@ -641,6 +642,12 @@ step_generate_configs() {
     # empty as $gw skips the map item. `//` replaces only null and false,
     # so a tunnels value of the wrong type (an array, say) is mapped to {}
     # by hand: indexing it by key would end the whole save with jq's rc 5.
+    # The record moves active_server's write counter one on from the record
+    # it replaces, as every writer of it does (vpnconfig.RecordActiveServer):
+    # the subscription watch tells a selection made since its own record by
+    # the counter, and one set back to zero could come round to a value the
+    # watch remembers. A counter that is no number starts again from zero
+    # rather than end the save.
     if printf '%s' "$base_json" | jq \
         --argjson clients "$xray_clients_json" \
         --argjson exclude "$xray_exclude_json" \
@@ -651,7 +658,7 @@ step_generate_configs() {
          .xray.clients = $clients |
          .xray.exclude_sets = $exclude |
          .xray.servers = $servers |
-         .xray.active_server = $active |
+         .xray.active_server = ($active + {seq: (((.xray.active_server | select(type == "object") | .seq | select(type == "number")) // 0) + 1)}) |
          del(.xray.preferred_server) |
          .tunnel_director.tunnels = (
              $tunnels

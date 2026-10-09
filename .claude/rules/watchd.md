@@ -123,6 +123,9 @@ IPs, plain HTTP blocked) never triggers the fast path; the legacy confirmation d
 Evidence from an old endpoint set, prober/session, activity epoch or completion is not proof.
 The config-lock guard revalidates ownership, subscription identity, inbound ports and evidence.
 Incomplete/invalid monitor evidence falls back to the legacy path, not an invented healthy route.
+A switch names in the watchd log the server it picked and the one it left (`Fast failover
+switched Xray to a live server`); each candidate that failed before it gets the line the walk and
+the return write for such a failure.
 
 The legacy path confirms death after 1 minute of proven TCP unreachability with a working WAN,
 otherwise 3 minutes. It remains available with monitoring disabled/unavailable. UDP/QUIC-only

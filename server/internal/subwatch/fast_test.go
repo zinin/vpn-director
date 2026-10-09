@@ -751,6 +751,93 @@ func TestFast_InconclusiveAttemptLogsOncePerEpisode(t *testing.T) {
 	}
 }
 
+// logRecords captures the log as JSON for the rest of the test and returns,
+// when called, every record written so far.
+func logRecords(t *testing.T) func() []map[string]any {
+	t.Helper()
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	return func() []map[string]any {
+		t.Helper()
+		var records []map[string]any
+		decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+		for {
+			var record map[string]any
+			if err := decoder.Decode(&record); errors.Is(err, io.EOF) {
+				return records
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			records = append(records, record)
+		}
+	}
+}
+
+// A switch says in the watchd log which server it switched to and from which,
+// and what each candidate before it failed at, as the walk and the return do:
+// otherwise its Telegram event and the config are all that tell of it.
+func TestFast_SwitchLogsTheServerAndEveryCandidateThatFailed(t *testing.T) {
+	logged := map[string]bool{
+		"Generating Xray config for server failed":     true,
+		"Xray restart failed":                          true,
+		"Server probe failed":                          true,
+		"Fast failover switched Xray to a live server": true,
+	}
+	for _, tc := range []struct{ failure, failed string }{
+		{"Generate", "WARN Generating Xray config for server failed server=Backup from=<nil> ips=<nil>"},
+		{"restart", "WARN Xray restart failed server=Backup from=<nil> ips=<nil>"},
+		{"main HTTPS", "INFO Server probe failed server=Backup from=<nil> ips=[198.51.100.20]"},
+	} {
+		t.Run(tc.failure, func(t *testing.T) {
+			s := newFastFixture(t)
+			records := logRecords(t)
+			s.f.subs[0].Servers = append(s.f.subs[0].Servers, fastServer("Extra", "extra.example", "192.0.2.30"))
+			s.setHealth()
+			generate := s.w.Generate
+			s.w.Generate = func(server vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				if tc.failure == "Generate" && server.Name == "Backup" {
+					if err := s.f.checkGuard(guard); err != nil {
+						return false, s.f.seq(), err
+					}
+					return false, s.f.seq(), errors.New("synthetic generation refusal")
+				}
+				return generate(server, guard)
+			}
+			restart := s.w.RestartXray
+			s.w.RestartXray = func() error {
+				err := restart()
+				if tc.failure == "restart" && s.restarts == 1 {
+					return errApply
+				}
+				return err
+			}
+			s.w.Probe = func(context.Context, int) error {
+				s.probes++
+				if len(s.written) == 0 || (tc.failure == "main HTTPS" && s.written[len(s.written)-1].Name == "Backup") {
+					return errProbe
+				}
+				return nil
+			}
+			s.w.Tick(context.Background())
+			if s.f.cfg.Xray.ActiveServer.Name != "Extra" {
+				t.Fatalf("active %+v; the fixture must switch to the second candidate", s.f.cfg.Xray.ActiveServer)
+			}
+			var got []string
+			for _, r := range records() {
+				if msg, _ := r["msg"].(string); logged[msg] {
+					got = append(got, fmt.Sprintf("%v %v server=%v from=%v ips=%v", r["level"], r["msg"], r["server"], r["from"], r["ips"]))
+				}
+			}
+			want := []string{tc.failed, "INFO Fast failover switched Xray to a live server server=Extra from=Oslo ips=[192.0.2.30]"}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("log %q, want %q", got, want)
+			}
+		})
+	}
+}
+
 func TestFast_StopAndCompatibilityDrainFreshChecks(t *testing.T) {
 	defer func(poll time.Duration) { stopPoll = poll }(stopPoll)
 	stopPoll = time.Millisecond
