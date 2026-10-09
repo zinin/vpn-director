@@ -52,7 +52,7 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 		if gate == nil {
 			return watchcompat.ErrIncompatible
 		}
-		return gate.Check(current)
+		return gateCheck(current, gate.Check)
 	}
 	w.LoadPlatform = func() (vpnconfig.PlatformInfo, error) {
 		info, err := vpn.ForContext(operationContext()).Platform()
@@ -120,6 +120,22 @@ func newWatch(ctx context.Context, p paths.Paths, cfg *service.ConfigService, vp
 		}
 	}
 	return w
+}
+
+// gateCheck runs the compatibility check of the operation current. One that
+// the operation's end cut short reports that end, as an operation that had
+// already ended does: the gate answers a caller that went away with a bare
+// ErrIncompatible, and the periodic refresh, which takes the end of a tick
+// for no refusal, would read it as a closed gate and drop its round.
+func gateCheck(current context.Context, check func(context.Context) error) error {
+	err := check(current)
+	if err == nil {
+		return nil
+	}
+	if cause := context.Cause(current); cause != nil {
+		return cause
+	}
+	return err
 }
 
 type watchOperationError struct {

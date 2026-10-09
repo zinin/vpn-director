@@ -836,6 +836,37 @@ func TestRuntime_CanMutateReportsWhyTheOperationEnded(t *testing.T) {
 	}
 }
 
+// A compatibility check that the operation's end cut short reports that end,
+// not the gate's bare refusal: the periodic refresh takes a context error as
+// no refusal, and a tick that ends is no closed gate. A check that refuses
+// while the operation lives still refuses.
+func TestGateCheck_ReportsTheEndThatCutItShort(t *testing.T) {
+	ended := errors.New("synthetic end of the operation")
+	for _, tc := range []struct {
+		name string
+		end  func(context.CancelCauseFunc)
+		want error
+	}{
+		{"with a cause", func(cancel context.CancelCauseFunc) { cancel(ended) }, ended},
+		{"plainly", func(cancel context.CancelCauseFunc) { cancel(nil) }, context.Canceled},
+	} {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		err := gateCheck(ctx, func(context.Context) error {
+			tc.end(cancel)
+			return watchcompat.ErrIncompatible
+		})
+		cancel(nil)
+		if !errors.Is(err, tc.want) || errors.Is(err, watchcompat.ErrIncompatible) {
+			t.Errorf("%s: gateCheck = %v, want %v", tc.name, err, tc.want)
+		}
+	}
+	if err := gateCheck(context.Background(), func(context.Context) error {
+		return watchcompat.ErrIncompatible
+	}); !errors.Is(err, watchcompat.ErrIncompatible) {
+		t.Errorf("gateCheck = %v while the operation lives, want %v", err, watchcompat.ErrIncompatible)
+	}
+}
+
 func TestRuntime_NewWatchGeneratesUnderTheRealConfigLock(t *testing.T) {
 	p := runtimePaths(t)
 	cfg := runtimeConfig(t, p, `{"data_dir":"resolved-data","advanced":{"xray":{"tproxy_port":23456,"socks_port":23457}},"xray":{"active_server":{"name":"old","address":"old.example","port":443,"subscription":"0a1b2c3d","seq":7}}}`)
