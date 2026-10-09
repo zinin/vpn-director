@@ -82,7 +82,7 @@ cd server && go run ./cmd/watchd --dev
 | `server/cmd/webui/main.go` | Web UI daemon: HTTPS server, DI, dev mode |
 | `server/cmd/watchd/` | `vpn-director-watchd`: monitoring, subscription automation and queue, one socket-owned runtime |
 | `server/internal/monitor/` | Endpoint checks, `vpn-director-probe`, schedule, WAN guard and fresh failover evidence |
-| `server/internal/subwatch/` | Watchd's SOCKS probe, subscription walk, failover, preferred return and pending restore |
+| `server/internal/subwatch/` | Watchd's SOCKS probe, subscription walk, failover, preferred return, pending restore and periodic subscription refresh |
 | `server/internal/watchcompat/` | Read-only capability gate for installed and running bot executables |
 | `server/internal/notifications/` | Watchd's durable events, per-chat delivery progress and subscription-health transitions |
 | `server/internal/watchdapi/` | Unix IPC: independent monitor/watch status, recipient sync, pending events and ack |
@@ -146,7 +146,7 @@ shutdown, durable notification and recovery contracts.
 
 **Web UI settings**: the `webui` section of `vpn-director.json` — `port` (8444), `cert_file`, `key_file`, `jwt_secret` (auto-generated when empty), `log_level` (`debug|info|warn|error`).
 
-**Server monitor settings**: the `monitor` section of `vpn-director.json` — `enabled` (true), `interval` (`1m`, a live server's check), `dead_interval_max` (`30m`, the longest pause of a dead one), `concurrency` (8), `log_level`. The daemon rereads it every minute.
+**Server monitor settings**: the `monitor` section of `vpn-director.json` — `enabled` (true), `interval` (`1m`, a live server's check), `dead_interval_max` (`30m`, the longest pause of a dead one), `concurrency` (8), `log_level`, `subscription_refresh` (`5m`, how often watchd downloads every subscription with a link and writes what changed; `"0"` off, whatever `enabled` says). The daemon rereads it every minute.
 
 ## Shell Conventions
 

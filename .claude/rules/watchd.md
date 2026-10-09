@@ -21,7 +21,7 @@ server/cmd/watchd/main.go          # flags, logging, readers, DI; self-update ru
 server/cmd/watchd/runtime.go       # socket ownership, monitor/watch/queue start and drain
 server/cmd/watchd/watch.go         # shared netpath readiness, generation, compatibility gate
 server/cmd/watchd/health.go        # subscription-health event producer
-server/internal/subwatch/         # fast/legacy failover, walk, preferred return, pending restore
+server/internal/subwatch/         # fast/legacy failover, walk, preferred return, pending restore, periodic refresh
 server/internal/watchcompat/      # read-only installed/running bot capability checks
 server/internal/notifications/    # sole-writer durable events and per-chat progress
 server/internal/endpoint/          # PerAddress, ServerForDial, DialKey, Key, Keys, WANControls
@@ -151,6 +151,42 @@ the config lock; automatic apply/restart use `--unless-stopped`, with restart li
 `restart xray-process`. Manual server selection increments `active_server.seq` even when the
 same server is selected again, ending stale walks/returns. Subscription deletion/refresh and
 client changes also invalidate stale writes. Recovery must preserve make-before-break ordering.
+
+## Periodic subscription refresh
+
+`(*Watch).StartRefresh` (`subwatch/refresh.go`) downloads every subscription with a link every
+`monitor.subscription_refresh` (`5m` by default, `"0"` off, a value below `1m` the default with a
+WARN), whatever `monitor.enabled` says: the failover walk wants current lists too. Its first round
+starts a minute after watchd, each next one an interval after the previous one ended, and a round
+that stands down looks again a minute later. A round stands down while VPN Director is stopped, the
+compatibility gate is closed, or the watch handles an Xray failure - its probe failing
+(`failSince`), an apply of its own pending, a `xray.failover` or a `xray.pending_restore`: the wave
+refreshes then.
+
+It downloads outside the tick through the wave's fetcher (`SubscriptionFetcher.FetchList`: the WAN,
+then the tunnel; every listed server, without addresses where the host did not resolve), each
+subscription within `FetchTimeout`; a stop or a closed gate ends the downloads within `stopPoll`. It
+publishes between ticks, holding `tickMu`, after checking the stand-down conditions again, one
+config-lock update per subscription (`vpnconfig.PublishRefresh`). It applies and restarts nothing.
+
+`vpnconfig.MergeRefresh` merges the download with the file as it is under the lock. A server's
+identity (`vpnconfig.ServerIdentity`) is its stored outbound without the REALITY `serverName`,
+`shortId` and `spiderX` that 3x-ui and Marzban pick at random for every download. A fresh server
+pairs with the first stored server of its identity and stays that stored record under the fresh
+name - so its endpoint key, and its monitor status, survive; its addresses stay too when the fresh
+ones are the same set or did not resolve this time. A merge equal to the file, with no error
+recorded, writes nothing at all, `refreshed` included; anything else writes the list, `refreshed`,
+a cleared error and `xray.servers` once. `active_server`, `preferred_server` and
+`pending_restore.active` follow a renamed server in that write, `seq` unchanged: a rename is no
+selection, and `sameRestoreActive` compares the records whole. A download that fails, or a merge
+that comes out empty, records its error once (`RecordSubscriptionError`) and keeps the list.
+Nothing goes to Telegram; the log gives the counts and every record that followed a rename, never a
+link.
+
+A successful probe remembers the active server's identity (`probeOKActive`): Xray dying within
+about 30 s of a rename, before the next successful probe, leaves that episode to the legacy
+confirmation. A stored REALITY pick that the server's admin removes leaves the stored copy dead until
+a manual refresh or the wave, which take fresh copies.
 
 ## Durable notifications
 

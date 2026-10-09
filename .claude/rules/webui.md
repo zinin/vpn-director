@@ -53,7 +53,7 @@ Every route below `/api/` except `POST /api/login` requires a valid token.
 | GET | `/api/platform` | `vpn-director.sh platform`: firmware, password file, LAN/WAN interfaces, tunnels; 503 when the script cannot answer |
 | GET | `/api/servers` | The servers grouped by subscription — `subscriptions`, each with `id`, `name` and its `servers`: name, address, port, IPs, the protocol label (`vless·reality`, `ss`, `hysteria2`) and the `fingerprint` that matches the server with its row of `/api/monitor`, no credentials — plus `active`, the recorded server with its `subscription` |
 | POST | `/api/servers/active` | Select the active server: `subscription`, the `index` within it, and the `name`, `address` and `port` the page showed there; 409 "server list changed" when the subscription is gone or has another server at that index |
-| GET | `/api/subscriptions` | Every subscription: `id`, `name`, `host`, `static`, `servers` (the count), `added`, `refreshed`, `error`. No link |
+| GET | `/api/subscriptions` | Every subscription: `id`, `name`, `host`, `static`, `servers` (the count), `added`, `refreshed` (when its list was last written: the Servers tab's Changed column), `error`. No link |
 | POST | `/api/subscriptions` | Add `{url, name?}`; a saved link is refreshed instead, and renamed when a free name is given. A body over 1 MiB is refused; the answer carries `count`, `total`, `skipped` by reason, `dns_errors` and the `summary` the page shows, plus `id`, `name` and `existed` |
 | POST | `/api/subscriptions/refresh` | `?id=` refreshes one subscription (404 when it is gone, 400 for a static list), no id every one with a link, in parallel; `results`, one per subscription, each with its `summary` and the counts or its `error` |
 | POST | `/api/subscriptions/rename` | `?id=` and `{name}`; 400 for a name the rules refuse or another subscription has |
@@ -165,7 +165,15 @@ and nothing is written): it may have been deleted meanwhile, or deleted and its
 link added again under another id, and the list would bring it back. A refresh
 whose download failed is a result (200) that says why, and the subscription
 records it in its `error`, unless a refresh that succeeded meanwhile has moved
-its `refreshed`. Every write of a subscription also deletes the `servers.json`
+its `refreshed`. A refresh, and an add of a saved link, carry `active_server`,
+`preferred_server` and `pending_restore.active` over a server the fresh list
+renamed - the same server by `vpnconfig.ServerIdentity`, its outbound without
+the REALITY picks - without moving `seq`
+(`vpnconfig.RefreshSubscriptionFollowingRenames`): a panel that puts the
+traffic left into every name would otherwise lose the Active mark at each
+refresh. watchd's periodic refresh writes a list only when it changed
+(`watchd.md`), so `refreshed` is when the list last changed. Every write of a
+subscription also deletes the `servers.json`
 of earlier releases (`vpnconfig.RemoveLegacyServers`), and the next config
 write of a daemon drops `xray.subscription_url`, whose Go field is gone. All of
 them serialize on `Deps.OpMutex`, and the subscription routes extend the write
