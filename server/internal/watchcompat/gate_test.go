@@ -417,12 +417,9 @@ func TestGate_RefusalNamesTheExecutable(t *testing.T) {
 			t.Fatal(err)
 		}
 		checkGate(t, g, true)
-		if err := os.WriteFile(answer, []byte(`{}`), 0600); err != nil {
-			t.Fatal(err)
-		}
-		// Another compatible copy changes the set, so the same refusing
-		// target runs again.
-		writeBotProcess(t, g.ProcRoot, 92, 502, g.BotPath, g.BotPath)
+		// A verified executable is not run again; the process running a
+		// rebuilt one is, and its refusal is named again.
+		writeCapabilityExecutable(t, running, capabilityReply(`{"protocol_version":1,"watch_owner":"bot"}`))
 		checkGate(t, g, false)
 		assertWarned(2)
 	})
@@ -489,21 +486,40 @@ func TestGate_CacheInvalidation(t *testing.T) {
 			checkGate(t, g, false)
 		})
 	}
-	t.Run("PID reuse with same executable fingerprint", func(t *testing.T) {
+	// A reused PID that runs the verified executable runs the verified bytes and
+	// is not run again; one that runs another executable is.
+	t.Run("PID reuse with the same executable", func(t *testing.T) {
 		g := gateFixture(t)
 		writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
-		answer := filepath.Join(t.TempDir(), "answer")
-		if err := os.WriteFile(answer, []byte(compatibleJSON), 0600); err != nil {
-			t.Fatal(err)
+		runs := 0
+		g.exec = func(ctx context.Context, path string) ([]byte, error) {
+			runs++
+			return readCapabilities(ctx, path)
 		}
-		running := filepath.Join(t.TempDir(), "vpn-director-bot")
-		writeCapabilityExecutable(t, running, fmt.Sprintf("exec /bin/cat %q", answer))
-		dir := writeBotProcess(t, g.ProcRoot, 61, 201, running, g.BotPath)
+		dir := writeBotProcess(t, g.ProcRoot, 61, 201, g.BotPath, g.BotPath)
 		checkGate(t, g, true)
-		if err := os.WriteFile(answer, []byte(`{}`), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(gateProcessStat(61, 202)), 0600); err != nil {
 			t.Fatal(err)
 		}
+		checkGate(t, g, true)
+		if runs != 1 {
+			t.Fatalf("capability runs %d, want 1: one executable is verified once", runs)
+		}
+	})
+	t.Run("PID reuse with another executable", func(t *testing.T) {
+		g := gateFixture(t)
+		writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+		dir := writeBotProcess(t, g.ProcRoot, 61, 201, g.BotPath, g.BotPath)
+		checkGate(t, g, true)
+		old := filepath.Join(t.TempDir(), "vpn-director-bot")
+		writeCapabilityExecutable(t, old, capabilityReply(`{}`))
 		if err := os.WriteFile(filepath.Join(dir, "stat"), []byte(gateProcessStat(61, 202)), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(filepath.Join(dir, "exe")); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(old, filepath.Join(dir, "exe")); err != nil {
 			t.Fatal(err)
 		}
 		checkGate(t, g, false)
@@ -543,18 +559,25 @@ func TestGate_CancellationKeepsTheVerifiedCache(t *testing.T) {
 	}
 }
 
+// A PID reused during the check by the executable just verified adds no
+// unverified code; one reused by another executable does.
 func TestGate_ProcessChangesDuringCheck(t *testing.T) {
 	for _, tc := range []struct {
 		change     string
 		compatible bool
-	}{{"PID reused", false}, {"process vanished", true}} {
+	}{{"PID reused by the same executable", true}, {"PID reused by another executable", false}, {"process vanished", true}} {
 		t.Run(tc.change, func(t *testing.T) {
 			g := gateFixture(t)
 			writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
 			running := filepath.Join(t.TempDir(), "vpn-director-bot")
 			dir := filepath.Join(g.ProcRoot, "71")
 			body := fmt.Sprintf("printf '%%s' %s > %q", shellQuote(gateProcessStat(71, 302)), filepath.Join(dir, "stat"))
-			if tc.change == "process vanished" {
+			switch tc.change {
+			case "PID reused by another executable":
+				other := filepath.Join(t.TempDir(), "vpn-director-bot")
+				writeCapabilityExecutable(t, other, capabilityReply(compatibleJSON))
+				body += fmt.Sprintf("\n/bin/ln -sfn %q %q", other, filepath.Join(dir, "exe"))
+			case "process vanished":
 				body = fmt.Sprintf("/bin/rm -r -- %q", dir)
 			}
 			writeCapabilityExecutable(t, running, body+"\n"+capabilityReply(compatibleJSON))
@@ -605,8 +628,8 @@ func TestGate_ProcessesBetweenTheScans(t *testing.T) {
 			if !tc.compatible {
 				return
 			}
-			if _, ok := g.cache[bot]; ok {
-				t.Fatal("the cache keeps a process the second scan no longer saw")
+			if _, ok := g.cache[bot.identity]; ok {
+				t.Fatal("the cache keeps an executable the second scan no longer saw")
 			}
 			// The verified set is what the second scan saw: the next check finds
 			// it unchanged and runs nothing again.
@@ -615,5 +638,157 @@ func TestGate_ProcessesBetweenTheScans(t *testing.T) {
 				t.Fatalf("capability runs %d, want 2", runs)
 			}
 		})
+	}
+}
+
+// The bot's own child between fork and exec runs the bot's executable under a
+// new PID. It adds no unverified code, so the check stands without another
+// run, whichever scans see it.
+func TestGate_AChildOfAVerifiedBotIsVerified(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		first, second bool // the child is in the first, the second scan
+	}{
+		{"in the second scan only", false, true},
+		{"in both scans", true, true},
+		{"in the first scan only", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := gateFixture(t)
+			writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+			identity, err := identifyExecutable(g.BotPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bot := executableTarget{path: g.BotPath, identity: identity, pid: 90, start: 500}
+			child := executableTarget{path: g.BotPath, identity: identity, pid: 93, start: 503}
+			scans, runs := 0, 0
+			g.proc = func(context.Context, string, string) ([]executableTarget, error) {
+				scans++
+				if (scans == 1 && tc.first) || (scans == 2 && tc.second) {
+					return []executableTarget{bot, child}, nil
+				}
+				return []executableTarget{bot}, nil
+			}
+			g.exec = func(ctx context.Context, path string) ([]byte, error) {
+				runs++
+				return readCapabilities(ctx, path)
+			}
+			checkGate(t, g, true)
+			if runs != 1 {
+				t.Fatalf("capability runs %d, want 1: one executable, verified once", runs)
+			}
+		})
+	}
+}
+
+// replaceExe points a fake process's exe link at executable.
+func replaceExe(t *testing.T, dir, executable string) {
+	t.Helper()
+	if err := os.Remove(filepath.Join(dir, "exe")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(executable, filepath.Join(dir, "exe")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A process whose first reads named the bot but that executes another program
+// before the scan is done with it - the bot's child between fork and exec - no
+// longer runs the bot: it is skipped, neither run nor a refusal.
+func TestGate_AProcessThatExecsAwayIsSkipped(t *testing.T) {
+	g := gateFixture(t)
+	writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+	utility := filepath.Join(t.TempDir(), "sh")
+	writeCapabilityExecutable(t, utility, "exit 93")
+	dir := writeBotProcess(t, g.ProcRoot, 96, 601, g.BotPath, g.BotPath)
+	previous := readProcExe
+	t.Cleanup(func() { readProcExe = previous })
+	readProcExe = func(d string) (string, error) {
+		link, err := previous(d)
+		if d == dir && err == nil && link == g.BotPath {
+			// The exec lands right after this read.
+			replaceExe(t, dir, utility)
+			if err := os.WriteFile(filepath.Join(dir, "cmdline"), []byte(utility+"\x00"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return link, err
+	}
+	checkGate(t, g, true)
+}
+
+// A bot process that exits between the two reads of its stat runs nothing: it
+// is skipped, not a refusal.
+func TestGate_AProcessThatExitsBetweenTheStatReadsIsSkipped(t *testing.T) {
+	g := gateFixture(t)
+	writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+	dir := writeBotProcess(t, g.ProcRoot, 97, 701, g.BotPath, g.BotPath)
+	previous := readProcStat
+	t.Cleanup(func() { readProcStat = previous })
+	reads := 0
+	readProcStat = func(d string) ([]byte, error) {
+		body, err := previous(d)
+		if d == dir {
+			reads++
+			if reads == 2 {
+				return []byte(strings.Replace(gateProcessStat(97, 701), ") S ", ") Z ", 1)), nil
+			}
+		}
+		return body, err
+	}
+	checkGate(t, g, true)
+	if reads < 2 {
+		t.Fatalf("stat reads %d, want the scan to read it twice", reads)
+	}
+}
+
+// A refusal that runs no executable - a scan that cannot vouch for a process, a
+// bot that starts during the check - is named in the log too, once for as long
+// as it keeps the gate closed.
+func TestGate_RefusalsWithoutARunAreLogged(t *testing.T) {
+	g := gateFixture(t)
+	warnings := gateWarnings(t)
+	writeCapabilityExecutable(t, g.BotPath, capabilityReply(compatibleJSON))
+	other := filepath.Join(t.TempDir(), "vpn-director-bot")
+	writeCapabilityExecutable(t, other, capabilityReply(compatibleJSON))
+	identity, err := identifyExecutable(other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	late := executableTarget{path: other, identity: identity, pid: 98, start: 801}
+	scans := 0
+	g.proc = func(context.Context, string, string) ([]executableTarget, error) {
+		scans++
+		if scans%2 == 0 {
+			return []executableTarget{late}, nil
+		}
+		return nil, nil
+	}
+	checkGate(t, g, false)
+	checkGate(t, g, false)
+	got := warnings()
+	if len(got) != 1 || got[0]["pid"] != float64(98) || got[0]["path"] != other {
+		t.Fatalf("Warn records %v, want one naming pid 98 and %s", got, other)
+	}
+
+	g.proc = func(context.Context, string, string) ([]executableTarget, error) {
+		return nil, fmt.Errorf("%w: pid 99: owner unreadable", ErrIncompatible)
+	}
+	checkGate(t, g, false)
+	checkGate(t, g, false)
+	got = warnings()
+	if len(got) != 2 || !strings.Contains(fmt.Sprint(got[1]["reason"]), "pid 99: owner unreadable") {
+		t.Fatalf("Warn records %v, want a second one giving the scan's reason", got)
+	}
+
+	g.proc = nil
+	checkGate(t, g, true)
+	g.proc = func(context.Context, string, string) ([]executableTarget, error) {
+		return nil, fmt.Errorf("%w: pid 99: owner unreadable", ErrIncompatible)
+	}
+	checkGate(t, g, false)
+	if got = warnings(); len(got) != 3 {
+		t.Fatalf("Warn records %d, want the refusal named again after a check passed", len(got))
 	}
 }
