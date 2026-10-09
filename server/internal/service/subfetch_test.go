@@ -183,6 +183,40 @@ func TestSubscriptionTunnel_NonDefaultTablesPath(t *testing.T) {
 	}
 }
 
+// vpnconfig.TDExits names only a tunnel other than main that has clients:
+// without one the platform could not change the answer, and finding the tunnel
+// runs no vpn-director.sh platform, which watchd's periodic refresh would pay
+// every round for every subscription with a host the WAN resolver does not
+// answer. With one, the platform is asked as before.
+func TestSubscriptionTunnel_NoTunnelThatCouldCarryTheFetchRunsNoPlatform(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		tunnels map[string]vpnconfig.TunnelConfig
+		runs    int
+	}{
+		{"main and a tunnel without clients", map[string]vpnconfig.TunnelConfig{
+			"main": {Clients: []string{"192.168.1.3"}},
+			"wgc1": {},
+		}, 0},
+		{"a tunnel with a client", map[string]vpnconfig.TunnelConfig{
+			"main": {Clients: []string{"192.168.1.3"}},
+			"wgc1": {Clients: []string{"192.168.1.4"}},
+		}, 1},
+	} {
+		plat := &countingPlatform{}
+		cfg := &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{Tunnels: tc.tunnels}}
+
+		p, client := subscriptionTunnel(configOnly{cfg: cfg}, plat, "")
+
+		if client != nil || p != (netpath.Path{}) {
+			t.Errorf("%s: tunnel %q; the platform lists none connected", tc.name, p.ID)
+		}
+		if plat.runs != tc.runs {
+			t.Errorf("%s: %d platform runs, want %d", tc.name, plat.runs, tc.runs)
+		}
+	}
+}
+
 // remoteConn is a net.Conn that only answers RemoteAddr.
 type remoteConn struct {
 	net.Conn
@@ -612,11 +646,19 @@ func (p *countingPlatform) Platform() (vpnconfig.PlatformInfo, error) {
 	return vpnconfig.PlatformInfo{}, nil
 }
 
+// exitCfg names a tunnel the fetch could go through, so finding the tunnel
+// runs vpn-director.sh platform unless what a test checks stops it first.
+func exitCfg() *vpnconfig.VPNDirectorConfig {
+	return &vpnconfig.VPNDirectorConfig{TunnelDirector: vpnconfig.TunnelDirectorConfig{Tunnels: map[string]vpnconfig.TunnelConfig{
+		"wgc1": {Clients: []string{"192.168.1.4"}},
+	}}}
+}
+
 // A fetch finds its tunnel when it first asks for it, and once: the client and
 // the lookup share that one platform run.
 func TestLazyTunnel_FindsTheTunnelOnceAndOnlyWhenAskedFor(t *testing.T) {
 	plat := &countingPlatform{}
-	client, lookup := lazyTunnel(context.Background(), configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat, "")
+	client, lookup := lazyTunnel(context.Background(), configOnly{cfg: exitCfg()}, plat, "")
 	if plat.runs != 0 {
 		t.Fatalf("%d platform runs before the tunnel was asked for", plat.runs)
 	}
@@ -642,7 +684,7 @@ func TestLazyTunnel_AnEndedContextLooksForNoTunnel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	plat := &countingPlatform{}
-	_, lookup := lazyTunnel(ctx, configOnly{cfg: &vpnconfig.VPNDirectorConfig{}}, plat, "")
+	_, lookup := lazyTunnel(ctx, configOnly{cfg: exitCfg()}, plat, "")
 
 	ips, err := lookup("example.com")
 
@@ -676,7 +718,7 @@ func TestSubscriptionFetcher_SharedDeadlinePublishesNoPartialList(t *testing.T) 
 			defer cancel()
 			plat := &countingPlatform{}
 			fetcher := SubscriptionFetcher{
-				Store:      configOnly{cfg: &vpnconfig.VPNDirectorConfig{}},
+				Store:      configOnly{cfg: exitCfg()},
 				VPN:        plat,
 				TablesPath: "",
 			}
@@ -737,7 +779,7 @@ func TestSubscriptionFetcher_SharedDeadlinePublishesNoPartialList(t *testing.T) 
 		cancel()
 		plat := &countingPlatform{}
 		fetcher := SubscriptionFetcher{
-			Store:      configOnly{cfg: &vpnconfig.VPNDirectorConfig{}},
+			Store:      configOnly{cfg: exitCfg()},
 			VPN:        plat,
 			TablesPath: "",
 		}

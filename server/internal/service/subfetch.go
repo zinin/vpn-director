@@ -264,7 +264,7 @@ func subscriptionTunnel(cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath strin
 		return netpath.Path{}, nil
 	}
 	cfg, err := cfgSvc.LoadVPNConfig()
-	if err != nil || cfg == nil {
+	if err != nil || cfg == nil || !hasTunnelExit(cfg) {
 		return netpath.Path{}, nil
 	}
 	plat, platErr := vpnSvc.Platform()
@@ -285,6 +285,21 @@ func subscriptionTunnel(cfgSvc ConfigStore, vpnSvc VPNDirector, tablesPath strin
 	return p, newTunnelHTTPClient(func(ctx context.Context, network, addr string) (net.Conn, error) {
 		return refusePrivatePeer(netpath.DialPath(ctx, p, "tcp4", addr))
 	})
+}
+
+// hasTunnelExit reports whether cfg names a tunnel the fetch could go through:
+// one other than main with at least one client. vpnconfig.TDExits names only
+// such a tunnel, so without one the platform could not change the answer - and
+// finding the tunnel runs vpn-director.sh platform, which watchd's periodic
+// refresh would otherwise pay every round for every subscription with a host
+// the WAN resolver does not answer.
+func hasTunnelExit(cfg *vpnconfig.VPNDirectorConfig) bool {
+	for id, tun := range cfg.TunnelDirector.Tunnels {
+		if id != "main" && len(tun.Clients) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // newTunnelHTTPClient gives the tunnel fetch what ssrf.NewClient gives the WAN
