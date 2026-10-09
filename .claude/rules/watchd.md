@@ -187,10 +187,12 @@ them at DEBUG, and so does every record that followed a rename: a panel that put
 into every name renames at every round, and watchd's log is cut at 200 KB. No line carries a link.
 
 A successful probe remembers the active server's record (`probeOKActive`: its subscription,
-name, address and port): Xray dying within about 30 s of a rename, before the next successful
-probe, leaves that episode to the legacy confirmation. A stored REALITY pick that the server's
-admin removes leaves the stored copy dead until a manual refresh or the wave, which take fresh
-copies.
+name, address and port). A periodic publication that renames the active server moves it, and the
+walk's `lastPicked`, to the new name with the record, so the fast path still knows the server. A
+manual refresh renames it from another daemon: Xray dying within about 30 s of that, before the
+next successful probe, leaves that episode to the legacy confirmation. A stored REALITY pick that
+the server's admin removes leaves the stored copy dead until a manual refresh or the wave, which
+take fresh copies.
 
 ## Durable notifications
 

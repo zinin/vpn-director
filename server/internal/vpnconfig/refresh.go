@@ -82,6 +82,11 @@ var ErrNoServerResolved = errors.New("could not resolve IP for any server")
 type RecordRename struct {
 	Record   string // active_server, preferred_server or pending_restore.active
 	From, To string
+	// Address and Port are the record's, which the rename left as they were.
+	// The watch names the active server by its subscription, name, address
+	// and port, and needs all four to move what it remembers of it along.
+	Address string
+	Port    int
 }
 
 // RefreshResult is what one PublishRefresh came to, for the log.
@@ -192,7 +197,7 @@ func followRenames(cfg *VPNDirectorConfig, id string, stored, fresh []Server, pa
 				continue
 			}
 			if name, ok := renamed[si]; ok {
-				out = append(out, RecordRename{Record: record, From: a.Name, To: name})
+				out = append(out, RecordRename{Record: record, From: a.Name, To: name, Address: a.Address, Port: a.Port})
 				a.Name = name
 			}
 			return

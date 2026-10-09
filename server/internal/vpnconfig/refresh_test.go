@@ -202,6 +202,13 @@ func TestPublishRefresh_TheRecordsFollowARename(t *testing.T) {
 	if err != nil || len(res.Followed) != 3 {
 		t.Fatalf("result %+v, err %v", res, err)
 	}
+	// The watch moves what it remembers of the active server along with the
+	// record: it needs the record's address and port, which stay.
+	for _, f := range res.Followed {
+		if f.From != "DE 10GB" || f.To != "DE 9GB" || f.Address != "de.example" || f.Port != 443 {
+			t.Errorf("followed %+v", f)
+		}
+	}
 	for record, a := range map[string]*ActiveServer{
 		"active_server":          m.cfg.Xray.ActiveServer,
 		"preferred_server":       m.cfg.Xray.PreferredServer,

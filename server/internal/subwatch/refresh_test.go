@@ -94,6 +94,113 @@ func TestRefreshRound_ARenamedServerTakesItsRecords(t *testing.T) {
 	}
 }
 
+// renameOslo serves the fast fixture's list with its active server, Oslo,
+// under another name.
+func renameOslo(s *fastFixture) {
+	servers := cloneSubs(s.f.subs)[0].Servers
+	servers[0].Name = "Oslo 10GB"
+	s.w.FetchList = serveList(servers...)
+}
+
+// The fast path takes the monitor's dead for proof only when it came after the
+// main probe last passed on the active server (diedAfterProbeOK). A periodic
+// publication that renames that server takes the probe's memory along with its
+// record: the first miss after the rename still switches at once.
+func TestRefreshRound_TheProbesMemoryFollowsARenamedActiveServer(t *testing.T) {
+	s := newFastFixture(t)
+	s.passThenMiss(10 * time.Second)
+	renameOslo(s)
+
+	if !s.w.refreshRound(context.Background()) || s.f.cfg.Xray.ActiveServer.Name != "Oslo 10GB" {
+		t.Fatalf("the round did not rename the active server: %+v", s.f.cfg.Xray.ActiveServer)
+	}
+	s.w.Tick(context.Background())
+
+	if s.generateCalls != 1 || s.f.cfg.Xray.ActiveServer.Name != "Backup" {
+		t.Fatalf("generate %d, active %+v; the first miss after the rename must switch at once", s.generateCalls, s.f.cfg.Xray.ActiveServer)
+	}
+}
+
+// A probe that passed on another server proves nothing about the renamed one.
+func TestRefreshRound_TheProbesMemoryOfAnotherServerStays(t *testing.T) {
+	for _, other := range []*vpnconfig.ActiveServer{
+		{Subscription: "alpha", Name: "Backup", Address: "backup.example", Port: 443},
+		{Subscription: "beta", Name: "Oslo", Address: "oslo.example", Port: 443}, // another subscription's Oslo
+	} {
+		s := newFastFixture(t)
+		s.w.probeOKActive = activeID(other)
+		renameOslo(s)
+
+		s.w.refreshRound(context.Background())
+
+		if s.f.cfg.Xray.ActiveServer.Name != "Oslo 10GB" || s.w.probeOKActive != activeID(other) {
+			t.Errorf("active %+v, probe's memory %q; want %+v's left as it was", s.f.cfg.Xray.ActiveServer, s.w.probeOKActive, other)
+		}
+	}
+}
+
+// pickedAt is the copy of s the walk picks on ip, in subscription sub.
+func pickedAt(s vpnconfig.Server, sub, ip string) vpnconfig.Server {
+	s.Subscription, s.IPs = sub, []string{ip}
+	return s
+}
+
+// pickedLabel names a picked copy for a failure message, without its outbound.
+func pickedLabel(p *vpnconfig.Server) string {
+	if p == nil {
+		return "nothing"
+	}
+	return fmt.Sprintf("%s / %s on %s", p.Subscription, p.Name, dialIP(*p))
+}
+
+// A failed return goes back to the server that ran, led by the copy the walk
+// picked: the address Xray passed its probe on (rollbackOrder). A periodic
+// publication that renames that server takes the copy along with its record.
+func TestRefreshRound_ThePickedCopyFollowsARenamedActiveServer(t *testing.T) {
+	de := realityAt("DE 10GB", "de.example", "aa11", "203.0.113.10", "203.0.113.11")
+	f, w, _ := refreshRig(alphaOf(de))
+	f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "DE 10GB", Address: "de.example", Port: 443, Seq: 7}
+	picked := pickedAt(de, "aaaaaaaa", "203.0.113.11")
+	w.lastPicked = &picked
+	w.FetchList = serveList(realityAt("DE 9GB", "de.example", "bb22", "203.0.113.10", "203.0.113.11"))
+
+	w.refreshRound(context.Background())
+
+	want := picked
+	want.Name = "DE 9GB"
+	if p := w.lastPicked; p == nil || !reflect.DeepEqual(*p, want) {
+		t.Fatalf("picked %s, want %s", pickedLabel(p), pickedLabel(&want))
+	}
+	var back []string
+	for _, c := range rollbackOrder(vpnconfig.AllServers(f.subs), f.cfg.Xray.ActiveServer, w.lastPicked) {
+		back = append(back, dialIP(c))
+	}
+	if !reflect.DeepEqual(back, []string{"203.0.113.11", "203.0.113.10"}) {
+		t.Fatalf("the way back %v; want the picked address first", back)
+	}
+}
+
+func TestRefreshRound_APickedCopyOfAnotherServerStays(t *testing.T) {
+	de := realityAt("DE 10GB", "de.example", "aa11", "203.0.113.10")
+	fr := realityAt("FR", "fr.example", "cc33", "203.0.113.20")
+	for _, other := range []vpnconfig.Server{
+		pickedAt(fr, "aaaaaaaa", "203.0.113.20"),
+		pickedAt(de, "bbbbbbbb", "203.0.113.10"), // another subscription's DE 10GB
+	} {
+		f, w, _ := refreshRig(alphaOf(de, fr))
+		f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "DE 10GB", Address: "de.example", Port: 443, Seq: 7}
+		picked := other
+		w.lastPicked = &picked
+		w.FetchList = serveList(realityAt("DE 9GB", "de.example", "bb22", "203.0.113.10"), fr)
+
+		w.refreshRound(context.Background())
+
+		if p := w.lastPicked; f.cfg.Xray.ActiveServer.Name != "DE 9GB" || p == nil || !reflect.DeepEqual(*p, other) {
+			t.Errorf("active %+v, picked %s; want %s left as it was", f.cfg.Xray.ActiveServer, pickedLabel(p), pickedLabel(&other))
+		}
+	}
+}
+
 // While the watch handles an Xray failure the wave refreshes: the periodic
 // refresh downloads nothing and writes nothing, and so while VPN Director is
 // stopped or the gate is closed.

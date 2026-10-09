@@ -244,6 +244,7 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 		res, perr := vpnconfig.PublishRefresh(update, files, s.ID, s.URL, l.servers, w.Now())
 		switch {
 		case perr == nil:
+			w.followActiveRename(s.ID, res.Followed)
 			logPublished(s, res)
 			return
 		case errors.Is(perr, vpnconfig.ErrNoServerResolved):
@@ -270,6 +271,36 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 	rerr := vpnconfig.RecordSubscriptionError(update, files, s.ID, s.URL, s.Refreshed, msg)
 	if rerr != nil && !errors.Is(rerr, errStopped) && !errors.Is(rerr, watchcompat.ErrIncompatible) && !errors.Is(rerr, vpnconfig.ErrSubscriptionGone) {
 		slog.Warn("Failed to record why the subscription did not refresh", "subscription", s.Name, watchErrorAttr(rerr))
+	}
+}
+
+// followActiveRename moves what the watch remembers of the active server to
+// the new name when a publication of subscription id renamed the server along
+// with its active_server record. Left on the old name, the record the main
+// probe last passed on (probeOKActive) no longer matches active_server, and
+// the fast path does not know the server until the next probe passes; the copy
+// the walk picked or a return proved (lastPicked) no longer leads the way back
+// of a failed return. A panel that puts the traffic left into every name
+// renames at nearly every round. lastPicked moves only when it names that
+// server, as rollbackOrder matches it with the record; address and port stay,
+// as the record's do. Its caller holds tickMu and mu, as every tick that reads
+// them does.
+func (w *Watch) followActiveRename(id string, followed []vpnconfig.RecordRename) {
+	for _, f := range followed {
+		if f.Record != "active_server" {
+			continue
+		}
+		before := vpnconfig.ActiveServer{Subscription: id, Name: f.From, Address: f.Address, Port: f.Port}
+		after := before
+		after.Name = f.To
+		if w.probeOKActive == activeID(&before) {
+			w.probeOKActive = activeID(&after)
+		}
+		if p := w.lastPicked; p != nil && sameServer(*p, &before) {
+			renamed := *p
+			renamed.Name = f.To
+			w.lastPicked = &renamed
+		}
 	}
 }
 
