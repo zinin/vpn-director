@@ -78,6 +78,13 @@ func sameIPSet(a, b []string) bool {
 // file has. The list stays.
 var ErrNoServerResolved = errors.New("could not resolve IP for any server")
 
+// ErrRefreshSuperseded is a periodic refresh whose subscription another
+// refresh wrote while it downloaded - a manual refresh, an add of the saved
+// link or the wave - and so moved its refreshed. That list is newer than the
+// download, which would take back what it brought: the publication writes
+// nothing, and the next round takes the newer list up.
+var ErrRefreshSuperseded = errors.New("a newer refresh wrote the list while this one downloaded")
+
 // RecordRename is a server record that followed its renamed server.
 type RecordRename struct {
 	Record   string // active_server, preferred_server or pending_restore.active
@@ -95,8 +102,9 @@ type RefreshResult struct {
 	// error was cleared.
 	Wrote bool
 	// Cleared says the publication cleared an error the file recorded - the
-	// file as it was under the lock, which a manual refresh may have written
-	// since the caller read the subscription.
+	// file as it was under the lock, where a refresh that failed - a manual
+	// one, the wave's or the shell's - may have recorded one since the caller
+	// read the subscription.
 	Cleared bool
 	// Count is the servers of the merged list; the rest are MergeRefresh's.
 	Count, Added, Removed, Renamed, Readdressed int
@@ -105,22 +113,27 @@ type RefreshResult struct {
 }
 
 // PublishRefresh publishes a periodic refresh of subscription id, downloaded
-// from rawURL, under update's lock. listed is every server the download
-// lists, in its order, without addresses where its host did not resolve. The
-// merge (MergeRefresh) runs against the file as it is under the lock, not
-// against what the caller read before downloading: a manual refresh may have
-// written in between. A merged list equal to the file's, with no error
-// recorded, writes nothing at all - neither the file nor the config. Anything
-// else writes the merged list, refreshed, a cleared error and xray.servers in
-// one update, and the records that named a renamed server follow it
-// (followRenames). ErrSubscriptionGone when the subscription was deleted or
-// relinked meanwhile, ErrNoServerResolved when the merge comes out empty;
-// neither writes. A config write that fails after the file was written puts
-// the file back as it was (restoreSubscription): the next round finds the
-// change again and writes the file and the config together. Only when the
-// file cannot be put back - another writer wrote it since, or its own write
-// fails - does the failure carry ErrServersSaved.
-func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, listed []Server, now time.Time) (RefreshResult, error) {
+// from rawURL, under update's lock. since is the subscription's refreshed as
+// the caller read it before downloading, and listed every server the download
+// lists, in its order, without addresses where its host did not resolve. A
+// file whose refreshed is no longer since holds a list another refresh wrote
+// in between, newer than the download: nothing is written
+// (ErrRefreshSuperseded), as RecordSubscriptionError writes no error then.
+// Otherwise the merge (MergeRefresh) runs against the file as it is under the
+// lock, not against what the caller read: an error recorded meanwhile, or a
+// new name of the subscription, leaves refreshed as it was, and the
+// publication clears that error and keeps that name. A merged list equal to
+// the file's, with no error recorded, writes nothing at all - neither the file
+// nor the config. Anything else writes the merged list, refreshed, a cleared
+// error and xray.servers in one update, and the records that named a renamed
+// server follow it (followRenames). ErrSubscriptionGone when the subscription
+// was deleted or relinked meanwhile, ErrNoServerResolved when the merge comes
+// out empty; none of the three writes. A config write that fails after the
+// file was written puts the file back as it was (restoreSubscription): the
+// next round finds the change again and writes the file and the config
+// together. Only when the file cannot be put back - another writer wrote it
+// since, or its own write fails - does the failure carry ErrServersSaved.
+func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, since time.Time, listed []Server, now time.Time) (RefreshResult, error) {
 	if rawURL == "" {
 		return RefreshResult{}, ErrSubscriptionStatic
 	}
@@ -136,6 +149,11 @@ func PublishRefresh(update ConfigUpdate, files SubscriptionFiles, id, rawURL str
 		i := FindSubscription(subs, id)
 		if i < 0 || subs[i].URL != rawURL {
 			return ErrSubscriptionGone
+		}
+		// Every writer of a list moves refreshed: one moved since the caller
+		// read it is a list newer than this download.
+		if !subs[i].Refreshed.Equal(since) {
+			return ErrRefreshSuperseded
 		}
 		stored := subs[i].Servers
 		m := MergeRefresh(stored, listed)

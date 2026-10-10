@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -369,6 +370,50 @@ func TestRefreshRound_ClearingAnErrorAManualRefreshRecordedMeanwhileIsNews(t *te
 	}
 	if f.subs[0].Error != "" || saves.Load() != 1 {
 		t.Fatalf("error %q, writes %d; want the error cleared once", f.subs[0].Error, saves.Load())
+	}
+}
+
+// A manual refresh can write a list while the round downloads it. That list is
+// newer: the round's older download publishes nothing over it and records no
+// error, and the round goes on with the other subscriptions.
+func TestRefreshRound_AListANewerRefreshWroteMeanwhileStays(t *testing.T) {
+	de, fr := realityAt("DE 9GB", "de.example", "aa11", "203.0.113.10"), realityAt("FR", "fr.example", "cc33", "203.0.113.20")
+	beta := vpnconfig.Subscription{ID: "bbbbbbbb", Name: "Beta", URL: "https://b.example/s/token", Servers: []vpnconfig.Server{realityAt("NL 10GB", "nl.example", "dd44", "203.0.113.30")}}
+	f, w, saves := refreshRig(alphaOf(realityAt("DE 10GB", "de.example", "aa11", "203.0.113.10")), beta)
+	var newer vpnconfig.Subscription
+	w.FetchList = func(_ context.Context, url string) ([]vpnconfig.Server, error) {
+		if url == beta.URL {
+			return []vpnconfig.Server{realityAt("NL 9GB", "nl.example", "ee55", "203.0.113.30")}, nil
+		}
+		// The manual refresh writes Alpha meanwhile: DE renamed, FR come in.
+		f.subs[0].Servers = []vpnconfig.Server{de, fr}
+		f.subs[0].Refreshed = f.now
+		newer = f.subs[0]
+		return []vpnconfig.Server{realityAt("DE 10GB", "de.example", "bb22", "203.0.113.10")}, nil
+	}
+	records := logRecords(t)
+
+	if !w.refreshRound(context.Background()) {
+		t.Fatal("the round stood down")
+	}
+
+	if !reflect.DeepEqual(f.subs[0], newer) {
+		t.Fatalf("Alpha %+v, want the manual refresh's list left as it is", f.subs[0])
+	}
+	if saves.Load() != 1 || f.subs[1].Servers[0].Name != "NL 9GB" || f.subs[1].Error != "" {
+		t.Fatalf("writes %d, Beta %+v; want Beta published alone", saves.Load(), f.subs[1])
+	}
+	var dropped []map[string]any
+	for _, r := range records() {
+		if r["msg"] == "Periodic refresh dropped; a newer refresh wrote the list while it downloaded" {
+			dropped = append(dropped, r)
+		}
+		if r["level"] == "WARN" || strings.Contains(fmt.Sprint(r), alphaURL) {
+			t.Errorf("%v; no WARN, and no line carries the link", r)
+		}
+	}
+	if len(dropped) != 1 || dropped[0]["level"] != "INFO" || dropped[0]["subscription"] != "Alpha" {
+		t.Fatalf("dropped %v; want one INFO line naming Alpha", dropped)
 	}
 }
 

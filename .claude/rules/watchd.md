@@ -169,7 +169,10 @@ subscription within `FetchTimeout`; a stop or a closed gate ends the downloads w
 publishes between ticks, holding `tickMu`, after checking the stand-down conditions again, one
 config-lock update per subscription (`vpnconfig.PublishRefresh`). It applies and restarts nothing.
 
-`vpnconfig.MergeRefresh` merges the download with the file as it is under the lock. A server's
+`vpnconfig.MergeRefresh` merges the download with the file as it is under the lock. A round whose
+subscription another refresh - a manual one, an add of its link, the wave - wrote while it
+downloaded, moving its `refreshed`, publishes nothing (`vpnconfig.ErrRefreshSuperseded`): that list
+is newer, and the next round takes it up, the rule the error record already follows. A server's
 identity (`vpnconfig.ServerIdentity`) is its stored outbound without the REALITY `serverName`,
 `shortId` and `spiderX` that 3x-ui and Marzban pick at random for every download. A fresh server
 pairs with the first stored server of its identity not yet paired, in list order, and

@@ -248,7 +248,7 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 	update, files := w.updateFor(ctx), w.files(ctx)
 	err := l.err
 	if err == nil {
-		res, perr := vpnconfig.PublishRefresh(update, files, s.ID, s.URL, l.servers, w.Now())
+		res, perr := vpnconfig.PublishRefresh(update, files, s.ID, s.URL, s.Refreshed, l.servers, w.Now())
 		switch {
 		case perr == nil:
 			w.followActiveRename(s.ID, res.Followed)
@@ -258,6 +258,11 @@ func (w *Watch) publishList(ctx context.Context, s vpnconfig.Subscription, l lis
 			err = perr
 		case errors.Is(perr, vpnconfig.ErrSubscriptionGone):
 			slog.Info("Periodic refresh dropped; the subscription was deleted or relinked while it downloaded", "subscription", s.Name)
+			return nil
+		case errors.Is(perr, vpnconfig.ErrRefreshSuperseded):
+			// The newer list is no failure of this download, and the next
+			// round takes it up: nothing to record.
+			slog.Info("Periodic refresh dropped; a newer refresh wrote the list while it downloaded", "subscription", s.Name)
 			return nil
 		case errors.Is(perr, errStopped), errors.Is(perr, watchcompat.ErrIncompatible):
 			return perr
