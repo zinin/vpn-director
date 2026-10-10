@@ -174,10 +174,15 @@ subscription another refresh - a manual one, an add of its link, the wave - wrot
 downloaded, moving its `refreshed`, publishes nothing (`vpnconfig.ErrRefreshSuperseded`): that list
 is newer, and the next round takes it up, the rule the error record already follows. A server's
 identity (`vpnconfig.ServerIdentity`) is its stored outbound without the REALITY `serverName`,
-`shortId` and `spiderX` that 3x-ui and Marzban pick at random for every download, and without the
-WebSocket and HTTPUpgrade `host` and `path` (a `Host` in their `headers` too) that some panels
-generate anew for every download, to mask the traffic. A fresh server
-pairs with the first stored server of its identity not yet paired, in list order, and
+`shortId` and `spiderX` that 3x-ui and Marzban pick at random for every download. The merge pairs
+in two passes (`pairServers`). First each fresh server, in list order, pairs with the first stored
+server of its identity not yet paired. Then each one still without a pair pairs, in list order,
+with the first stored server not yet paired that has its name and its loose identity
+(`looseIdentity`): the identity without the WebSocket and HTTPUpgrade `host` and `path`, and a
+`Host` in their `headers`, that some panels generate anew for every download to mask the traffic.
+Only under the same name: one front often routes servers by the path alone - one UUID for every
+inbound, `/de` to one country and `/nl` to another - and such twins must never trade outbounds.
+Any other fresh server stays unpaired and comes in as a fresh copy. A paired one
 stays that stored record under the fresh name - so its endpoint key, and its monitor
 status, survive; its addresses stay too when the fresh ones are the same set or did
 not resolve this time. A merge equal to the file, with no error recorded, writes

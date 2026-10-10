@@ -170,7 +170,7 @@ records it in its `error`, unless a refresh that succeeded meanwhile has moved
 its `refreshed`. A refresh, and an add of a saved link, carry `active_server`,
 `preferred_server` and `pending_restore.active` over a server the fresh list
 renamed - the same server by `vpnconfig.ServerIdentity`, its outbound without
-the REALITY picks and the ws/httpupgrade Host and path - without moving `seq`
+the REALITY picks - without moving `seq`
 (`vpnconfig.RefreshSubscriptionFollowingRenames`, `vpnconfig.AddSubscription`):
 a panel that puts the traffic left into every name would otherwise lose the
 Active mark at each refresh. watchd's periodic refresh writes a list only when
