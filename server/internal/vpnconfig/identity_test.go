@@ -24,6 +24,20 @@ func trojanTo(address string) json.RawMessage {
 	return json.RawMessage(`{"protocol":"trojan","settings":{"servers":[{"address":"` + address + `","port":443,"password":"p"}]}}`)
 }
 
+// upgradeOutbound is a VLESS outbound over TLS on address and port whose
+// stream holds transport under the key settings - wsSettings or
+// httpupgradeSettings, however spelled - and runs the network that key names.
+func upgradeOutbound(settings, address string, port int, transport string) json.RawMessage {
+	network := strings.ToLower(strings.TrimSuffix(settings, "Settings"))
+	return json.RawMessage(fmt.Sprintf(`{"protocol":"vless","settings":{"vnext":[{"address":%q,"port":%d,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":%q,"security":"tls","tlsSettings":{"serverName":"nl.example","fingerprint":"chrome"},%q:%s}}`, address, port, network, settings, transport))
+}
+
+// webSocket is a server on nl.example over WebSocket as an import stores it,
+// with the Host and the path a panel generated for one download.
+func webSocket(name, host, path string, ips ...string) Server {
+	return Server{Name: name, Address: "nl.example", Port: 443, IPs: ips, Outbound: upgradeOutbound("wsSettings", "nl.example", 443, fmt.Sprintf(`{"host":%q,"path":%q}`, host, path))}
+}
+
 // 3x-ui and Marzban pick the REALITY server name and short id at random for
 // every download: two downloads of one server are one server.
 func TestServerIdentity_WhatAPanelPicksAtRandomDoesNotCount(t *testing.T) {
@@ -70,6 +84,55 @@ func TestServerIdentity_LooksIntoTheDownloadStream(t *testing.T) {
 	}
 	if a, b := ServerIdentity(xhttp("x.example", "cc33")), ServerIdentity(xhttp("y.example", "dd44")); a == "" || a != b {
 		t.Fatalf("identities %q and %q, want one", a, b)
+	}
+}
+
+// Some panels generate the WebSocket and HTTPUpgrade Host and path anew for
+// every download, to mask the traffic: two downloads of one server are one
+// server, whether the Host comes as host or in the headers, and however Xray's
+// folding lets the keys be spelled.
+func TestServerIdentity_AnUpgradeHostAndPathAPanelGeneratesDoNotCount(t *testing.T) {
+	downloads := map[string][2]string{
+		"host and path": {`{"host":"a1.example","path":"/x7f"}`, `{"host":"q9z.example","path":"/kd83jd?ed=2048"}`},
+		"headers Host":  {`{"path":"/p","headers":{"Host":"a1.example","User-Agent":"ua"}}`, `{"path":"/p","headers":{"Host":"q9z.example","User-Agent":"ua"}}`},
+		"folded keys":   {`{"host":"a1.example","path":"/x7f","Headers":{"Host":"a1.example"}}`, `{"HOST":"q9z.example","Path":"/kd83jd","Headers":{"hOsT":"q9z.example"}}`},
+	}
+	for _, settings := range []string{"wsSettings", "httpupgradeSettings", "WSSettings", "HttpUpgradeSettings"} {
+		for what, d := range downloads {
+			a := ServerIdentity(Server{Outbound: upgradeOutbound(settings, "nl.example", 443, d[0])})
+			b := ServerIdentity(Server{Outbound: upgradeOutbound(settings, "nl.example", 443, d[1])})
+			if a == "" || a != b {
+				t.Errorf("%s, %s: identities %q and %q, want one", settings, what, a, b)
+			}
+		}
+	}
+}
+
+// Only the ws and httpupgrade Host and path are dropped: the xhttp Host and
+// path, the gRPC service, the TLS server name, which picks the backend on a
+// CDN, any other header and the address still tell two servers apart.
+func TestServerIdentity_WhatNoPanelGeneratesStillCounts(t *testing.T) {
+	vless := func(stream string) Server {
+		return Server{Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"nl.example","port":443,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"security":"tls",` + stream + `}}`)}
+	}
+	download := func(host, path string) string {
+		return fmt.Sprintf(`"network":"xhttp","xhttpSettings":{"path":"/up","extra":{"downloadSettings":{"address":"dl.example","port":443,"network":"xhttp","security":"tls","xhttpSettings":{"host":%q,"path":%q}}}}`, host, path)
+	}
+	ws := `{"host":"a1.example","path":"/x7f"}`
+	for what, apart := range map[string][2]Server{
+		"xhttp host and path":          {vless(`"network":"xhttp","xhttpSettings":{"host":"a.example","path":"/a"}`), vless(`"network":"xhttp","xhttpSettings":{"host":"b.example","path":"/b"}`)},
+		"splithttp host and path":      {vless(`"network":"splithttp","splithttpSettings":{"host":"a.example","path":"/a"}`), vless(`"network":"splithttp","splithttpSettings":{"host":"b.example","path":"/b"}`)},
+		"xhttp download host and path": {vless(download("a.example", "/a")), vless(download("b.example", "/b"))},
+		"gRPC service name":            {vless(`"network":"grpc","grpcSettings":{"serviceName":"a"}`), vless(`"network":"grpc","grpcSettings":{"serviceName":"b"}`)},
+		"gRPC authority":               {vless(`"network":"grpc","grpcSettings":{"serviceName":"s","authority":"a.example"}`), vless(`"network":"grpc","grpcSettings":{"serviceName":"s","authority":"b.example"}`)},
+		"TLS server name":              {vless(`"network":"ws","tlsSettings":{"serverName":"a.example"},"wsSettings":` + ws), vless(`"network":"ws","tlsSettings":{"serverName":"b.example"},"wsSettings":` + ws)},
+		"ws header other than Host":    {vless(`"network":"ws","wsSettings":{"headers":{"User-Agent":"a"}}`), vless(`"network":"ws","wsSettings":{"headers":{"User-Agent":"b"}}`)},
+		"ws address":                   {{Outbound: upgradeOutbound("wsSettings", "nl.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "fr.example", 443, ws)}},
+		"ws port":                      {{Outbound: upgradeOutbound("wsSettings", "nl.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "nl.example", 8443, ws)}},
+	} {
+		if a, b := ServerIdentity(apart[0]), ServerIdentity(apart[1]); a == "" || a == b {
+			t.Errorf("%s: identities %q and %q, want two", what, a, b)
+		}
 	}
 }
 

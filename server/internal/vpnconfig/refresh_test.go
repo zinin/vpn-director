@@ -20,6 +20,19 @@ func TestMergeRefresh_WhatAPanelPicksAtRandomKeepsTheStoredCopy(t *testing.T) {
 	}
 }
 
+// A panel that generates the WebSocket Host and path anew for every download
+// lists the same server each time: it pairs with the stored copy, which stays
+// as it is.
+func TestMergeRefresh_AGeneratedWebSocketHostAndPathKeepTheStoredCopy(t *testing.T) {
+	stored := []Server{webSocket("NL", "a1.example", "/x7f", "203.0.113.30")}
+
+	m := MergeRefresh(stored, []Server{webSocket("NL", "q9z.example", "/kd83jd", "203.0.113.30")})
+
+	if len(m.Servers) != 1 || !bytes.Equal(m.Servers[0].Outbound, stored[0].Outbound) || m.Added+m.Removed+m.Renamed+m.Readdressed != 0 {
+		t.Fatalf("merge %+v, want the stored copy as it is", m)
+	}
+}
+
 // 3x-ui's default remark puts the traffic left into every name.
 func TestMergeRefresh_TheFreshNameOnTheStoredCopy(t *testing.T) {
 	stored := []Server{reality("DE 10GB", "www.example.com", "aa11", "203.0.113.10")}
@@ -116,6 +129,22 @@ func TestPublishRefresh_NothingChangedWritesNothing(t *testing.T) {
 	m := &memStore{subs: []Subscription{alphaWith(stored)}, saveErr: errors.New("the file was written"), configErr: errors.New("the config was written")}
 
 	res, err := PublishRefresh(m.update, m.files(), "0a1b2c3d", alphaLink, t0, []Server{reality("DE", "example.com", "bb22", "203.0.113.10")}, t0.Add(time.Hour))
+
+	if err != nil || res.Wrote {
+		t.Fatalf("result %+v, err %v", res, err)
+	}
+	if !reflect.DeepEqual(m.subs[0].Servers, []Server{stored}) || !m.subs[0].Refreshed.Equal(t0) {
+		t.Fatalf("file %+v", m.subs[0])
+	}
+}
+
+// Nor does one that differs in the WebSocket Host and path some panels
+// generate for every download.
+func TestPublishRefresh_AGeneratedWebSocketHostAndPathWriteNothing(t *testing.T) {
+	stored := webSocket("NL", "a1.example", "/x7f", "203.0.113.30")
+	m := &memStore{subs: []Subscription{alphaWith(stored)}, saveErr: errors.New("the file was written"), configErr: errors.New("the config was written")}
+
+	res, err := PublishRefresh(m.update, m.files(), "0a1b2c3d", alphaLink, t0, []Server{webSocket("NL", "q9z.example", "/kd83jd", "203.0.113.30")}, t0.Add(time.Hour))
 
 	if err != nil || res.Wrote {
 		t.Fatalf("result %+v, err %v", res, err)
