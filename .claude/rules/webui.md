@@ -83,8 +83,10 @@ marks. Missing watch IPC, including an older daemon that serves only monitoring,
 `not_running` for automation; do not infer watch health from a successful monitor response.
 
 `ServersTab.vue` polls watch state independently of the server list and monitor marks, and
-`WatchStatus.vue` shows action, committed failover, pending restore and queue pending/storage
-error. Unavailable or failed watch reads clear stale status rather than implying healthy
+re-reads `/api/subscriptions` on every poll: watchd's periodic refresh records and clears a
+subscription's `error` and moves its `refreshed` without changing a server, and the table's
+Status and Changed would otherwise stay stale until a reload. `WatchStatus.vue` shows action,
+committed failover, pending restore and queue pending/storage error. Unavailable or failed watch reads clear stale status rather than implying healthy
 failover. `active` describes an available worker, not proof that it is armed or that every
 notification is durable. Committed failover and pending restore are separate booleans; a restore
 can remain pending across watchd restart until readiness/apply succeeds. Logs use source `watchd`
