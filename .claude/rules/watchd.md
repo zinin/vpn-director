@@ -174,7 +174,9 @@ subscription another refresh - a manual one, an add of its link, the wave - wrot
 downloaded, moving its `refreshed`, publishes nothing (`vpnconfig.ErrRefreshSuperseded`): that list
 is newer, and the next round takes it up, the rule the error record already follows. A server's
 identity (`vpnconfig.ServerIdentity`) is its stored outbound without the REALITY `serverName`,
-`shortId` and `spiderX` that 3x-ui and Marzban pick at random for every download. A fresh server
+`shortId` and `spiderX` that 3x-ui and Marzban pick at random for every download, and without the
+WebSocket and HTTPUpgrade `host` and `path` (a `Host` in their `headers` too) that some panels
+generate anew for every download, to mask the traffic. A fresh server
 pairs with the first stored server of its identity not yet paired, in list order, and
 stays that stored record under the fresh name - so its endpoint key, and its monitor
 status, survive; its addresses stay too when the fresh ones are the same set or did
@@ -194,8 +196,8 @@ name, address and port). A periodic publication that renames the active server m
 walk's `lastPicked`, to the new name with the record, so the fast path still knows the server. A
 manual refresh renames it from another daemon: Xray dying within about 30 s of that, before the
 next successful probe, leaves that episode to the legacy confirmation. A stored REALITY pick that
-the server's admin removes leaves the stored copy dead until a manual refresh or the wave, which
-take fresh copies.
+the server's admin removes, or a ws or httpupgrade `host` or `path` the operator really moves,
+leaves the stored copy dead until a manual refresh or the wave, which take fresh copies.
 
 ## Durable notifications
 
