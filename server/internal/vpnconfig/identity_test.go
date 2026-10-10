@@ -29,13 +29,14 @@ func trojanTo(address string) json.RawMessage {
 // httpupgradeSettings, however spelled - and runs the network that key names.
 func upgradeOutbound(settings, address string, port int, transport string) json.RawMessage {
 	network := strings.ToLower(strings.TrimSuffix(settings, "Settings"))
-	return json.RawMessage(fmt.Sprintf(`{"protocol":"vless","settings":{"vnext":[{"address":%q,"port":%d,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":%q,"security":"tls","tlsSettings":{"serverName":"nl.example","fingerprint":"chrome"},%q:%s}}`, address, port, network, settings, transport))
+	return json.RawMessage(fmt.Sprintf(`{"protocol":"vless","settings":{"vnext":[{"address":%q,"port":%d,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":%q,"security":"tls","tlsSettings":{"serverName":"front.example","fingerprint":"chrome"},%q:%s}}`, address, port, network, settings, transport))
 }
 
-// webSocket is a server on nl.example over WebSocket as an import stores it,
-// with the Host and the path a panel generated for one download.
+// webSocket is a server on front.example over WebSocket as an import stores
+// it, with its Host and path. Every such server shares the address, the port
+// and the UUID: the front routes them by the Host and the path alone.
 func webSocket(name, host, path string, ips ...string) Server {
-	return Server{Name: name, Address: "nl.example", Port: 443, IPs: ips, Outbound: upgradeOutbound("wsSettings", "nl.example", 443, fmt.Sprintf(`{"host":%q,"path":%q}`, host, path))}
+	return Server{Name: name, Address: "front.example", Port: 443, IPs: ips, Outbound: upgradeOutbound("wsSettings", "front.example", 443, fmt.Sprintf(`{"host":%q,"path":%q}`, host, path))}
 }
 
 // 3x-ui and Marzban pick the REALITY server name and short id at random for
@@ -87,33 +88,59 @@ func TestServerIdentity_LooksIntoTheDownloadStream(t *testing.T) {
 	}
 }
 
-// Some panels generate the WebSocket and HTTPUpgrade Host and path anew for
-// every download, to mask the traffic: two downloads of one server are one
-// server, whether the Host comes as host or in the headers, and however Xray's
-// folding lets the keys be spelled.
-func TestServerIdentity_AnUpgradeHostAndPathAPanelGeneratesDoNotCount(t *testing.T) {
-	downloads := map[string][2]string{
-		"host and path": {`{"host":"a1.example","path":"/x7f"}`, `{"host":"q9z.example","path":"/kd83jd?ed=2048"}`},
-		"headers Host":  {`{"path":"/p","headers":{"Host":"a1.example","User-Agent":"ua"}}`, `{"path":"/p","headers":{"Host":"q9z.example","User-Agent":"ua"}}`},
-		"folded keys":   {`{"host":"a1.example","path":"/x7f","Headers":{"Host":"a1.example"}}`, `{"HOST":"q9z.example","Path":"/kd83jd","Headers":{"hOsT":"q9z.example"}}`},
-	}
-	for _, settings := range []string{"wsSettings", "httpupgradeSettings", "WSSettings", "HttpUpgradeSettings"} {
-		for what, d := range downloads {
-			a := ServerIdentity(Server{Outbound: upgradeOutbound(settings, "nl.example", 443, d[0])})
-			b := ServerIdentity(Server{Outbound: upgradeOutbound(settings, "nl.example", 443, d[1])})
-			if a == "" || a != b {
-				t.Errorf("%s, %s: identities %q and %q, want one", settings, what, a, b)
+// The WebSocket and HTTPUpgrade Host and path can route: one front often
+// sends /de to one country and /nl to another. To ServerIdentity two of them
+// are two servers.
+func TestServerIdentity_AnUpgradeHostOrPathCounts(t *testing.T) {
+	for _, settings := range []string{"wsSettings", "httpupgradeSettings"} {
+		for what, d := range map[string][2]string{
+			"path":         {`{"host":"front.example","path":"/de"}`, `{"host":"front.example","path":"/nl"}`},
+			"host":         {`{"host":"de.example","path":"/"}`, `{"host":"nl.example","path":"/"}`},
+			"headers Host": {`{"path":"/","headers":{"Host":"de.example"}}`, `{"path":"/","headers":{"Host":"nl.example"}}`},
+		} {
+			a := ServerIdentity(Server{Outbound: upgradeOutbound(settings, "front.example", 443, d[0])})
+			b := ServerIdentity(Server{Outbound: upgradeOutbound(settings, "front.example", 443, d[1])})
+			if a == "" || a == b {
+				t.Errorf("%s, %s: identities %q and %q, want two", settings, what, a, b)
 			}
 		}
 	}
 }
 
-// Only the ws and httpupgrade Host and path are dropped: the xhttp Host and
-// path, the gRPC service, the TLS server name, which picks the backend on a
-// CDN, any other header and the address still tell two servers apart.
-func TestServerIdentity_WhatNoPanelGeneratesStillCounts(t *testing.T) {
+// Some panels generate the WebSocket and HTTPUpgrade Host and path anew for
+// every download, to mask the traffic: to the loose identity two downloads of
+// one server are one, whether the Host comes as host or in the headers, with
+// an emptied headers counting as none and the keys spelled any way Xray's
+// folding lets them be. The REALITY picks do not count either.
+func TestLooseIdentity_AnUpgradeHostAndPathDoNotCount(t *testing.T) {
+	downloads := map[string][2]string{
+		"host and path":   {`{"host":"a1.example","path":"/x7f"}`, `{"host":"q9z.example","path":"/kd83jd?ed=2048"}`},
+		"headers Host":    {`{"path":"/p","headers":{"Host":"a1.example","User-Agent":"ua"}}`, `{"path":"/p","headers":{"Host":"q9z.example","User-Agent":"ua"}}`},
+		"emptied headers": {`{"path":"/x7f","headers":{"Host":"a1.example"}}`, `{"path":"/kd83jd"}`},
+		"empty headers":   {`{"path":"/x7f","headers":{}}`, `{"path":"/kd83jd"}`},
+		"folded keys":     {`{"host":"a1.example","path":"/x7f","Headers":{"Host":"a1.example"}}`, `{"HOST":"q9z.example","Path":"/kd83jd","headers":{"hOsT":"q9z.example"}}`},
+	}
+	for _, settings := range []string{"wsSettings", "httpupgradeSettings", "WSSettings", "HttpUpgradeSettings"} {
+		for what, d := range downloads {
+			a := looseIdentity(Server{Outbound: upgradeOutbound(settings, "front.example", 443, d[0])})
+			b := looseIdentity(Server{Outbound: upgradeOutbound(settings, "front.example", 443, d[1])})
+			if a == "" || a != b {
+				t.Errorf("%s, %s: loose identities %q and %q, want one", settings, what, a, b)
+			}
+		}
+	}
+	if a, b := looseIdentity(reality("DE", "www.example.com", "aa11")), looseIdentity(reality("DE", "example.com", "bb22")); a == "" || a != b {
+		t.Errorf("REALITY picks: loose identities %q and %q, want one", a, b)
+	}
+}
+
+// The loose identity drops only the ws and httpupgrade Host and path besides
+// the REALITY picks: the xhttp Host and path, the gRPC service, the TLS
+// server name, which picks the backend on a CDN, any other header, the
+// address and the port still tell two servers apart.
+func TestLooseIdentity_EverythingElseCounts(t *testing.T) {
 	vless := func(stream string) Server {
-		return Server{Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"nl.example","port":443,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"security":"tls",` + stream + `}}`)}
+		return Server{Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"front.example","port":443,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"security":"tls",` + stream + `}}`)}
 	}
 	download := func(host, path string) string {
 		return fmt.Sprintf(`"network":"xhttp","xhttpSettings":{"path":"/up","extra":{"downloadSettings":{"address":"dl.example","port":443,"network":"xhttp","security":"tls","xhttpSettings":{"host":%q,"path":%q}}}}`, host, path)
@@ -127,11 +154,11 @@ func TestServerIdentity_WhatNoPanelGeneratesStillCounts(t *testing.T) {
 		"gRPC authority":               {vless(`"network":"grpc","grpcSettings":{"serviceName":"s","authority":"a.example"}`), vless(`"network":"grpc","grpcSettings":{"serviceName":"s","authority":"b.example"}`)},
 		"TLS server name":              {vless(`"network":"ws","tlsSettings":{"serverName":"a.example"},"wsSettings":` + ws), vless(`"network":"ws","tlsSettings":{"serverName":"b.example"},"wsSettings":` + ws)},
 		"ws header other than Host":    {vless(`"network":"ws","wsSettings":{"headers":{"User-Agent":"a"}}`), vless(`"network":"ws","wsSettings":{"headers":{"User-Agent":"b"}}`)},
-		"ws address":                   {{Outbound: upgradeOutbound("wsSettings", "nl.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "fr.example", 443, ws)}},
-		"ws port":                      {{Outbound: upgradeOutbound("wsSettings", "nl.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "nl.example", 8443, ws)}},
+		"ws address":                   {{Outbound: upgradeOutbound("wsSettings", "front.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "back.example", 443, ws)}},
+		"ws port":                      {{Outbound: upgradeOutbound("wsSettings", "front.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "front.example", 8443, ws)}},
 	} {
-		if a, b := ServerIdentity(apart[0]), ServerIdentity(apart[1]); a == "" || a == b {
-			t.Errorf("%s: identities %q and %q, want two", what, a, b)
+		if a, b := looseIdentity(apart[0]), looseIdentity(apart[1]); a == "" || a == b {
+			t.Errorf("%s: loose identities %q and %q, want two", what, a, b)
 		}
 	}
 }
@@ -148,6 +175,9 @@ func TestServerIdentity_ARecordWithoutAnOutboundHasNone(t *testing.T) {
 	legacy := Server{Name: "DE", Address: "de.example", Port: 443, UUID: "u-1", Security: "reality", ShortID: "aa11"}
 	if id := ServerIdentity(legacy); id != "" {
 		t.Fatalf("legacy record identity %q", id)
+	}
+	if id := looseIdentity(legacy); id != "" {
+		t.Fatalf("legacy record loose identity %q", id)
 	}
 	if id := ServerIdentity(Server{Outbound: json.RawMessage(`not json`)}); id != "" {
 		t.Fatalf("unreadable outbound identity %q", id)
@@ -172,5 +202,15 @@ func TestPairServers_EachTakesTheFirstFreeStoredTwin(t *testing.T) {
 	}
 	if got := pairServers(stored, fresh); !reflect.DeepEqual(got, []int{0, 1, -1, -1}) {
 		t.Fatalf("pairs %v, want [0 1 -1 -1]", got)
+	}
+}
+
+// A server that keeps its path pairs with its own copy before a twin of its
+// name whose path was generated anew takes the copy by the loose identity.
+func TestPairServers_TheStrictIdentityGoesFirst(t *testing.T) {
+	stored := []Server{webSocket("DE", "front.example", "/de"), webSocket("DE", "a1.example", "/x7f")}
+	fresh := []Server{webSocket("DE", "q9z.example", "/kd83jd"), webSocket("DE", "front.example", "/de")}
+	if got := pairServers(stored, fresh); !reflect.DeepEqual(got, []int{1, 0}) {
+		t.Fatalf("pairs %v, want [1 0]", got)
 	}
 }

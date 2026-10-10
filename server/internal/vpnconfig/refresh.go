@@ -22,10 +22,12 @@ type RefreshMerge struct {
 
 // MergeRefresh merges listed, every server a periodic refresh downloaded in
 // subscription order - without addresses where its host did not resolve -
-// with stored, the list in the file. Each listed server pairs with the first
-// stored server of the same ServerIdentity not yet paired and is then that
-// stored record - its outbound, and so the stored REALITY picks - under the
-// listed name: its endpoint keys, and so its monitor statuses, stay. Its
+// with stored, the list in the file. Each listed server pairs (pairServers)
+// with the first stored server not yet paired of the same ServerIdentity or,
+// failing that, of the same looseIdentity under the same name, and is then
+// that stored record - its outbound, and so the stored REALITY picks and
+// generated ws or httpupgrade Host and path - under the listed name: its
+// endpoint keys, and so its monitor statuses, stay. Its
 // addresses are the stored ones when the listed ones are the same set or
 // there are none, the listed ones otherwise. A listed server without a pair
 // comes in as it is, unless it has no address; a stored one without a pair
