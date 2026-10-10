@@ -222,4 +222,33 @@ func TestPairServers_ARecordWithoutAnOutboundPairsWithNothing(t *testing.T) {
 	if got := pairServers([]Server{legacy}, []Server{legacy}); !reflect.DeepEqual(got, []int{-1}) {
 		t.Fatalf("pairs %v, want [-1]", got)
 	}
+	// Nor when a server of its name with an outbound sends the loose pass to
+	// look at that name.
+	if got := pairServers([]Server{legacy}, []Server{legacy, webSocket("DE", "q9z.example", "/kd83jd")}); !reflect.DeepEqual(got, []int{-1, -1}) {
+		t.Fatalf("pairs %v, want [-1 -1]", got)
+	}
+}
+
+// A name tells a server apart only when each list holds one server of that
+// name and loose identity: with two on either side, servers whose Host and
+// path were generated anew pair with nothing.
+func TestPairServers_TheLooseIdentityNeedsANameEachListHoldsOnce(t *testing.T) {
+	for what, tc := range map[string]struct{ stored, fresh []Server }{
+		"two stored": {
+			[]Server{webSocket("S", "a1.example", "/x7f"), webSocket("S", "b2.example", "/p4q")},
+			[]Server{webSocket("S", "q9z.example", "/kd83jd")},
+		},
+		"two fresh": {
+			[]Server{webSocket("S", "a1.example", "/x7f")},
+			[]Server{webSocket("S", "q9z.example", "/kd83jd"), webSocket("S", "r5.example", "/m2")},
+		},
+	} {
+		want := make([]int, len(tc.fresh))
+		for i := range want {
+			want[i] = -1
+		}
+		if got := pairServers(tc.stored, tc.fresh); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s: pairs %v, want %v", what, got, want)
+		}
+	}
 }
