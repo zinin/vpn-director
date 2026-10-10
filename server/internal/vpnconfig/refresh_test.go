@@ -60,6 +60,21 @@ func TestMergeRefresh_TwinsWithGeneratedPathsPairByName(t *testing.T) {
 	}
 }
 
+// A name two stored servers share tells neither apart. The front drops /de
+// and adds /fr under that name: /nl pairs by its identity, /fr comes in
+// fresh and /de leaves - /fr never dials /de's outbound.
+func TestMergeRefresh_ANameTwinsShareDoesNotPairByTheLooseIdentity(t *testing.T) {
+	de := webSocket("S", "front.example", "/de", "203.0.113.30")
+	nl := webSocket("S", "front.example", "/nl", "203.0.113.30")
+	fr := webSocket("S", "front.example", "/fr", "203.0.113.30")
+
+	m := MergeRefresh([]Server{de, nl}, []Server{nl, fr})
+
+	if !reflect.DeepEqual(m.Servers, []Server{nl, fr}) || m.Added != 1 || m.Removed != 1 || m.Renamed != 0 {
+		t.Fatalf("merge %+v, want /nl kept and /fr fresh", m)
+	}
+}
+
 // Under a new name, a server whose Host and path were generated anew is
 // another server: the fresh copy comes in, and the stored one leaves.
 func TestMergeRefresh_AGeneratedHostAndPathUnderANewNameIsANewServer(t *testing.T) {

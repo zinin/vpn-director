@@ -43,12 +43,13 @@ func ServerIdentity(s Server) string {
 // ServerIdentity every download would bring new servers. But one front often
 // routes servers by the path alone - one UUID for every inbound, /de to one
 // country and /nl to another - and then the loose identity of such twins is
-// one: pairServers pairs by it only under the same name, so twins never trade
-// outbounds. The cost: an operator who really moves such a server's Host or
-// path is not taken up by the periodic refresh, and its stored copy stays
-// until a manual refresh or the wave, which take fresh copies. Everything else
-// stays, as in ServerIdentity: the xhttp and splithttp Host and path, gRPC, the
-// TLS serverName, address, port and credentials.
+// one: pairServers pairs by it only under a name that tells the server apart,
+// one server of that name and loose identity in each list, so twins never
+// trade outbounds. The cost: an operator who really moves such a server's
+// Host or path is not taken up by the periodic refresh, and its stored copy
+// stays until a manual refresh or the wave, which take fresh copies.
+// Everything else stays, as in ServerIdentity: the xhttp and splithttp Host
+// and path, gRPC, the TLS serverName, address, port and credentials.
 func looseIdentity(s Server) string {
 	return identity(s, true)
 }
@@ -128,11 +129,16 @@ func dropKeys(obj map[string]interface{}, names []string) {
 // pairServers pairs each fresh server with a stored one not yet paired:
 // pairs[i] is the index in stored of fresh[i]'s pair, or -1. First each fresh
 // server, in order, pairs with the first stored server of the same
-// ServerIdentity; then each one still without a pair, in order, with the
-// first stored server of the same looseIdentity and the same name. The strict
-// pass goes first, so a server that kept its Host and path takes its own copy
-// before a twin of its name whose Host and path were generated anew can. A
-// server without an identity pairs with nothing.
+// ServerIdentity. Then a fresh server still without a pair pairs by its name
+// and its looseIdentity, but only where that name tells the server apart: the
+// stored list and the fresh one each hold exactly one server of that name and
+// loose identity, and the strict pass left both. Twins a name does not tell
+// apart - /de and /nl under one name, /de dropped and /fr added - stay
+// unpaired, and the fresh one comes in as it is rather than dial a stored
+// twin's path. The strict pass goes first, so a server renamed with its
+// stored outbound is that stored server, whatever a server of the old name
+// whose Host and path are new would take by the loose identity. A server
+// without an identity pairs with nothing.
 func pairServers(stored, fresh []Server) []int {
 	pairs := make([]int, len(fresh))
 	paired := make([]bool, len(stored))
@@ -142,29 +148,43 @@ func pairServers(stored, fresh []Server) []int {
 			strict[id] = append(strict[id], i)
 		}
 	}
+	// The names of the fresh servers the strict pass leaves: only they can
+	// pair by the loose identity.
+	left := map[string]bool{}
 	for i, f := range fresh {
 		pairs[i] = -1
 		id := ServerIdentity(f)
 		if q := strict[id]; id != "" && len(q) > 0 {
 			pairs[i], strict[id] = q[0], q[1:]
 			paired[q[0]] = true
+		} else if id != "" {
+			left[f.Name] = true
 		}
 	}
+	if len(left) == 0 {
+		return pairs
+	}
+	// Whether a name tells a server apart is a matter of the whole list, the
+	// servers the strict pass paired included: of /de and /nl under one name,
+	// /nl pairing by its identity does not make the name tell /de apart.
 	type named struct{ name, id string }
-	loose := map[named][]int{}
-	for i, s := range stored {
-		if id := looseIdentity(s); id != "" && !paired[i] {
-			k := named{s.Name, id}
-			loose[k] = append(loose[k], i)
+	holders := func(list []Server) map[named][]int {
+		by := map[named][]int{}
+		for i, s := range list {
+			if !left[s.Name] {
+				continue
+			}
+			if id := looseIdentity(s); id != "" {
+				k := named{s.Name, id}
+				by[k] = append(by[k], i)
+			}
 		}
+		return by
 	}
-	for i, f := range fresh {
-		if pairs[i] >= 0 {
-			continue
-		}
-		k := named{f.Name, looseIdentity(f)}
-		if q := loose[k]; k.id != "" && len(q) > 0 {
-			pairs[i], loose[k] = q[0], q[1:]
+	inStored := holders(stored)
+	for k, fi := range holders(fresh) {
+		if si := inStored[k]; len(fi) == 1 && len(si) == 1 && pairs[fi[0]] < 0 && !paired[si[0]] {
+			pairs[fi[0]] = si[0]
 		}
 	}
 	return pairs

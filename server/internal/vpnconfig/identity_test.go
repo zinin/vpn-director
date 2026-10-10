@@ -154,6 +154,7 @@ func TestLooseIdentity_EverythingElseCounts(t *testing.T) {
 		"gRPC authority":               {vless(`"network":"grpc","grpcSettings":{"serviceName":"s","authority":"a.example"}`), vless(`"network":"grpc","grpcSettings":{"serviceName":"s","authority":"b.example"}`)},
 		"TLS server name":              {vless(`"network":"ws","tlsSettings":{"serverName":"a.example"},"wsSettings":` + ws), vless(`"network":"ws","tlsSettings":{"serverName":"b.example"},"wsSettings":` + ws)},
 		"ws header other than Host":    {vless(`"network":"ws","wsSettings":{"headers":{"User-Agent":"a"}}`), vless(`"network":"ws","wsSettings":{"headers":{"User-Agent":"b"}}`)},
+		"ws header beside the Host":    {vless(`"network":"ws","wsSettings":{"headers":{"Host":"a.example","User-Agent":"x"}}`), vless(`"network":"ws","wsSettings":{"headers":{"Host":"b.example","User-Agent":"y"}}`)},
 		"ws address":                   {{Outbound: upgradeOutbound("wsSettings", "front.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "back.example", 443, ws)}},
 		"ws port":                      {{Outbound: upgradeOutbound("wsSettings", "front.example", 443, ws)}, {Outbound: upgradeOutbound("wsSettings", "front.example", 8443, ws)}},
 	} {
@@ -205,12 +206,20 @@ func TestPairServers_EachTakesTheFirstFreeStoredTwin(t *testing.T) {
 	}
 }
 
-// A server that keeps its path pairs with its own copy before a twin of its
-// name whose path was generated anew takes the copy by the loose identity.
+// The strict pass goes first: a server listed under a new name with the
+// stored outbound is that stored server renamed, and a server of the old name
+// whose Host and path are new does not take its copy by the loose identity.
 func TestPairServers_TheStrictIdentityGoesFirst(t *testing.T) {
-	stored := []Server{webSocket("DE", "front.example", "/de"), webSocket("DE", "a1.example", "/x7f")}
-	fresh := []Server{webSocket("DE", "q9z.example", "/kd83jd"), webSocket("DE", "front.example", "/de")}
-	if got := pairServers(stored, fresh); !reflect.DeepEqual(got, []int{1, 0}) {
-		t.Fatalf("pairs %v, want [1 0]", got)
+	stored := []Server{webSocket("DE", "front.example", "/de")}
+	fresh := []Server{webSocket("DE", "q9z.example", "/kd83jd"), webSocket("DE 9GB", "front.example", "/de")}
+	if got := pairServers(stored, fresh); !reflect.DeepEqual(got, []int{-1, 0}) {
+		t.Fatalf("pairs %v, want [-1 0]", got)
+	}
+}
+
+func TestPairServers_ARecordWithoutAnOutboundPairsWithNothing(t *testing.T) {
+	legacy := Server{Name: "DE", Address: "de.example", Port: 443, UUID: "u-1"}
+	if got := pairServers([]Server{legacy}, []Server{legacy}); !reflect.DeepEqual(got, []int{-1}) {
+		t.Fatalf("pairs %v, want [-1]", got)
 	}
 }
