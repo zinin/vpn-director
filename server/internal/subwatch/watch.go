@@ -85,14 +85,21 @@ type Watch struct {
 	Health            HealthMonitor              // nil => legacy confirmation
 	WANUp             func(context.Context) bool // nil => legacy confirmation
 	Fetch             func(ctx context.Context, url string) ([]vpnconfig.Server, error)
-	Reachable         func(ctx context.Context, ip string, port int) bool // nil => no TCP checks: no fast death, no return
-	Notify            func(msg string)
-	Now               func() time.Time
-	AfterRestart      func(time.Duration)
-	FallbackReady     func(tunnel string) bool // nil => ready; false keeps Xray membership
-	TPROXYReady       func() bool              // nil => ready; false keeps fallback membership after restore
-	Stopped           func() bool              // nil => not stopped; true skips apply/restart after /stop
-	CanMutate         func() error             // nil => compatible; non-nil error pauses automation
+	// FetchList downloads a subscription for the periodic refresh: every
+	// server it lists, in its order, without addresses where the host did not
+	// resolve. nil leaves the periodic refresh off.
+	FetchList func(ctx context.Context, url string) ([]vpnconfig.Server, error)
+	// RefreshInterval is the period of the periodic refresh, read before every
+	// round; 0 turns it off, and so does a nil RefreshInterval.
+	RefreshInterval func() time.Duration
+	Reachable       func(ctx context.Context, ip string, port int) bool // nil => no TCP checks: no fast death, no return
+	Notify          func(msg string)
+	Now             func() time.Time
+	AfterRestart    func(time.Duration)
+	FallbackReady   func(tunnel string) bool // nil => ready; false keeps Xray membership
+	TPROXYReady     func() bool              // nil => ready; false keeps fallback membership after restore
+	Stopped         func() bool              // nil => not stopped; true skips apply/restart after /stop
+	CanMutate       func() error             // nil => compatible; non-nil error pauses automation
 
 	// Tick ownership outlives the unlocked notification callback.
 	tickMu            sync.Mutex
@@ -127,13 +134,14 @@ type Watch struct {
 	lastFallbackCheck time.Time                     // last platform lookup for a committed failover's tunnel
 	fallbackDownSince time.Time                     // since when that tunnel is no exit; zero while it is one
 	running           bool
-	returnNotBefore   time.Time         // no look for the preferred server before this
-	returnRetry       time.Duration     // wait after the last failed return; zero before any
-	returnFails       int               // returns in a row that failed; at ReturnFailsMax the returns stop
-	lastReturn        time.Time         // when the last return proved live; zero once it held for ReturnHold or a death followed it
-	returnSeq         int               // active_server's write counter the last return left
-	returnDeath       time.Time         // failSince of the last death the returns were settled at
-	lastPicked        *vpnconfig.Server // the copy the walk picked or a return proved, with the address it ran on
+	returnNotBefore   time.Time                            // no look for the preferred server before this
+	returnRetry       time.Duration                        // wait after the last failed return; zero before any
+	returnFails       int                                  // returns in a row that failed; at ReturnFailsMax the returns stop
+	lastReturn        time.Time                            // when the last return proved live; zero once it held for ReturnHold or a death followed it
+	returnSeq         int                                  // active_server's write counter the last return left
+	returnDeath       time.Time                            // failSince of the last death the returns were settled at
+	lastPicked        *vpnconfig.Server                    // the copy the walk picked or a return proved, with the address it ran on
+	after             func(time.Duration) <-chan time.Time // StartRefresh's waits; nil is time.After
 }
 
 func (w *Watch) Start(ctx context.Context) {

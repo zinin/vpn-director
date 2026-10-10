@@ -836,6 +836,37 @@ func TestRuntime_CanMutateReportsWhyTheOperationEnded(t *testing.T) {
 	}
 }
 
+// A compatibility check that the operation's end cut short reports that end,
+// not the gate's bare refusal: the periodic refresh takes a context error as
+// no refusal, and a tick that ends is no closed gate. A check that refuses
+// while the operation lives still refuses.
+func TestGateCheck_ReportsTheEndThatCutItShort(t *testing.T) {
+	ended := errors.New("synthetic end of the operation")
+	for _, tc := range []struct {
+		name string
+		end  func(context.CancelCauseFunc)
+		want error
+	}{
+		{"with a cause", func(cancel context.CancelCauseFunc) { cancel(ended) }, ended},
+		{"plainly", func(cancel context.CancelCauseFunc) { cancel(nil) }, context.Canceled},
+	} {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		err := gateCheck(ctx, func(context.Context) error {
+			tc.end(cancel)
+			return watchcompat.ErrIncompatible
+		})
+		cancel(nil)
+		if !errors.Is(err, tc.want) || errors.Is(err, watchcompat.ErrIncompatible) {
+			t.Errorf("%s: gateCheck = %v, want %v", tc.name, err, tc.want)
+		}
+	}
+	if err := gateCheck(context.Background(), func(context.Context) error {
+		return watchcompat.ErrIncompatible
+	}); !errors.Is(err, watchcompat.ErrIncompatible) {
+		t.Errorf("gateCheck = %v while the operation lives, want %v", err, watchcompat.ErrIncompatible)
+	}
+}
+
 func TestRuntime_NewWatchGeneratesUnderTheRealConfigLock(t *testing.T) {
 	p := runtimePaths(t)
 	cfg := runtimeConfig(t, p, `{"data_dir":"resolved-data","advanced":{"xray":{"tproxy_port":23456,"socks_port":23457}},"xray":{"active_server":{"name":"old","address":"old.example","port":443,"subscription":"0a1b2c3d","seq":7}}}`)
@@ -1709,6 +1740,33 @@ func TestPublishSubscriptionHealth_RuntimeStoreErrorDoesNotStopWatch(t *testing.
 	for _, secret := range []string{"SUBSCRIPTION_URL_SECRET", "RAW_MONITOR_ERROR_SECRET", "RAW_ENDPOINT_ERROR_SECRET", sub.Servers[0].UUID} {
 		if strings.Contains(logs.String(), secret) {
 			t.Fatalf("runtime health diagnostic exposed %q", secret)
+		}
+	}
+}
+
+// The periodic refresh reads monitor.subscription_refresh before every round:
+// absent is 5 minutes, 0 is off, a value below a minute is the default.
+func TestNewWatch_RefreshFollowsTheMonitorSection(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want time.Duration
+	}{
+		{`{"data_dir":"data"}`, 5 * time.Minute},
+		{`{"data_dir":"data","monitor":{"subscription_refresh":"7m"}}`, 7 * time.Minute},
+		{`{"data_dir":"data","monitor":{"subscription_refresh":"0"}}`, 0},
+		{`{"data_dir":"data","monitor":{"subscription_refresh":"30s"}}`, 5 * time.Minute},
+	} {
+		p := runtimePaths(t)
+		cfg := runtimeConfig(t, p, tc.raw)
+		q := runtimeQueue(t, filepath.Join(t.TempDir(), "watchd-notifications.json"))
+		w := runtimeWatch(t, context.Background(), p, cfg, q, runtimeExecutor(func(context.Context, string, ...string) (*shell.Result, error) {
+			return &shell.Result{}, nil
+		}))
+		if w.FetchList == nil || w.RefreshInterval == nil {
+			t.Fatal("newWatch left the periodic refresh unwired")
+		}
+		if got := w.RefreshInterval(); got != tc.want {
+			t.Errorf("%s: interval %s, want %s", tc.raw, got, tc.want)
 		}
 	}
 }

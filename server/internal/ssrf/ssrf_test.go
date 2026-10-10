@@ -13,32 +13,32 @@ func TestIsPrivateOrReserved(t *testing.T) {
 		ip      string
 		blocked bool
 	}{
-		{"127.0.0.1", true},             // loopback
-		{"10.0.0.1", true},              // RFC1918
-		{"172.16.0.1", true},            // RFC1918
-		{"192.168.1.1", true},           // RFC1918
-		{"169.254.169.254", true},       // link-local (cloud metadata)
-		{"100.64.0.1", true},            // CGNAT (no stdlib method covers it)
-		{"0.0.0.0", true},               // unspecified
-		{"0.1.2.3", true},               // 0.0.0.0/8 "this network"
-		{"224.0.0.1", true},             // multicast
-		{"::1", true},                   // IPv6 loopback
-		{"::", true},                    // IPv6 unspecified
-		{"fc00::1", true},               // IPv6 ULA
-		{"fe80::1", true},               // IPv6 link-local
-		{"ff02::1", true},               // IPv6 multicast
+		{"127.0.0.1", true},              // loopback
+		{"10.0.0.1", true},               // RFC1918
+		{"172.16.0.1", true},             // RFC1918
+		{"192.168.1.1", true},            // RFC1918
+		{"169.254.169.254", true},        // link-local (cloud metadata)
+		{"100.64.0.1", true},             // CGNAT (no stdlib method covers it)
+		{"0.0.0.0", true},                // unspecified
+		{"0.1.2.3", true},                // 0.0.0.0/8 "this network"
+		{"224.0.0.1", true},              // multicast
+		{"::1", true},                    // IPv6 loopback
+		{"::", true},                     // IPv6 unspecified
+		{"fc00::1", true},                // IPv6 ULA
+		{"fe80::1", true},                // IPv6 link-local
+		{"ff02::1", true},                // IPv6 multicast
 		{"::ffff:127.0.0.1", true},       // IPv4-mapped loopback
 		{"::ffff:192.168.0.1", true},     // IPv4-mapped private
 		{"::ffff:100.64.0.1", true},      // IPv4-mapped CGNAT (To4 + extraBlockedCIDRs)
 		{"::ffff:169.254.169.254", true}, // IPv4-mapped link-local metadata
 		// IPv4-embedded IPv6 transition addresses: the embedded IPv4 must be
 		// unwrapped and re-checked, else NAT64/6to4/IPv4-compatible bypass the guard.
-		{"64:ff9b::7f00:1", true},   // NAT64 well-known (64:ff9b::/96) -> 127.0.0.1
-		{"64:ff9b::a00:1", true},    // NAT64 well-known -> 10.0.0.1
-		{"2002:7f00:1::", true},     // 6to4 (2002::/16) -> 127.0.0.1
-		{"2002:a00:1::", true},      // 6to4 -> 10.0.0.1
-		{"::127.0.0.1", true},       // IPv4-compatible (deprecated, ::/96) -> 127.0.0.1
-		{"::169.254.169.254", true}, // IPv4-compatible -> link-local metadata
+		{"64:ff9b::7f00:1", true},       // NAT64 well-known (64:ff9b::/96) -> 127.0.0.1
+		{"64:ff9b::a00:1", true},        // NAT64 well-known -> 10.0.0.1
+		{"2002:7f00:1::", true},         // 6to4 (2002::/16) -> 127.0.0.1
+		{"2002:a00:1::", true},          // 6to4 -> 10.0.0.1
+		{"::127.0.0.1", true},           // IPv4-compatible (deprecated, ::/96) -> 127.0.0.1
+		{"::169.254.169.254", true},     // IPv4-compatible -> link-local metadata
 		{"8.8.8.8", false},              // public
 		{"1.1.1.1", false},              // public
 		{"2001:4860:4860::8888", false}, // public IPv6
@@ -68,9 +68,9 @@ func TestDialGuard(t *testing.T) {
 		{"100.64.0.1:443", true},
 		{"169.254.169.254:80", true},
 		{"[::1]:80", true},
-		{"[64:ff9b::7f00:1]:443", true},   // NAT64 -> 127.0.0.1
-		{"[2002:7f00:1::]:80", true},      // 6to4 -> 127.0.0.1
-		{"[::127.0.0.1]:80", true},        // IPv4-compatible -> 127.0.0.1
+		{"[64:ff9b::7f00:1]:443", true}, // NAT64 -> 127.0.0.1
+		{"[2002:7f00:1::]:80", true},    // 6to4 -> 127.0.0.1
+		{"[::127.0.0.1]:80", true},      // IPv4-compatible -> 127.0.0.1
 		{"8.8.8.8:443", false},
 		{"1.1.1.1:80", false},
 		{"[64:ff9b::808:808]:443", false}, // NAT64 wrapping public 8.8.8.8

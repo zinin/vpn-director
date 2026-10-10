@@ -292,6 +292,49 @@ func TestRecordSubscriptionError_ADeletedSubscriptionStaysDeleted(t *testing.T) 
 	}
 }
 
+// watchd's periodic refresh logs an error only when it appears or changes in
+// the file, which only the write under the lock knows: a manual refresh may
+// have recorded the same error, or refreshed the list, meanwhile.
+func TestRecordSubscriptionErrorChanged(t *testing.T) {
+	const link, msg = "https://sub.example.com/s/t", "download failed: HTTP 403"
+	alpha := Subscription{ID: "0a1b2c3d", URL: link, Refreshed: t0, Servers: oslo()}
+	failed, newer, relinked := alpha, alpha, alpha
+	failed.Error = "download failed: HTTP 502"
+	newer.Refreshed = t0.Add(time.Minute)
+	relinked.URL = "https://sub.example.com/s/other"
+	recorded := alpha
+	recorded.Error = msg
+	for _, tc := range []struct {
+		name    string
+		subs    []Subscription
+		changed bool
+		err     error
+		want    string // the file's error afterwards
+	}{
+		{"a new error", []Subscription{alpha}, true, nil, msg},
+		{"a changed error", []Subscription{failed}, true, nil, msg},
+		{"the same error", []Subscription{recorded}, false, nil, msg},
+		{"a newer refresh", []Subscription{newer}, false, nil, ""},
+		{"a relinked subscription", []Subscription{relinked}, false, ErrSubscriptionGone, ""},
+		{"a deleted subscription", nil, false, ErrSubscriptionGone, ""},
+	} {
+		m := &memStore{subs: tc.subs}
+		if !tc.changed {
+			// Any write would fail: none may happen.
+			m.saveErr, m.configErr = errors.New("the file was written"), errors.New("the config was written")
+		}
+
+		changed, err := RecordSubscriptionErrorChanged(m.update, m.files(), "0a1b2c3d", link, t0, msg)
+
+		if changed != tc.changed || !errors.Is(err, tc.err) {
+			t.Errorf("%s: changed %v, err %v; want %v, %v", tc.name, changed, err, tc.changed, tc.err)
+		}
+		if len(m.subs) > 0 && m.subs[0].Error != tc.want {
+			t.Errorf("%s: the file's error %q, want %q", tc.name, m.subs[0].Error, tc.want)
+		}
+	}
+}
+
 func TestRenameSubscription(t *testing.T) {
 	m := &memStore{subs: []Subscription{{ID: "0a1b2c3d", Name: "Alpha"}, {ID: "1b2c3d4e", Name: "Beta"}}}
 
@@ -349,5 +392,53 @@ func TestDeleteSubscription_KeepsAChoiceFromAnotherSubscription(t *testing.T) {
 
 	if err != nil || active || m.cfg.Xray.PreferredServer == nil {
 		t.Fatalf("active %v, err %v, preferred %+v", active, err, m.cfg.Xray.PreferredServer)
+	}
+}
+
+// A refresh a user asks for takes the fresh copies and carries the records
+// over a server the panel renamed - 3x-ui puts the traffic left into every
+// name - without moving the write counter.
+func TestRefreshSubscriptionFollowingRenames_TheRecordsFollowTheFreshCopy(t *testing.T) {
+	m := &memStore{subs: []Subscription{alphaWith(reality("DE 10GB", "www.example.com", "aa11", "203.0.113.10"))}}
+	m.cfg.Xray.ActiveServer = &ActiveServer{Subscription: "0a1b2c3d", Name: "DE 10GB", Address: "de.example", Port: 443, Seq: 7}
+	fresh := reality("DE 9GB", "example.com", "bb22", "203.0.113.10")
+
+	if _, err := RefreshSubscriptionFollowingRenames(m.update, m.files(), "0a1b2c3d", alphaLink, []Server{fresh}, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(m.subs[0].Servers, []Server{fresh}) {
+		t.Fatalf("servers %+v, want the fresh copy", m.subs[0].Servers)
+	}
+	if a := m.cfg.Xray.ActiveServer; a.Name != "DE 9GB" || a.Seq != 7 {
+		t.Fatalf("active %+v", a)
+	}
+}
+
+// The wave's walk compares the records within its tick: its refresh leaves
+// them alone.
+func TestRefreshSubscription_TheWaveLeavesTheRecordsAlone(t *testing.T) {
+	m := &memStore{subs: []Subscription{alphaWith(reality("DE 10GB", "www.example.com", "aa11", "203.0.113.10"))}}
+	m.cfg.Xray.ActiveServer = &ActiveServer{Subscription: "0a1b2c3d", Name: "DE 10GB", Address: "de.example", Port: 443, Seq: 7}
+
+	if _, err := RefreshSubscription(m.update, m.files(), "0a1b2c3d", alphaLink, []Server{reality("DE 9GB", "example.com", "bb22", "203.0.113.10")}, t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	if m.cfg.Xray.ActiveServer.Name != "DE 10GB" {
+		t.Fatalf("active %+v, want it left alone", m.cfg.Xray.ActiveServer)
+	}
+}
+
+func TestAddSubscription_ASavedLinkCarriesTheRecords(t *testing.T) {
+	m := &memStore{subs: []Subscription{alphaWith(reality("DE 10GB", "www.example.com", "aa11", "203.0.113.10"))}}
+	m.cfg.Xray.PreferredServer = &ActiveServer{Subscription: "0a1b2c3d", Name: "DE 10GB", Address: "de.example", Port: 443}
+
+	if _, existed, err := AddSubscription(m.update, m.files(), alphaLink, "", []Server{reality("DE 9GB", "example.com", "bb22", "203.0.113.10")}, t0.Add(time.Hour)); err != nil || !existed {
+		t.Fatalf("existed %v, err %v", existed, err)
+	}
+
+	if m.cfg.Xray.PreferredServer.Name != "DE 9GB" {
+		t.Fatalf("preferred %+v", m.cfg.Xray.PreferredServer)
 	}
 }

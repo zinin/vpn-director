@@ -12,6 +12,7 @@
     "interval": "1m",
     "dead_interval_max": "30m",
     "concurrency": 8,
+    "subscription_refresh": "5m",
     "log_level": "info"
   },
   "tunnel_director": {

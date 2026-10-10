@@ -30,10 +30,13 @@ type State struct {
 	Step        Step
 	ServerIndex int
 	Picked      *vpnconfig.ActiveServer // the server step 1 picked, as the list read then
-	Exclusions  map[string]bool
-	ExcludeIPs  []string
-	Clients     []ClientRoute
-	PendingIP   string
+	// pickedIdentity is the pick's vpnconfig.ServerIdentity: a refresh can
+	// rename it while the steps run.
+	pickedIdentity string
+	Exclusions     map[string]bool
+	ExcludeIPs     []string
+	Clients        []ClientRoute
+	PendingIP      string
 }
 
 // Thread-safe setters
@@ -50,19 +53,21 @@ func (s *State) SetServerIndex(idx int) {
 }
 
 // PickServer records the server step 1 picked and where the list had it. Steps
-// 2 to 4 take minutes, and meanwhile a refresh - the subscription watch, another
-// importer - can move it or drop it: its index then names a server the user
-// never chose.
+// 2 to 4 take minutes, and meanwhile a refresh - the subscription watch,
+// watchd's periodic refresh, another importer - can move it, rename it or drop
+// it: its index then names a server the user never chose.
 func (s *State) PickServer(idx int, srv vpnconfig.Server) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ServerIndex = idx
 	s.Picked = vpnconfig.NewActiveServer(srv)
+	s.pickedIdentity = vpnconfig.ServerIdentity(srv)
 }
 
-// PickedIndex is where servers has the server step 1 picked, by subscription,
-// name, address and port, or -1 when servers no longer has it. A state with no
-// pick recorded has only its index to go by.
+// PickedIndex is where servers has the server step 1 picked - by subscription,
+// name, address and port, or, renamed by a refresh, by subscription and
+// identity - or -1 when servers no longer has it. A state with no pick
+// recorded has only its index to go by.
 func (s *State) PickedIndex(servers []vpnconfig.Server) int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -79,6 +84,16 @@ func (s *State) PickedIndex(servers []vpnconfig.Server) int {
 	for i, srv := range servers {
 		if s.picks(srv) {
 			return i
+		}
+	}
+	// A refresh renamed it - a panel that puts the traffic left into every
+	// name renames them all: the server of the picked subscription with the
+	// picked identity is the pick.
+	if s.pickedIdentity != "" {
+		for i, srv := range servers {
+			if srv.Subscription == s.Picked.Subscription && vpnconfig.ServerIdentity(srv) == s.pickedIdentity {
+				return i
+			}
 		}
 	}
 	return -1

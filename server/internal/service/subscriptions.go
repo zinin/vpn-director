@@ -231,7 +231,8 @@ func refresh(ctx context.Context, store ConfigStore, client *http.Client, sub vp
 		}
 		return res
 	}
-	_, res.Err = vpnconfig.RefreshSubscription(store.UpdateVPNConfig, SubscriptionFilesOf(store), sub.ID, sub.URL, imp.Servers, time.Now())
+	// A refresh a user asked for: the records follow a server it renamed.
+	_, res.Err = vpnconfig.RefreshSubscriptionFollowingRenames(store.UpdateVPNConfig, SubscriptionFilesOf(store), sub.ID, sub.URL, imp.Servers, time.Now())
 	return res
 }
 

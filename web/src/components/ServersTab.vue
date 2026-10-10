@@ -44,6 +44,8 @@ let watchRequest = 0
 let listRequest = 0
 // Active reads share a generation without invalidating list publication.
 let activeRequest = 0
+// Subscription reads share a generation: an older answer never replaces a newer list.
+let subscriptionsRequest = 0
 let listLoaded = false
 let checkRequest = 0
 
@@ -55,13 +57,14 @@ async function load() {
   if (unmounted) return
   const request = ++listRequest
   const activeGeneration = ++activeRequest
+  const subscriptionsGeneration = ++subscriptionsRequest
   loading.value = true
   error.value = ''
   const watchRead = loadWatch()
   try {
     const [subsRes, serversRes] = await Promise.all([api.getSubscriptions(), api.getServers()])
     if (unmounted || request !== listRequest) return
-    subscriptions.value = subsRes.data.subscriptions ?? []
+    if (subscriptionsGeneration === subscriptionsRequest) subscriptions.value = subsRes.data.subscriptions ?? []
     groups.value = serversRes.data.subscriptions ?? []
     if (activeGeneration === activeRequest) active.value = serversRes.data.active ?? null
     listLoaded = true
@@ -81,6 +84,21 @@ async function loadActive() {
     const resp = await api.getServers()
     if (unmounted || request !== activeRequest) return
     active.value = resp.data.active ?? null
+  } catch {
+    return
+  }
+}
+
+// watchd's periodic refresh records and clears a subscription's error and moves
+// its refreshed without changing a server's fingerprint: the table follows them
+// on every poll, not only when the server list moves.
+async function loadSubscriptions() {
+  if (unmounted || !listLoaded) return
+  const request = ++subscriptionsRequest
+  try {
+    const resp = await api.getSubscriptions()
+    if (unmounted || request !== subscriptionsRequest) return
+    subscriptions.value = resp.data.subscriptions ?? []
   } catch {
     return
   }
@@ -374,7 +392,7 @@ async function selectServer(group: SubscriptionServers, index: number) {
 
 async function pollStatus() {
   if (unmounted) return
-  await Promise.all([loadMonitor(), loadWatch(), loadActive()])
+  await Promise.all([loadMonitor(), loadWatch(), loadActive(), loadSubscriptions()])
 }
 
 onMounted(() => {
@@ -387,6 +405,7 @@ onUnmounted(() => {
   unmounted = true
   listRequest++
   activeRequest++
+  subscriptionsRequest++
   monitorRequest++
   watchRequest++
   checkRequest++
@@ -407,7 +426,7 @@ onUnmounted(() => {
             <th>Name</th>
             <th>Host</th>
             <th>Servers</th>
-            <th>Refreshed</th>
+            <th>Changed</th>
             <th>Status</th>
             <th>Actions</th>
           </tr>

@@ -91,7 +91,7 @@ func (h *SubsHandler) list() (string, tgbotapi.InlineKeyboardMarkup, error) {
 }
 
 // subLine is one subscription on the list:
-// "Alpha — sub.example.com — 32 servers — 2 h ago — OK".
+// "Alpha — sub.example.com — 32 servers — changed 2 h ago — OK".
 func subLine(s vpnconfig.Subscription, now time.Time) string {
 	where := s.Host()
 	if s.Static() {
@@ -101,7 +101,18 @@ func subLine(s vpnconfig.Subscription, now time.Time) string {
 	if s.Error != "" {
 		status = s.Error
 	}
-	return fmt.Sprintf("%s — %s — %d servers — %s — %s", s.Name, where, len(s.Servers), timeAgo(now, s.Refreshed), status)
+	return fmt.Sprintf("%s — %s — %d servers — %s — %s", s.Name, where, len(s.Servers), changedAgo(now, s.Refreshed), status)
+}
+
+// changedAgo is when a subscription's list was last written, the way a list
+// says it: "changed 2 h ago". watchd's periodic refresh writes a list only
+// when it changed, so this is the last change, manual refresh or cleared
+// error - not the last check; the status after it says how that went.
+func changedAgo(now, t time.Time) string {
+	if t.IsZero() {
+		return "never changed"
+	}
+	return "changed " + timeAgo(now, t)
 }
 
 // timeAgo is how long before now t was, the way a list says it: "2 h ago".

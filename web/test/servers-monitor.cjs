@@ -6,8 +6,12 @@ const ts = require('typescript')
 
 const sourceRoot = path.join(__dirname, '..', 'src')
 const component = fs.readFileSync(path.join(sourceRoot, 'components/ServersTab.vue'), 'utf8')
+// watchd's periodic refresh writes a list only when it changed: the column
+// shows when the list last changed, not when it was last checked.
+assert.match(component, /<th>Changed<\/th>/)
+assert.doesNotMatch(component, /<th>Refreshed<\/th>/)
 const script = component.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1]
-const exposed = ['groups', 'monitor', 'load', 'loadMonitor', 'healthOf', 'aliveText', 'monitorLine', 'canCheck', 'checkAll', 'checkServer', 'checking']
+const exposed = ['groups', 'subscriptions', 'monitor', 'error', 'loading', 'load', 'loadMonitor', 'loadSubscriptions', 'pollStatus', 'healthOf', 'aliveText', 'monitorLine', 'canCheck', 'checkAll', 'checkServer', 'checking']
 const code = ts.transpileModule(script + '\nexport const exposed = {' + exposed.join(',') + ', checkNotice: typeof checkNotice === "undefined" ? undefined : checkNotice}', {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
 }).outputText
@@ -27,12 +31,17 @@ function deferred() {
 }
 
 function setup() {
-  const pending = [], timers = new Map(), unmount = [], checks = [], alerts = []
+  const pending = [], timers = new Map(), unmount = [], checks = [], alerts = [], subscriptionReads = []
   let groups = [group]
+  let subscriptions = []
+  let subscriptionsRead = null
   let checkResult = async () => ({ data: { queued: 1 } })
   const api = {
     getMonitor: () => { const d = deferred(); pending.push(d); return d.promise },
-    getSubscriptions: async () => ({ data: { subscriptions: [] } }),
+    getSubscriptions: () => {
+      subscriptionReads.push(subscriptions)
+      return subscriptionsRead ? subscriptionsRead() : Promise.resolve({ data: { subscriptions } })
+    },
     getServers: async () => ({ data: { subscriptions: groups, active: null } }),
     getWatch: async () => ({ data: { state: 'active', updated_at: '2026-10-07T12:00:00Z', committed_failover: false, pending_restore: false, notifications: { pending: 0 } } }),
     checkServer: (...args) => { checks.push({ kind: 'one', args }); return checkResult() },
@@ -51,7 +60,9 @@ function setup() {
   vm.runInNewContext(code, context)
   const x = context.exports.exposed
   x.groups.value = [group]
-  return { x, api, pending, timers, unmount, checks, alerts, setGroups: value => { groups = value }, setCheck: fn => { checkResult = fn } }
+  return { x, api, pending, timers, unmount, checks, alerts, subscriptionReads,
+    setGroups: value => { groups = value }, setCheck: fn => { checkResult = fn },
+    setSubscriptions: value => { subscriptions = value }, setSubscriptionsRead: fn => { subscriptionsRead = fn } }
 }
 
 let passes = 0, failures = 0
@@ -346,6 +357,63 @@ async function showWANNotice(c) {
       assert.equal([...c.timers.values()][0].ms, 3000)
     })
   }
+  // watchd's periodic refresh records and clears a subscription's error and
+  // moves its refreshed without changing a server's fingerprint.
+  const listed = { id: group.id, name: 'Synthetic', host: 'subscription.example.test', static: false, servers: 1, added: '2026-10-07T12:00:00Z', refreshed: '2026-10-07T12:00:00Z' }
+  async function pollWith(c, data) {
+    const polling = c.x.pollStatus()
+    c.pending.at(-1).resolve({ data })
+    await polling
+  }
+  await test('a poll shows the error and the time a periodic refresh wrote while the server list stayed', async () => {
+    const c = setup()
+    c.setSubscriptions([listed])
+    await c.x.load()
+    const failed = { ...listed, error: 'download failed: HTTP 403', refreshed: '2026-10-07T12:05:00Z' }
+    c.setSubscriptions([failed])
+    await pollWith(c, snapshot)
+    assert.deepEqual(c.x.subscriptions.value, [failed])
+    assert.equal(c.subscriptionReads.length, 2, 'The poll reads the subscriptions itself, with no list reload')
+    const recovered = { ...listed, refreshed: '2026-10-07T12:10:00Z' }
+    c.setSubscriptions([recovered])
+    await pollWith(c, snapshot)
+    assert.deepEqual(c.x.subscriptions.value, [recovered])
+    assert.equal(c.subscriptionReads.length, 3)
+    assert.equal(c.x.groups.value[0].servers[0].fingerprint, server.fingerprint)
+    assert.equal(c.x.loading.value, false)
+    assert.equal(c.x.error.value, '')
+  })
+  await test('an older subscription poll answer cannot replace a newer list', async () => {
+    const c = setup()
+    c.setSubscriptions([listed])
+    await c.x.load()
+    const held = deferred()
+    c.setSubscriptionsRead(() => held.promise)
+    const polling = c.x.loadSubscriptions()
+    c.setSubscriptionsRead(null)
+    const newer = { ...listed, name: 'Renamed synthetic', refreshed: '2026-10-07T12:10:00Z' }
+    c.setSubscriptions([newer])
+    await c.x.load()
+    assert.deepEqual(c.x.subscriptions.value, [newer])
+    held.resolve({ data: { subscriptions: [{ ...listed, error: 'download failed: HTTP 403' }] } }); await polling
+    assert.deepEqual(c.x.subscriptions.value, [newer])
+  })
+  await test('a poll reads no subscriptions before the first list, and a failed one changes nothing', async () => {
+    const c = setup()
+    c.setSubscriptions([listed])
+    await pollWith(c, snapshot)
+    assert.equal(c.subscriptionReads.length, 0, 'No subscription read before the first list has loaded')
+    assert.equal(c.x.subscriptions.value.length, 0)
+    await c.x.load()
+    const shown = c.x.subscriptions.value
+    c.x.error.value = 'Synthetic foreground error'
+    c.setSubscriptionsRead(() => Promise.reject(Error('offline')))
+    await pollWith(c, snapshot)
+    assert.equal(c.subscriptionReads.length, 2)
+    assert.equal(c.x.subscriptions.value, shown)
+    assert.equal(c.x.error.value, 'Synthetic foreground error')
+    assert.equal(c.x.loading.value, false)
+  })
   const watchVM = require('./watch-status.cjs')
   await test('Task14 watch outage and storage recovery preserve WAN notice and real health', async () => {
     const http = watchVM.makeHTTP()
@@ -747,7 +815,7 @@ async function showWANNotice(c) {
 
   function assertSameRows(c, before) {
     assert.equal(c.x.groups.value, before.groups, 'Passive reads must retain visible group identity')
-    assert.equal(c.x.subscriptions.value, before.subscriptions, 'Passive reads must not reload subscription rows')
+    assert.deepEqual(c.x.subscriptions.value, before.subscriptions, 'Passive reads must keep the subscription rows the router has')
     const current = visibleRows(c)
     current.servers.forEach((servers, i) => assert.equal(servers, before.servers[i]))
     current.rows.forEach((server, i) => assert.equal(server, before.rows[i]))
@@ -780,10 +848,10 @@ async function showWANNotice(c) {
 
   function assertPassiveReads(http, start) {
     const requests = http.requests.slice(start)
-    for (const url of ['/api/servers', '/api/monitor', '/api/watch']) {
+    for (const url of ['/api/servers', '/api/monitor', '/api/watch', '/api/subscriptions']) {
       assert.equal(requests.filter(r => r.method === 'GET' && r.url === url).length, 1, 'Passive poll must independently read ' + url)
     }
-    assert.equal(requests.length, 3, 'An unchanged list needs only three independent GETs')
+    assert.equal(requests.length, 4, 'An unchanged list needs only four independent GETs')
     assert.equal(requests.filter(r => r.method !== 'GET').length, 0, 'Polling must never mutate configuration')
   }
 
@@ -805,7 +873,7 @@ async function showWANNotice(c) {
         assert.deepEqual(c.alerts, [])
       }
       assert.equal(http.calls('/api/servers').length, 3)
-      assert.equal(http.calls('/api/subscriptions').length, 1)
+      assert.equal(http.calls('/api/subscriptions').length, 3)
       assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
     })
   })
@@ -864,7 +932,7 @@ async function showWANNotice(c) {
         assert.equal(c.x.monitorLine.value, state === 'disabled' ? 'Monitoring: disabled in settings' : state === 'GET500' ? 'Monitoring: unavailable' : 'Monitoring: not running')
         assert.equal(watchVM.watchProps(c).unavailable, state === 'GET500')
         if (state !== 'GET500') assert.equal(watchVM.watchProps(c).snapshot.state, state === 'disabled' ? 'active' : 'not_running')
-        assert.equal(http.calls('/api/subscriptions').length, 1)
+        assert.equal(http.calls('/api/subscriptions').length, 2)
         assert.deepEqual(c.alerts, [])
       })
     })
@@ -939,7 +1007,7 @@ async function showWANNotice(c) {
         assertIntent()
         assertPassiveBadges(c, outcome === 'GET500' ? passiveA : passiveB)
       }
-      assert.equal(http.calls('/api/subscriptions').length, 1)
+      assert.equal(http.calls('/api/subscriptions').length, 3)
       assert.equal(http.calls('/api/monitor/check', 'POST').length, 1)
       assert.equal(http.calls('/api/subscriptions/rename', 'POST').length, 1)
       assert.equal(http.calls('/api/servers/active', 'POST').length, 0)
@@ -997,7 +1065,7 @@ async function showWANNotice(c) {
       assert.equal(c.x.error.value, '')
       assert.deepEqual(c.alerts, [])
       assert.equal(http.calls('/api/servers').length, 4)
-      assert.equal(http.calls('/api/subscriptions').length, 1)
+      assert.equal(http.calls('/api/subscriptions').length, 4)
       assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
     })
   })
@@ -1029,7 +1097,7 @@ async function showWANNotice(c) {
         assertPassiveBadges(c, passiveB)
         assert.equal(c.x.loading.value, false)
         assert.equal(http.calls('/api/servers').length, origin === 'initial' ? 2 : 3)
-        assert.equal(http.calls('/api/subscriptions').length, origin === 'initial' ? 1 : 2)
+        assert.equal(http.calls('/api/subscriptions').length, origin === 'initial' ? 1 : 3)
         assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
       }, http => { if (origin === 'initial') http.hold('/api/servers') })
     })
@@ -1062,7 +1130,7 @@ async function showWANNotice(c) {
       assertSameRows(c, before)
       assert.equal(c.x.aliveText(watchVM.group.id), '2/2 alive')
       assert.equal(http.calls('/api/servers').length, 3)
-      assert.equal(http.calls('/api/subscriptions').length, 2)
+      assert.equal(http.calls('/api/subscriptions').length, 3)
       assert.equal(http.calls('/api/monitor').length, 2)
       assert.equal(http.calls('/api/watch').length, 3)
       assert.equal(http.requests.filter(r => r.method !== 'GET').length, 0)
@@ -1094,7 +1162,7 @@ async function showWANNotice(c) {
         assert.equal(c.x.error.value, '')
         assert.deepEqual(c.alerts, [control === 'saved500' ? 'Error: failed to restart xray: Synthetic saved selection' : 'Server selected: Synthetic / Secondary'])
         assert.equal(http.calls('/api/servers').length, 3)
-        assert.equal(http.calls('/api/subscriptions').length, 2)
+        assert.equal(http.calls('/api/subscriptions').length, 3)
         assert.equal(http.calls('/api/servers/active', 'POST').length, 1)
         assert.equal(http.requests.filter(r => r.method !== 'GET').length, 1)
       })

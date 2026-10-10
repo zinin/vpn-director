@@ -107,6 +107,7 @@ func AddSubscription(update ConfigUpdate, files SubscriptionFiles, rawURL, name 
 			i = len(subs)
 			subs = append(subs, sub)
 		}
+		stored := sub.Servers
 		sub.Servers = servers
 		sub.Refreshed = stamp(now)
 		sub.Error = ""
@@ -117,6 +118,11 @@ func AddSubscription(update ConfigUpdate, files SubscriptionFiles, rawURL, name 
 		subs[i] = sub
 		if cfg != nil {
 			cfg.Xray.Servers = SubscriptionIPs(subs)
+			if existed {
+				// A saved link is a refresh a user asked for: the records that
+				// named a server it renamed follow it.
+				followRenames(cfg, sub.ID, stored, servers, pairServers(stored, servers))
+			}
 		}
 		return nil
 	})
@@ -134,8 +140,23 @@ func AddSubscription(update ConfigUpdate, files SubscriptionFiles, rawURL, name 
 // downloaded from rawURL, under update's lock, and clears its error - only
 // while that subscription still exists with that link: ErrSubscriptionGone
 // otherwise, and nothing is written. xray.servers is recomputed in the same
-// update.
+// update. The watch's wave refreshes here: its walk compares the server
+// records within one tick, and they must not change under it.
 func RefreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, servers []Server, now time.Time) (Subscription, error) {
+	return refreshSubscription(update, files, id, rawURL, servers, now, false)
+}
+
+// RefreshSubscriptionFollowingRenames is RefreshSubscription for a refresh a
+// user asked for - the Web UI's and the bot's. It takes the fresh copies as
+// well, and the records that named a server the fresh list renamed follow it
+// (followRenames): a panel that puts the traffic left into every name would
+// otherwise lose the Active mark, and the return to the preferred server, at
+// every refresh.
+func RefreshSubscriptionFollowingRenames(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, servers []Server, now time.Time) (Subscription, error) {
+	return refreshSubscription(update, files, id, rawURL, servers, now, true)
+}
+
+func refreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, servers []Server, now time.Time, follow bool) (Subscription, error) {
 	if rawURL == "" {
 		return Subscription{}, ErrSubscriptionStatic
 	}
@@ -151,6 +172,7 @@ func RefreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawUR
 			return ErrSubscriptionGone
 		}
 		sub = subs[i]
+		stored := sub.Servers
 		sub.Servers = servers
 		sub.Refreshed = stamp(now)
 		sub.Error = ""
@@ -161,6 +183,9 @@ func RefreshSubscription(update ConfigUpdate, files SubscriptionFiles, id, rawUR
 		subs[i] = sub
 		if cfg != nil {
 			cfg.Xray.Servers = SubscriptionIPs(subs)
+			if follow {
+				followRenames(cfg, id, stored, servers, pairServers(stored, servers))
+			}
 		}
 		return nil
 	})
@@ -186,7 +211,17 @@ var errNothingToWrite = errors.New("nothing to write")
 // when msg is recorded already: every wave of the watch fails alike while an
 // outage lasts.
 func RecordSubscriptionError(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, since time.Time, msg string) error {
-	err := update(func(*VPNDirectorConfig) error {
+	_, err := RecordSubscriptionErrorChanged(update, files, id, rawURL, since, msg)
+	return err
+}
+
+// RecordSubscriptionErrorChanged is RecordSubscriptionError that also says
+// whether it wrote msg: changed is true when the subscription's error appeared
+// or changed in the file. watchd's periodic refresh logs an error only then,
+// and only the write under the lock knows: a manual refresh may have recorded
+// the same error, or cleared it, since the caller read the subscription.
+func RecordSubscriptionErrorChanged(update ConfigUpdate, files SubscriptionFiles, id, rawURL string, since time.Time, msg string) (changed bool, err error) {
+	err = update(func(*VPNDirectorConfig) error {
 		subs, err := files.Load()
 		if err != nil {
 			return err
@@ -203,12 +238,13 @@ func RecordSubscriptionError(update ConfigUpdate, files SubscriptionFiles, id, r
 		if err := files.Save(sub); err != nil {
 			return fmt.Errorf("%w: %w", ErrSaveSubscription, err)
 		}
+		changed = true
 		return nil
 	})
 	if errors.Is(err, errNothingToWrite) {
-		return nil
+		return false, nil
 	}
-	return err
+	return changed, err
 }
 
 // RenameSubscription gives subscription id the name name, under update's lock.
