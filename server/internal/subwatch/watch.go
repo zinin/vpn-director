@@ -774,24 +774,36 @@ func serverID(s vpnconfig.Server) string {
 // endpoints gives a name a new address every day, and the name and the kind are
 // what the user chose. Another subscription's server of the same name is never
 // it, nor a server of another kind: a panel can give one name to several
-// inbounds. -1 when the list has neither.
+// inbounds. Among the entries of its choice in either place, one with a's
+// identity mark comes first: a panel can list twins of one name, address, port
+// and kind with other keys, and the user may run either. -1 when the list has
+// neither.
 func chosenIndex(servers []vpnconfig.Server, a *vpnconfig.ActiveServer) int {
 	if a == nil || a.Name == "" {
 		return -1
 	}
-	first := -1
+	// rank: 0 at a's address and port with its mark, 1 there without it, 2
+	// elsewhere with its mark, 3 elsewhere without it.
+	best, rank := -1, 4
 	for i, s := range servers {
 		if !vpnconfig.SameChoice(a, s) {
 			continue
 		}
+		r := 2
 		if sameServer(s, a) {
-			return i
+			r = 0
 		}
-		if first < 0 {
-			first = i
+		if a.Identity == "" || vpnconfig.IdentityMark(s) != a.Identity {
+			r++
+		}
+		if r < rank {
+			best, rank = i, r
+		}
+		if rank == 0 {
+			break
 		}
 	}
-	return first
+	return best
 }
 
 // pickOrder is servers with the one chosen names moved to the front.

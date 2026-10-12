@@ -1483,6 +1483,28 @@ func TestMaybeReturn_ASameNamedServerOfAnotherKindIsNotThePreferredServer(t *tes
 	}
 }
 
+// A panel lists two vless+tls inbounds behind Oslo's host and port under one
+// name, with other keys, and the user chose the second. The return goes back
+// to that twin - the one with the record's mark - not to the first of the name.
+func TestMaybeReturn_GoesBackToTheTwinTheUserChose(t *testing.T) {
+	s := newReturnKeeper(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	twin := oslo
+	twin.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+	s.f.subs[0].Servers = []vpnconfig.Server{twin, oslo, backup}
+	s.setStates(map[string]watchdapi.EndpointState{
+		"Oslo": aliveSince(s.f.now.Add(-6*time.Minute), 40), "Backup": aliveSince(s.f.now.Add(-time.Hour), 17),
+	})
+	s.w.Tick(context.Background())
+	if len(s.written) != 1 || vpnconfig.IdentityMark(s.written[0]) != vpnconfig.IdentityMark(oslo) || s.f.cfg.Xray.PreferredServer != nil {
+		var marks []string
+		for _, c := range s.written {
+			marks = append(marks, vpnconfig.IdentityMark(c))
+		}
+		t.Fatalf("written marks %v, want [%s], the twin the user chose; preferred %+v", marks, vpnconfig.IdentityMark(oslo), s.f.cfg.Xray.PreferredServer)
+	}
+}
+
 // groupReturnStates is the monitor's view of newGroupReturnKeeper at now - Oslo
 // dead for an hour, Shadow alive for an hour, Backup alive for six minutes -
 // with the states in more added or put in their place.
