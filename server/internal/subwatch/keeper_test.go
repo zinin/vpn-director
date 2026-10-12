@@ -54,11 +54,26 @@ func writtenNames(servers []vpnconfig.Server) []string {
 	return out
 }
 
+// missOnce runs the tick of a first failed probe, which the actuality check
+// lets pass - it acts from the second failed probe in a row - and moves the
+// clock on to the next tick. Nothing may be written, restarted or said there.
+func (s *fastFixture) missOnce(t *testing.T) {
+	t.Helper()
+	generated, restarts, notes := s.generateCalls, s.restarts, len(s.f.notes)
+	s.w.Tick(context.Background())
+	if s.generateCalls != generated || s.restarts != restarts || len(s.f.notes) != notes {
+		t.Fatalf("generate %d, restarts %d, notes %v after a single failed probe; the check waits for a second",
+			s.generateCalls-generated, s.restarts-restarts, s.f.notes[notes:])
+	}
+	s.f.now = s.f.now.Add(ProbeInterval)
+}
+
 // The provider moved Oslo to a new address, and Xray no longer works at the
-// old one: the keeper follows it at the first failed probe.
+// old one: the keeper follows it at the second failed probe in a row.
 func TestKeeper_FollowsAMovedServer(t *testing.T) {
 	s := newKeeperFixture(t)
 	s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@oslo-2.example"}) {
 		t.Fatalf("written %v", got)
@@ -78,6 +93,7 @@ func TestKeeper_FollowsAServerChangedInPlace(t *testing.T) {
 	oslo := s.f.subs[0].Servers[0]
 	oslo.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
 	s.f.subs[0].Servers[0] = oslo
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if a := s.f.cfg.Xray.ActiveServer; len(s.written) != 1 || a == nil || a.Identity != vpnconfig.IdentityMark(oslo) {
 		t.Fatalf("written %v, active %+v", writtenNames(s.written), a)
@@ -107,6 +123,7 @@ func TestKeeper_TheFollowTriesTheAliveAddressFirst(t *testing.T) {
 		}
 		return errProbe
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := healthLabels(s.written); !reflect.DeepEqual(got, []string{"Oslo@203.0.113.31"}) || s.restarts != 1 {
 		t.Fatalf("written %v, restarts %d; want the alive address alone", got, s.restarts)
@@ -126,6 +143,7 @@ func TestKeeper_ReplacesAServerThatLeftItsSubscription(t *testing.T) {
 	s.f.subs[0].Servers = []vpnconfig.Server{ssServer("Shadow", "198.51.100.40"), backup}
 	s.setHealth()
 	s.setLatency("Shadow", 5)
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
 		t.Fatalf("written %v", got)
@@ -242,6 +260,7 @@ func TestKeeper_AFollowedEntryThatDoesNotAnswerIsReplaced(t *testing.T) {
 		}
 		return errProbe
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@oslo-2.example", "Backup@backup.example"}) {
 		t.Fatalf("written %v", got)
@@ -265,6 +284,7 @@ func TestKeeper_AFailedFollowsCopiesAreNotTriedAgain(t *testing.T) {
 	moved.IPs = []string{"203.0.113.30", "203.0.113.31"}
 	s.f.subs[0].Servers[0] = moved
 	s.w.Probe = func(context.Context, int) error { s.probes++; return errProbe }
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := healthLabels(s.written); !reflect.DeepEqual(got, []string{"Oslo@203.0.113.30", "Oslo@203.0.113.31", "Backup@198.51.100.20"}) {
 		t.Fatalf("written %v; the follow's copies are tried once", got)
@@ -306,6 +326,7 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 				s := newKeeperFixture(t)
 				kind.change(s)
 				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax // the returns had stopped
+				s.missOnce(t)
 				s.w.Tick(context.Background())
 				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
 					t.Fatalf("written %v, want %v", got, kind.written)
@@ -319,6 +340,7 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 				kind.change(s)
 				// A minute ago a return wrote the record that fails now.
 				s.w.lastReturn, s.w.returnSeq = s.f.now.Add(-time.Minute), vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer)
+				s.missOnce(t)
 				s.w.Tick(context.Background())
 				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
 					t.Fatalf("written %v, want %v", got, kind.written)
@@ -339,6 +361,7 @@ func TestKeeper_NothingWorksSaysOnceAndBacksOff(t *testing.T) {
 	s.f.subs[0].Servers = s.f.subs[0].Servers[1:] // Oslo left; Backup alone
 	s.setHealth()
 	s.w.Probe = func(context.Context, int) error { s.probes++; return errProbe }
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if want := []string{"No working Xray server found; Xray stays on Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
 		t.Fatalf("notes %v, want %v", s.f.notes, want)
@@ -426,6 +449,7 @@ func TestKeeper_AStopEndsTheSwitchSilently(t *testing.T) {
 		stopped = true
 		return generate(server, guard)
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if s.restarts != 0 || len(s.f.notes) != 0 || len(s.written) != 0 {
 		t.Fatalf("restarts %d, notes %v, written %v after a stop", s.restarts, s.f.notes, writtenNames(s.written))
@@ -443,6 +467,7 @@ func TestKeeper_AClosedGateEndsTheSwitchSilently(t *testing.T) {
 		closed = watchcompat.ErrIncompatible
 		return generate(server, guard)
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if s.restarts != 0 || len(s.f.notes) != 0 || len(s.written) != 0 {
 		t.Fatalf("restarts %d, notes %v, written %v after the gate closed", s.restarts, s.f.notes, writtenNames(s.written))
@@ -459,6 +484,7 @@ func TestKeeper_ASelectionDuringTheSwitchStands(t *testing.T) {
 		s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, backup)
 		return generate(server, guard)
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if a := s.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Backup" || len(s.written) != 0 || len(s.f.notes) != 0 {
 		t.Fatalf("active %+v, written %v, notes %v; the user's selection must stand", a, writtenNames(s.written), s.f.notes)
@@ -481,18 +507,20 @@ func TestKeeper_NoXrayDoesNothing(t *testing.T) {
 	s := newKeeperFixture(t)
 	s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
 	s.h.cached.State = watchdapi.StateNoXray
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if s.generateCalls != 0 {
 		t.Fatalf("generate %d with no xray", s.generateCalls)
 	}
 }
 
-// With clients on Xray the same actuality check runs once the probe fails,
-// before the death rules: the follow moves no client.
+// With clients on Xray the same actuality check runs once the probe fails
+// twice in a row, before the death rules: the follow moves no client.
 func TestTick_WithClientsFollowsAMovedServer(t *testing.T) {
 	s := newFastFixture(t)
 	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(&vpnconfig.ActiveServer{Seq: 6}, s.f.subs[0].Servers[0])
 	s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@oslo-2.example"}) || s.f.cfg.Xray.Failover != nil {
 		t.Fatalf("written %v, failover %+v", got, s.f.cfg.Xray.Failover)
@@ -537,12 +565,13 @@ func TestTick_WithClientsAFollowThatDoesNotAnswerFailsOver(t *testing.T) {
 	moved.IPs = []string{"203.0.113.30", "203.0.113.31"}
 	s.f.subs[0].Servers[0] = moved
 	s.w.Probe = func(context.Context, int) error { s.probes++; return errProbe }
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := healthLabels(s.written); !reflect.DeepEqual(got, []string{"Oslo@203.0.113.30", "Oslo@203.0.113.31"}) {
 		t.Fatalf("written %v; want the followed entry's copies alone", got)
 	}
 	s.f.now = s.f.now.Add(ProbeInterval)
-	tickFor(s.w, s.f, DeadAfter-2*ProbeInterval)
+	tickFor(s.w, s.f, DeadAfter-3*ProbeInterval)
 	if s.f.cfg.Xray.Failover != nil || len(s.written) != 2 {
 		t.Fatalf("failover %+v, written %v before DeadAfter", s.f.cfg.Xray.Failover, healthLabels(s.written))
 	}
@@ -570,10 +599,11 @@ func newClientsKeeper(t *testing.T) *fastFixture {
 // subscription - its subscription deleted included - is neither followed nor
 // replaced, however many ticks pass. A panel that picks a host's address or SNI
 // at random for each download reads as moved at every refresh. Once the probe
-// fails - the old address no longer answers - a server that moved or changed
-// is followed on that tick, in both modes. One that left its list is replaced
-// on that tick in keeper mode; with clients on Xray it goes to the death rules,
-// and nothing is written then.
+// fails twice in a row - the old address no longer answers - a server that
+// moved or changed is followed on the second failed tick, in both modes; the
+// first does nothing. One that left its list is replaced on that tick in keeper
+// mode; with clients on Xray it goes to the death rules, and nothing is written
+// then.
 func TestActuality_OnlyOnceTheProbeFails(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -630,19 +660,84 @@ func TestActuality_OnlyOnceTheProbeFails(t *testing.T) {
 							s.generateCalls, s.restarts, s.f.notes, s.f.cfg.Xray.ActiveServer)
 					}
 					working = false
+					s.missOnce(t)
 					s.w.Tick(context.Background())
 					if tc.left && mode.clients {
 						if s.generateCalls != 0 || s.restarts != 0 || len(s.f.notes) != 0 {
-							t.Fatalf("generate %d, restarts %d, notes %v at the first failed probe; with clients on Xray the death rules take it",
+							t.Fatalf("generate %d, restarts %d, notes %v at the second failed probe; with clients on Xray the death rules take it",
 								s.generateCalls, s.restarts, s.f.notes)
 						}
 						return
 					}
 					if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{tc.written}) || s.restarts != 1 {
-						t.Fatalf("written %v, restarts %d at the first failed probe; want %s", got, s.restarts, tc.written)
+						t.Fatalf("written %v, restarts %d at the second failed probe; want %s", got, s.restarts, tc.written)
 					}
 					if want := []string{tc.note}; !reflect.DeepEqual(s.f.notes, want) {
 						t.Fatalf("notes %v, want %v", s.f.notes, want)
+					}
+				})
+			}
+		})
+	}
+}
+
+// A single miss is no confirmation: one failed probe between working ones - a
+// gstatic timeout - neither follows nor replaces a server that moved, changed
+// in place or left its list, in either mode, however often it comes. A panel
+// that picks at random for each download reads as moved after every refresh,
+// and acting on such a miss would restart a working Xray and send a false
+// message.
+func TestActuality_ASingleMissIsNoConfirmation(t *testing.T) {
+	for _, mode := range []struct {
+		name    string
+		fixture func(*testing.T) *fastFixture
+	}{
+		{"keeper mode", newKeeperFixture},
+		{"clients mode", newClientsKeeper},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			for _, tc := range []struct {
+				name   string
+				change func(*fastFixture)
+			}{
+				{"moved", func(s *fastFixture) {
+					s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+				}},
+				{"changed in place", func(s *fastFixture) {
+					oslo := s.f.subs[0].Servers[0]
+					oslo.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+					s.f.subs[0].Servers[0] = oslo
+				}},
+				{"left its subscription", func(s *fastFixture) {
+					s.f.subs[0].Servers = s.f.subs[0].Servers[1:]
+				}},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					s := mode.fixture(t)
+					tc.change(s)
+					working := false
+					s.w.Probe = func(context.Context, int) error {
+						s.probes++
+						if working {
+							return nil
+						}
+						return errProbe
+					}
+					before, err := cloneCfg(s.f.cfg)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for range 3 {
+						working = false
+						s.w.Tick(context.Background()) // a single miss
+						s.f.now = s.f.now.Add(ProbeInterval)
+						working = true
+						s.w.Tick(context.Background()) // and Xray works again
+						s.f.now = s.f.now.Add(ProbeInterval)
+					}
+					if s.generateCalls != 0 || s.restarts != 0 || len(s.f.notes) != 0 || !reflect.DeepEqual(s.f.cfg, before) {
+						t.Fatalf("generate %d, restarts %d, notes %v, active %+v after single misses; a single miss is no confirmation",
+							s.generateCalls, s.restarts, s.f.notes, s.f.cfg.Xray.ActiveServer)
 					}
 				})
 			}
@@ -677,12 +772,14 @@ func TestKeeper_ASelectionDuringTheFollowsProbeStands(t *testing.T) {
 	s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
 	s.w.Probe = func(context.Context, int) error {
 		s.probes++
-		// The tick's own probe fails first; the second is the followed entry's.
-		if s.probes == 2 {
+		// The own probes of two ticks fail first; the third is the followed
+		// entry's.
+		if s.probes == 3 {
 			s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, third)
 		}
 		return errProbe
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if a := s.f.cfg.Xray.ActiveServer; a.Name != "Third" || !reflect.DeepEqual(writtenNames(s.written), []string{"Oslo@oslo-2.example"}) ||
 		s.restarts != 1 || len(s.f.notes) != 0 {
@@ -724,12 +821,13 @@ func TestKeeper_ASelectionDuringTheLastProbeEndsTheRun(t *testing.T) {
 	s.setHealth()
 	s.w.Probe = func(context.Context, int) error {
 		s.probes++
-		// The tick's own probe comes first, before anything is written.
+		// The ticks' own probes come first, before anything is written.
 		if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Third" {
 			s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, backup)
 		}
 		return errProbe
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if a := s.f.cfg.Xray.ActiveServer; a.Name != "Backup" || len(s.f.notes) != 0 || !s.w.keeperNotBefore.IsZero() {
 		t.Fatalf("active %+v, notes %v, next attempt %v; the selection must end the run", a, s.f.notes, s.w.keeperNotBefore)
@@ -760,6 +858,7 @@ func TestKeeper_ASelectionDuringTheReadAfterTheRunEndsIt(t *testing.T) {
 		}
 		return load()
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if a := s.f.cfg.Xray.ActiveServer; a.Name != "Backup" || len(s.f.notes) != 0 || !s.w.keeperNotBefore.IsZero() || s.w.keeperRetry != 0 {
 		t.Fatalf("active %+v, notes %v, next attempt %v, keeper retry %v; the selection must end the run",
@@ -858,6 +957,7 @@ func TestKeeper_AWorkingProbeEndsTheBackoff(t *testing.T) {
 		}
 		return errProbe
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background()) // Backup and Spare do not answer: the run backs off
 	s.f.now = s.f.now.Add(ProbeInterval)
 	working = true
@@ -885,9 +985,9 @@ func TestKeeper_AWorkingProbeEndsTheBackoff(t *testing.T) {
 
 // With clients on Xray a working probe ends the keeper's run as well (Ruling
 // T5-R1): a server that moves afterwards is followed as soon as its old
-// address stops answering, not after the backoff of a run that found nothing
-// working before the clients came. While Xray still works there, the move is
-// left alone (owner decision C1).
+// address fails two probes in a row, not after the backoff of a run that found
+// nothing working before the clients came. While Xray still works there, the
+// move is left alone (owner decision C1).
 func TestTick_AWorkingProbeEndsTheKeeperBackoff(t *testing.T) {
 	s := newKeeperFixture(t)
 	s.f.subs[0].Servers = s.f.subs[0].Servers[1:] // Oslo left; Backup alone
@@ -899,6 +999,7 @@ func TestTick_AWorkingProbeEndsTheKeeperBackoff(t *testing.T) {
 		}
 		return errProbe
 	}
+	s.missOnce(t)
 	s.w.Tick(context.Background()) // the keeper replaces Oslo by Backup, which does not answer: the run backs off
 	// A client comes onto Xray, and the watch is armed.
 	s.f.cfg.Xray.Clients = []string{"192.168.1.8"}
@@ -913,9 +1014,10 @@ func TestTick_AWorkingProbeEndsTheKeeperBackoff(t *testing.T) {
 	}
 	s.f.now = s.f.now.Add(ProbeInterval)
 	working = false
+	s.missOnce(t)
 	s.w.Tick(context.Background())
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example", "Backup@backup-2.example"}) {
-		t.Fatalf("written %v; the moved server must be followed at the first failed probe", got)
+		t.Fatalf("written %v; the moved server must be followed at the second failed probe in a row", got)
 	}
 	want := []string{"No working Xray server found; Xray stays on Alpha / Backup", "Xray server Alpha / Backup moved; Xray follows it"}
 	if !reflect.DeepEqual(s.f.notes, want) {

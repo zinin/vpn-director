@@ -44,11 +44,11 @@ func (w *Watch) keeps(cfg *vpnconfig.VPNDirectorConfig, subs int) bool {
 // keep is a tick in keeper mode. There is nobody to move into a tunnel and no
 // wave to run: the periodic refresh keeps the lists current, and keeps running
 // while the probe fails (refreshStandsDown), so each attempt works from the
-// lists as they are. Once the probe fails, a server that moved or changed is
-// followed, and one that left its subscription is replaced, at once
-// (followActive); one still listed is replaced once the armed tick's rules
-// confirm its death (spec 4.4): the fast path's evidence, the unreachable
-// streak, or DeadAfter.
+// lists as they are. Once the probe fails twice in a row, a server that moved
+// or changed is followed, and one that left its subscription is replaced, at
+// once (followActive); one still listed is replaced once the armed tick's
+// rules confirm its death (spec 4.4): the fast path's evidence, the
+// unreachable streak, or DeadAfter.
 func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	w.setStatusAction("probe")
 	err := w.Probe(ctx, w.socksPort(cfg))
@@ -69,6 +69,7 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		w.failSince = now
 		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 	}
+	w.failedProbes++
 	if w.followActive(ctx, cfg, false) {
 		return
 	}
@@ -105,24 +106,31 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 }
 
 // followActive is the actuality check of spec 4.2, made only while the probe
-// fails: in both modes, a tick whose probe failed compares the selected server
-// with its list before the death rules - on every such tick outside the
-// keeper's backoff (keeperNotBefore, which a run in which no candidate worked
-// sets), so a server the periodic refresh moves while Xray is already failing
-// is followed too. A server that changed in place or moved is followed. In
-// keeper mode one whose new entry does not answer either, and one that left
-// its subscription, are replaced. With clients on Xray (clients) the check
-// only follows: spec 4.4 leaves a death with clients to the make-before-break
-// failover, which moves them into a tunnel first and lets the wave and the
-// walk pick the server, while a replacement would keep them on a dead Xray for
-// a restart per candidate. So a server that left its subscription goes to the
-// death rules of the same tick, and a follow whose entry does not answer ends
-// the tick on its write: the next tick finds that record current, and its
-// death rules act on it, failSince still counting from the first miss. The
-// whole action has one fence, the record the check classified: a replacement
-// after a follow that failed carries on from the follow's write, and a
-// selection the user commits meanwhile ends it. It reports whether it acted -
-// switched, tried, or was ended - and the tick then ends.
+// fails, and only from the second failed probe in a row: in both modes, a tick
+// whose probe failed, the second in a row or a later one, compares the
+// selected server with its list before the death rules - on every such tick
+// outside the keeper's backoff (keeperNotBefore, which a run in which no
+// candidate worked sets), so a server the periodic refresh moves while Xray is
+// already failing is followed too. A single miss - one probe timing out - is
+// the common transient the legacy confirmation waits three minutes out, and
+// with a panel that picks at random for each download (below) the record reads
+// moved or changed after every refresh: acting on that miss would restart a
+// working Xray and send a false message. A server that really moved pays about
+// one probe interval for the wait. A server that changed in place or moved is
+// followed. In keeper mode one whose new entry does not answer either, and one
+// that left its subscription, are replaced. With clients on Xray (clients) the
+// check only follows: spec 4.4 leaves a death with clients to the
+// make-before-break failover, which moves them into a tunnel first and lets
+// the wave and the walk pick the server, while a replacement would keep them
+// on a dead Xray for a restart per candidate. So a server that left its
+// subscription goes to the death rules of the same tick, and a follow whose
+// entry does not answer ends the tick on its write: the next tick finds that
+// record current, and its death rules act on it, failSince still counting from
+// the first miss. The whole action has one fence, the record the check
+// classified: a replacement after a follow that failed carries on from the
+// follow's write, and a selection the user commits meanwhile ends it. It
+// reports whether it acted - switched, tried, or was ended - and the tick then
+// ends.
 //
 // While the probe passes it does nothing: a working Xray is left alone. A
 // panel that picks a host's address or SNI at random for each download -
@@ -132,14 +140,14 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 // So would a refresh that does not follow renames, which reads a renamed
 // server as gone, and the deletion of the running server's subscription,
 // after which the Web UI promises that Xray keeps running it. A server that
-// really moved stops answering at its old address, and the next probe brings
-// the check in. Nor does it act while xray.failover or xray.pending_restore
-// is recorded, or an apply of the watch's own is pending: that episode's own
-// logic owns the record then - the walk picks the server, a restore finishes
-// on the one its probe passed - and a switch of the check's own would cut
-// across it.
+// really moved stops answering at its old address, and the second probe that
+// fails in a row brings the check in. Nor does it act while xray.failover or
+// xray.pending_restore is recorded, or an apply of the watch's own is pending:
+// that episode's own logic owns the record then - the walk picks the server, a
+// restore finishes on the one its probe passed - and a switch of the check's
+// own would cut across it.
 func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, clients bool) bool {
-	if cfg == nil || w.failSince.IsZero() || w.pendingApply || cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil {
+	if cfg == nil || w.failSince.IsZero() || w.failedProbes < 2 || w.pendingApply || cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil {
 		return false
 	}
 	if cfg.Xray.ActiveServer == nil || w.Generate == nil || w.Probe == nil ||

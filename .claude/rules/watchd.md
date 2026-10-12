@@ -218,46 +218,50 @@ leaves the stored copy dead until a manual refresh or the wave, which take fresh
 ## Keeping Xray on a working server
 
 The watch keeps Xray on a working server whether or not anybody is on Xray. Armed, it works as
-described above, with the check below once its probe fails. Not armed, but with `xray.active_server`
-naming a server of a subscription, its tick runs in keeper mode (`subwatch/keeper.go`): it probes
-Xray through SOCKS every 30 s and confirms a death by the same rules - the fast path's evidence,
-the unreachable streak, `DeadAfter` - but moves no client and runs no wave. The fast path switches
-as it does with clients; a death it does not switch away from - confirmed by the legacy rules, or
-with none of its candidates working - the keeper replaces (`replaceDead`). The periodic refresh
-keeps the lists current, and keeps running while the probe fails (`refreshStandsDown`); with
-`subscription_refresh` at `"0"` the keeper works from the lists as they are. The keeper does
-nothing while VPN Director is stopped, the gate is closed, no server of a subscription is selected,
-or the monitor reports `no_xray`.
+described above, with the check below once its probe fails twice in a row. Not armed, but with
+`xray.active_server` naming a server of a subscription, its tick runs in keeper mode
+(`subwatch/keeper.go`): it probes Xray through SOCKS every 30 s and confirms a death by the same
+rules - the fast path's evidence, the unreachable streak, `DeadAfter` - but moves no client and runs
+no wave. The fast path switches as it does with clients; a death it does not switch away from -
+confirmed by the legacy rules, or with none of its candidates working - the keeper replaces
+(`replaceDead`). The periodic refresh keeps the lists current, and keeps running while the probe
+fails (`refreshStandsDown`); with `subscription_refresh` at `"0"` the keeper works from the lists as
+they are. The keeper does nothing while VPN Director is stopped, the gate is closed, no server of a
+subscription is selected, or the monitor reports `no_xray`.
 
-In both modes, a tick whose probe failed checks the selected server against its list before the
-death rules (`followActive`, `classifyActive`), on every such tick: a server the periodic refresh
-moves while Xray is already failing is followed too. While the probe passes the check does nothing,
-whatever the list says: a working Xray is left alone. A panel that picks a host's address or SNI at
-random for each download - Marzban draws them from a list, or salts a `*` - would read as a move at
-every refresh, each one an Xray restart that cuts the clients' connections, and a message; so would
-a refresh that does not follow renames (`import_server_list.sh`), which reads a renamed server as
-gone. The deletion of the running server's subscription leaves Xray on that server while it works. A
-server that really moved stops answering at its old address, and the failed probe brings the check
-in. An apply of the watch's own pending (`pendingApply`), a `xray.failover` or a
-`xray.pending_restore` owns the record while it lasts, and the check stands down. `active_server`
-carries `identity` (`vpnconfig.IdentityMark`: the first 16 hex digits of a SHA-256 of the loose
-identity, `looseIdentity` above) and `group` (`Server.Group`: protocol and security, lowercased as
-Xray reads them, such as `vless+reality`). Every Go writer fills them in through
-`vpnconfig.RecordActiveServer`; a rename moves only the name. The record is current while an entry
-of its subscription with its name, address and port carries its mark - a panel can list twins of one
-name, address and port, and the user may run any of them - or, for a record without a mark
-(`configure.sh`'s, an older daemon's), while such an entry is listed. It changed in place when such
-entries are listed but none carries the mark, and the first of them is followed; it moved when there
-is none and exactly one entry has its name; anything else - the subscription deleted, no entry of
-the name, several - means it left its list. A changed or moved server is followed. In keeper mode
-one that left, or whose new entry does not answer either, is replaced. With clients on Xray the
-check only follows and leaves such a server to the death rules: they move the clients into a tunnel
-first, and the wave and the walk then pick the server (spec 4.4 leaves a death with clients to that
-failover), where a replacement would keep them on a dead Xray for a restart per candidate. After a
-follow whose entry does not answer, the tick ends on the follow's write; the next tick finds that
-record current, and its death rules act on it, the minutes still counting from the first miss. The
-check reads the lists as a refresh left them: a server the periodic refresh moved is followed at the
-next tick whose probe fails.
+In both modes, a tick whose probe failed for the second time in a row or later checks the selected
+server against its list before the death rules (`followActive`, `classifyActive`), on every such
+tick: a server the periodic refresh moves while Xray is already failing is followed too. While the
+probe passes the check does nothing, whatever the list says: a working Xray is left alone. A panel
+that picks a host's address or SNI at random for each download - Marzban draws them from a list, or
+salts a `*` - would read as a move at every refresh, each one an Xray restart that cuts the clients'
+connections, and a message; so would a refresh that does not follow renames
+(`import_server_list.sh`), which reads a renamed server as gone. The deletion of the running
+server's subscription leaves Xray on that server while it works. A server that really moved stops
+answering at its old address, and its second failed probe in a row brings the check in. A single
+miss - one probe timing out - is the common transient the legacy confirmation waits three minutes
+out, and with such a panel, acting on it would restart a working Xray and send a false message; a
+server that really moved pays about one probe interval for the wait. An apply of the watch's own
+pending (`pendingApply`), a `xray.failover` or a `xray.pending_restore` owns the record while it
+lasts, and the check stands down. `active_server` carries `identity` (`vpnconfig.IdentityMark`: the
+first 16 hex digits of a SHA-256 of the loose identity, `looseIdentity` above) and `group`
+(`Server.Group`: protocol and security, lowercased as Xray reads them, such as `vless+reality`).
+Every Go writer fills them in through `vpnconfig.RecordActiveServer`; a rename moves only the name.
+The record is current while an entry of its subscription with its name, address and port carries its
+mark - a panel can list twins of one name, address and port, and the user may run any of them - or,
+for a record without a mark (`configure.sh`'s, an older daemon's), while such an entry is listed. It
+changed in place when such entries are listed but none carries the mark, and the first of them is
+followed; it moved when there is none and exactly one entry has its name; anything else - the
+subscription deleted, no entry of the name, several - means it left its list. A changed or moved
+server is followed. In keeper mode one that left, or whose new entry does not answer either, is
+replaced. With clients on Xray the check only follows and leaves such a server to the death rules:
+they move the clients into a tunnel first, and the wave and the walk then pick the server (spec 4.4
+leaves a death with clients to that failover), where a replacement would keep them on a dead Xray
+for a restart per candidate. After a follow whose entry does not answer, the tick ends on the
+follow's write; the next tick finds that record current, and its death rules act on it, the minutes
+still counting from the first miss. The check reads the lists as a refresh left them: a server the
+periodic refresh moved is followed at the next tick whose probe fails, the second failure in a row
+or a later one.
 
 A replacement tries the candidates in `orderBest` order (`subwatch/best.go`), the same order the
 fast path and the walk use. Its reference is the user's choice (`refFor`): `preferred_server`, else

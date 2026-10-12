@@ -114,6 +114,7 @@ type Watch struct {
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
 	failSeq           int       // active_server's write counter when failSince was set: the record that began to fail
+	failedProbes      int       // probes failed since failSince was set: the actuality check waits for two, a single miss being the common transient
 	probeOKAt         time.Time // when the main SOCKS probe last succeeded,
 	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on
 	fastLogged        time.Time // failSince of the episode whose fast attempt was last logged as not switching
@@ -382,12 +383,13 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.failSince = now
 		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 	}
-	// The probe failed: a selected server that moved or changed is followed
-	// before the death rules, as the keeper does. One that left its list, or
-	// whose new entry does not answer either, is not replaced here: the death
-	// rules move the clients into a tunnel first (spec 4.4), and the wave and
-	// the walk pick the server. While Xray works the check leaves it alone
-	// (followActive).
+	w.failedProbes++
+	// The probe failed: from the second failure in a row, a selected server
+	// that moved or changed is followed before the death rules, as the keeper
+	// does. One that left its list, or whose new entry does not answer
+	// either, is not replaced here: the death rules move the clients into a
+	// tunnel first (spec 4.4), and the wave and the walk pick the server.
+	// While Xray works the check leaves it alone (followActive).
 	if w.followActive(ctx, cfg, true) {
 		return
 	}
@@ -1722,6 +1724,7 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 // unreachable checks that can shorten them - start again from its next miss.
 func (w *Watch) resetFail() {
 	w.failSince = time.Time{}
+	w.failedProbes = 0
 	w.downChecks = 0
 }
 
