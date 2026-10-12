@@ -333,8 +333,10 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	ref := refFor(cfg, vpnconfig.AllServers(subs))
 	switched, ended := w.switchAmong(ctx, sw, append(w.bestWalkOrder(copies, cfg, ref), w.bestWalkOrder(last, cfg, ref)...), func(c vpnconfig.Server) string {
 		// Xray runs the dead server's current entry now, which changed in a
-		// way the identity mark ignores: it is followed, not replaced.
-		if dead != nil && serverID(c) == serverID(*dead) {
+		// way the identity mark ignores: it is followed, not replaced. An
+		// entry of another kind on its address and port - a panel's fallback
+		// inbound - is another server (vpnconfig.SameChoice): a replacement.
+		if dead != nil && serverID(c) == serverID(*dead) && vpnconfig.SameChoice(replaced, c) {
 			return fmt.Sprintf(msgFollowedChanged, was)
 		}
 		from, to := was, label(names, c.Subscription, c.Name)

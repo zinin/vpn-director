@@ -284,7 +284,9 @@ the message names, even when a fast-path fallback has left Xray on one of the fa
 candidates. Its stored entry can differ from what Xray ran in ways the identity mark ignores - a
 REALITY pick or a ws/httpupgrade Host or path a manual refresh took fresh, new IPs of its host - so
 with nothing else working it is still worth one try, and when it works the message is
-`Xray server <s> changed; Xray follows it`. The candidates the fast path is done with stay out
+`Xray server <s> changed; Xray follows it`. An entry of another kind on its address and port - a
+panel's fallback inbound - goes last with it but is another server: when it works, the message is
+the replacement's, with both kinds. The candidates the fast path is done with stay out
 (`fastAttempt.Tried`): one it switched to whose restart or probe failed, one its fresh checks found
 dead. So do the copies a failed follow has just tried. Each candidate - each connection once - goes
 through the walk's guarded write (`switcher.to`), `restart xray-process`, 3 s and the SOCKS probe.

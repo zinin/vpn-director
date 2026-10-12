@@ -272,6 +272,63 @@ func TestKeeper_AReplacementOntoASameNamedServerOfAnotherKindNamesBothKinds(t *t
 	}
 }
 
+// A panel's fallback inbound: "Oslo" over Shadowsocks on Oslo's own address and
+// port. Oslo, the user's vless+tls choice, dies - or changed in place, and its
+// new entry does not answer either - and only the twin works. The twin is
+// another server, not Oslo's current entry, whichever comes first in the list:
+// Xray switched, preferred_server keeps Oslo, and the message names both kinds
+// rather than "changed; Xray follows it".
+func TestKeeper_AFallbackTwinOnTheDeadServersAddressIsNoFollow(t *testing.T) {
+	want := "Xray server Alpha / Oslo (vless+tls) is not answering; Xray switched to Alpha / Oslo (shadowsocks)"
+	for _, tc := range []struct {
+		name    string
+		changed bool // Oslo changed in place, and its follow fails
+		first   bool // the twin is listed before Oslo
+	}{
+		{"dead, the twin listed second", false, false},
+		{"dead, the twin listed first", false, true},
+		{"a follow that failed", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newKeeperFixture(t)
+			s.w.Health = nil
+			oslo := s.f.subs[0].Servers[0]
+			if tc.changed {
+				oslo.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+			}
+			twin := ssServer("Oslo", "198.51.100.40")
+			twin.Address, twin.Port = oslo.Address, oslo.Port
+			s.f.subs[0].Servers = []vpnconfig.Server{oslo, twin}
+			if tc.first {
+				s.f.subs[0].Servers = []vpnconfig.Server{twin, oslo}
+			}
+			// Only the twin works.
+			s.w.Probe = func(context.Context, int) error {
+				s.probes++
+				if n := len(s.written); n > 0 && s.written[n-1].Group() == "shadowsocks" {
+					return nil
+				}
+				return errProbe
+			}
+			if tc.changed {
+				s.missOnce(t)
+				s.w.Tick(context.Background())
+			} else {
+				tickUntilDead(s.w, s.f)
+			}
+			if a := s.f.cfg.Xray.ActiveServer; a == nil || a.Group != "shadowsocks" {
+				t.Fatalf("active %+v, want the twin", a)
+			}
+			if p := s.f.cfg.Xray.PreferredServer; p == nil || p.Group != "vless+tls" {
+				t.Fatalf("preferred %+v, want the user's vless+tls Oslo", p)
+			}
+			if !reflect.DeepEqual(s.f.notes, []string{want}) {
+				t.Fatalf("notes %v, want [%s]", s.f.notes, want)
+			}
+		})
+	}
+}
+
 // With fresh evidence the fast path replaces the server within a tick, with
 // its own message.
 func TestKeeper_FastEvidenceSwitchesAtOnce(t *testing.T) {
