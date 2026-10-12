@@ -170,9 +170,10 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 	slog.Warn("Return to the preferred server failed and the previous server did not come back", "previous", before.Name)
 }
 
-// switcher is one return attempt's run of switches. It carries the walk's
-// bookkeeping from write to write - the record the last one left and the
-// counter it moved to - which the guard of the next compares with the config.
+// switcher is one return attempt's run of switches, or one keeper action's. It
+// carries the walk's bookkeeping from write to write - the record the last one
+// left and the counter it moved to - which the guard of the next compares with
+// the config.
 type switcher struct {
 	w            *Watch
 	links        map[string]string // subscription id -> the link the attempt read
@@ -191,7 +192,10 @@ type switcher struct {
 // ran. live is a probe that passed; ended is a write the guard refused for a
 // stop or a newer selection, a restart a stop skipped, or a stop or a cancelled
 // tick that ended the attempt, after which nothing more may be written. A
-// timeout of the switch's own while the tick runs is a failed switch.
+// timeout of the switch's own while the tick runs is a failed switch. It writes
+// through generateWalked: under a fallback's ownership - the keeper's
+// replacement after the fast path - the owner checks and records the write, as
+// it does the walk's; without one that is Generate.
 func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended, gone bool) {
 	w := s.w
 	if ctx.Err() != nil || w.mutationEnded(ctx) {
@@ -201,7 +205,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 	if holds {
 		sub, link = c.Subscription, s.links[c.Subscription]
 	}
-	generated, seq, err := w.Generate(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq, ctx))
+	generated, seq, err := w.generateWalked(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq, ctx))
 	if w.endsWalk(err) {
 		return false, true, false
 	}

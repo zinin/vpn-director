@@ -23,7 +23,9 @@ const (
 
 var (
 	// errEpisode stands the periodic refresh down while the watch handles an
-	// Xray failure: the wave refreshes the subscriptions then.
+	// Xray failure of its clients: a failing probe while it is armed, whose
+	// wave refreshes the subscriptions then, or a failover, a restore or an
+	// apply of its own still under way.
 	errEpisode = errors.New("the watch is handling an Xray failure")
 	// errNoLinks stands it down when no subscription has a link.
 	errNoLinks = errors.New("no subscription has a link")
@@ -41,9 +43,9 @@ type listed struct {
 // RefreshInterval, until ctx ends, and publishes what changed. It downloads
 // outside the watch's tick, publishes between ticks, and stands down while
 // VPN Director is stopped, the gate is closed or the watch handles an Xray
-// failure. The first round starts RefreshFirst after it does; each next one
-// RefreshInterval after the last one ended, or RefreshRetry after one that
-// stood down.
+// failure of its clients (errEpisode). The first round starts RefreshFirst
+// after it does; each next one RefreshInterval after the last one ended, or
+// RefreshRetry after one that stood down.
 func (w *Watch) StartRefresh(ctx context.Context) {
 	wait := RefreshFirst
 	for {
@@ -139,7 +141,10 @@ func (w *Watch) refreshTargets() ([]vpnconfig.Subscription, error) {
 }
 
 // refreshStandsDown is why the periodic refresh may not download or publish
-// now, or nil. Its caller holds tickMu and mu, so no tick runs meanwhile.
+// now, or nil. Its caller holds tickMu and mu, so no tick runs meanwhile. A
+// failing probe stands it down only while the watch is armed: the wave
+// refreshes the lists then. In keeper mode nothing else would, and the
+// keeper's next attempt wants the lists as they are now.
 func (w *Watch) refreshStandsDown() error {
 	w.applyDefaults()
 	if w.FetchList == nil || w.LoadVPN == nil || w.UpdateVPN == nil {
@@ -148,7 +153,7 @@ func (w *Watch) refreshStandsDown() error {
 	if err := w.mutationRefused(); err != nil {
 		return err
 	}
-	if !w.failSince.IsZero() || w.pendingApply {
+	if w.pendingApply {
 		return errEpisode
 	}
 	cfg, err := w.LoadVPN()
@@ -156,6 +161,9 @@ func (w *Watch) refreshStandsDown() error {
 		return err
 	}
 	if cfg != nil && (cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil) {
+		return errEpisode
+	}
+	if !w.failSince.IsZero() && vpnconfig.Armed(cfg, w.subscriptionCount()) {
 		return errEpisode
 	}
 	return nil

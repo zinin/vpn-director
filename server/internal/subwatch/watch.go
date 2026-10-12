@@ -375,7 +375,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.importRetry = 0
 		w.lastRouteKind = noteNone
 		w.lastImportKind = noteNone
-		w.keeperFailNoted = false
+		w.resetKeeper()
 		w.maybeReturn(ctx, cfg)
 		return
 	}

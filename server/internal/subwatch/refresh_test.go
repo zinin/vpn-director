@@ -202,9 +202,9 @@ func TestRefreshRound_APickedCopyOfAnotherServerStays(t *testing.T) {
 	}
 }
 
-// While the watch handles an Xray failure the wave refreshes: the periodic
-// refresh downloads nothing and writes nothing, and so while VPN Director is
-// stopped or the gate is closed.
+// While a watch with Xray clients handles an Xray failure the wave refreshes:
+// the periodic refresh downloads nothing and writes nothing, and so while VPN
+// Director is stopped or the gate is closed.
 func TestRefreshRound_StandsDownWhileTheWatchMayNotOrIsBusy(t *testing.T) {
 	for name, set := range map[string]func(*fake, *Watch){
 		"a failover":      func(f *fake, _ *Watch) { f.cfg = failedOverCfg() },
@@ -225,6 +225,42 @@ func TestRefreshRound_StandsDownWhileTheWatchMayNotOrIsBusy(t *testing.T) {
 		if w.refreshRound(context.Background()) || fetched != 0 || saves.Load() != 0 {
 			t.Errorf("%s: the round ran, downloads %d, writes %d", name, fetched, saves.Load())
 		}
+	}
+}
+
+// A failing probe stands the periodic refresh down only while the watch is
+// armed: its wave refreshes the lists then. In keeper mode nothing else would,
+// so the round runs, and the keeper's next attempt finds the server where the
+// provider moved it.
+func TestRefreshRound_AFailingProbeStandsItDownOnlyWithClients(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		clients []string
+		runs    bool
+	}{
+		{"keeper mode", nil, true},
+		{"clients mode", []string{"192.168.1.8"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, w, saves := refreshRig(alphaOf(realityAt("DE", "de.example", "aa11", "203.0.113.10")))
+			f.cfg.Xray.Clients = tc.clients
+			f.cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Subscription: "aaaaaaaa", Name: "DE", Address: "de.example", Port: 443, Seq: 7}
+			w.failSince = f.now
+			fetched := 0
+			w.FetchList = func(context.Context, string) ([]vpnconfig.Server, error) {
+				fetched++
+				return []vpnconfig.Server{realityAt("DE", "de-2.example", "aa11", "203.0.113.30")}, nil
+			}
+
+			ran := w.refreshRound(context.Background())
+
+			if ran != tc.runs || (fetched == 1) != tc.runs || (saves.Load() == 1) != tc.runs {
+				t.Fatalf("round ran %v, downloads %d, writes %d; want it to run: %v", ran, fetched, saves.Load(), tc.runs)
+			}
+			if tc.runs && f.subs[0].Servers[0].Address != "de-2.example" {
+				t.Fatalf("servers %+v; want DE at its new address", f.subs[0].Servers)
+			}
+		})
 	}
 }
 

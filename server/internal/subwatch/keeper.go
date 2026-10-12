@@ -42,10 +42,12 @@ func (w *Watch) keeps(cfg *vpnconfig.VPNDirectorConfig, subs int) bool {
 }
 
 // keep is a tick in keeper mode. There is nobody to move into a tunnel and no
-// wave to run - the periodic refresh keeps the lists current - so a server
-// that moved, left its subscription or died is replaced at once. A death is
-// confirmed by the armed tick's rules (spec 4.4): the fast path's evidence,
-// the unreachable streak, or DeadAfter.
+// wave to run: the periodic refresh keeps the lists current, and keeps running
+// while the probe fails (refreshStandsDown), so each attempt works from the
+// lists as they are. A server that moved or changed is followed, and one that
+// left its subscription or died is replaced, at once. A death is confirmed by
+// the armed tick's rules (spec 4.4): the fast path's evidence, the unreachable
+// streak, or DeadAfter.
 func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.followActive(ctx, cfg) {
 		return
@@ -59,7 +61,7 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		w.probeOKAt = w.Now()
 		w.probeOKActive = activeID(cfg.Xray.ActiveServer)
 		w.resetFail()
-		w.keeperFailNoted = false
+		w.resetKeeper()
 		w.lastRouteKind, w.lastImportKind = noteNone, noteNone
 		w.maybeReturn(ctx, cfg)
 		return
@@ -80,7 +82,7 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		w.resetFail()
 		return
 	case fastFallback:
-		w.replaceDead(ctx, attempt.Config, "monitor")
+		w.replaceDead(ctx, attempt.Config, "monitor", attempt.Guard)
 		return
 	}
 	cfg = attempt.Config
@@ -88,22 +90,24 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		w.checkReach(ctx, cfg)
 	}
 	if reason := w.deadReason(now); reason != "" {
-		w.replaceDead(ctx, cfg, reason)
+		w.replaceDead(ctx, cfg, reason, attempt.Guard)
 	}
 }
 
 // followActive is the actuality check (spec 4.2), made between episodes in
 // both modes. A server that changed in place or moved is followed; one whose
 // new entry does not answer either, and one that left its subscription, are
-// replaced. It reports whether it acted - switched, or tried and backed off -
-// and the tick then ends.
+// replaced. The whole action has one fence, the record the check classified: a
+// replacement after a follow that failed carries on from the follow's write,
+// and a selection the user commits meanwhile ends it. It reports whether it
+// acted - switched, tried and backed off, or was ended - and the tick then
+// ends.
 //
 // During an episode it does nothing: while the probe fails, xray.failover or
-// xray.pending_restore is recorded, or an apply of the watch's own is pending,
-// as the periodic refresh stands down (refreshStandsDown). The episode's own
-// logic owns the record then - the death rules and the walk pick the server, a
-// restore finishes on the one its probe passed - and a switch of the check's
-// own would cut across it.
+// xray.pending_restore is recorded, or an apply of the watch's own is pending
+// (spec 4.2). The episode's own logic owns the record then - the death rules
+// and the walk pick the server, a restore finishes on the one its probe
+// passed - and a switch of the check's own would cut across it.
 func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
 	if cfg == nil || !w.failSince.IsZero() || w.pendingApply || cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil {
 		return false
@@ -122,9 +126,10 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	}
 	a := cfg.Xray.ActiveServer
 	was := label(subscriptionNames(subs), a.Subscription, a.Name)
+	sw := w.newSwitcher(cfg, subs)
 	if state == actualGone {
 		slog.Info("The Xray server left its subscription; replacing it", "server", was)
-		w.replaceActive(ctx, cfg, subs, nil, msgReplacedGone, was)
+		w.replaceActive(ctx, cfg, subs, sw, nil, msgReplacedGone, was)
 		return true
 	}
 	msg := msgFollowedMoved
@@ -132,26 +137,36 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		msg = msgFollowedChanged
 	}
 	slog.Info("The Xray server moved or changed; following it", "server", was, "changed", state == actualChanged)
-	switched, ended := w.switchAmong(ctx, cfg, subs, endpoint.PerAddress([]vpnconfig.Server{entry}), func(vpnconfig.Server) string {
+	switched, ended := w.switchAmong(ctx, sw, endpoint.PerAddress([]vpnconfig.Server{entry}), func(vpnconfig.Server) string {
 		return fmt.Sprintf(msg, was)
 	})
 	if switched || ended {
 		return true
 	}
 	// The entry it moved to does not answer either: as far as Xray goes, the
-	// server died.
-	w.replaceActive(ctx, cfg, subs, &entry, msgReplacedDead, was)
+	// server died. The follow's write is the action's own, and sw knows it.
+	w.replaceActive(ctx, cfg, subs, sw, &entry, msgReplacedDead, was)
 	return true
 }
 
 // replaceDead replaces the server active_server names once its death is
-// confirmed: nobody to move, so no tunnel and no wave.
-func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, reason string) {
+// confirmed: nobody to move, so no tunnel and no wave. The action's fence is
+// cfg, the record the death was confirmed on - after the fast path, a read its
+// ownership validated - and never a later read: a selection committed since
+// refuses the first write. guard is the fast path's ownership when it got that
+// far (fastAttempt.Guard), and the replacement writes under it as
+// failOutbound's fallback does: the owner checks and records each write, its
+// port snapshot stays guarded, and what it refuses is neither written nor
+// said.
+func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, reason string, guard func(*vpnconfig.VPNDirectorConfig) error) {
 	if cfg == nil || cfg.Xray.ActiveServer == nil {
 		return
 	}
+	previousGuard, previousRefused := w.outboundGuard, w.outboundRefused
+	w.outboundGuard, w.outboundRefused = guard, nil
+	defer func() { w.outboundGuard, w.outboundRefused = previousGuard, previousRefused }()
 	subs, err := w.loadSubscriptions()
-	if err != nil || len(subs) == 0 || w.mutationEnded(ctx) {
+	if err != nil || len(subs) == 0 || w.mutationEnded(ctx) || w.outboundAllowedNow() != nil {
 		return
 	}
 	// The returns settle once per death, as failOutbound settles them.
@@ -166,23 +181,20 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if s, ok := exactFastServer(subs, a); ok {
 		dead = &s
 	}
-	w.replaceActive(ctx, cfg, subs, dead, msgReplacedDead, was)
+	w.replaceActive(ctx, cfg, subs, w.newSwitcher(cfg, subs), dead, msgReplacedDead, was)
 }
 
-// replaceActive switches Xray to the best working server (spec 4.3). It reads
-// the config again first: a follow that failed has written a record since. It
-// leaves out dead - every copy of it, and every copy that dials the same
-// connection (endpoint.DialKey), which dies with it. It sends msg with was,
-// the server replaced, and the server found. With none working it says so once
-// a run and backs the next attempt off. RecordWalkedServer keeps the user's
-// choice in preferred_server for the return.
-func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, dead *vpnconfig.Server, msg, was string) {
-	if w.LoadVPN != nil {
-		if latest, err := w.LoadVPN(); err == nil && latest != nil {
-			cfg = latest
-		}
-	}
-	if w.mutationEnded(ctx) || cfg.Xray.ActiveServer == nil {
+// replaceActive switches Xray to the best working server (spec 4.3) through
+// sw, the action's fence. cfg is the record the action started from, and it
+// orders the candidates too: a follow that failed recorded the same choice,
+// which walkOrder still finds by its name, and the write after it keeps the
+// record it left in preferred_server (RecordWalkedServer). It leaves out dead -
+// every copy of it, and every copy that dials the same connection
+// (endpoint.DialKey), which dies with it. It sends msg with was, the server
+// replaced, and the server found. With none working it says so once a run and
+// backs the next attempt off.
+func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, msg, was string) {
+	if w.mutationEnded(ctx) {
 		return
 	}
 	chosen := cfg.Xray.PreferredServer
@@ -210,7 +222,7 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	}
 	names := subscriptionNames(subs)
 	ref := refFor(cfg, vpnconfig.AllServers(subs))
-	switched, ended := w.switchAmong(ctx, cfg, subs, w.bestWalkOrder(copies, cfg, ref), func(c vpnconfig.Server) string {
+	switched, ended := w.switchAmong(ctx, sw, w.bestWalkOrder(copies, cfg, ref), func(c vpnconfig.Server) string {
 		return fmt.Sprintf(msg, was, label(names, c.Subscription, c.Name))
 	})
 	if switched || ended {
@@ -221,6 +233,7 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 		return
 	}
 	w.keeperFailNoted = true
+	// Read for the message alone: the server the action's last write left.
 	stays := was
 	if w.LoadVPN != nil {
 		if latest, err := w.LoadVPN(); err == nil && latest != nil && latest.Xray.ActiveServer != nil {
@@ -231,18 +244,26 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	w.say(fmt.Sprintf(msgNoWorking, stays))
 }
 
-// switchAmong switches Xray to the first of candidates the SOCKS probe finds
-// working, through the walk's guarded write (switcher.to), and sends message
-// for it. It skips a copy whose endpoint.DialKey it tried already, and the
-// copies of a subscription deleted meanwhile. ended is a stop, a closed gate
-// or a selection the user made meanwhile: nothing more may be written.
-func (w *Watch) switchAmong(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, candidates []vpnconfig.Server, message func(vpnconfig.Server) string) (switched, ended bool) {
+// newSwitcher is the fence of one keeper action, set at cfg: the record the
+// action starts from, and the links of subs it was read with. Every write of
+// the action goes through it (switcher.to), so a selection the user commits
+// after cfg was read refuses the next write and ends the action.
+func (w *Watch) newSwitcher(cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription) *switcher {
 	links := make(map[string]string, len(subs))
 	for _, s := range subs {
 		links[s.ID] = s.URL
 	}
 	before := cfg.Xray.ActiveServer
-	sw := &switcher{w: w, links: links, started: activeID(before), seq: vpnconfig.ActiveSeq(before), socks: w.socksPort(cfg)}
+	return &switcher{w: w, links: links, started: activeID(before), seq: vpnconfig.ActiveSeq(before), socks: w.socksPort(cfg)}
+}
+
+// switchAmong switches Xray to the first of candidates the SOCKS probe finds
+// working, through sw - the action's fence, carried from write to write - and
+// sends message for it. It skips a copy whose endpoint.DialKey it tried
+// already, and the copies of a subscription deleted meanwhile. ended is a
+// stop, a closed gate or a selection the user made since the action began:
+// nothing more may be written.
+func (w *Watch) switchAmong(ctx context.Context, sw *switcher, candidates []vpnconfig.Server, message func(vpnconfig.Server) string) (switched, ended bool) {
 	seen, gone := map[string]bool{}, map[string]bool{}
 	w.setStatusAction("switch")
 	for _, c := range candidates {
@@ -275,12 +296,23 @@ func (w *Watch) switchAmong(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		w.lastPicked = &picked
 		w.settled()
 		w.lastRouteKind, w.lastImportKind = noteNone, noteNone
-		w.keeperRetry, w.keeperNotBefore, w.keeperFailNoted = 0, time.Time{}, false
+		w.resetKeeper()
 		slog.Info("Xray switched to a working server", "server", c.Name, "ips", c.IPs)
 		w.say(message(c))
 		return true, false
 	}
-	return false, w.mutationEnded(ctx)
+	// A selection committed during the last probe ends the action as well, as
+	// the walk looks before it reports no live server: the run did not fail
+	// on the user's server.
+	return false, w.mutationEnded(ctx) || w.endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq))
+}
+
+// resetKeeper ends a run of keeper attempts: Xray works, and the next failure
+// is a new run. Its first attempt is not held back, a run that finds nothing
+// working backs off KeeperRetry again, and its "No working Xray server found"
+// is news.
+func (w *Watch) resetKeeper() {
+	w.keeperRetry, w.keeperNotBefore, w.keeperFailNoted = 0, time.Time{}, false
 }
 
 // keeperBackOff holds the next attempt back after a run of switches none of
