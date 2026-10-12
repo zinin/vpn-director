@@ -23,16 +23,17 @@ const (
 	// can accept TCP and still refuse the proxy - doubling up to ReturnRetryMax.
 	ReturnRetry    = 10 * time.Minute
 	ReturnRetryMax = 30 * time.Minute
-	// ReturnHold is how long the preferred server has to keep working after a
-	// return for the return to count as held: a death that starts within it
-	// counts as a failed return, and only a held return ends the backoff.
+	// ReturnHold is how long the server a return went back to - the preferred
+	// server, or a server of its group - has to keep working for the return to
+	// count as held: a death that starts within it counts as a failed return,
+	// and only a held return ends the backoff.
 	ReturnHold = 30 * time.Minute
 	// ReturnFailsMax is how many returns in a row may fail - a death within
 	// ReturnHold of one included - before the watch stops trying. An address
 	// that accepts TCP and keeps refusing the proxy, a blocked endpoint, would
 	// otherwise cost every Xray client a few dead seconds every ReturnRetryMax
-	// for as long as the block lasts. A new death, a selection or a restart of
-	// watchd starts the returns over.
+	// for as long as the block lasts. A new death, a selection, a held return or
+	// a restart of watchd starts the returns over.
 	ReturnFailsMax = 4
 	// ReturnAlive is how long the monitor has to hold a server alive before
 	// Xray goes back to it - to the preferred server, or to the user's group:
@@ -49,17 +50,26 @@ const (
 // alive as long, and preferred_server stays. It runs after a probe that
 // passed, with no failover and no restore apply outstanding, and looks every
 // ReturnCheck - after a failed return, ReturnRetry and longer. After
-// ReturnFailsMax failed attempts in a row the returns stop.
+// ReturnFailsMax failed attempts in a row the returns stop; a return of either
+// kind that has held for ReturnHold ends that count and its wait.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.mutationEnded(ctx) {
 		return
 	}
+	// A return that has held for ReturnHold ends the backoff, whichever server
+	// it went to: the preferred server, whose record cleared preferred_server,
+	// or a server of its group, which kept it and the returns to it going.
+	if !w.lastReturn.IsZero() && w.Now().Sub(w.lastReturn) >= ReturnHold {
+		w.returnRetry = 0
+		w.returnFails = 0
+		w.lastReturn = time.Time{}
+	}
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
-		// A return clears preferred_server too; its backoff ends once it has held.
-		if w.lastReturn.IsZero() || w.Now().Sub(w.lastReturn) >= ReturnHold {
+		// Nothing to return to. A return clears preferred_server too, and its
+		// backoff waits until it has held; without one, the backoff ends now.
+		if w.lastReturn.IsZero() {
 			w.returnRetry = 0
 			w.returnFails = 0
-			w.lastReturn = time.Time{}
 		}
 		return
 	}
@@ -115,27 +125,41 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		return
 	}
 	// The preferred server is not back, but Xray may run another group than
-	// the user's: a server of that group alive for ReturnAlive is the nearer
-	// choice. preferred_server stays, and the return to it still comes.
+	// the user's - preferred_server's, or its entry's for a record an older
+	// writer left without one (spec 4.5): the best server of that group alive
+	// for ReturnAlive is the nearer choice. preferred_server stays, and the
+	// return to it still comes.
+	ref := refFor(cfg, servers)
 	activeGroup := active.Group
 	if activeGroup == "" {
 		if j := chosenIndex(servers, active); j >= 0 {
 			activeGroup = servers[j].Group()
 		}
 	}
-	if !fresh || preferred.Group == "" || activeGroup == "" || activeGroup == preferred.Group {
+	if !fresh || ref.Group == "" || activeGroup == "" || activeGroup == ref.Group {
 		return
 	}
-	ref := bestRef{Subscription: preferred.Subscription, Group: preferred.Group}
 	var group []vpnconfig.Server
 	for _, c := range aliveFor(endpoint.PerAddress(servers), ev, now, ReturnAlive) {
 		if c.Group() == ref.Group {
 			group = append(group, c)
 		}
 	}
-	if len(group) > 0 {
-		w.tryReturn(ctx, cfg, subs, servers, orderBest(group, ref, ev, true), ref.Group)
+	if len(group) == 0 {
+		return
 	}
+	// A look tries that one server (spec 4.6), its alive copies in the order
+	// that chose it: each copy costs an Xray restart, and the other servers of
+	// a group the probe refuses - twins on one endpoint among them - would cost
+	// one each. Another server waits until a later look finds it the best.
+	order := orderBest(group, ref, ev, true)
+	var best []vpnconfig.Server
+	for _, c := range order {
+		if serverID(c) == serverID(order[0]) {
+			best = append(best, c)
+		}
+	}
+	w.tryReturn(ctx, cfg, subs, servers, best, ref.Group)
 }
 
 // aliveFor is the copies the monitor has held alive for at least d at now,
@@ -163,8 +187,9 @@ func aliveFor(copies []vpnconfig.Server, ev monitor.Evidence, now time.Time, d t
 // it, and the attempt ends there. A switch to the preferred server is refused
 // too once its subscription is deleted; nobody else wrote, so the attempt
 // fails as a dead one does, and goes back to the server that ran before if it
-// has left it. With group set, the candidates are servers of the user's group,
-// not the preferred server: the messages say so, and preferred_server stays.
+// has left it. With group set, the candidates are the copies of the best
+// server of the user's group, not of the preferred server: the log and the
+// message name the group, and preferred_server stays.
 func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, servers, candidates []vpnconfig.Server, group string) {
 	before := cfg.Xray.ActiveServer
 	links := make(map[string]string, len(subs))
@@ -181,7 +206,11 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 	}
 	back := rollbackOrder(servers, before, w.lastPicked)
 	if len(back) == 0 {
-		slog.Info("Return to the preferred server put off; no way back to the server that runs now", "server", before.Name)
+		if group == "" {
+			slog.Info("Return to the preferred server put off; no way back to the server that runs now", "server", before.Name)
+		} else {
+			slog.Info("Return to a server of the preferred group put off; no way back to the server that runs now", "group", group, "server", before.Name)
+		}
 		return
 	}
 	w.setStatusAction("returning")
@@ -196,7 +225,11 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			return
 		}
 		if gone {
-			slog.Info("Return to the preferred server abandoned; its subscription was deleted", "server", c.Name)
+			if group == "" {
+				slog.Info("Return to the preferred server abandoned; its subscription was deleted", "server", c.Name)
+			} else {
+				slog.Info("Return to a server of the preferred group abandoned; its subscription was deleted", "group", group, "server", c.Name)
+			}
 			break
 		}
 		if live {
@@ -208,6 +241,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			w.lastPicked = &c
 			w.lastReturn = w.Now()
 			w.returnSeq = sw.seq
+			w.returnGroup = group
 			if group == "" {
 				slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
 				w.notify(noteReturned, fmt.Sprintf(msgReturned, label(names, c.Subscription, c.Name)))
@@ -221,7 +255,7 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 	if w.mutationEnded(ctx) {
 		return
 	}
-	w.backOffReturn()
+	w.backOffReturn(group)
 	if !sw.wrote {
 		return
 	}
@@ -231,12 +265,20 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			return
 		}
 		if live {
-			slog.Info("Return to the preferred server failed; back on the previous server", "server", c.Name, "ips", c.IPs)
+			if group == "" {
+				slog.Info("Return to the preferred server failed; back on the previous server", "server", c.Name, "ips", c.IPs)
+			} else {
+				slog.Info("Return to a server of the preferred group failed; back on the previous server", "group", group, "server", c.Name, "ips", c.IPs)
+			}
 			w.lastPicked = &c
 			return
 		}
 	}
-	slog.Warn("Return to the preferred server failed and the previous server did not come back", "previous", before.Name)
+	if group == "" {
+		slog.Warn("Return to the preferred server failed and the previous server did not come back", "previous", before.Name)
+	} else {
+		slog.Warn("Return to a server of the preferred group failed and the previous server did not come back", "group", group, "previous", before.Name)
+	}
 }
 
 // switcher is one return attempt's run of switches, or one keeper action's. It
@@ -356,15 +398,20 @@ func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, l
 
 // returnAfterDeath settles the returns at a death. A death is a new episode,
 // and whatever the returns backed off to is done with - unless it started
-// within ReturnHold of a return, on the record that return wrote: the
-// preferred server has failed again, and the death counts as a failed return,
-// so a server that flaps is not returned to every few minutes. A selection
-// since the return wrote another record - the same server selected again
-// too - and the death of the user's new choice starts the returns over.
+// within ReturnHold of a return, on the record that return wrote: the server
+// it went back to - the preferred server, or a server of its group - has
+// failed again, and the death counts as a failed return, so a server that
+// flaps is not returned to every few minutes. A selection since the return
+// wrote another record - the same server selected again too - and the death
+// of the user's new choice starts the returns over.
 func (w *Watch) returnAfterDeath() {
 	if !w.lastReturn.IsZero() && w.failSeq == w.returnSeq && w.failSince.Sub(w.lastReturn) < ReturnHold {
-		slog.Info("The preferred server died soon after the return; counted as a failed return", "after", w.failSince.Sub(w.lastReturn))
-		w.backOffReturn()
+		if w.returnGroup == "" {
+			slog.Info("The preferred server died soon after the return; counted as a failed return", "after", w.failSince.Sub(w.lastReturn))
+		} else {
+			slog.Info("The server of the preferred group died soon after the return; counted as a failed return", "group", w.returnGroup, "after", w.failSince.Sub(w.lastReturn))
+		}
+		w.backOffReturn(w.returnGroup)
 	} else {
 		w.returnRetry = 0
 		w.returnFails = 0
@@ -375,8 +422,10 @@ func (w *Watch) returnAfterDeath() {
 
 // backOffReturn holds the next attempt back after a return that failed:
 // ReturnRetry, then twice the last wait, ReturnRetryMax at most. After
-// ReturnFailsMax failures in a row there is no next attempt: the returns stop.
-func (w *Watch) backOffReturn() {
+// ReturnFailsMax failures in a row there is no next attempt: the returns stop,
+// to the preferred server and to its group alike. group is the preferred group
+// when the return that failed went to a server of it, and the log names it.
+func (w *Watch) backOffReturn(group string) {
 	w.returnFails++
 	if w.returnRetry == 0 {
 		w.returnRetry = ReturnRetry
@@ -385,8 +434,16 @@ func (w *Watch) backOffReturn() {
 	}
 	w.returnNotBefore = w.Now().Add(w.returnRetry)
 	if w.returnFails >= ReturnFailsMax {
-		slog.Info("Returns to the preferred server stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "failed", w.returnFails)
+		if group == "" {
+			slog.Info("Returns to the preferred server stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "failed", w.returnFails)
+		} else {
+			slog.Info("Returns to the preferred server and its group stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "group", group, "failed", w.returnFails)
+		}
 		return
 	}
-	slog.Info("Next return attempt backed off", "after", w.returnRetry)
+	if group == "" {
+		slog.Info("Next return attempt backed off", "after", w.returnRetry)
+	} else {
+		slog.Info("Next return attempt backed off after a failed return to a server of the preferred group", "group", group, "after", w.returnRetry)
+	}
 }

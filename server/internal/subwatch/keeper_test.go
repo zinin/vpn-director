@@ -606,20 +606,40 @@ func TestMaybeReturn_TwoMinutesAliveIsNotEnough(t *testing.T) {
 	}
 }
 
-// Xray runs a Shadowsocks server while Oslo, the user's vless+tls choice, is
-// dead: once Backup, of Oslo's group, has been alive five minutes, Xray goes
-// there, and Oslo stays the choice to return to.
-func TestMaybeReturn_BackToTheUsersGroup(t *testing.T) {
+// groupReturnStates is the monitor's view of newGroupReturnKeeper at now - Oslo
+// dead for an hour, Shadow alive for an hour, Backup alive for six minutes -
+// with the states in more added or put in their place.
+func groupReturnStates(now time.Time, more map[string]watchdapi.EndpointState) map[string]watchdapi.EndpointState {
+	states := map[string]watchdapi.EndpointState{
+		"Oslo":   {Status: watchdapi.StatusDead, Since: now.Add(-time.Hour)},
+		"Shadow": aliveSince(now.Add(-time.Hour), 5),
+		"Backup": aliveSince(now.Add(-6*time.Minute), 17),
+	}
+	for name, st := range more {
+		states[name] = st
+	}
+	return states
+}
+
+// newGroupReturnKeeper is the return keeper with Xray on Shadow, a Shadowsocks
+// server, while Oslo, the user's vless+tls choice, is dead and Backup, of
+// Oslo's group, has been alive six minutes.
+func newGroupReturnKeeper(t *testing.T) *fastFixture {
+	t.Helper()
 	s := newReturnKeeper(t)
 	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
 	shadow := ssServer("Shadow", "198.51.100.40")
 	s.f.subs[0].Servers = []vpnconfig.Server{oslo, shadow, backup}
 	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, shadow)
-	s.setStates(map[string]watchdapi.EndpointState{
-		"Oslo":   {Status: watchdapi.StatusDead, Since: s.f.now.Add(-time.Hour)},
-		"Shadow": aliveSince(s.f.now.Add(-time.Hour), 5),
-		"Backup": aliveSince(s.f.now.Add(-6*time.Minute), 17),
-	})
+	s.setStates(groupReturnStates(s.f.now, nil))
+	return s
+}
+
+// Xray runs a Shadowsocks server while Oslo, the user's vless+tls choice, is
+// dead: once Backup, of Oslo's group, has been alive five minutes, Xray goes
+// there, and Oslo stays the choice to return to.
+func TestMaybeReturn_BackToTheUsersGroup(t *testing.T) {
+	s := newGroupReturnKeeper(t)
 	s.w.Tick(context.Background())
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
 		t.Fatalf("written %v", got)
@@ -659,24 +679,96 @@ func TestAliveFor(t *testing.T) {
 // Back to the group goes by the order of a replacement (spec 4.6): a server of
 // the group in the user's subscription before a faster one elsewhere.
 func TestMaybeReturn_BackToTheGroupPrefersTheUsersSubscription(t *testing.T) {
-	s := newReturnKeeper(t)
-	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
-	shadow := ssServer("Shadow", "198.51.100.40")
-	s.f.subs[0].Servers = []vpnconfig.Server{oslo, shadow, backup}
+	s := newGroupReturnKeeper(t)
 	s.f.subs = append(s.f.subs, vpnconfig.Subscription{ID: "beta", Name: "Beta", URL: "https://beta.example/list",
 		Servers: []vpnconfig.Server{fastServer("Faster", "faster.example", "198.51.100.30")}})
-	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, shadow)
-	s.setStates(map[string]watchdapi.EndpointState{
-		"Oslo":   {Status: watchdapi.StatusDead, Since: s.f.now.Add(-time.Hour)},
-		"Shadow": aliveSince(s.f.now.Add(-time.Hour), 5),
-		"Backup": aliveSince(s.f.now.Add(-6*time.Minute), 17),
-		"Faster": aliveSince(s.f.now.Add(-6*time.Minute), 3),
-	})
+	s.setStates(groupReturnStates(s.f.now, map[string]watchdapi.EndpointState{"Faster": aliveSince(s.f.now.Add(-6*time.Minute), 3)}))
 	s.w.Tick(context.Background())
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
 		t.Fatalf("written %v, want Backup of the user's subscription before Beta / Faster", got)
 	}
 	if want := []string{"Xray back on a vless+tls server Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
 		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
+// Back to the group tries the best server of the group alone (Ruling T6-R1,
+// spec 4.6): Backup's probe fails, so Xray goes back to Shadow and the next
+// attempt backs off - Spare, alive too, is not tried. The log names the group
+// the return was for, not the preferred server (Ruling T6-R3).
+func TestMaybeReturn_BackToTheGroupTriesItsBestServerAlone(t *testing.T) {
+	s := newGroupReturnKeeper(t)
+	s.f.subs[0].Servers = append(s.f.subs[0].Servers, fastServer("Spare", "spare.example", "198.51.100.30"))
+	s.setStates(groupReturnStates(s.f.now, map[string]watchdapi.EndpointState{"Spare": aliveSince(s.f.now.Add(-6*time.Minute), 20)}))
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Backup" {
+			return errProbe
+		}
+		return nil
+	}
+	log := captureLog(t)
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example", "Shadow@198.51.100.40"}) {
+		t.Fatalf("written %v; want Backup alone, then back on Shadow", got)
+	}
+	if a := s.f.cfg.Xray.ActiveServer; a.Name != "Shadow" || s.w.returnFails != 1 || len(s.f.notes) != 0 {
+		t.Fatalf("active %+v, returnFails %d, notes %v; a failed return backs off and tells nobody", a, s.w.returnFails, s.f.notes)
+	}
+	if out := log.String(); !strings.Contains(out, "Return to a server of the preferred group failed; back on the previous server") ||
+		strings.Contains(out, "preferred server") {
+		t.Fatalf("log:\n%s\nthe lines of a return to the group name the group, not the preferred server", out)
+	}
+}
+
+// A preferred record an older writer left without its group takes the group
+// of its entry (Ruling T6-R2, spec 4.5): Xray goes back to that group all the
+// same.
+func TestMaybeReturn_BackToTheGroupOfAPreferredRecordWithoutOne(t *testing.T) {
+	s := newGroupReturnKeeper(t)
+	p := s.f.cfg.Xray.PreferredServer
+	p.Identity, p.Group = "", ""
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
+		t.Fatalf("written %v", got)
+	}
+	if want := []string{"Xray back on a vless+tls server Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
+// A return to the user's group that has held for ReturnHold ends the backoff,
+// as a held return to the preferred server does (Ruling T6-R4). Three returns
+// to Oslo had failed before it; the failed returns to Oslo after it start a
+// new count, and the returns go on instead of stopping at ReturnFailsMax.
+func TestMaybeReturn_AHeldGroupReturnEndsTheBackoff(t *testing.T) {
+	s := newGroupReturnKeeper(t)
+	s.w.returnFails, s.w.returnRetry = ReturnFailsMax-1, ReturnRetryMax
+	s.w.Tick(context.Background()) // back on Backup, of Oslo's group
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
+		t.Fatalf("written %v", got)
+	}
+	// Backup has held. The monitor has Oslo back, but its probe fails.
+	s.f.now = s.f.now.Add(ReturnHold)
+	s.setStates(groupReturnStates(s.f.now, map[string]watchdapi.EndpointState{"Oslo": aliveSince(s.f.now.Add(-ReturnAlive), 40)}))
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if s.written[len(s.written)-1].Name == "Oslo" {
+			return errProbe
+		}
+		return nil
+	}
+	s.w.Tick(context.Background())
+	s.f.now = s.f.now.Add(ReturnRetry)
+	s.w.Tick(context.Background())
+	tries := 0
+	for _, server := range s.written {
+		if server.Name == "Oslo" {
+			tries++
+		}
+	}
+	if tries != 4 || s.w.returnFails != 2 {
+		t.Fatalf("written %v, returnFails %d; want two returns to Oslo's two addresses, counted anew",
+			writtenNames(s.written), s.w.returnFails)
 	}
 }

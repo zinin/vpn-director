@@ -134,11 +134,12 @@ type Watch struct {
 	lastFallbackCheck time.Time                     // last platform lookup for a committed failover's tunnel
 	fallbackDownSince time.Time                     // since when that tunnel is no exit; zero while it is one
 	running           bool
-	returnNotBefore   time.Time                            // no look for the preferred server before this
+	returnNotBefore   time.Time                            // no look for the preferred server or its group before this
 	returnRetry       time.Duration                        // wait after the last failed return; zero before any
 	returnFails       int                                  // returns in a row that failed; at ReturnFailsMax the returns stop
 	lastReturn        time.Time                            // when the last return proved live; zero once it held for ReturnHold or a death followed it
 	returnSeq         int                                  // active_server's write counter the last return left
+	returnGroup       string                               // the preferred group whose server the last return went to; "" for the preferred server itself
 	returnDeath       time.Time                            // failSince of the last death the returns were settled at
 	lastPicked        *vpnconfig.Server                    // the copy the walk picked or a return proved, with the address it ran on
 	keeperNotBefore   time.Time                            // no keeper switch before this: the backoff after a run that found nothing working
