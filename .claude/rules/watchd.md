@@ -247,12 +247,16 @@ lasts, and the check stands down. `active_server` carries `identity` (`vpnconfig
 first 16 hex digits of a SHA-256 of the loose identity, `looseIdentity` above) and `group`
 (`Server.Group`: protocol and security, lowercased as Xray reads them, such as `vless+reality`).
 Every Go writer fills them in through `vpnconfig.RecordActiveServer`; a rename moves only the name.
-The record is current while an entry of its subscription with its name, address and port carries its
-mark - a panel can list twins of one name, address and port, and the user may run any of them - or,
-for a record without a mark (`configure.sh`'s, an older daemon's), while such an entry is listed. It
-changed in place when such entries are listed but none carries the mark, and the first of them is
-followed; it moved when there is none and exactly one entry has its name; anything else - the
-subscription deleted, no entry of the name, several - means it left its list. A changed or moved
+Only an entry of the record's choice counts - its subscription, name and kind
+(`vpnconfig.SameChoice`): a panel can give one name to several inbounds, and an entry of another kind
+is another server, even at the record's address and port. The record is current while an entry of its
+choice at its address and port carries its mark - a panel can list twins of one name, address and
+port, and the user may run any of them - or, for a record without a mark (`configure.sh`'s, an older
+daemon's), while such an entry is listed. It changed in place when such entries are listed but none
+carries the mark, and the first of them is followed; it moved when there is none and exactly one
+entry of its choice is listed elsewhere; anything else - the subscription deleted, no entry of its
+choice, several - means it left its list. A record without `group` knows no kind and goes by
+subscription and name. A changed or moved
 server is followed. In keeper mode one that left, or whose new entry does not answer either, is
 replaced. With clients on Xray the check only follows and leaves such a server to the death rules:
 they move the clients into a tunnel first, and the wave and the walk then pick the server (spec 4.4

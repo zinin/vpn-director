@@ -10,14 +10,14 @@ import "github.com/zinin/vpn-director/server/internal/vpnconfig"
 const OwnFirst = 3
 
 // walkOrder is the order a walk tries the servers of subs in (spec 5.3): the
-// chosen server - found by its subscription, name, address and port, or by
-// subscription and name - then the next servers of its subscription in list
-// order, OwnFirst of them in all; then one server of each subscription in
-// turn, in subscription order, starting with the one after the chosen
-// server's; the chosen subscription's remaining servers take their turns too.
-// Without the chosen server's subscription the turns start at the first. With
-// one subscription this is pickOrder. chosenFirst reports that the chosen
-// server leads the order. Every server carries its subscription's id.
+// chosen server - found by chosenIndex, by its subscription, name and kind -
+// then the next servers of its subscription in list order, OwnFirst of them
+// in all; then one server of each subscription in turn, in subscription order,
+// starting with the one after the chosen server's; the chosen subscription's
+// remaining servers take their turns too. Without the chosen server's
+// subscription the turns start at the first. With one subscription this is
+// pickOrder. chosenFirst reports that the chosen server leads the order. Every
+// server carries its subscription's id.
 func walkOrder(subs []vpnconfig.Subscription, chosen *vpnconfig.ActiveServer) (order []vpnconfig.Server, chosenFirst bool) {
 	if len(subs) == 0 {
 		return nil, false

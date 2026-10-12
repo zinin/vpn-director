@@ -1274,6 +1274,25 @@ func TestMaybeReturn_TwoMinutesAliveIsNotEnough(t *testing.T) {
 	}
 }
 
+// Xray runs Oslo's Shadowsocks twin, a server of the same name and another
+// kind, while Oslo, the user's vless+tls choice, waits in preferred_server. The
+// twin is not the preferred server: once Oslo has been alive five minutes, Xray
+// goes back to it.
+func TestMaybeReturn_ASameNamedServerOfAnotherKindIsNotThePreferredServer(t *testing.T) {
+	s := newReturnKeeper(t)
+	oslo, twin := s.f.subs[0].Servers[0], ssServer("Oslo", "198.51.100.40")
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, twin}
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, twin)
+	s.setStates(map[string]watchdapi.EndpointState{"Oslo": aliveSince(s.f.now.Add(-6*time.Minute), 40)})
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@oslo.example"}) || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v", got, s.f.cfg.Xray.PreferredServer)
+	}
+	if want := []string{"Xray back on the preferred server Alpha / Oslo"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
 // groupReturnStates is the monitor's view of newGroupReturnKeeper at now - Oslo
 // dead for an hour, Shadow alive for an hour, Backup alive for six minutes -
 // with the states in more added or put in their place.

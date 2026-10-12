@@ -37,6 +37,11 @@ func TestClassifyActive(t *testing.T) {
 	// another server there.
 	beta := alpha(oslo)[0]
 	beta.ID, beta.Name, beta.URL = "beta", "Beta", "https://beta.example/list"
+	// A Shadowsocks inbound of the provider under the same name: another kind.
+	ss := ssServer("Oslo", "198.51.100.40")
+	// The same inbound at the record's own address and port.
+	ssHere := ss
+	ssHere.Address, ssHere.Port = "oslo.example", 443
 	cases := []struct {
 		name string
 		subs []vpnconfig.Subscription
@@ -55,6 +60,11 @@ func TestClassifyActive(t *testing.T) {
 		{"changed: the name also at another address", alpha(moved, rekeyed), record, actualChanged, &rekeyed},
 		{"moved", alpha(bergen, moved), record, actualMoved, &moved},
 		{"moved: another port at the address", alpha(bergen, ported), record, actualMoved, &ported},
+		{"current: another kind at the record's address and port beside it", alpha(ssHere, oslo), record, actualCurrent, &oslo},
+		{"moved: the one entry of the name of the record's kind", alpha(ss, moved), record, actualMoved, &moved},
+		{"gone: only another kind left under the name", alpha(bergen, ss), record, actualGone, nil},
+		{"gone: another kind at the record's address and port", alpha(ssHere), record, actualGone, nil},
+		{"a record without a group follows an entry of any kind", alpha(bergen, ss), &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Oslo", Address: "oslo.example", Port: 443}, actualMoved, &ss},
 		{"gone: no entry of the name", alpha(bergen), record, actualGone, nil},
 		{"gone: the name twice", alpha(moved, fastServer("Oslo", "oslo-3.example", "203.0.113.40")), record, actualGone, nil},
 		{"gone: the subscription deleted", nil, record, actualGone, nil},

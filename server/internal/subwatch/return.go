@@ -83,7 +83,9 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		return
 	}
 	active, preferred := cfg.Xray.ActiveServer, cfg.Xray.PreferredServer
-	if active == nil || (active.Subscription == preferred.Subscription && active.Name == preferred.Name) {
+	// A same-named server of another kind is not the preferred server
+	// (vpnconfig.SameChoice): the return goes on looking.
+	if active == nil || vpnconfig.SameChoiceRecord(preferred, active) {
 		return
 	}
 	now := w.Now()

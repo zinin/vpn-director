@@ -762,28 +762,29 @@ func serverID(s vpnconfig.Server) string {
 }
 
 // chosenIndex is where servers has the server a names: the entry of its
-// subscription with its name, address and port, or else the first entry of its
-// subscription with its name - a subscription that rotates endpoints gives a
-// name a new address every day, and the name is what the user chose. Another
-// subscription's server of the same name is never it. -1 when the list has
-// neither.
+// choice (vpnconfig.SameChoice: its subscription, name and kind) at its address
+// and port, or else the first entry of its choice - a subscription that rotates
+// endpoints gives a name a new address every day, and the name and the kind are
+// what the user chose. Another subscription's server of the same name is never
+// it, nor a server of another kind: a panel can give one name to several
+// inbounds. -1 when the list has neither.
 func chosenIndex(servers []vpnconfig.Server, a *vpnconfig.ActiveServer) int {
 	if a == nil || a.Name == "" {
 		return -1
 	}
-	byName := -1
+	first := -1
 	for i, s := range servers {
-		if s.Subscription != a.Subscription || s.Name != a.Name {
+		if !vpnconfig.SameChoice(a, s) {
 			continue
 		}
 		if sameServer(s, a) {
 			return i
 		}
-		if byName < 0 {
-			byName = i
+		if first < 0 {
+			first = i
 		}
 	}
-	return byName
+	return first
 }
 
 // pickOrder is servers with the one chosen names moved to the front.
