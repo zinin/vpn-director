@@ -113,3 +113,74 @@ func TestPublishRefresh_ARenameKeepsTheRecordsMarkAndGroup(t *testing.T) {
 		t.Fatalf("record %+v, want %+v under the new name", got, want)
 	}
 }
+
+// The choice is a server's subscription, name and kind. A panel can give one
+// name to several inbounds; a record without a group knows no kind, and its
+// subscription and name decide.
+func TestSameChoice(t *testing.T) {
+	oslo := reality("Oslo", "www.example.com", "aa11")
+	oslo.Subscription = "0a1b2c3d"
+	record := NewActiveServer(oslo)
+	rotated := oslo
+	rotated.Address, rotated.Outbound = "nl.example", realityOutbound("nl.example", "www.example.com", "aa11")
+	trojan := Server{Subscription: "0a1b2c3d", Name: "Oslo", Address: "de.example", Port: 443, Outbound: trojanTo("de.example")}
+	legacy := Server{Subscription: "0a1b2c3d", Name: "Oslo", Address: "de.example", Port: 443}
+	other := oslo
+	other.Subscription = "1b2c3d4e"
+	bergen := oslo
+	bergen.Name = "Bergen"
+	noGroup := &ActiveServer{Subscription: "0a1b2c3d", Name: "Oslo", Address: "de.example", Port: 443}
+	cases := []struct {
+		name string
+		a    *ActiveServer
+		s    Server
+		want bool
+	}{
+		{"the same server", record, oslo, true},
+		{"the same kind at a new address", record, rotated, true},
+		{"another kind at the same address and port", record, trojan, false},
+		{"an entry without an outbound", record, legacy, false},
+		{"another subscription", record, other, false},
+		{"another name", record, bergen, false},
+		{"a record without a group, another kind", noGroup, trojan, true},
+		{"no record", nil, oslo, false},
+	}
+	for _, tc := range cases {
+		if got := SameChoice(tc.a, tc.s); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// SameChoiceRecord holds the server another record names to the choice by that
+// record's group. The first record is the choice: a second one without a group
+// is not of its kind when the choice has one.
+func TestSameChoiceRecord(t *testing.T) {
+	oslo := reality("Oslo", "www.example.com", "aa11")
+	oslo.Subscription = "0a1b2c3d"
+	choice := NewActiveServer(oslo)
+	trojan := NewActiveServer(Server{Subscription: "0a1b2c3d", Name: "Oslo", Address: "de.example", Port: 443, Outbound: trojanTo("de.example")})
+	rotated := *choice
+	rotated.Address = "nl.example"
+	noGroup := &ActiveServer{Subscription: "0a1b2c3d", Name: "Oslo", Address: "de.example", Port: 443}
+	other := *choice
+	other.Subscription = "1b2c3d4e"
+	cases := []struct {
+		name string
+		a, b *ActiveServer
+		want bool
+	}{
+		{"the same kind at a new address", choice, &rotated, true},
+		{"another kind", choice, trojan, false},
+		{"a record without a group for a choice with one", choice, noGroup, false},
+		{"a choice without a group", noGroup, trojan, true},
+		{"another subscription", choice, &other, false},
+		{"no record", choice, nil, false},
+		{"no choice", nil, choice, false},
+	}
+	for _, tc := range cases {
+		if got := SameChoiceRecord(tc.a, tc.b); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

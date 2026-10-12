@@ -248,6 +248,59 @@ func TestKeeper_FastEvidenceSwitchesAtOnce(t *testing.T) {
 	}
 }
 
+// setHealthOf is setHealth for servers a name does not tell apart: the monitor
+// holds the endpoints of dead dead and those of alive alive, and the main probe
+// last worked on the active server a minute before the monitor saw them die.
+func (s *fastFixture) setHealthOf(dead, alive []vpnconfig.Server) {
+	cached := monitor.Evidence{State: watchdapi.StateOK, Endpoints: make(map[string]watchdapi.EndpointState)}
+	fresh := monitor.Evidence{State: watchdapi.StateOK, Endpoints: make(map[string]watchdapi.EndpointState)}
+	put := func(servers []vpnconfig.Server, status watchdapi.Status) {
+		for _, server := range servers {
+			for _, key := range endpoint.Keys(server) {
+				state := watchdapi.EndpointState{Status: status, CheckedAt: s.f.now, NextAt: s.f.now.Add(time.Minute), Since: s.f.now}
+				if status == watchdapi.StatusAlive {
+					state.LatencyMS = 17
+				} else {
+					state.Fails, state.Error = 1, "timeout"
+				}
+				fresh.Endpoints[key] = state
+				state.CheckedAt = s.f.now.Add(-time.Minute)
+				cached.Endpoints[key] = state
+			}
+		}
+	}
+	put(dead, watchdapi.StatusDead)
+	put(alive, watchdapi.StatusAlive)
+	s.h = &fastHealth{cached: cached, fresh: fresh, invalid: make(map[string]bool)}
+	s.w.Health = s.h
+	s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(s.f.cfg.Xray.ActiveServer)
+}
+
+// A panel lists Oslo twice: the user's vless+tls server and a Shadowsocks
+// inbound. Oslo dies while the twin is alive: the fast path switches to the
+// twin, and the record keeps Oslo, the user's kind, in preferred_server - the
+// twin is another server, and the return can bring Xray back.
+func TestKeeper_AFastSwitchToASameNamedServerOfAnotherKindKeepsTheChoice(t *testing.T) {
+	s := newKeeperFixture(t)
+	oslo, twin := s.f.subs[0].Servers[0], ssServer("Oslo", "198.51.100.40")
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, twin}
+	s.setHealthOf([]vpnconfig.Server{oslo}, []vpnconfig.Server{twin})
+	s.passThenMiss(time.Second)
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@198.51.100.40"}) {
+		t.Fatalf("written %v", got)
+	}
+	if p := s.f.cfg.Xray.PreferredServer; p == nil || p.Address != "oslo.example" || p.Group != "vless+tls" {
+		t.Fatalf("preferred %+v, want the user's vless+tls Oslo", p)
+	}
+	if a := s.f.cfg.Xray.ActiveServer; a == nil || a.Group != "shadowsocks" {
+		t.Fatalf("active %+v, want the twin", a)
+	}
+	if want := []string{"Xray switched to server Alpha / Oslo"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
 // The entry Oslo moved to does not answer either: it is replaced as dead, and
 // not tried again on the next tick.
 func TestKeeper_AFollowedEntryThatDoesNotAnswerIsReplaced(t *testing.T) {
