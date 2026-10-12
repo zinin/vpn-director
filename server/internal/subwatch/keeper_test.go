@@ -584,6 +584,57 @@ func TestTick_WithClientsAFollowThatDoesNotAnswerFailsOver(t *testing.T) {
 	}
 }
 
+// With clients on Xray a follow that records nothing leaves active_server
+// naming the server that moved, and every tick after it would follow that
+// server again: the death rules of the same tick act on it instead, and the
+// clients fail over DeadAfter after the first miss. The generator refuses an
+// outbound the router's Xray cannot run; a config that cannot be saved leaves
+// config.json written but not the record.
+func TestTick_WithClientsAFollowThatRecordsNothingFailsOver(t *testing.T) {
+	cases := []struct {
+		name      string
+		generated bool // config.json written, the record not saved
+	}{
+		{"the generator refuses the entry", false},
+		{"the record is not saved", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newClientsKeeper(t)
+			s.w.Health = nil
+			s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+			generate := s.w.Generate
+			var follows, others int
+			s.w.Generate = func(server vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				if server.Name != "Oslo" {
+					others++
+					return generate(server, guard)
+				}
+				s.generateCalls++
+				follows++
+				if !tc.generated {
+					return false, 0, errors.New("unsupported outbound")
+				}
+				return true, s.f.seq(), errors.New("config not saved")
+			}
+			s.w.Probe = func(context.Context, int) error { s.probes++; return errProbe }
+			s.missOnce(t)
+			tickFor(s.w, s.f, DeadAfter-2*ProbeInterval)
+			if s.f.cfg.Xray.Failover != nil || follows == 0 || others != 0 {
+				t.Fatalf("failover %+v, follows %d, other servers generated %d before DeadAfter",
+					s.f.cfg.Xray.Failover, follows, others)
+			}
+			s.w.Tick(context.Background())
+			if f := s.f.cfg.Xray.Failover; f == nil || f.Tunnel != "ovpnc2" {
+				t.Fatalf("failover %+v DeadAfter after the first miss; a follow that recorded nothing leaves the death rules to its tick", f)
+			}
+			if want := []string{fmt.Sprintf(msgMoved, "tunnel:ovpnc2")}; !reflect.DeepEqual(s.f.notes, want) {
+				t.Fatalf("notes %v, want %v", s.f.notes, want)
+			}
+		})
+	}
+}
+
 // newClientsKeeper is the fast fixture with clients on Xray - the watch armed -
 // and active_server recorded as a Go writer records it, identity and group
 // included.

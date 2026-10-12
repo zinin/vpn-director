@@ -126,11 +126,12 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 // subscription goes to the death rules of the same tick, and a follow whose
 // entry does not answer ends the tick on its write: the next tick finds that
 // record current, and its death rules act on it, failSince still counting from
-// the first miss. The whole action has one fence, the record the check
-// classified: a replacement after a follow that failed carries on from the
-// follow's write, and a selection the user commits meanwhile ends it. It
-// reports whether it acted - switched, tried, or was ended - and the tick then
-// ends.
+// the first miss. A follow that recorded nothing leaves them to its own tick.
+// The whole action has one fence, the record the check classified: a
+// replacement after a follow that failed carries on from the follow's write,
+// and a selection the user commits meanwhile ends it. It reports whether it
+// acted - switched, tried, or was ended - and the tick then ends; with clients
+// on Xray, a follow that recorded nothing has not acted.
 //
 // While the probe passes it does nothing: a working Xray is left alone. A
 // panel that picks a host's address or SNI at random for each download -
@@ -202,9 +203,14 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	// server died. With clients on Xray the tick ends on the follow's write,
 	// and the death rules of the next tick, which finds that record current,
 	// act on it. They do not run in this one: its cfg predates the write,
-	// which the fast path's ownership would take for a newer selection.
+	// which the fast path's ownership would take for a newer selection. A
+	// follow that recorded nothing - the generator refused every copy, the
+	// monitor rejected them all, or the record was not saved - left cfg
+	// current and active_server naming the server that moved: the death
+	// rules of this tick act on it, or every tick would follow that server
+	// again and the clients would never fail over.
 	if clients {
-		return true
+		return sw.lastRecorded != ""
 	}
 	// In keeper mode a replacement carries on from the follow's write, which
 	// is the action's own, and sw knows it.

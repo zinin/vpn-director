@@ -259,7 +259,11 @@ they move the clients into a tunnel first, and the wave and the walk then pick t
 leaves a death with clients to that failover), where a replacement would keep them on a dead Xray
 for a restart per candidate. After a follow whose entry does not answer, the tick ends on the
 follow's write; the next tick finds that record current, and its death rules act on it, the minutes
-still counting from the first miss. The check reads the lists as a refresh left them: a server the
+still counting from the first miss. A follow that records nothing - the generator refuses every copy
+of the entry, as it refuses an outbound the router's Xray cannot run, the monitor rejected them all,
+or the record is not saved - leaves `active_server` naming the server that moved, and the death
+rules of the same tick act on it: every later tick would otherwise follow that server again, and
+the clients would never fail over. The check reads the lists as a refresh left them: a server the
 periodic refresh moved is followed at the next tick whose probe fails, the second failure in a row
 or a later one.
 
