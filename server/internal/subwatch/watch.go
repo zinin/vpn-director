@@ -382,10 +382,13 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.failSince = now
 		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 	}
-	// The probe failed: a selected server that moved, changed or left its list
-	// is followed or replaced before the death rules, as the keeper does. While
-	// Xray works the check leaves it alone (followActive).
-	if w.followActive(ctx, cfg) {
+	// The probe failed: a selected server that moved or changed is followed
+	// before the death rules, as the keeper does. One that left its list, or
+	// whose new entry does not answer either, is not replaced here: the death
+	// rules move the clients into a tunnel first (spec 4.4), and the wave and
+	// the walk pick the server. While Xray works the check leaves it alone
+	// (followActive).
+	if w.followActive(ctx, cfg, true) {
 		return
 	}
 	attempt := w.fastFailover(ctx, cfg)

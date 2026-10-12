@@ -249,9 +249,15 @@ name, address and port, and the user may run any of them - or, for a record with
 (`configure.sh`'s, an older daemon's), while such an entry is listed. It changed in place when such
 entries are listed but none carries the mark, and the first of them is followed; it moved when there
 is none and exactly one entry has its name; anything else - the subscription deleted, no entry of
-the name, several - means it left its list. A changed or moved server is followed; one that left, or
-whose new entry does not answer either, is replaced. The check reads the lists as a refresh left
-them: a server the periodic refresh moved is followed at the next tick whose probe fails.
+the name, several - means it left its list. A changed or moved server is followed. In keeper mode
+one that left, or whose new entry does not answer either, is replaced. With clients on Xray the
+check only follows and leaves such a server to the death rules: they move the clients into a tunnel
+first, and the wave and the walk then pick the server (spec 4.4 leaves a death with clients to that
+failover), where a replacement would keep them on a dead Xray for a restart per candidate. After a
+follow whose entry does not answer, the tick ends on the follow's write; the next tick finds that
+record current, and its death rules act on it, the minutes still counting from the first miss. The
+check reads the lists as a refresh left them: a server the periodic refresh moved is followed at the
+next tick whose probe fails.
 
 A replacement tries the candidates in `orderBest` order (`subwatch/best.go`), the same order the
 fast path and the walk use. Its reference is the user's choice (`refFor`): `preferred_server`, else
@@ -279,8 +285,8 @@ WAN's sake, each after an Xray restart, and the run would end in a "No working X
 that blames the servers; the armed watch walks nothing when every download failed, for the same
 reason. Once the WAN is back the replacement goes on. The fast path and the unreachable rule
 confirm a death only with the WAN working. A follow does not wait: the server's new entry is right
-whatever the WAN does. With clients on Xray, the death rules run on while a replacement of a server
-that left its list waits, and can still move the clients into a tunnel.
+whatever the WAN does. With clients on Xray the check replaces nothing and so waits for nothing: a
+server that left its list goes to the death rules, which can move the clients into a tunnel.
 
 Each keeper action - a follow and the replacement after it, a replacement of a server that left its
 list or died - has one fence, the record it started from (`newSwitcher`): a Web UI, `/xray` or

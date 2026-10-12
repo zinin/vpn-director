@@ -502,6 +502,59 @@ func TestTick_WithClientsFollowsAMovedServer(t *testing.T) {
 	}
 }
 
+// With clients on Xray the check only follows (spec 4.4): a server that left
+// its list is left to the death rules. The tick of the first failed probe
+// writes and restarts nothing, and once the death is confirmed the clients
+// fail over into a tunnel - no keeper replacement, no "left its subscription"
+// message.
+func TestTick_WithClientsAServerThatLeftItsListFailsOver(t *testing.T) {
+	s := newClientsKeeper(t)
+	s.w.Health = nil
+	s.f.subs[0].Servers = s.f.subs[0].Servers[1:] // Oslo left; Backup alone
+	s.w.Tick(context.Background())
+	if s.generateCalls != 0 || s.restarts != 0 || len(s.f.notes) != 0 {
+		t.Fatalf("generate %d, restarts %d, notes %v at the first failed probe; the death rules take it", s.generateCalls, s.restarts, s.f.notes)
+	}
+	s.f.now = s.f.now.Add(ProbeInterval)
+	tickFor(s.w, s.f, DeadAfter-ProbeInterval)
+	if f := s.f.cfg.Xray.Failover; f == nil || f.Tunnel != "ovpnc2" || s.generateCalls != 0 || s.restarts != 0 {
+		t.Fatalf("failover %+v, generate %d, restarts %d; the clients must fail over, Xray untouched", f, s.generateCalls, s.restarts)
+	}
+	if want := []string{fmt.Sprintf(msgMoved, "tunnel:ovpnc2")}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
+// With clients on Xray a follow whose entry does not answer either ends the
+// tick on its write: the followed entry's copies are written, and no other
+// server. The next ticks find the followed record current, and their death
+// rules fail the clients over DeadAfter after the first miss - the follow does
+// not start the minutes over.
+func TestTick_WithClientsAFollowThatDoesNotAnswerFailsOver(t *testing.T) {
+	s := newClientsKeeper(t)
+	s.w.Health = nil
+	moved := fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+	moved.IPs = []string{"203.0.113.30", "203.0.113.31"}
+	s.f.subs[0].Servers[0] = moved
+	s.w.Probe = func(context.Context, int) error { s.probes++; return errProbe }
+	s.w.Tick(context.Background())
+	if got := healthLabels(s.written); !reflect.DeepEqual(got, []string{"Oslo@203.0.113.30", "Oslo@203.0.113.31"}) {
+		t.Fatalf("written %v; want the followed entry's copies alone", got)
+	}
+	s.f.now = s.f.now.Add(ProbeInterval)
+	tickFor(s.w, s.f, DeadAfter-2*ProbeInterval)
+	if s.f.cfg.Xray.Failover != nil || len(s.written) != 2 {
+		t.Fatalf("failover %+v, written %v before DeadAfter", s.f.cfg.Xray.Failover, healthLabels(s.written))
+	}
+	s.w.Tick(context.Background())
+	if f := s.f.cfg.Xray.Failover; f == nil || f.Tunnel != "ovpnc2" || len(s.written) != 2 {
+		t.Fatalf("failover %+v, written %v DeadAfter after the first miss", f, healthLabels(s.written))
+	}
+	if want := []string{fmt.Sprintf(msgMoved, "tunnel:ovpnc2")}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
 // newClientsKeeper is the fast fixture with clients on Xray - the watch armed -
 // and active_server recorded as a Go writer records it, identity and group
 // included.
@@ -517,38 +570,42 @@ func newClientsKeeper(t *testing.T) *fastFixture {
 // subscription - its subscription deleted included - is neither followed nor
 // replaced, however many ticks pass. A panel that picks a host's address or SNI
 // at random for each download reads as moved at every refresh. Once the probe
-// fails - the old address no longer answers - it is followed or replaced on
-// that tick, in both modes.
+// fails - the old address no longer answers - a server that moved or changed
+// is followed on that tick, in both modes. One that left its list is replaced
+// on that tick in keeper mode; with clients on Xray it goes to the death rules,
+// and nothing is written then.
 func TestActuality_OnlyOnceTheProbeFails(t *testing.T) {
 	cases := []struct {
 		name    string
 		change  func(*fastFixture)
+		left    bool // the server left its list
 		written string
 		note    string
 	}{
 		{"moved", func(s *fastFixture) {
 			s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
-		}, "Oslo@oslo-2.example", "Xray server Alpha / Oslo moved; Xray follows it"},
+		}, false, "Oslo@oslo-2.example", "Xray server Alpha / Oslo moved; Xray follows it"},
 		{"changed in place", func(s *fastFixture) {
 			oslo := s.f.subs[0].Servers[0]
 			oslo.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
 			s.f.subs[0].Servers[0] = oslo
-		}, "Oslo@oslo.example", "Xray server Alpha / Oslo changed; Xray follows it"},
+		}, false, "Oslo@oslo.example", "Xray server Alpha / Oslo changed; Xray follows it"},
 		{"left its subscription", func(s *fastFixture) {
 			s.f.subs[0].Servers = s.f.subs[0].Servers[1:]
-		}, "Backup@backup.example", "Xray server Alpha / Oslo left its subscription; Xray switched to Alpha / Backup"},
+		}, true, "Backup@backup.example", "Xray server Alpha / Oslo left its subscription; Xray switched to Alpha / Backup"},
 		{"its subscription deleted", func(s *fastFixture) {
 			s.f.subs = []vpnconfig.Subscription{{ID: "beta", Name: "Beta", URL: "https://beta.example/list",
 				Servers: []vpnconfig.Server{fastServer("Faster", "faster.example", "198.51.100.30")}}}
 			s.setHealth()
-		}, "Faster@faster.example", "Xray server Oslo left its subscription; Xray switched to Beta / Faster"},
+		}, true, "Faster@faster.example", "Xray server Oslo left its subscription; Xray switched to Beta / Faster"},
 	}
 	for _, mode := range []struct {
 		name    string
 		fixture func(*testing.T) *fastFixture
+		clients bool
 	}{
-		{"keeper mode", newKeeperFixture},
-		{"clients mode", newClientsKeeper},
+		{"keeper mode", newKeeperFixture, false},
+		{"clients mode", newClientsKeeper, true},
 	} {
 		t.Run(mode.name, func(t *testing.T) {
 			for _, tc := range cases {
@@ -574,6 +631,13 @@ func TestActuality_OnlyOnceTheProbeFails(t *testing.T) {
 					}
 					working = false
 					s.w.Tick(context.Background())
+					if tc.left && mode.clients {
+						if s.generateCalls != 0 || s.restarts != 0 || len(s.f.notes) != 0 {
+							t.Fatalf("generate %d, restarts %d, notes %v at the first failed probe; with clients on Xray the death rules take it",
+								s.generateCalls, s.restarts, s.f.notes)
+						}
+						return
+					}
 					if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{tc.written}) || s.restarts != 1 {
 						t.Fatalf("written %v, restarts %d at the first failed probe; want %s", got, s.restarts, tc.written)
 					}
@@ -822,10 +886,10 @@ func TestKeeper_AWorkingProbeEndsTheBackoff(t *testing.T) {
 // With clients on Xray a working probe ends the keeper's run as well (Ruling
 // T5-R1): a server that moves afterwards is followed as soon as its old
 // address stops answering, not after the backoff of a run that found nothing
-// working. While Xray still works there, the move is left alone (owner
-// decision C1).
+// working before the clients came. While Xray still works there, the move is
+// left alone (owner decision C1).
 func TestTick_AWorkingProbeEndsTheKeeperBackoff(t *testing.T) {
-	s := newClientsKeeper(t)
+	s := newKeeperFixture(t)
 	s.f.subs[0].Servers = s.f.subs[0].Servers[1:] // Oslo left; Backup alone
 	working := false
 	s.w.Probe = func(context.Context, int) error {
@@ -835,7 +899,9 @@ func TestTick_AWorkingProbeEndsTheKeeperBackoff(t *testing.T) {
 		}
 		return errProbe
 	}
-	s.w.Tick(context.Background()) // Oslo replaced by Backup, which does not answer: the run backs off
+	s.w.Tick(context.Background()) // the keeper replaces Oslo by Backup, which does not answer: the run backs off
+	// A client comes onto Xray, and the watch is armed.
+	s.f.cfg.Xray.Clients = []string{"192.168.1.8"}
 	s.f.now = s.f.now.Add(ProbeInterval)
 	working = true
 	s.w.Tick(context.Background()) // Xray works on Backup

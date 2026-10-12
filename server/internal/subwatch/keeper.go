@@ -69,7 +69,7 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		w.failSince = now
 		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 	}
-	if w.followActive(ctx, cfg) {
+	if w.followActive(ctx, cfg, false) {
 		return
 	}
 	if now.Before(w.keeperNotBefore) {
@@ -109,13 +109,20 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 // with its list before the death rules - on every such tick outside the
 // keeper's backoff (keeperNotBefore, which a run in which no candidate worked
 // sets), so a server the periodic refresh moves while Xray is already failing
-// is followed too. A server that changed in place or moved is followed; one
-// whose new entry does not answer either, and one that left its subscription,
-// are replaced. The whole action has one fence, the record the check
-// classified: a replacement after a follow that failed carries on from the
-// follow's write, and a selection the user commits meanwhile ends it. It
-// reports whether it acted - switched, tried and backed off, or was ended -
-// and the tick then ends.
+// is followed too. A server that changed in place or moved is followed. In
+// keeper mode one whose new entry does not answer either, and one that left
+// its subscription, are replaced. With clients on Xray (clients) the check
+// only follows: spec 4.4 leaves a death with clients to the make-before-break
+// failover, which moves them into a tunnel first and lets the wave and the
+// walk pick the server, while a replacement would keep them on a dead Xray for
+// a restart per candidate. So a server that left its subscription goes to the
+// death rules of the same tick, and a follow whose entry does not answer ends
+// the tick on its write: the next tick finds that record current, and its
+// death rules act on it, failSince still counting from the first miss. The
+// whole action has one fence, the record the check classified: a replacement
+// after a follow that failed carries on from the follow's write, and a
+// selection the user commits meanwhile ends it. It reports whether it acted -
+// switched, tried, or was ended - and the tick then ends.
 //
 // While the probe passes it does nothing: a working Xray is left alone. A
 // panel that picks a host's address or SNI at random for each download -
@@ -131,7 +138,7 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 // logic owns the record then - the walk picks the server, a restore finishes
 // on the one its probe passed - and a switch of the check's own would cut
 // across it.
-func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
+func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, clients bool) bool {
 	if cfg == nil || w.failSince.IsZero() || w.pendingApply || cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil {
 		return false
 	}
@@ -151,9 +158,14 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	was := label(subscriptionNames(subs), a.Subscription, a.Name)
 	sw := w.newSwitcher(cfg, subs)
 	if state == actualGone {
+		// With clients on Xray the death rules of this tick take it: they move
+		// the clients into a tunnel first, and the wave and the walk pick the
+		// server.
+		if clients {
+			return false
+		}
 		// A replacement that waits for the WAN does nothing: the tick goes
-		// on to the death rules, which with clients on Xray may still move
-		// them into a tunnel.
+		// on to the death rules.
 		if w.replacementWaits(ctx) {
 			return false
 		}
@@ -179,7 +191,15 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		return true
 	}
 	// The entry it moved to does not answer either: as far as Xray goes, the
-	// server died. The follow's write is the action's own, and sw knows it.
+	// server died. With clients on Xray the tick ends on the follow's write,
+	// and the death rules of the next tick, which finds that record current,
+	// act on it. They do not run in this one: its cfg predates the write,
+	// which the fast path's ownership would take for a newer selection.
+	if clients {
+		return true
+	}
+	// In keeper mode a replacement carries on from the follow's write, which
+	// is the action's own, and sw knows it.
 	if w.replacementWaits(ctx) {
 		return true
 	}
