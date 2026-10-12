@@ -88,8 +88,11 @@ func copyFastServer(s vpnconfig.Server) vpnconfig.Server {
 // address and port, inbounds of other kinds behind one port or one kind with
 // other keys, and each is an endpoint of its own to the monitor: the fast path
 // reads the death of the twin Xray runs, and a replacement tries that twin's
-// connection last. With no entry of a's kind there, there is none: the legacy
-// rules and the actuality check decide.
+// connection last. With no entry of a's kind there, or none that carries a's
+// mark - new keys in place, which Xray does not run until the actuality check
+// follows them - the monitor has no evidence of what Xray runs, and there is
+// none: the legacy rules and the actuality check decide. A record without a
+// mark takes the first entry of its kind.
 func exactFastServer(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (vpnconfig.Server, bool) {
 	if a == nil || a.Name == "" || a.Address == "" || a.Port == 0 {
 		return vpnconfig.Server{}, false
@@ -99,7 +102,7 @@ func exactFastServer(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (
 		return vpnconfig.Server{}, false
 	}
 	j := vpnconfig.RecordedIndex(a, subs[i].Servers)
-	if j < 0 {
+	if j < 0 || (a.Identity != "" && vpnconfig.IdentityMark(subs[i].Servers[j]) != a.Identity) {
 		return vpnconfig.Server{}, false
 	}
 	s := subs[i].Servers[j]
@@ -480,7 +483,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			owner.ports = &ports
 		}
 		w.setStatusAction("switch")
-		generated, seq, err := w.Generate(c.server, candidateGuard)
+		generated, seq, err := w.generate(c.server, candidateGuard)
 		if w.mutationEnded(ctx) || fastTerminal(err) || errors.Is(err, errFastEvidence) {
 			return finish(err)
 		}
@@ -566,9 +569,22 @@ func (w *Watch) outboundAllowedNow() error {
 	return err
 }
 
+// generate writes s as the running server through Generate - every write of
+// the record the watch makes goes through here - and remembers the write
+// counter of a record it saved (ownSeq): the failure episode it was written in
+// goes on, where a record the watch did not write begins one of its own
+// (missed).
+func (w *Watch) generate(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+	generated, seq, err := w.Generate(s, guard)
+	if generated && err == nil {
+		w.ownSeq = seq
+	}
+	return generated, seq, err
+}
+
 func (w *Watch) generateWalked(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 	if w.outboundGuard == nil {
-		return w.Generate(s, guard)
+		return w.generate(s, guard)
 	}
 	if err := w.outboundAllowedNow(); err != nil {
 		return false, 0, err
@@ -598,7 +614,7 @@ func (w *Watch) generateWalked(s vpnconfig.Server, guard func(*vpnconfig.VPNDire
 		}
 		return w.mutationAllowed()
 	}
-	generated, seq, err := w.Generate(s, combined)
+	generated, seq, err := w.generate(s, combined)
 	if generated && w.fastOwned != nil {
 		w.fastOwned.record(s, seq, err)
 	}

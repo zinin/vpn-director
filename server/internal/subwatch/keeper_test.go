@@ -389,6 +389,41 @@ func TestKeeper_AnAliveTwinOfAnotherKindTakesItsTurn(t *testing.T) {
 	}
 }
 
+// Oslo has failed for two and a half minutes when the user selects Backup in
+// the Web UI. Backup's first miss starts an episode of its own: the user's
+// server gets three minutes of its own, not what is left of Oslo's, before the
+// keeper replaces it or, with clients on Xray, they move into a tunnel.
+func TestTick_ASelectionStartsItsOwnConfirmation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		clients bool
+	}{
+		{"keeper", false},
+		{"clients on Xray", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newKeeperFixture(t)
+			if tc.clients {
+				s = newFastFixture(t)
+				s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, s.f.subs[0].Servers[0])
+			}
+			s.w.Health = nil
+			acted := func() bool { return len(s.written) > 0 || s.f.cfg.Xray.Failover != nil }
+			tickFor(s.w, s.f, DeadAfter-ProbeInterval)
+			s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, s.f.subs[0].Servers[1])
+			start := s.f.now
+			tickFor(s.w, s.f, DeadAfter-ProbeInterval)
+			if acted() {
+				t.Fatalf("written %v, failover %+v within %v of Backup's first miss", writtenNames(s.written), s.f.cfg.Xray.Failover, s.f.now.Sub(start))
+			}
+			s.w.Tick(context.Background())
+			if !acted() {
+				t.Fatalf("nothing acted %v after Backup's first miss", s.f.now.Sub(start))
+			}
+		})
+	}
+}
+
 // With fresh evidence the fast path replaces the server within a tick, with
 // its own message.
 func TestKeeper_FastEvidenceSwitchesAtOnce(t *testing.T) {

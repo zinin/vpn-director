@@ -114,6 +114,7 @@ type Watch struct {
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
 	failSeq           int       // active_server's write counter when failSince was set: the record that began to fail
+	ownSeq            int       // active_server's write counter of the record the watch last wrote itself (generate)
 	failedProbes      int       // probes failed since failSince was set: the actuality check waits for two, a single miss being the common transient
 	probeOKAt         time.Time // when the main SOCKS probe last succeeded,
 	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on,
@@ -380,11 +381,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 
 	now := w.Now()
-	if w.failSince.IsZero() {
-		w.failSince = now
-		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
-	}
-	w.failedProbes++
+	w.missed(cfg, now)
 	// The probe failed: from the second failure in a row, a selected server
 	// that moved or changed is followed before the death rules, as the keeper
 	// does. One that left its list, or whose new entry does not answer
@@ -1737,6 +1734,24 @@ func (w *Watch) resetFail() {
 	w.failSince = time.Time{}
 	w.failedProbes = 0
 	w.downChecks = 0
+}
+
+// missed counts a failed probe of the server the record cfg names. The first
+// miss begins a failure episode, and so does the first miss of a record the
+// watch did not write since the episode began - a selection in the Web UI,
+// /xray or the wizard: the user's server gets a confirmation of its own, the
+// full DeadAfter and the two misses in a row the actuality check waits for,
+// not what is left of the server it replaced. The watch's own writes in an
+// episode - a follow, a replacement, the fast path's - leave it counting.
+func (w *Watch) missed(cfg *vpnconfig.VPNDirectorConfig, now time.Time) {
+	seq := vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+	if !w.failSince.IsZero() && seq != w.failSeq && seq != w.ownSeq {
+		w.resetFail()
+	}
+	if w.failSince.IsZero() {
+		w.failSince, w.failSeq = now, seq
+	}
+	w.failedProbes++
 }
 
 // deadReason is why an outbound failing since failSince counts as dead at now,

@@ -114,6 +114,40 @@ func TestPublishRefresh_ARenameKeepsTheRecordsMarkAndGroup(t *testing.T) {
 	}
 }
 
+// RecordedIndex finds the server a record was written from among twins of one
+// name, address and port: its kind and its mark decide. With no twin of its
+// mark - new keys in place - the first of its kind is still the server the
+// record names, and a rename moves the record along with it. A record without
+// a group or a mark takes the first twin.
+func TestRecordedIndex(t *testing.T) {
+	oslo := reality("Oslo", "www.example.com", "aa11")
+	rekeyed := oslo
+	rekeyed.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), `"u-1"`, `"u-2"`, 1))
+	trojan := Server{Name: "Oslo", Address: "de.example", Port: 443, Outbound: trojanTo("de.example")}
+	elsewhere := oslo
+	elsewhere.Address = "nl.example"
+	record := NewActiveServer(oslo)
+	legacy := &ActiveServer{Name: "Oslo", Address: "de.example", Port: 443}
+	cases := []struct {
+		name    string
+		a       *ActiveServer
+		servers []Server
+		want    int
+	}{
+		{"its mark among twins", record, []Server{trojan, rekeyed, oslo}, 2},
+		{"no twin of its mark: the first of its kind", record, []Server{trojan, rekeyed}, 1},
+		{"another kind alone", record, []Server{trojan}, -1},
+		{"another address", record, []Server{elsewhere}, -1},
+		{"a record without a group or a mark", legacy, []Server{trojan, oslo}, 0},
+		{"no record", nil, []Server{oslo}, -1},
+	}
+	for _, tc := range cases {
+		if got := RecordedIndex(tc.a, tc.servers); got != tc.want {
+			t.Errorf("%s: %d, want %d", tc.name, got, tc.want)
+		}
+	}
+}
+
 // A panel lists twins of one name, address and port - a Trojan fallback
 // listed before the REALITY Oslo the user runs - and a refresh renames one of
 // them. The record follows the twin it was written from, by its kind and mark:

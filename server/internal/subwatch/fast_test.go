@@ -1731,9 +1731,10 @@ func TestFastFailover_TriesTheUsersGroupFirst(t *testing.T) {
 // A panel can list twins of one name, address and port: inbounds of other
 // kinds behind one port, or the same kind with other keys. Each is its own
 // endpoint to the monitor, so the entry the fast path reads is the twin Xray
-// runs: of the record's kind, with its mark, else the first of its kind. A twin
-// of another kind alone is not it. A record without a group or a mark knows
-// neither, and takes the first twin.
+// runs: of the record's kind, with its mark. A twin of another kind is not it,
+// nor one with other keys: with no twin of its mark, Xray runs an outbound the
+// list no longer has. A record without a group or a mark knows neither, and
+// takes the first twin.
 func TestExactFastServer_FindsTheTwinXrayRuns(t *testing.T) {
 	oslo := fastServer("Oslo", "oslo.example", "203.0.113.10")
 	rekeyed := oslo
@@ -1753,7 +1754,7 @@ func TestExactFastServer_FindsTheTwinXrayRuns(t *testing.T) {
 	}{
 		{"another kind listed first", alpha(ss, oslo), record, &oslo},
 		{"other keys of the kind listed first", alpha(rekeyed, oslo), record, &oslo},
-		{"no twin with the mark: the first of the kind", alpha(ss, rekeyed), record, &rekeyed},
+		{"no twin with the mark", alpha(ss, rekeyed), record, nil},
 		{"another kind alone", alpha(ss), record, nil},
 		{"a record without a group or a mark", alpha(ss, oslo), legacy, &ss},
 	}
@@ -1832,6 +1833,22 @@ func TestFast_AProbeOfOneTwinIsNoProofForTheOther(t *testing.T) {
 	}
 	healthy = false
 	s.f.now = s.f.now.Add(ProbeInterval)
+	s.w.Tick(context.Background())
+	s.assertNoMutation(t)
+}
+
+// A refresh gave Oslo new keys in place, and Xray still runs the old ones: no
+// entry carries the record's mark. The monitor's dead of the new entry says
+// nothing of the outbound Xray runs, and one miss switches nothing - from the
+// second the actuality check follows the new entry.
+func TestFast_TheDeathOfAnEntryWithOtherKeysIsNoProof(t *testing.T) {
+	s := newFastFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, oslo)
+	rekeyed := oslo
+	rekeyed.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+	s.f.subs[0].Servers = []vpnconfig.Server{rekeyed, backup}
+	s.setHealthOf([]vpnconfig.Server{rekeyed}, []vpnconfig.Server{backup})
 	s.w.Tick(context.Background())
 	s.assertNoMutation(t)
 }

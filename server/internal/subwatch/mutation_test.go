@@ -427,7 +427,8 @@ func TestMutation_GateAfterWaitDoesNotPublishOrAnnounce(t *testing.T) {
 			}
 			f := &fake{cfg: cfg, probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 			w := runningWatch(f.watch())
-			w.failSince = f.now.Add(-3 * time.Minute)
+			// The record has been failing for three minutes: the episode is its own.
+			w.failSince, w.failSeq = f.now.Add(-3*time.Minute), vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 			var incompatible atomic.Bool
 			w.CanMutate = mutationGate(&incompatible)
 			waits, saves, generations, restarts := 0, 0, 0, 0
@@ -564,7 +565,7 @@ func TestMutation_PollRefusedAtTheTickEndKeepsTheFailureClock(t *testing.T) {
 	f := &fake{cfg: mutationConfig(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	w := runningWatch(f.watch())
 	start := f.now.Add(-time.Minute)
-	w.failSince = start
+	w.failSince, w.failSeq = start, vpnconfig.ActiveSeq(f.cfg.Xray.ActiveServer)
 	var block, refused atomic.Bool
 	var tick context.Context
 	inflight := make(chan struct{})

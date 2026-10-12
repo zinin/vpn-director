@@ -117,10 +117,12 @@ first, by latency - and none on an address the active server uses: a rotation or
 block takes the address, so the other names a provider lists on it die with the active one, and
 their dead checks (22 s each) seldom end inside the deadline. The active endpoints are those of
 the entry Xray runs (`exactFastServer`, `vpnconfig.RecordedIndex`): the entry of the record's
-choice - its subscription, name and kind - at its address and port that carries its mark, or else
-the first such. A panel can list twins of one name, address and port, and each is an endpoint of
-its own to the monitor; a record without `group` takes the first entry there, and with none of its
-kind there the fast path does not apply. Fresh checks share one 30-second deadline and the
+choice - its subscription, name and kind - at its address and port that carries its mark. A panel
+can list twins of one name, address and port, and each is an endpoint of its own to the monitor. A
+record without `group` knows no kind, and one without a mark takes the first such entry. With none
+of the record's kind there, or none with its mark - new keys in place, which Xray does not run
+until the actuality check follows them - the monitor has no evidence of what Xray runs, and the
+fast path does not apply. Fresh checks share one 30-second deadline and the
 monitor's worker pool. Switching requires fresh active-dead/candidate-alive evidence and a working
 WAN; active-dead counts only when the monitor saw the active endpoints die after the main probe
 last succeeded on that same server, so a monitor that cannot reach what main Xray dials (stale
@@ -237,6 +239,13 @@ confirmed by the legacy rules, or with none of its candidates working - the keep
 fails (`refreshStandsDown`); with `subscription_refresh` at `"0"` the keeper works from the lists as
 they are. The keeper does nothing while VPN Director is stopped, the gate is closed, no server of a
 subscription is selected, or the monitor reports `no_xray`.
+
+In both modes, outside a failover, the failure episode a miss begins (`missed`) is the record's:
+a record the watch did not write since the episode began - a selection in the Web UI, `/xray` or
+the wizard - begins one of its own at its first miss, so the user's server gets the full
+`DeadAfter` and the two misses in a row the check below waits for, not what is left of the server
+it replaced. The watch's own writes in an episode - a follow, a replacement, the fast path's - leave
+it counting (`ownSeq`, which every write of the record through `generate` sets).
 
 In both modes, a tick whose probe failed for the second time in a row or later checks the selected
 server against its list before the death rules (`followActive`, `classifyActive`), on every such

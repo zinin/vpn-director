@@ -65,11 +65,7 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		return
 	}
 	now := w.Now()
-	if w.failSince.IsZero() {
-		w.failSince = now
-		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
-	}
-	w.failedProbes++
+	w.missed(cfg, now)
 	if w.followActive(ctx, cfg, false) {
 		return
 	}
