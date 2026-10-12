@@ -376,6 +376,29 @@ func newClientsKeeper(t *testing.T) *fastFixture {
 // fails - the old address no longer answers - it is followed or replaced on
 // that tick, in both modes.
 func TestActuality_OnlyOnceTheProbeFails(t *testing.T) {
+	cases := []struct {
+		name    string
+		change  func(*fastFixture)
+		written string
+		note    string
+	}{
+		{"moved", func(s *fastFixture) {
+			s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+		}, "Oslo@oslo-2.example", "Xray server Alpha / Oslo moved; Xray follows it"},
+		{"changed in place", func(s *fastFixture) {
+			oslo := s.f.subs[0].Servers[0]
+			oslo.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+			s.f.subs[0].Servers[0] = oslo
+		}, "Oslo@oslo.example", "Xray server Alpha / Oslo changed; Xray follows it"},
+		{"left its subscription", func(s *fastFixture) {
+			s.f.subs[0].Servers = s.f.subs[0].Servers[1:]
+		}, "Backup@backup.example", "Xray server Alpha / Oslo left its subscription; Xray switched to Alpha / Backup"},
+		{"its subscription deleted", func(s *fastFixture) {
+			s.f.subs = []vpnconfig.Subscription{{ID: "beta", Name: "Beta", URL: "https://beta.example/list",
+				Servers: []vpnconfig.Server{fastServer("Faster", "faster.example", "198.51.100.30")}}}
+			s.setHealth()
+		}, "Faster@faster.example", "Xray server Oslo left its subscription; Xray switched to Beta / Faster"},
+	}
 	for _, mode := range []struct {
 		name    string
 		fixture func(*testing.T) *fastFixture
@@ -383,59 +406,39 @@ func TestActuality_OnlyOnceTheProbeFails(t *testing.T) {
 		{"keeper mode", newKeeperFixture},
 		{"clients mode", newClientsKeeper},
 	} {
-		for _, tc := range []struct {
-			name    string
-			change  func(*fastFixture)
-			written string
-			note    string
-		}{
-			{"moved", func(s *fastFixture) {
-				s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
-			}, "Oslo@oslo-2.example", "Xray server Alpha / Oslo moved; Xray follows it"},
-			{"changed in place", func(s *fastFixture) {
-				oslo := s.f.subs[0].Servers[0]
-				oslo.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
-				s.f.subs[0].Servers[0] = oslo
-			}, "Oslo@oslo.example", "Xray server Alpha / Oslo changed; Xray follows it"},
-			{"left its subscription", func(s *fastFixture) {
-				s.f.subs[0].Servers = s.f.subs[0].Servers[1:]
-			}, "Backup@backup.example", "Xray server Alpha / Oslo left its subscription; Xray switched to Alpha / Backup"},
-			{"its subscription deleted", func(s *fastFixture) {
-				s.f.subs = []vpnconfig.Subscription{{ID: "beta", Name: "Beta", URL: "https://beta.example/list",
-					Servers: []vpnconfig.Server{fastServer("Faster", "faster.example", "198.51.100.30")}}}
-				s.setHealth()
-			}, "Faster@faster.example", "Xray server Oslo left its subscription; Xray switched to Beta / Faster"},
-		} {
-			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
-				s := mode.fixture(t)
-				tc.change(s)
-				working := true
-				s.w.Probe = func(context.Context, int) error {
-					s.probes++
-					if working || len(s.written) > 0 {
-						return nil
+		t.Run(mode.name, func(t *testing.T) {
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					s := mode.fixture(t)
+					tc.change(s)
+					working := true
+					s.w.Probe = func(context.Context, int) error {
+						s.probes++
+						if working || len(s.written) > 0 {
+							return nil
+						}
+						return errProbe
 					}
-					return errProbe
-				}
-				before, err := cloneCfg(s.f.cfg)
-				if err != nil {
-					t.Fatal(err)
-				}
-				tickFor(s.w, s.f, 2*ProbeInterval)
-				if s.generateCalls != 0 || s.restarts != 0 || len(s.f.notes) != 0 || !reflect.DeepEqual(s.f.cfg, before) {
-					t.Fatalf("generate %d, restarts %d, notes %v, active %+v while the probe passes; a working Xray is left alone",
-						s.generateCalls, s.restarts, s.f.notes, s.f.cfg.Xray.ActiveServer)
-				}
-				working = false
-				s.w.Tick(context.Background())
-				if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{tc.written}) || s.restarts != 1 {
-					t.Fatalf("written %v, restarts %d at the first failed probe; want %s", got, s.restarts, tc.written)
-				}
-				if want := []string{tc.note}; !reflect.DeepEqual(s.f.notes, want) {
-					t.Fatalf("notes %v, want %v", s.f.notes, want)
-				}
-			})
-		}
+					before, err := cloneCfg(s.f.cfg)
+					if err != nil {
+						t.Fatal(err)
+					}
+					tickFor(s.w, s.f, 2*ProbeInterval)
+					if s.generateCalls != 0 || s.restarts != 0 || len(s.f.notes) != 0 || !reflect.DeepEqual(s.f.cfg, before) {
+						t.Fatalf("generate %d, restarts %d, notes %v, active %+v while the probe passes; a working Xray is left alone",
+							s.generateCalls, s.restarts, s.f.notes, s.f.cfg.Xray.ActiveServer)
+					}
+					working = false
+					s.w.Tick(context.Background())
+					if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{tc.written}) || s.restarts != 1 {
+						t.Fatalf("written %v, restarts %d at the first failed probe; want %s", got, s.restarts, tc.written)
+					}
+					if want := []string{tc.note}; !reflect.DeepEqual(s.f.notes, want) {
+						t.Fatalf("notes %v, want %v", s.f.notes, want)
+					}
+				})
+			}
+		})
 	}
 }
 
