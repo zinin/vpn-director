@@ -139,12 +139,14 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if !fresh || ref.Group == "" || activeGroup == "" || activeGroup == ref.Group {
 		return
 	}
-	var group []vpnconfig.Server
-	for _, c := range aliveFor(endpoint.PerAddress(servers), ev, now, ReturnAlive) {
-		if c.Group() == ref.Group {
-			group = append(group, c)
+	// The group first, a server at a time: only its copies cost a key.
+	var inGroup []vpnconfig.Server
+	for _, s := range servers {
+		if s.Group() == ref.Group {
+			inGroup = append(inGroup, s)
 		}
 	}
+	group := aliveFor(endpoint.PerAddress(inGroup), ev, now, ReturnAlive)
 	if len(group) == 0 {
 		return
 	}
@@ -163,18 +165,27 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 }
 
 // aliveFor is the copies the monitor has held alive for at least d at now,
-// fastest first, ties in the order given.
+// fastest first, ties in the order given. Each copy's key, state and latency
+// are read once, as orderBest reads them: a key costs a decode and a SHA-256
+// of the outbound, and a comparator that took two keys a comparison spent
+// 120 ms on 600 copies on a desktop CPU, many times that on a router's.
 func aliveFor(copies []vpnconfig.Server, ev monitor.Evidence, now time.Time, d time.Duration) []vpnconfig.Server {
-	var out []vpnconfig.Server
+	type alive struct {
+		s       vpnconfig.Server
+		latency int64
+	}
+	var held []alive
 	for _, c := range copies {
 		st, ok := ev.Endpoints[endpoint.Key(c)]
 		if ok && st.Status == watchdapi.StatusAlive && !st.Since.After(now.Add(-d)) {
-			out = append(out, c)
+			held = append(held, alive{s: c, latency: st.LatencyMS})
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool {
-		return ev.Endpoints[endpoint.Key(out[i])].LatencyMS < ev.Endpoints[endpoint.Key(out[j])].LatencyMS
-	})
+	sort.SliceStable(held, func(i, j int) bool { return held[i].latency < held[j].latency })
+	out := make([]vpnconfig.Server, len(held))
+	for i, a := range held {
+		out[i] = a.s
+	}
 	return out
 }
 
