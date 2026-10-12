@@ -225,7 +225,8 @@ One Telegram message per switch, through the durable queue, in English like ever
 - `Xray back on a vless+reality server Alpha / NL-2`
 - `No working Xray server found; Xray stays on Alpha / DE-1`
 
-The armed failover keeps its present messages. Each switch sends its message: the watch's
+The armed failover keeps its present messages. A switch the fast path makes keeps its present
+message (`Xray switched to server Alpha / NL-2`), in either mode. Each switch sends its message: the watch's
 deduplication by message kind (`notify`), which suppresses a kind sent twice in a row, does not
 apply to these. "No working Xray server found" goes once per run of failed attempts. A candidate
 that fails gets no message; it gets the log line the walk writes today. Each action logs one INFO
