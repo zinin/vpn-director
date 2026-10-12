@@ -413,9 +413,13 @@ func TestFast_OrderDedupAndBudget(t *testing.T) {
 	nearby.IPs = []string{"198.51.100.20", "198.51.100.20", "198.51.100.21"}
 	beta := fastServer("Beta", "beta.example", "192.0.2.30")
 	gamma := fastServer("Gamma", "gamma.example", "192.0.2.40")
+	// Overflow is past OwnFirst, so the walk puts it after Beta and Gamma. It is
+	// alive in the user's group and subscription, so the fast path takes it
+	// before them (orderBest).
+	overflow := fastServer("Overflow", "overflow.example", "198.51.100.22")
 	s.f.subs = []vpnconfig.Subscription{
 		{ID: "gamma", Name: "Gamma", URL: "https://gamma.example/list", Servers: []vpnconfig.Server{gamma}},
-		{ID: "alpha", Name: "Alpha", URL: "https://alpha.example/list", Servers: []vpnconfig.Server{active, alias, nearby, fastServer("Overflow", "overflow.example", "198.51.100.22")}},
+		{ID: "alpha", Name: "Alpha", URL: "https://alpha.example/list", Servers: []vpnconfig.Server{active, alias, nearby, overflow}},
 		{ID: "beta", Name: "Beta", URL: "https://beta.example/list", Servers: []vpnconfig.Server{beta}},
 	}
 	s.setHealth()
@@ -470,7 +474,7 @@ func TestFast_OrderDedupAndBudget(t *testing.T) {
 	wantCandidates := map[string]bool{
 		endpoint.Key(endpoint.PerAddress([]vpnconfig.Server{nearby})[0]): true,
 		endpoint.Key(endpoint.PerAddress([]vpnconfig.Server{nearby})[2]): true,
-		endpoint.Key(beta): true,
+		endpoint.Key(overflow): true,
 	}
 	seen, activeCalls, controls := make(map[string]bool), 0, 0
 	var shared time.Time
@@ -509,8 +513,8 @@ func TestFast_OrderDedupAndBudget(t *testing.T) {
 	for _, server := range s.written {
 		dialed = append(dialed, server.Subscription+"/"+server.Name+"/"+endpoint.ServerForDial(server).Address)
 	}
-	if !reflect.DeepEqual(dialed, []string{"alpha/Nearby/198.51.100.20", "alpha/Nearby/198.51.100.21", "beta/Beta/192.0.2.30"}) || s.restarts != 3 || s.f.applies != 0 {
-		t.Fatalf("dialed %v, restart %d, apply %d; preserve OwnFirst/walkOrder/PerAddress despite parallel completion", dialed, s.restarts, s.f.applies)
+	if !reflect.DeepEqual(dialed, []string{"alpha/Nearby/198.51.100.20", "alpha/Nearby/198.51.100.21", "alpha/Overflow/198.51.100.22"}) || s.restarts != 3 || s.f.applies != 0 {
+		t.Fatalf("dialed %v, restart %d, apply %d; preserve orderBest/PerAddress order despite parallel completion", dialed, s.restarts, s.f.applies)
 	}
 	assertFastAssignments(t, s.f.cfg)
 }
@@ -1691,4 +1695,25 @@ func TestFast_CandidatesAvoidTheActiveServersAddresses(t *testing.T) {
 		t.Fatalf("generate %d, restart %d, active %+v; want the switch to the server on another address", s.generateCalls, s.restarts, s.f.cfg.Xray.ActiveServer)
 	}
 	assertFastAssignments(t, s.f.cfg)
+}
+
+// A Shadowsocks server listed before the VLESS backup, and faster, is still
+// tried after it: the fast path takes the user's group first.
+func TestFastFailover_TriesTheUsersGroupFirst(t *testing.T) {
+	s := newFastFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, ssServer("Shadow", "198.51.100.40"), backup}
+	s.setHealth()
+	for _, key := range endpoint.Keys(ssServer("Shadow", "198.51.100.40")) {
+		for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
+			st := endpoints[key]
+			st.LatencyMS = 5
+			endpoints[key] = st
+		}
+	}
+	s.passThenMiss(time.Second)
+	s.w.Tick(context.Background())
+	if len(s.written) == 0 || s.written[0].Name != "Backup" {
+		t.Fatalf("written %v, want Backup first", healthLabels(s.written))
+	}
 }

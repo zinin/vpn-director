@@ -315,7 +315,11 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		activeAddresses[endpoint.ServerForDial(c).Address] = true
 	}
 	var choices []fastChoice
-	for _, s := range endpoint.PerAddress(order) {
+	// The alive copies in the user's group and subscription first, by latency
+	// (orderBest): a server of another group can answer a check and carry
+	// nothing.
+	ref := refFor(cfg, vpnconfig.AllServers(subs))
+	for _, s := range orderBest(endpoint.PerAddress(order), ref, cached, true) {
 		key := endpoint.Key(s)
 		if seen[key] {
 			continue
