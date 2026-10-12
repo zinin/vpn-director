@@ -260,13 +260,16 @@ one. With valid monitor evidence the endpoints the monitor holds alive go first,
 group in the choice's subscription, the group in the other subscriptions, other groups in the
 subscription, other groups elsewhere, each by latency; endpoints the monitor rejected are left
 out. The rest follow, the group first, each part in the walk's order (`OwnFirst`, then one server
-of each subscription in turn). The dead server is left out too, with every copy that dials its
-connection (`endpoint.DialKey`): the server the tick's probe failed on, which the message names,
-even when a fast-path fallback has left Xray on one of the fast path's own candidates. Every
-candidate the fast path is done with is left out as well (`fastAttempt.Tried`): one it switched to
-whose restart or probe failed, one its fresh checks found dead. Each candidate - each connection
-once - goes through the walk's guarded write (`switcher.to`), `restart xray-process`, 3 s and the
-SOCKS probe.
+of each subscription in turn). The dead server goes last, after every other candidate, with every
+copy that dials its connection (`endpoint.DialKey`): the server the tick's probe failed on, which
+the message names, even when a fast-path fallback has left Xray on one of the fast path's own
+candidates. Its stored entry can differ from what Xray ran in ways the identity mark ignores - a
+REALITY pick or a ws/httpupgrade Host or path a manual refresh took fresh, new IPs of its host - so
+with nothing else working it is still worth one try, and when it works the message is
+`Xray server <s> changed; Xray follows it`. The candidates the fast path is done with stay out
+(`fastAttempt.Tried`): one it switched to whose restart or probe failed, one its fresh checks found
+dead. So do the copies a failed follow has just tried. Each candidate - each connection once - goes
+through the walk's guarded write (`switcher.to`), `restart xray-process`, 3 s and the SOCKS probe.
 
 A replacement first checks the WAN: `WANUp`, or without it a control address that accepts
 (`reachControls`); a watch with neither goes on. While the WAN is down it waits

@@ -171,7 +171,8 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		msg = msgFollowedChanged
 	}
 	slog.Info("The Xray server moved or changed; following it", "server", was, "changed", state == actualChanged)
-	switched, ended := w.switchAmong(ctx, sw, w.bestWalkOrder(endpoint.PerAddress([]vpnconfig.Server{entry}), cfg, refFor(cfg, vpnconfig.AllServers(subs))), func(vpnconfig.Server) string {
+	followed := w.bestWalkOrder(endpoint.PerAddress([]vpnconfig.Server{entry}), cfg, refFor(cfg, vpnconfig.AllServers(subs)))
+	switched, ended := w.switchAmong(ctx, sw, followed, func(vpnconfig.Server) string {
 		return fmt.Sprintf(msg, was)
 	})
 	if switched || ended {
@@ -187,19 +188,23 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		w.returnDeath = w.failSince
 		w.returnAfterDeath()
 	}
-	w.replaceActive(ctx, cfg, subs, sw, &entry, nil, msgReplacedDead, was)
+	// The copies the follow has just tried failed a moment ago: they stay out
+	// of the replacement rather than come back last as the dead server's.
+	w.replaceActive(ctx, cfg, subs, sw, &entry, followed, msgReplacedDead, was)
 	return true
 }
 
 // replaceDead replaces died - the server active_server named when the tick's
 // probe failed, the record its death was decided on - once that death is
 // confirmed: nobody to move, so no tunnel and no wave. The message and the log
-// name died, and the replacement leaves it out together with tried, the
-// candidates the fast path is done with (fastAttempt.Tried). The action's
-// fence is cfg: the tick's record, or after the fast path a read its ownership
-// validated, which names the last candidate the fast path wrote, if it wrote
-// one - and never a later read: a selection committed since refuses the first
-// write. guard is the fast path's ownership when it got that far
+// name died. The replacement leaves out tried, the candidates the fast path is
+// done with (fastAttempt.Tried), and tries died's current entry last: that
+// entry can differ from what Xray ran in ways the identity mark ignores, so
+// with nothing else working it is still worth one try (replaceActive). The
+// action's fence is cfg: the tick's record, or after the fast path a read its
+// ownership validated, which names the last candidate the fast path wrote, if
+// it wrote one - and never a later read: a selection committed since refuses
+// the first write. guard is the fast path's ownership when it got that far
 // (fastAttempt.Guard), and the replacement writes under it as failOutbound's
 // fallback does: the owner checks and records each write, its port snapshot
 // stays guarded, and a refusal ends the action - nothing more is written, said
@@ -244,13 +249,18 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // orders the candidates too: a follow that failed recorded the same choice,
 // which walkOrder still finds by its name, and the write after it keeps the
 // record it left in preferred_server (RecordWalkedServer), as does a write of
-// the fast path's. It leaves out dead - every copy of it, and every copy that
-// dials the same connection (endpoint.DialKey), which dies with it - and each
-// copy in tried with the copies that dial its connection: spec 4.5 leaves out
-// the server that died and the servers already tried in the attempt. It sends
-// msg with was, the server replaced, and the server found. With none working
-// it says so once a run and backs the next attempt off. Every caller has asked
-// replacementWaits first: with the WAN down none would work.
+// the fast path's. It leaves out each copy in tried with the copies that dial
+// its connection (endpoint.DialKey): spec 4.5 leaves out the servers already
+// tried in the attempt. dead - every copy of it, and every copy that dials the
+// same connection, which shares its fate - goes last, after every other
+// candidate, rather than out: its stored entry can differ from what Xray ran
+// in ways the identity mark ignores - a REALITY pick or a ws or httpupgrade
+// Host or path a manual refresh took fresh, new IPs of its host - so with
+// nothing else working it is still worth one try. It sends msg with was, the
+// server replaced, and the server found; a copy of dead that works sends
+// msgFollowedChanged instead, since Xray then runs dead's current entry. With
+// none working it says so once a run and backs the next attempt off. Every
+// caller has asked replacementWaits first: with the WAN down none would work.
 func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, tried []vpnconfig.Server, msg, was string) {
 	if w.mutationEnded(ctx) {
 		return
@@ -261,24 +271,34 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	}
 	order, _ := walkOrder(subs, chosen)
 	left := map[string]bool{}
-	if dead != nil {
-		for _, c := range endpoint.PerAddress([]vpnconfig.Server{*dead}) {
-			left[leftKey(c)] = true
-		}
-	}
 	for _, c := range tried {
 		left[leftKey(c)] = true
 	}
-	var copies []vpnconfig.Server
+	deadKeys := map[string]bool{}
+	if dead != nil {
+		for _, c := range endpoint.PerAddress([]vpnconfig.Server{*dead}) {
+			deadKeys[leftKey(c)] = true
+		}
+	}
+	var copies, last []vpnconfig.Server
 	for _, c := range endpoint.PerAddress(order) {
-		if (dead != nil && serverID(c) == serverID(*dead)) || left[leftKey(c)] {
+		if left[leftKey(c)] {
+			continue
+		}
+		if (dead != nil && serverID(c) == serverID(*dead)) || deadKeys[leftKey(c)] {
+			last = append(last, c)
 			continue
 		}
 		copies = append(copies, c)
 	}
 	names := subscriptionNames(subs)
 	ref := refFor(cfg, vpnconfig.AllServers(subs))
-	switched, ended := w.switchAmong(ctx, sw, w.bestWalkOrder(copies, cfg, ref), func(c vpnconfig.Server) string {
+	switched, ended := w.switchAmong(ctx, sw, append(w.bestWalkOrder(copies, cfg, ref), w.bestWalkOrder(last, cfg, ref)...), func(c vpnconfig.Server) string {
+		// Xray runs the dead server's current entry now, which changed in a
+		// way the identity mark ignores: it is followed, not replaced.
+		if dead != nil && serverID(c) == serverID(*dead) {
+			return fmt.Sprintf(msgFollowedChanged, was)
+		}
 		return fmt.Sprintf(msg, was, label(names, c.Subscription, c.Name))
 	})
 	if switched || ended {
