@@ -209,6 +209,67 @@ func TestKeeper_NothingWorksSaysOnceAndBacksOff(t *testing.T) {
 	}
 }
 
+// With the WAN down every candidate would fail its probe, each after an Xray
+// restart, and the run would end in a "No working Xray server found" that
+// blames the servers (Ruling F-R1). So a replacement waits: past DeadAfter,
+// tick after tick, nothing is written, restarted, said or backed off, and the
+// log says so once. The WAN comes back, and the replacement happens. A watch
+// without WANUp asks the control addresses instead.
+func TestKeeper_AReplacementWaitsForTheWAN(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(s *fastFixture, wan *bool)
+		note  string
+	}{
+		{"a dead server", func(s *fastFixture, wan *bool) {
+			s.w.Health = nil
+			s.w.WANUp = func(context.Context) bool { s.wanCalls.Add(1); return *wan }
+		}, "Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Backup"},
+		{"a server that left its subscription", func(s *fastFixture, wan *bool) {
+			s.f.subs[0].Servers = s.f.subs[0].Servers[1:]
+			s.setHealth()
+			s.w.WANUp = func(context.Context) bool { s.wanCalls.Add(1); return *wan }
+		}, "Xray server Alpha / Oslo left its subscription; Xray switched to Alpha / Backup"},
+		{"no WANUp, the control addresses", func(s *fastFixture, wan *bool) {
+			s.w.Health, s.w.WANUp = nil, nil
+			s.w.Reachable = func(_ context.Context, ip string, _ int) bool {
+				return *wan && (ip == "1.1.1.1" || ip == "8.8.8.8")
+			}
+		}, "Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Backup"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newKeeperFixture(t)
+			wan := false
+			tc.setup(s, &wan)
+			s.w.Probe = func(context.Context, int) error { // Oslo is dead, and nothing answers without the WAN
+				s.probes++
+				if !wan || len(s.written) == 0 {
+					return errProbe
+				}
+				return nil
+			}
+			log := captureLog(t)
+			tickUntilDead(s.w, s.f)
+			tickFor(s.w, s.f, 2*ProbeInterval)
+			if s.generateCalls != 0 || s.restarts != 0 || len(s.f.notes) != 0 || !s.w.keeperNotBefore.IsZero() || s.w.keeperRetry != 0 {
+				t.Fatalf("generate %d, restarts %d, notes %v, next attempt %v while the WAN is down; the replacement waits",
+					s.generateCalls, s.restarts, s.f.notes, s.w.keeperNotBefore)
+			}
+			if n := strings.Count(log.String(), "The replacement of the Xray server waits for the WAN"); n != 1 {
+				t.Fatalf("%d lines say the replacement waits, want one an episode; log:\n%s", n, log)
+			}
+			wan = true
+			s.w.Tick(context.Background())
+			if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
+				t.Fatalf("written %v once the WAN is back", got)
+			}
+			if want := []string{tc.note}; !reflect.DeepEqual(s.f.notes, want) {
+				t.Fatalf("notes %v, want %v", s.f.notes, want)
+			}
+		})
+	}
+}
+
 // A /stop while the keeper switches ends it: nothing restarts, nothing is said.
 func TestKeeper_AStopEndsTheSwitchSilently(t *testing.T) {
 	s := newKeeperFixture(t)

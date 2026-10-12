@@ -140,6 +140,12 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	was := label(subscriptionNames(subs), a.Subscription, a.Name)
 	sw := w.newSwitcher(cfg, subs)
 	if state == actualGone {
+		// A replacement that waits for the WAN does nothing: the tick goes
+		// on to the death rules, which with clients on Xray may still move
+		// them into a tunnel.
+		if w.replacementWaits(ctx) {
+			return false
+		}
 		slog.Info("The Xray server left its subscription; replacing it", "server", was)
 		w.replaceActive(ctx, cfg, subs, sw, nil, msgReplacedGone, was)
 		return true
@@ -157,6 +163,9 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	}
 	// The entry it moved to does not answer either: as far as Xray goes, the
 	// server died. The follow's write is the action's own, and sw knows it.
+	if w.replacementWaits(ctx) {
+		return true
+	}
 	w.replaceActive(ctx, cfg, subs, sw, &entry, msgReplacedDead, was)
 	return true
 }
@@ -169,9 +178,11 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 // far (fastAttempt.Guard), and the replacement writes under it as
 // failOutbound's fallback does: the owner checks and records each write, its
 // port snapshot stays guarded, and a refusal ends the action - nothing more is
-// written, said or backed off.
+// written, said or backed off. While the WAN is down it waits
+// (replacementWaits), and the returns are not settled either: a WAN outage is
+// no death of the server a return went back to.
 func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, reason string, guard func(*vpnconfig.VPNDirectorConfig) error) {
-	if cfg == nil || cfg.Xray.ActiveServer == nil {
+	if cfg == nil || cfg.Xray.ActiveServer == nil || w.replacementWaits(ctx) {
 		return
 	}
 	previousGuard, previousRefused := w.outboundGuard, w.outboundRefused
@@ -212,7 +223,8 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // every copy of it, and every copy that dials the same connection
 // (endpoint.DialKey), which dies with it. It sends msg with was, the server
 // replaced, and the server found. With none working it says so once a run and
-// backs the next attempt off.
+// backs the next attempt off. Every caller has asked replacementWaits first:
+// with the WAN down none would work.
 func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, msg, was string) {
 	if w.mutationEnded(ctx) {
 		return
@@ -262,6 +274,39 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	}
 	slog.Warn("No working Xray server found", "stays", stays)
 	w.say(fmt.Sprintf(msgNoWorking, stays))
+}
+
+// replacementWaits reports whether a keeper replacement has to wait for the
+// WAN (Ruling F-R1): with the WAN down every candidate fails its probe, each
+// after an Xray restart, and the run ends in a "No working Xray server found"
+// that blames the servers - the armed watch walks nothing when every download
+// failed, for the same reason. Waiting switches nothing, backs nothing off and
+// says nothing; the log says so once an episode, since the death rules come
+// back here on every tick past DeadAfter. The fast path and the unreachable
+// rule confirm a death only with the WAN working, and the check passes there.
+func (w *Watch) replacementWaits(ctx context.Context) bool {
+	if !w.wanDown(ctx) {
+		return false
+	}
+	if !w.mutationEnded(ctx) && !w.keeperWANNoted.Equal(w.failSince) {
+		w.keeperWANNoted = w.failSince
+		slog.Info("The replacement of the Xray server waits for the WAN")
+	}
+	return true
+}
+
+// wanDown reports whether the WAN is down as far as the watch can tell:
+// WANUp says so, or, without WANUp, no control address accepts a TCP
+// connection (reachControls), as in the unreachable rule's look. With neither
+// it cannot tell, and says it is not.
+func (w *Watch) wanDown(ctx context.Context) bool {
+	switch {
+	case w.WANUp != nil:
+		return !w.WANUp(ctx)
+	case w.Reachable != nil:
+		return len(w.reachable(ctx, reachControls)) == 0
+	}
+	return false
 }
 
 // newSwitcher is the fence of one keeper action, set at cfg: the record the

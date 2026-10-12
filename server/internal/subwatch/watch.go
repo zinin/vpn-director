@@ -145,6 +145,7 @@ type Watch struct {
 	keeperNotBefore   time.Time                            // no keeper switch before this: the backoff after a run that found nothing working
 	keeperRetry       time.Duration                        // the current keeper backoff; zero before any
 	keeperFailNoted   bool                                 // "No working Xray server found" sent for this run of failures
+	keeperWANNoted    time.Time                            // failSince of the episode whose replacement was logged as waiting for the WAN
 	after             func(time.Duration) <-chan time.Time // StartRefresh's waits; nil is time.After
 }
 
