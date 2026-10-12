@@ -20,9 +20,14 @@ func TestServerGroup_ProtocolAndSecurity(t *testing.T) {
 		{"trojan", Server{Outbound: json.RawMessage(`{"protocol":"trojan","settings":{"servers":[{"address":"t.example","port":443,"password":"p"}]},"streamSettings":{"network":"tcp","security":"tls"}}`)}, "trojan+tls"},
 		{"shadowsocks", Server{Outbound: json.RawMessage(`{"protocol":"shadowsocks","settings":{"servers":[{"address":"ss.example","port":8388,"method":"aes-256-gcm","password":"p"}]}}`)}, "shadowsocks"},
 		{"security none", Server{Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"a.example","port":80,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"none"}}`)}, "vless"},
+		// Xray reads the protocol and the security without regard to case.
+		{"security in capitals", Server{Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"a.example","port":443,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"TLS"}}`)}, "vless+tls"},
+		{"protocol in capitals", Server{Outbound: json.RawMessage(`{"protocol":"VLESS","settings":{"vnext":[{"address":"a.example","port":443,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":"tcp","security":"Reality"}}`)}, "vless+reality"},
+		{"none in capitals", Server{Outbound: json.RawMessage(`{"protocol":"vless","settings":{"vnext":[{"address":"a.example","port":80,"users":[{"id":"u-1","encryption":"none"}]}]},"streamSettings":{"network":"ws","security":"None"}}`)}, "vless"},
 		{"legacy record", Server{Name: "Old", Address: "old.example", Port: 443}, ""},
 		{"unreadable", Server{Outbound: json.RawMessage(`{"protocol":`)}, ""},
 		{"null", Server{Outbound: json.RawMessage(`null`)}, ""},
+		{"array", Server{Outbound: json.RawMessage(`[{"protocol":"vless"}]`)}, ""},
 		{"no protocol", Server{Outbound: json.RawMessage(`{"settings":{}}`)}, ""},
 	}
 	for _, tc := range cases {

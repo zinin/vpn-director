@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 )
 
 // Group is the kind of server s is when a replacement is picked: its
@@ -12,14 +13,13 @@ import (
 // path - a panel's Shadowsocks servers can pass a check and carry nothing
 // while its REALITY ones work - so the watch tries the group of the user's
 // choice first. The transport is no part of it: tcp, xhttp, ws and grpc of one
-// protocol and security would split a provider's servers too finely. A legacy
-// record without an outbound, and an outbound that does not parse or names no
-// protocol, have no group.
+// protocol and security would split a provider's servers too finely. Both are
+// lowercased first, as Xray lowercases them before it reads them: "TLS" is a
+// tls stream to it, so it is one group with "tls" whatever wrote the stored
+// outbound. A legacy record without an outbound, and an outbound that does not
+// parse or names no protocol, have no group.
 func (s Server) Group() string {
 	if len(s.Outbound) == 0 {
-		return ""
-	}
-	if _, err := DecodeOutbound(s.Outbound); err != nil {
 		return ""
 	}
 	var ob struct {
@@ -28,13 +28,16 @@ func (s Server) Group() string {
 			Security string `json:"security"`
 		} `json:"streamSettings"`
 	}
+	// A null leaves the protocol empty; a string, a number or an array does
+	// not decode into the struct at all.
 	if err := json.Unmarshal(s.Outbound, &ob); err != nil || ob.Protocol == "" {
 		return ""
 	}
-	if ob.StreamSettings.Security == "" || ob.StreamSettings.Security == "none" {
-		return ob.Protocol
+	protocol, security := strings.ToLower(ob.Protocol), strings.ToLower(ob.StreamSettings.Security)
+	if security == "" || security == "none" {
+		return protocol
 	}
-	return ob.Protocol + "+" + ob.StreamSettings.Security
+	return protocol + "+" + security
 }
 
 // IdentityMark is a short fingerprint of s's loose identity - its outbound
