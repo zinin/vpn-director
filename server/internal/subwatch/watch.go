@@ -141,6 +141,9 @@ type Watch struct {
 	returnSeq         int                                  // active_server's write counter the last return left
 	returnDeath       time.Time                            // failSince of the last death the returns were settled at
 	lastPicked        *vpnconfig.Server                    // the copy the walk picked or a return proved, with the address it ran on
+	keeperNotBefore   time.Time                            // no keeper switch before this: the backoff after a run that found nothing working
+	keeperRetry       time.Duration                        // the current keeper backoff; zero before any
+	keeperFailNoted   bool                                 // "No working Xray server found" sent for this run of failures
 	after             func(time.Duration) <-chan time.Time // StartRefresh's waits; nil is time.After
 }
 
@@ -227,7 +230,11 @@ func (w *Watch) Tick(ctx context.Context) {
 	subs := w.subscriptionCount()
 	// A restore whose last apply failed is work the watch has started, as a
 	// failover is: neither waits for a subscription or for Xray clients.
-	if !vpnconfig.Armed(cfg, subs) && !w.pendingApply {
+	// A watch with nobody on Xray still keeps Xray on a working server
+	// (keeper mode, spec 4.1); one without a server to keep does nothing.
+	armed := vpnconfig.Armed(cfg, subs) || w.pendingApply
+	keeper := !armed && w.keeps(cfg, subs)
+	if !armed && !keeper {
 		w.resetFail()
 		return
 	}
@@ -250,6 +257,10 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 		endWatch()
 	}()
+	if keeper {
+		w.keep(ctx, cfg)
+		return
+	}
 	if !w.reconciled {
 		w.reconciled = true
 		// The move is written before Apply, and a process that stopped in
@@ -342,6 +353,11 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.resetFail()
 		return
 	}
+	// Between episodes the selected server is checked against its list: one
+	// that moved, changed or left it is followed or replaced before Xray dies.
+	if w.followActive(ctx, cfg) {
+		return
+	}
 
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
 	if socks == 0 {
@@ -359,6 +375,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.importRetry = 0
 		w.lastRouteKind = noteNone
 		w.lastImportKind = noteNone
+		w.keeperFailNoted = false
 		w.maybeReturn(ctx, cfg)
 		return
 	}

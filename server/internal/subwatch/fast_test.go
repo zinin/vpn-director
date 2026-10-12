@@ -571,8 +571,17 @@ func TestFast_InconclusiveUsesLegacy(t *testing.T) {
 		{"fresh active generation invalidated", func(s *fastFixture) { s.h.invalidate(s.activeKeys()[0]) }},
 		{"fresh candidate generation invalidated", func(s *fastFixture) { s.h.invalidate(s.candidateKey()) }},
 		{"missing active selection", func(s *fastFixture) { s.f.cfg.Xray.ActiveServer = nil }},
-		{"same name but rotated active address", func(s *fastFixture) { s.f.cfg.Xray.ActiveServer.Address = "rotated.example" }},
-		{"no matching active subscription", func(s *fastFixture) { s.f.cfg.Xray.ActiveServer.Subscription = "missing" }},
+		// Between episodes the actuality check follows or replaces a record its
+		// list no longer has, before the probe (spec 4.2). The fast path meets
+		// one when the list changed while the probe was already failing.
+		{"same name but rotated active address", func(s *fastFixture) {
+			s.f.cfg.Xray.ActiveServer.Address = "rotated.example"
+			s.w.failSince = s.f.now.Add(-ProbeInterval)
+		}},
+		{"no matching active subscription", func(s *fastFixture) {
+			s.f.cfg.Xray.ActiveServer.Subscription = "missing"
+			s.w.failSince = s.f.now.Add(-ProbeInterval)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
