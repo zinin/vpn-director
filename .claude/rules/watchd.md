@@ -332,8 +332,11 @@ the return backoff, and both kinds count toward `ReturnFailsMax`.
 Each of these switches sends one message, past `notify`'s one-per-kind deduplication:
 `Xray server <s> moved; Xray follows it`, `… changed; Xray follows it`,
 `… left its subscription; Xray switched to <s>`, `… is not answering; Xray switched to <s>`,
-`Xray back on a <group> server <s>`, `<s>` being `<subscription> / <server>`; the failover, the
-fast path and the return to the preferred server keep their messages. No line names a link.
+`Xray back on a <group> server <s>`, `<s>` being `<subscription> / <server>`. When the two
+servers of a replacement read alike - a same-named server of another kind - each carries its kind:
+`Xray server Alpha / Oslo (vless+reality) left its subscription; Xray switched to Alpha / Oslo
+(shadowsocks)`. The failover, the fast path and the return to the preferred server keep their
+messages. No line names a link.
 
 ## Durable notifications
 

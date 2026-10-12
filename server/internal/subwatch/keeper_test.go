@@ -234,6 +234,44 @@ func TestKeeper_TheDeadServerGoesLast(t *testing.T) {
 	}
 }
 
+// Oslo, the user's vless+tls choice, is replaced by its Shadowsocks twin of the
+// same name - after it left the list, or once its death is confirmed. The
+// keeper keeps Oslo in preferred_server, and the message tells the two apart by
+// their kinds: "Alpha / Oslo" twice says nothing.
+func TestKeeper_AReplacementOntoASameNamedServerOfAnotherKindNamesBothKinds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		left bool // Oslo's entry left the list; otherwise it is listed and dead
+		note string
+	}{
+		{"left its subscription", true, "Xray server Alpha / Oslo (vless+tls) left its subscription; Xray switched to Alpha / Oslo (shadowsocks)"},
+		{"not answering", false, "Xray server Alpha / Oslo (vless+tls) is not answering; Xray switched to Alpha / Oslo (shadowsocks)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newKeeperFixture(t)
+			s.w.Health = nil
+			oslo, twin := s.f.subs[0].Servers[0], ssServer("Oslo", "198.51.100.40")
+			if tc.left {
+				s.f.subs[0].Servers = []vpnconfig.Server{twin}
+				s.missOnce(t)
+				s.w.Tick(context.Background())
+			} else {
+				s.f.subs[0].Servers = []vpnconfig.Server{oslo, twin}
+				tickUntilDead(s.w, s.f)
+			}
+			if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@198.51.100.40"}) {
+				t.Fatalf("written %v", got)
+			}
+			if p := s.f.cfg.Xray.PreferredServer; p == nil || p.Address != "oslo.example" || p.Group != "vless+tls" {
+				t.Fatalf("preferred %+v, want the user's vless+tls Oslo", p)
+			}
+			if want := []string{tc.note}; !reflect.DeepEqual(s.f.notes, want) {
+				t.Fatalf("notes %v, want %v", s.f.notes, want)
+			}
+		})
+	}
+}
+
 // With fresh evidence the fast path replaces the server within a tick, with
 // its own message.
 func TestKeeper_FastEvidenceSwitchesAtOnce(t *testing.T) {

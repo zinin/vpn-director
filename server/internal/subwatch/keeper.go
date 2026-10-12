@@ -184,7 +184,7 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			w.returnDeath = w.failSince
 			w.returnAfterDeath()
 		}
-		w.replaceActive(ctx, cfg, subs, sw, nil, nil, msgReplacedGone, was)
+		w.replaceActive(ctx, cfg, subs, sw, nil, nil, msgReplacedGone, a)
 		return true
 	}
 	msg := msgFollowedMoved
@@ -224,7 +224,7 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	}
 	// The copies the follow has just tried failed a moment ago: they stay out
 	// of the replacement rather than come back last as the dead server's.
-	w.replaceActive(ctx, cfg, subs, sw, &entry, followed, msgReplacedDead, was)
+	w.replaceActive(ctx, cfg, subs, sw, &entry, followed, msgReplacedDead, a)
 	return true
 }
 
@@ -275,7 +275,7 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if s, ok := exactFastServer(subs, died); ok {
 		dead = &s
 	}
-	w.replaceActive(ctx, cfg, subs, w.newSwitcher(cfg, subs), dead, tried, msgReplacedDead, was)
+	w.replaceActive(ctx, cfg, subs, w.newSwitcher(cfg, subs), dead, tried, msgReplacedDead, died)
 }
 
 // replaceActive switches Xray to the best working server (spec 4.3) through
@@ -292,12 +292,13 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // from what Xray ran in ways the identity mark ignores - a REALITY pick or a
 // ws or httpupgrade Host or path a manual refresh took fresh, new IPs of its
 // host - so with nothing else working it is still worth one try. It sends msg
-// with was, the server replaced, and the server found; a copy of dead that
-// works sends msgFollowedChanged instead, since Xray then runs dead's current
-// entry. With none working it says so once a run and backs the next attempt
-// off. Every caller has asked replacementWaits first: with the WAN down none
-// would work.
-func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, tried []vpnconfig.Server, msg, was string) {
+// with the server replaced - replaced, the record the action decided on - and
+// the server found; when the two read alike, a same-named server of another
+// kind, each carries its kind. A copy of dead that works sends
+// msgFollowedChanged instead, since Xray then runs dead's current entry. With
+// none working it says so once a run and backs the next attempt off. Every
+// caller has asked replacementWaits first: with the WAN down none would work.
+func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, tried []vpnconfig.Server, msg string, replaced *vpnconfig.ActiveServer) {
 	if w.mutationEnded(ctx) {
 		return
 	}
@@ -328,6 +329,7 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 		copies = append(copies, c)
 	}
 	names := subscriptionNames(subs)
+	was := label(names, replaced.Subscription, replaced.Name)
 	ref := refFor(cfg, vpnconfig.AllServers(subs))
 	switched, ended := w.switchAmong(ctx, sw, append(w.bestWalkOrder(copies, cfg, ref), w.bestWalkOrder(last, cfg, ref)...), func(c vpnconfig.Server) string {
 		// Xray runs the dead server's current entry now, which changed in a
@@ -335,7 +337,13 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 		if dead != nil && serverID(c) == serverID(*dead) {
 			return fmt.Sprintf(msgFollowedChanged, was)
 		}
-		return fmt.Sprintf(msg, was, label(names, c.Subscription, c.Name))
+		from, to := was, label(names, c.Subscription, c.Name)
+		// A same-named server of another kind reads like the one it replaces:
+		// their kinds tell the two apart.
+		if from == to {
+			from, to = withKind(from, replaced.Group), withKind(to, c.Group())
+		}
+		return fmt.Sprintf(msg, from, to)
 	})
 	if switched || ended {
 		return
@@ -362,6 +370,15 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	}
 	slog.Warn("No working Xray server found", "stays", stays)
 	w.say(fmt.Sprintf(msgNoWorking, stays))
+}
+
+// withKind is the label l with the kind group in parentheses, l alone when the
+// kind is not known.
+func withKind(l, group string) string {
+	if group == "" {
+		return l
+	}
+	return l + " (" + group + ")"
 }
 
 // leftKey tells apart the copies a replacement leaves out: by what a copy
