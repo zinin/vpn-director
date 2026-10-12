@@ -87,6 +87,35 @@ func TestKeeper_FollowsAServerChangedInPlace(t *testing.T) {
 	}
 }
 
+// The follow tries the moved entry's addresses in a replacement's order (spec
+// 4.5): the address the monitor holds alive before the dead one, so the dead
+// one costs no restart.
+func TestKeeper_TheFollowTriesTheAliveAddressFirst(t *testing.T) {
+	s := newKeeperFixture(t)
+	moved := fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+	moved.IPs = []string{"203.0.113.30", "203.0.113.31"}
+	s.f.subs[0].Servers[0] = moved
+	s.setHealth() // every address of Oslo dead
+	alive := endpoint.Keys(cloneSubs(s.f.subs)[0].Servers[0])[1]
+	for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
+		endpoints[alive] = aliveSince(s.f.now.Add(-time.Minute), 17)
+	}
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if len(s.written) > 0 && dialIP(s.written[len(s.written)-1]) == "203.0.113.31" {
+			return nil
+		}
+		return errProbe
+	}
+	s.w.Tick(context.Background())
+	if got := healthLabels(s.written); !reflect.DeepEqual(got, []string{"Oslo@203.0.113.31"}) || s.restarts != 1 {
+		t.Fatalf("written %v, restarts %d; want the alive address alone", got, s.restarts)
+	}
+	if want := []string{"Xray server Alpha / Oslo moved; Xray follows it"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
 // Oslo left its subscription and Xray no longer works: the best working server
 // of its group replaces it - Backup, though the Shadowsocks server answers
 // faster - and the vanished choice stays in preferred_server, its group with
@@ -185,6 +214,64 @@ func TestKeeper_AFollowedEntryThatDoesNotAnswerIsReplaced(t *testing.T) {
 	s.w.Tick(context.Background())
 	if len(s.written) != 2 {
 		t.Fatalf("written %v; the next tick switched again", writtenNames(s.written))
+	}
+}
+
+// The actuality check's replacements settle the returns once per death, as
+// replaceDead and failOutbound do: as far as Xray goes, a server that left its
+// subscription, or whose followed entry does not answer either, died. With no
+// return within ReturnHold the death starts the returns over, those stopped at
+// ReturnFailsMax included; within ReturnHold of a return, on the record that
+// return wrote, it counts as a failed return and backs the next one off.
+func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
+	for _, kind := range []struct {
+		name    string
+		change  func(*fastFixture)
+		written []string
+	}{
+		{"a server that left its subscription", func(s *fastFixture) {
+			s.f.subs[0].Servers = s.f.subs[0].Servers[1:]
+			s.setHealth()
+		}, []string{"Backup@backup.example"}},
+		{"a followed entry that does not answer", func(s *fastFixture) {
+			s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+			s.w.Probe = func(context.Context, int) error {
+				s.probes++
+				if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Backup" {
+					return nil
+				}
+				return errProbe
+			}
+		}, []string{"Oslo@oslo-2.example", "Backup@backup.example"}},
+	} {
+		t.Run(kind.name, func(t *testing.T) {
+			t.Run("no return within ReturnHold", func(t *testing.T) {
+				s := newKeeperFixture(t)
+				kind.change(s)
+				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax // the returns had stopped
+				s.w.Tick(context.Background())
+				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
+					t.Fatalf("written %v, want %v", got, kind.written)
+				}
+				if s.w.returnFails != 0 || s.w.returnRetry != 0 {
+					t.Fatalf("returnFails %d, returnRetry %v; a new death starts the returns over", s.w.returnFails, s.w.returnRetry)
+				}
+			})
+			t.Run("a return within ReturnHold", func(t *testing.T) {
+				s := newKeeperFixture(t)
+				kind.change(s)
+				// A minute ago a return wrote the record that fails now.
+				s.w.lastReturn, s.w.returnSeq = s.f.now.Add(-time.Minute), vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer)
+				s.w.Tick(context.Background())
+				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
+					t.Fatalf("written %v, want %v", got, kind.written)
+				}
+				if want := s.f.now.Add(ReturnRetry); s.w.returnFails != 1 || s.w.returnRetry != ReturnRetry || !s.w.returnNotBefore.Equal(want) {
+					t.Fatalf("returnFails %d, returnRetry %v, next return %v; want a failed return, the next one at %v",
+						s.w.returnFails, s.w.returnRetry, s.w.returnNotBefore, want)
+				}
+			})
+		})
 	}
 }
 
@@ -525,6 +612,37 @@ func TestKeeper_ASelectionDuringTheLastProbeEndsTheRun(t *testing.T) {
 	s.w.Tick(context.Background())
 	if a := s.f.cfg.Xray.ActiveServer; a.Name != "Backup" || len(s.f.notes) != 0 || !s.w.keeperNotBefore.IsZero() {
 		t.Fatalf("active %+v, notes %v, next attempt %v; the selection must end the run", a, s.f.notes, s.w.keeperNotBefore)
+	}
+}
+
+// A selection committed after the run's last look, during the read that names
+// the server Xray stays on, ends the run as well (owner decision B): nothing is
+// said and nothing backs off.
+func TestKeeper_ASelectionDuringTheReadAfterTheRunEndsIt(t *testing.T) {
+	s := newKeeperFixture(t)
+	backup := s.f.subs[0].Servers[1]
+	s.f.subs[0].Servers = []vpnconfig.Server{backup, fastServer("Third", "third.example", "198.51.100.30")} // Oslo left
+	s.setHealth()
+	reads := 0
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		reads = 0
+		return errProbe
+	}
+	load := s.w.LoadVPN
+	s.w.LoadVPN = func() (*vpnconfig.VPNDirectorConfig, error) {
+		reads++
+		// After the last candidate's probe the first read is the run's last
+		// look; the selection commits during the one after it.
+		if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Third" && reads == 2 {
+			s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, backup)
+		}
+		return load()
+	}
+	s.w.Tick(context.Background())
+	if a := s.f.cfg.Xray.ActiveServer; a.Name != "Backup" || len(s.f.notes) != 0 || !s.w.keeperNotBefore.IsZero() || s.w.keeperRetry != 0 {
+		t.Fatalf("active %+v, notes %v, next attempt %v, keeper retry %v; the selection must end the run",
+			a, s.f.notes, s.w.keeperNotBefore, s.w.keeperRetry)
 	}
 }
 

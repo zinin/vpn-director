@@ -86,6 +86,12 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		w.replaceDead(ctx, attempt.Config, cfg.Xray.ActiveServer, attempt.Tried, "monitor", attempt.Guard)
 		return
 	}
+	// The death is left to the legacy confirmation: say so, and why, once an
+	// episode, as the armed tick does.
+	if !w.fastLogged.Equal(w.failSince) {
+		w.fastLogged = w.failSince
+		slog.Info("Fast failover did not switch; confirming the failure", watchErrorAttr(attempt.Err))
+	}
 	// The death is decided on the record this tick read; an attempt that wrote
 	// a candidate before it ended leaves attempt.Config naming that one.
 	died := cfg.Xray.ActiveServer
@@ -100,14 +106,16 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 
 // followActive is the actuality check of spec 4.2, made only while the probe
 // fails: in both modes, a tick whose probe failed compares the selected server
-// with its list before the death rules - on every such tick, so a server the
-// periodic refresh moves while Xray is already failing is followed too. A
-// server that changed in place or moved is followed; one whose new entry does
-// not answer either, and one that left its subscription, are replaced. The
-// whole action has one fence, the record the check classified: a replacement
-// after a follow that failed carries on from the follow's write, and a
-// selection the user commits meanwhile ends it. It reports whether it acted -
-// switched, tried and backed off, or was ended - and the tick then ends.
+// with its list before the death rules - on every such tick outside the
+// keeper's backoff (keeperNotBefore, which a run in which no candidate worked
+// sets), so a server the periodic refresh moves while Xray is already failing
+// is followed too. A server that changed in place or moved is followed; one
+// whose new entry does not answer either, and one that left its subscription,
+// are replaced. The whole action has one fence, the record the check
+// classified: a replacement after a follow that failed carries on from the
+// follow's write, and a selection the user commits meanwhile ends it. It
+// reports whether it acted - switched, tried and backed off, or was ended -
+// and the tick then ends.
 //
 // While the probe passes it does nothing: a working Xray is left alone. A
 // panel that picks a host's address or SNI at random for each download -
@@ -150,6 +158,11 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			return false
 		}
 		slog.Info("The Xray server left its subscription; replacing it", "server", was)
+		// The returns settle once per death, as in replaceDead and failOutbound.
+		if !w.returnDeath.Equal(w.failSince) {
+			w.returnDeath = w.failSince
+			w.returnAfterDeath()
+		}
 		w.replaceActive(ctx, cfg, subs, sw, nil, nil, msgReplacedGone, was)
 		return true
 	}
@@ -158,7 +171,7 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		msg = msgFollowedChanged
 	}
 	slog.Info("The Xray server moved or changed; following it", "server", was, "changed", state == actualChanged)
-	switched, ended := w.switchAmong(ctx, sw, endpoint.PerAddress([]vpnconfig.Server{entry}), func(vpnconfig.Server) string {
+	switched, ended := w.switchAmong(ctx, sw, w.bestWalkOrder(endpoint.PerAddress([]vpnconfig.Server{entry}), cfg, refFor(cfg, vpnconfig.AllServers(subs))), func(vpnconfig.Server) string {
 		return fmt.Sprintf(msg, was)
 	})
 	if switched || ended {
@@ -168,6 +181,11 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	// server died. The follow's write is the action's own, and sw knows it.
 	if w.replacementWaits(ctx) {
 		return true
+	}
+	// The returns settle once per death, as in replaceDead and failOutbound.
+	if !w.returnDeath.Equal(w.failSince) {
+		w.returnDeath = w.failSince
+		w.returnAfterDeath()
 	}
 	w.replaceActive(ctx, cfg, subs, sw, &entry, nil, msgReplacedDead, was)
 	return true
@@ -266,17 +284,25 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	if switched || ended {
 		return
 	}
+	// This read is checked against the action's fence before anything backs
+	// off or is said, and it names the server the action's last write left.
+	var latest *vpnconfig.VPNDirectorConfig
+	if w.LoadVPN != nil {
+		if read, err := w.LoadVPN(); err == nil {
+			latest = read
+		}
+	}
+	if walkOwns(latest, sw.started, sw.lastRecorded, sw.seq) != nil {
+		return
+	}
 	w.keeperBackOff()
 	if w.keeperFailNoted {
 		return
 	}
 	w.keeperFailNoted = true
-	// Read for the message alone: the server the action's last write left.
 	stays := was
-	if w.LoadVPN != nil {
-		if latest, err := w.LoadVPN(); err == nil && latest != nil && latest.Xray.ActiveServer != nil {
-			stays = label(names, latest.Xray.ActiveServer.Subscription, latest.Xray.ActiveServer.Name)
-		}
+	if latest != nil && latest.Xray.ActiveServer != nil {
+		stays = label(names, latest.Xray.ActiveServer.Subscription, latest.Xray.ActiveServer.Name)
 	}
 	slog.Warn("No working Xray server found", "stays", stays)
 	w.say(fmt.Sprintf(msgNoWorking, stays))

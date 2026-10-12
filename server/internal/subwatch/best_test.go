@@ -38,7 +38,7 @@ func healthLabels(servers []vpnconfig.Server) []string {
 	return out
 }
 
-func TestHealthOrder_StableGroupsAndCurrentRejections(t *testing.T) {
+func TestOrderBest_StableGroupsAndCurrentRejections(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	t.Run("alive first by latency", func(t *testing.T) {
 		servers := subOf("aaaaaaaa", "Alpha", "", "unknown1", "alive1", "dead1", "alive2", "rejected1").Servers
