@@ -114,10 +114,11 @@ the user commits meanwhile ends the action, as it ends a walk.
   to it, with a new `identity` and `group`. So does `preferred_server` when it named the same
   server. The probe decides: a live one ends the action; a dead one goes on as "died" (below), with
   the followed entry as the user's choice.
-- **Replace, gone**: the user's choice has left the list, and nothing can return to it. The watch
-  switches to the first working server in `bestServers` order. It clears a `preferred_server` that
-  named the vanished server. The watch remembers the vanished server's group in memory as the
-  wanted group (4.6).
+- **Replace, gone**: the user's choice has left the list. The watch switches to the first working
+  server in `bestServers` order. `RecordWalkedServer` keeps the vanished choice in
+  `preferred_server`, as it keeps any choice the walk leaves, so its `group` stays the reference
+  group across a watchd restart. Nothing returns to it while no entry of its subscription has its
+  name. Should one appear again, the return treats it as the user's choice, as any other.
 - **Replace, died**: the server is listed but Xray does not work through it (4.4). The watch
   switches to the first working server in `bestServers`, leaving out the dead one. The user's
   choice stays in `preferred_server`, as the walk keeps it today (`RecordWalkedServer`).
@@ -148,11 +149,9 @@ A server without a group never matches the reference group: it sorts with the ot
 
 **Reference group.** The group the user wants:
 
-1. `preferred_server.group` when a preferred server is set;
-2. otherwise the wanted group the watch remembers (4.6). After a vanished server, it outranks the
-   group of the replacement Xray runs.
-3. otherwise `active_server.group`;
-4. otherwise the group of the entry the record names, when it is listed.
+1. `preferred_server.group` when a preferred server is set (a vanished choice included, 4.3);
+2. otherwise `active_server.group`;
+3. otherwise the group of the entry the record names, when it is listed.
 
 With none of these, groups do not order the candidates.
 
@@ -167,7 +166,10 @@ fastest first (`endpoint.PerAddress` copies, reordered).
 2. alive servers of the reference group in the other subscriptions, as one list;
 3. alive servers of other groups in the reference subscription;
 4. alive servers of other groups in the other subscriptions;
-5. every other server (unchecked, dead), in the same tiers, in the walk's present order.
+5. every other server (unchecked, dead): those of the reference group first, then the rest. Each
+   part keeps the walk's present order (`walkOrder`: `OwnFirst` of the user's subscription, then
+   one server of each subscription in turn). A provider that fails as a whole must not cost a try
+   of each of its servers before another provider's first.
 
 Left out:
 
@@ -178,8 +180,8 @@ Left out:
 The reference subscription is the user's choice's.
 
 **Without evidence.** The monitor may be disabled, or its state not OK (WAN down, prober failing).
-The tiers by group and subscription stay; inside each tier the walk's present order applies, and
-latency plays no part.
+Nothing counts as alive then: the order is that of tier 5, the reference group first and each part
+in the walk's present order. Latency plays no part.
 
 The watch never switches between alive servers to gain latency. A switch happens only for the
 cases of 4.2, a death, or a return (4.6).
@@ -196,10 +198,6 @@ The existing return (`preferred_server`, `ReturnCheck` every 5 minutes, `ReturnR
   alive server (5 minutes, as above). The preferred server itself may be unavailable or dead. Then
   the watch switches to the best alive server of the reference group, by the order of 4.5, tiers 1
   and 2. `preferred_server` stays, so a later return to the user's own server still happens.
-
-**The wanted group.** In memory, the watch keeps the group of a server that left the list (4.3,
-gone), as long as Xray runs another group. It drops it once Xray runs that group again, or when the
-user selects a server. A watchd restart forgets it (section 7).
 
 A return that fails rolls back as today and backs off. A user selection clears `preferred_server`
 and ends the returns.
@@ -223,13 +221,15 @@ One Telegram message per switch, through the durable queue, in English like ever
 - `Xray server Alpha / DE-1 changed; Xray follows it`
 - `Xray server Alpha / DE-1 left its subscription; Xray switched to Alpha / NL-2`
 - `Xray server Alpha / DE-1 is not answering; Xray switched to Beta / FI-3`
-- `Xray back on the chosen server Alpha / DE-1`
+- `Xray back on the preferred server Alpha / DE-1` (the present return message)
 - `Xray back on a vless+reality server Alpha / NL-2`
 - `No working Xray server found; Xray stays on Alpha / DE-1`
 
-The armed failover keeps its present messages. A candidate that fails gets no message; it gets the
-log line the walk writes today. Each action logs one INFO line with its reason. No log line carries
-a link.
+The armed failover keeps its present messages. Each switch sends its message: the watch's
+deduplication by message kind (`notify`), which suppresses a kind sent twice in a row, does not
+apply to these. "No working Xray server found" goes once per run of failed attempts. A candidate
+that fails gets no message; it gets the log line the walk writes today. Each action logs one INFO
+line with its reason. No log line carries a link.
 
 ### 4.9 When the keeper does nothing
 
@@ -257,8 +257,8 @@ a link.
 - A server renamed and moved in one download is "gone". It is replaced by the best server of its
   group, and nothing returns to it.
 - Several entries of one subscription with the record's name make it "gone" as well.
-- A watchd restart forgets the wanted group of a vanished server. The reference group then falls
-  back to the group of the server Xray runs.
+- A vanished choice stays in `preferred_server` (4.3). Should an entry of its subscription take its
+  name again, the return treats that entry as the user's choice.
 - The probe proves an HTTP 204 through Xray, not throughput. A server that answers and throttles
   stays selected. The group preference keeps such a server out unless no alive server of the group
   exists.
@@ -275,14 +275,13 @@ Go:
   - several endpoints per server (alive if one is alive, lowest latency, alive addresses first);
   - rejected and dead servers, servers already tried;
   - no evidence: tiers with the walk order inside;
-  - the reference group from `preferred_server`, `active_server`, the listed entry and the wanted
-    group.
+  - the reference group from `preferred_server`, `active_server` and the listed entry.
 - **Actuality:** current, changed in place, moved, gone (no name, an ambiguous name, a deleted
   subscription), a record without `identity`, a record without a subscription.
 - **Keeper tick:**
   - follow (moved, changed) with a live probe;
   - follow with a dead probe, which goes on as "died";
-  - gone (best of the group, the wanted group remembered);
+  - gone (best of the group; the vanished choice kept in `preferred_server`);
   - died (fast, unreachable, legacy), with `preferred_server` kept;
   - nothing works (message and backoff);
   - return after 5 minutes, back to the group, rollback on a failed probe;
