@@ -214,7 +214,7 @@ func (s *fastFixture) setHealth() {
 	s.w.Health = s.h
 	// The main probe last worked on the active server a minute before the
 	// monitor saw it die, so its dead is proof (diedAfterProbeOK).
-	s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(active)
+	s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = s.f.now.Add(-time.Minute), activeID(active), recordMark(active)
 }
 
 // passThenMiss runs a tick whose main probe passes on the active server, has
@@ -231,7 +231,7 @@ func (s *fastFixture) passThenMiss(died time.Duration) {
 		}
 		return errProbe
 	}
-	s.w.probeOKAt, s.w.probeOKActive = time.Time{}, ""
+	s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = time.Time{}, "", ""
 	s.w.Tick(context.Background())
 	for _, key := range s.activeKeys() {
 		for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
@@ -385,9 +385,9 @@ func TestFast_NoWorkingProbeOfTheActiveServerIsNoProof(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newFastFixture(t)
 			kinds := fastLogKinds(t)
-			s.w.probeOKAt, s.w.probeOKActive = time.Time{}, ""
+			s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = time.Time{}, "", ""
 			if tc.worked != nil {
-				s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(tc.worked)
+				s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = s.f.now.Add(-time.Minute), activeID(tc.worked), recordMark(tc.worked)
 			}
 			s.w.Tick(context.Background())
 			if len(s.h.requests()) == 0 {
@@ -1799,4 +1799,39 @@ func TestFast_ReadsTheEvidenceOfTheTwinXrayRuns(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The main probe passes on Oslo, and the user then selects its Shadowsocks
+// twin of the same name, address and port. The twin has never passed the main
+// probe: a death of its endpoints the monitor sees after Oslo's probe proves
+// nothing, and one miss switches nothing - the legacy confirmation decides.
+func TestFast_AProbeOfOneTwinIsNoProofForTheOther(t *testing.T) {
+	s := newFastFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	twin := ssServer("Oslo", oslo.IPs[0])
+	twin.Address, twin.Port, twin.IPs = oslo.Address, oslo.Port, oslo.IPs
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, twin, backup}
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, oslo)
+	s.setHealthOf(nil, []vpnconfig.Server{oslo, twin, backup})
+	healthy := true
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if healthy || len(s.written) > 0 {
+			return nil
+		}
+		return errProbe
+	}
+	s.w.Tick(context.Background())
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, twin)
+	for _, key := range endpoint.Keys(twin) {
+		for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
+			state := endpoints[key]
+			state.Status, state.Since, state.LatencyMS, state.Fails, state.Error = watchdapi.StatusDead, s.f.now.Add(10*time.Second), 0, 1, "timeout"
+			endpoints[key] = state
+		}
+	}
+	healthy = false
+	s.f.now = s.f.now.Add(ProbeInterval)
+	s.w.Tick(context.Background())
+	s.assertNoMutation(t)
 }

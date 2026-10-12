@@ -262,6 +262,33 @@ func SameChoiceRecord(a, b *ActiveServer) bool {
 		(a.Group == "" || b.Group == a.Group)
 }
 
+// RecordedIndex is the index in servers - the list of a's subscription - of
+// the server the record a was written from: one with its name, address and
+// port, of its kind (Group), that carries its identity mark, or else the
+// first such. A panel can list twins of one name, address and port -
+// inbounds of other kinds behind one port, or one kind with other keys - and
+// only the kind and the mark tell which one the record names. A record
+// without a group knows no kind, and one without a mark takes the first such.
+// -1 when servers has none.
+func RecordedIndex(a *ActiveServer, servers []Server) int {
+	if a == nil {
+		return -1
+	}
+	first := -1
+	for i, s := range servers {
+		if s.Name != a.Name || s.Address != a.Address || s.Port != a.Port || (a.Group != "" && s.Group() != a.Group) {
+			continue
+		}
+		if a.Identity == "" || IdentityMark(s) == a.Identity {
+			return i
+		}
+		if first < 0 {
+			first = i
+		}
+	}
+	return first
+}
+
 // ClientInfo represents a VPN client with its route and pause status.
 type ClientInfo struct {
 	IP     string `json:"ip"`

@@ -116,7 +116,8 @@ type Watch struct {
 	failSeq           int       // active_server's write counter when failSince was set: the record that began to fail
 	failedProbes      int       // probes failed since failSince was set: the actuality check waits for two, a single miss being the common transient
 	probeOKAt         time.Time // when the main SOCKS probe last succeeded,
-	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on
+	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on,
+	probeOKMark       string    // and that record's kind and mark (recordMark): twins of one activeID are two servers
 	fastLogged        time.Time // failSince of the episode whose fast attempt was last logged as not switching
 	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
 	lastImport        time.Time
@@ -368,7 +369,7 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	if err == nil {
 		w.probeOKAt = w.Now()
-		w.probeOKActive = activeID(cfg.Xray.ActiveServer)
+		w.probeOKActive, w.probeOKMark = activeID(cfg.Xray.ActiveServer), recordMark(cfg.Xray.ActiveServer)
 		w.resetFail()
 		w.importRetry = 0
 		w.lastRouteKind = noteNone
@@ -755,6 +756,15 @@ func activeID(a *vpnconfig.ActiveServer) string {
 		return a.Subscription + "\x1f" + a.Name
 	}
 	return a.Subscription + "\x1f" + a.Name + "\x1f" + a.Address + "\x1f" + strconv.Itoa(a.Port)
+}
+
+// recordMark is the kind and the identity mark of the record a, which tell
+// apart the twins of one name, address and port that one activeID covers.
+func recordMark(a *vpnconfig.ActiveServer) string {
+	if a == nil {
+		return ""
+	}
+	return a.Group + "\x1f" + a.Identity
 }
 
 func serverID(s vpnconfig.Server) string {

@@ -360,6 +360,35 @@ func TestKeeper_TheConnectionOfTheTwinThatDiedGoesLast(t *testing.T) {
 	}
 }
 
+// Oslo dies, and a panel's Shadowsocks fallback on its host and port, which the
+// monitor holds alive, is another server: it takes its turn among the
+// candidates - ahead of Backup, which the monitor holds dead - rather than wait
+// behind every other one, as Oslo's own entry does.
+func TestKeeper_AnAliveTwinOfAnotherKindTakesItsTurn(t *testing.T) {
+	s := newKeeperFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	twin := ssServer("Oslo", oslo.IPs[0])
+	twin.Address, twin.Port, twin.IPs = oslo.Address, oslo.Port, oslo.IPs
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, twin, backup}
+	s.setHealthOf([]vpnconfig.Server{oslo, backup}, []vpnconfig.Server{twin})
+	// Only the twin works.
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if n := len(s.written); n > 0 && s.written[n-1].Group() == "shadowsocks" {
+			return nil
+		}
+		return errProbe
+	}
+	s.w.Tick(context.Background())
+	if len(s.written) != 1 || s.written[0].Group() != "shadowsocks" || s.restarts != 1 {
+		t.Fatalf("written %v, restarts %d; want the alive twin alone", healthLabels(s.written), s.restarts)
+	}
+	want := "Xray server Alpha / Oslo (vless+tls) is not answering; Xray switched to Alpha / Oslo (shadowsocks)"
+	if !reflect.DeepEqual(s.f.notes, []string{want}) {
+		t.Fatalf("notes %v, want [%s]", s.f.notes, want)
+	}
+}
+
 // With fresh evidence the fast path replaces the server within a tick, with
 // its own message.
 func TestKeeper_FastEvidenceSwitchesAtOnce(t *testing.T) {
@@ -399,7 +428,7 @@ func (s *fastFixture) setHealthOf(dead, alive []vpnconfig.Server) {
 	put(alive, watchdapi.StatusAlive)
 	s.h = &fastHealth{cached: cached, fresh: fresh, invalid: make(map[string]bool)}
 	s.w.Health = s.h
-	s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(s.f.cfg.Xray.ActiveServer)
+	s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = s.f.now.Add(-time.Minute), activeID(s.f.cfg.Xray.ActiveServer), recordMark(s.f.cfg.Xray.ActiveServer)
 }
 
 // A panel lists Oslo twice: the user's vless+tls server and a Shadowsocks

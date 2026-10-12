@@ -82,37 +82,29 @@ func copyFastServer(s vpnconfig.Server) vpnconfig.Server {
 	return s
 }
 
-// exactFastServer is the entry Xray runs for the record a: an entry of its
-// choice (vpnconfig.SameChoice: its subscription, name and kind) at its
-// address and port - the one that carries its identity mark, or else the
-// first. A panel can list twins of one name, address and port, inbounds of
-// other kinds behind one port or one kind with other keys, and each is an
-// endpoint of its own to the monitor: the fast path reads the death of the
-// twin Xray runs, and a replacement tries that twin's connection last. A
-// record without a group knows no kind, and one without a mark takes the
-// first such entry. With no entry of a's kind there, there is none: the
-// legacy rules and the actuality check decide.
+// exactFastServer is the entry Xray runs for the record a: the server of its
+// subscription it was written from (vpnconfig.RecordedIndex: its name, address
+// and port, its kind and its mark). A panel can list twins of one name,
+// address and port, inbounds of other kinds behind one port or one kind with
+// other keys, and each is an endpoint of its own to the monitor: the fast path
+// reads the death of the twin Xray runs, and a replacement tries that twin's
+// connection last. With no entry of a's kind there, there is none: the legacy
+// rules and the actuality check decide.
 func exactFastServer(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (vpnconfig.Server, bool) {
 	if a == nil || a.Name == "" || a.Address == "" || a.Port == 0 {
 		return vpnconfig.Server{}, false
 	}
-	servers := vpnconfig.AllServers(subs)
-	first := -1
-	for i, s := range servers {
-		if s.Address != a.Address || s.Port != a.Port || !vpnconfig.SameChoice(a, s) {
-			continue
-		}
-		if a.Identity == "" || vpnconfig.IdentityMark(s) == a.Identity {
-			return copyFastServer(s), true
-		}
-		if first < 0 {
-			first = i
-		}
-	}
-	if first < 0 {
+	i := vpnconfig.FindSubscription(subs, a.Subscription)
+	if i < 0 {
 		return vpnconfig.Server{}, false
 	}
-	return copyFastServer(servers[first]), true
+	j := vpnconfig.RecordedIndex(a, subs[i].Servers)
+	if j < 0 {
+		return vpnconfig.Server{}, false
+	}
+	s := subs[i].Servers[j]
+	s.Subscription = subs[i].ID
+	return copyFastServer(s), true
 }
 
 func fastCandidatePresent(subs []vpnconfig.Subscription, s vpnconfig.Server) bool {
@@ -289,8 +281,11 @@ func (w *Watch) fastGuardNow(ctx context.Context, guard func(*vpnconfig.VPNDirec
 
 // The monitor dials stored IPs over plain HTTP, main Xray may dial a hostname: its dead proves a death
 // only if it came after main Xray last worked on this server, else the legacy confirmation decides.
+// This server is the record's twin too, by its kind and mark: a twin of one name, address and port
+// the user selected since has not passed the main probe because the other one did.
 func (w *Watch) diedAfterProbeOK(cfg *vpnconfig.VPNDirectorConfig, e monitor.Evidence, keys []string) bool {
-	if w.probeOKAt.IsZero() || w.probeOKActive != activeID(cfg.Xray.ActiveServer) {
+	a := cfg.Xray.ActiveServer
+	if w.probeOKAt.IsZero() || w.probeOKActive != activeID(a) || w.probeOKMark != recordMark(a) {
 		return false
 	}
 	for _, key := range keys {

@@ -116,15 +116,15 @@ connections the monitor last saw alive, in `orderBest` order - the user's group 
 first, by latency - and none on an address the active server uses: a rotation or a
 block takes the address, so the other names a provider lists on it die with the active one, and
 their dead checks (22 s each) seldom end inside the deadline. The active endpoints are those of
-the entry Xray runs (`exactFastServer`): the entry of the record's choice - its subscription, name
-and kind - at its address and port that carries its mark, or else the first such. A panel can list
-twins of one name, address and port, and each is an endpoint of its own to the monitor; a record
-without `group` takes the first entry there, and with none of its kind there the fast path does
-not apply. Fresh checks share one 30-second deadline and the monitor's worker pool. Switching
-requires fresh active-dead/candidate-alive evidence and a working WAN; active-dead counts only
-when the monitor saw the active endpoints die after the main probe last succeeded on that same
-server, so a monitor that cannot reach what main Xray dials (stale stored IPs, plain HTTP blocked)
-never triggers the fast path; the legacy confirmation decides then.
+the entry Xray runs (`exactFastServer`, `vpnconfig.RecordedIndex`): the entry of the record's
+choice - its subscription, name and kind - at its address and port that carries its mark, or else
+the first such. A panel can list twins of one name, address and port, and each is an endpoint of
+its own to the monitor; a record without `group` takes the first entry there, and with none of its
+kind there the fast path does not apply. Fresh checks share one 30-second deadline and the
+monitor's worker pool. Switching requires fresh active-dead/candidate-alive evidence and a working
+WAN; active-dead counts only when the monitor saw the active endpoints die after the main probe
+last succeeded on that same server, so a monitor that cannot reach what main Xray dials (stale
+stored IPs, plain HTTP blocked) never triggers the fast path; the legacy confirmation decides then.
 Evidence from an old endpoint set, prober/session, activity epoch or completion is not proof.
 The config-lock guard revalidates ownership, subscription identity, inbound ports and evidence.
 Incomplete/invalid monitor evidence falls back to the legacy path, not an invented healthy route.
@@ -204,20 +204,25 @@ not resolve this time. A merge equal to the file, with no error recorded, writes
 nothing at all, `refreshed` included; anything else writes the list, `refreshed`,
 a cleared error and `xray.servers` once. `active_server`, `preferred_server` and
 `pending_restore.active` follow a renamed server in that write, `seq` unchanged: a rename is no
-selection, and `sameRestoreActive` compares the records whole. A download that fails, or a merge
-that comes out empty, records its error once (`RecordSubscriptionError`) and keeps the list.
+selection, and `sameRestoreActive` compares the records whole. Each follows the server it was
+written from (`vpnconfig.RecordedIndex`: its name, address and port, its kind and its mark): a
+panel can list twins of one name, address and port, and the rename of one is no rename of the
+other. A download that fails, or a merge that comes out empty, records its error once
+(`RecordSubscriptionError`) and keeps the list.
 Nothing goes to Telegram. The log gives the counts at INFO when a round added, removed or
 readdressed servers. A round that only renamed or reordered them, or only cleared an error, logs
 them at DEBUG, and so does every record that followed a rename: a panel that puts the traffic left
 into every name renames at every round, and watchd's log is cut at 200 KB. No line carries a link.
 
 A successful probe remembers the active server's record (`probeOKActive`: its subscription,
-name, address and port). A periodic publication that renames the active server moves it, and the
-walk's `lastPicked`, to the new name with the record, so the fast path still knows the server. A
-manual refresh renames it from another daemon: Xray dying within about 30 s of that, before the
-next successful probe, leaves that episode to the legacy confirmation. A stored REALITY pick that
-the server's admin removes, or a ws or httpupgrade `host` or `path` the operator really moves,
-leaves the stored copy dead until a manual refresh or the wave, which take fresh copies.
+name, address and port; `probeOKMark`: its kind and mark, so a twin of one name, address and port
+that the user selects afterwards has not passed the probe because the other did). A periodic
+publication that renames the active server moves it, and the walk's `lastPicked`, to the new name
+with the record, so the fast path still knows the server. A manual refresh renames it from another
+daemon: Xray dying within about 30 s of that, before the next successful probe, leaves that episode
+to the legacy confirmation. A stored REALITY pick that the server's admin removes, or a ws or
+httpupgrade `host` or `path` the operator really moves, leaves the stored copy dead until a manual
+refresh or the wave, which take fresh copies.
 
 ## Keeping Xray on a working server
 
@@ -291,11 +296,12 @@ can differ from what Xray ran in ways the identity mark ignores - a REALITY pick
 Host or path a manual refresh took fresh, new IPs of its host - so with nothing else working it is
 still worth one try, and when it works the message is
 `Xray server <s> changed; Xray follows it`. An entry of another kind on its address and port - a
-panel's fallback inbound - goes last with it but is another server: when it works, the message is
-the replacement's, with both kinds. The candidates the fast path is done with stay out
-(`fastAttempt.Tried`): one it switched to whose restart or probe failed, one its fresh checks found
-dead. So do the copies a failed follow has just tried. Each candidate - each connection once - goes
-through the walk's guarded write (`switcher.to`), `restart xray-process`, 3 s and the SOCKS probe.
+panel's fallback inbound - is another server and takes its turn among the candidates, as the
+monitor ranks it: when it works, the message is the replacement's, with both kinds. The candidates
+the fast path is done with stay out (`fastAttempt.Tried`): one it switched to whose restart or
+probe failed, one its fresh checks found dead. So do the copies a failed follow has just tried.
+Each candidate - each connection once - goes through the walk's guarded write (`switcher.to`),
+`restart xray-process`, 3 s and the SOCKS probe.
 
 A replacement first checks the WAN: `WANUp`, or without it a control address that accepts
 (`reachControls`); a watch with neither goes on. While the WAN is down it waits

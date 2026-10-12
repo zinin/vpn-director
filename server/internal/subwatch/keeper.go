@@ -57,7 +57,7 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	}
 	if err == nil {
 		w.probeOKAt = w.Now()
-		w.probeOKActive = activeID(cfg.Xray.ActiveServer)
+		w.probeOKActive, w.probeOKMark = activeID(cfg.Xray.ActiveServer), recordMark(cfg.Xray.ActiveServer)
 		w.resetFail()
 		w.resetKeeper()
 		w.lastRouteKind, w.lastImportKind = noteNone, noteNone
@@ -286,18 +286,21 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // path's, one onto a same-named server of another kind included: that is
 // another server (vpnconfig.SameChoice). It leaves out each copy in tried with
 // the copies that dial its connection (endpoint.DialKey): spec 4.5 leaves out
-// the servers already tried in the attempt. dead - every copy of it, and every
-// copy that dials the same connection, which shares its fate - goes last,
-// after every other candidate, rather than out: its stored entry can differ
-// from what Xray ran in ways the identity mark ignores - a REALITY pick or a
-// ws or httpupgrade Host or path a manual refresh took fresh, new IPs of its
-// host - so with nothing else working it is still worth one try. It sends msg
-// with the server replaced - replaced, the record the action decided on - and
-// the server found; when the two read alike, a same-named server of another
-// kind, each carries its kind. A copy of dead that works sends
-// msgFollowedChanged instead, since Xray then runs dead's current entry. With
-// none working it says so once a run and backs the next attempt off. Every
-// caller has asked replacementWaits first: with the WAN down none would work.
+// the servers already tried in the attempt. dead - every copy of its choice at
+// its address and port, and every copy that dials the same connection, which
+// shares its fate - goes last, after every other candidate, rather than out:
+// its stored entry can differ from what Xray ran in ways the identity mark
+// ignores - a REALITY pick or a ws or httpupgrade Host or path a manual
+// refresh took fresh, new IPs of its host - so with nothing else working it is
+// still worth one try. A twin of another kind on its address and port - a
+// panel's fallback inbound - is another server and takes its turn among the
+// candidates: the monitor may hold it alive. It sends msg with the server
+// replaced - replaced, the record the action decided on - and the server
+// found; when the two read alike, a same-named server of another kind, each
+// carries its kind. A copy of dead that works sends msgFollowedChanged
+// instead, since Xray then runs dead's current entry. With none working it
+// says so once a run and backs the next attempt off. Every caller has asked
+// replacementWaits first: with the WAN down none would work.
 func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, tried []vpnconfig.Server, msg string, replaced *vpnconfig.ActiveServer) {
 	if w.mutationEnded(ctx) {
 		return
@@ -317,12 +320,18 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 			deadKeys[leftKey(c)] = true
 		}
 	}
+	// isDead is a copy of the dead server's current entry: its choice at its
+	// address and port. An entry of another kind there - a panel's fallback
+	// inbound - is another server (vpnconfig.SameChoice).
+	isDead := func(c vpnconfig.Server) bool {
+		return dead != nil && serverID(c) == serverID(*dead) && vpnconfig.SameChoice(replaced, c)
+	}
 	var copies, last []vpnconfig.Server
 	for _, c := range endpoint.PerAddress(order) {
 		if left[leftKey(c)] {
 			continue
 		}
-		if (dead != nil && serverID(c) == serverID(*dead)) || deadKeys[leftKey(c)] {
+		if isDead(c) || deadKeys[leftKey(c)] {
 			last = append(last, c)
 			continue
 		}
@@ -333,10 +342,8 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	ref := refFor(cfg, vpnconfig.AllServers(subs))
 	switched, ended := w.switchAmong(ctx, sw, append(w.bestWalkOrder(copies, cfg, ref), w.bestWalkOrder(last, cfg, ref)...), func(c vpnconfig.Server) string {
 		// Xray runs the dead server's current entry now, which changed in a
-		// way the identity mark ignores: it is followed, not replaced. An
-		// entry of another kind on its address and port - a panel's fallback
-		// inbound - is another server (vpnconfig.SameChoice): a replacement.
-		if dead != nil && serverID(c) == serverID(*dead) && vpnconfig.SameChoice(replaced, c) {
+		// way the identity mark ignores: it is followed, not replaced.
+		if isDead(c) {
 			return fmt.Sprintf(msgFollowedChanged, was)
 		}
 		from, to := was, label(names, c.Subscription, c.Name)

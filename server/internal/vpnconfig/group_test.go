@@ -114,6 +114,38 @@ func TestPublishRefresh_ARenameKeepsTheRecordsMarkAndGroup(t *testing.T) {
 	}
 }
 
+// A panel lists twins of one name, address and port - a Trojan fallback
+// listed before the REALITY Oslo the user runs - and a refresh renames one of
+// them. The record follows the twin it was written from, by its kind and mark:
+// the twin's rename leaves it as it was, and its own server's moves it.
+func TestPublishRefresh_ARecordFollowsTheTwinItNames(t *testing.T) {
+	oslo := reality("Oslo", "www.example.com", "aa11", "203.0.113.10")
+	twin := Server{Name: "Oslo", Address: "de.example", Port: 443, IPs: []string{"203.0.113.10"}, Outbound: trojanTo("de.example")}
+	twinRenamed, osloRenamed := twin, oslo
+	twinRenamed.Name, osloRenamed.Name = "Oslo Trojan", "Oslo REALITY"
+	for _, tc := range []struct {
+		name   string
+		listed []Server
+		want   string
+	}{
+		{"the twin renamed", []Server{twinRenamed, oslo}, "Oslo"},
+		{"its own server renamed", []Server{twin, osloRenamed}, "Oslo REALITY"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &memStore{subs: []Subscription{alphaWith(twin, oslo)}}
+			chosen := oslo
+			chosen.Subscription = "0a1b2c3d"
+			m.cfg.Xray.ActiveServer = RecordActiveServer(nil, chosen)
+			if _, err := PublishRefresh(m.update, m.files(), "0a1b2c3d", alphaLink, t0, tc.listed, t0.Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+			if a := m.cfg.Xray.ActiveServer; a.Name != tc.want || a.Group != "vless+reality" {
+				t.Fatalf("active %+v, want %q", a, tc.want)
+			}
+		})
+	}
+}
+
 // The choice is a server's subscription, name and kind. A panel can give one
 // name to several inbounds; a record without a group knows no kind, and its
 // subscription and name decide.
