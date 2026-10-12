@@ -10,9 +10,13 @@ const (
 	// actualUnknown is no record, or one without a subscription or a name:
 	// nothing to keep.
 	actualUnknown actuality = iota
+	// actualCurrent is an entry of the record's name, address and port with
+	// its mark, or any such entry when the record has no mark; for a record
+	// without an address and a port, any entry of its name.
 	actualCurrent
-	// actualChanged is the entry of the record's name, address and port with
-	// another mark: new keys or a new UUID behind the same name and address.
+	// actualChanged is entries of the record's name, address and port, all
+	// with another mark: new keys or a new UUID behind the same name and
+	// address.
 	actualChanged
 	// actualMoved is no such entry, and exactly one entry of the name.
 	actualMoved
@@ -22,10 +26,13 @@ const (
 )
 
 // classifyActive compares a with its subscription's list in subs, and returns
-// the entry a is to follow when the server changed in place or moved. A record
-// without a mark - configure.sh's, an older daemon's - is current while the
-// entry of its name, address and port is listed; one without an address and a
-// port while an entry of its name is.
+// the entry a is to follow when the server changed in place or moved. Several
+// entries can share a name, address and port - a panel's inbounds behind one
+// name - and the Web UI selects by index, so a can name any of them: the
+// server changed only when none of them carries a's mark, and the first is
+// then followed. A record without a mark - configure.sh's, an older daemon's -
+// is current while the entry of its name, address and port is listed; one
+// without an address and a port while an entry of its name is.
 func classifyActive(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (actuality, vpnconfig.Server) {
 	if a == nil || a.Subscription == "" || a.Name == "" {
 		return actualUnknown, vpnconfig.Server{}
@@ -35,6 +42,7 @@ func classifyActive(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (a
 		return actualGone, vpnconfig.Server{}
 	}
 	var named []vpnconfig.Server
+	var changed *vpnconfig.Server
 	for _, s := range subs[i].Servers {
 		if s.Name != a.Name {
 			continue
@@ -47,9 +55,16 @@ func classifyActive(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (a
 			if a.Identity == "" || vpnconfig.IdentityMark(s) == a.Identity {
 				return actualCurrent, s
 			}
-			return actualChanged, s
+			// A twin further down can still carry the mark: the user may run it.
+			if changed == nil {
+				changed = &s
+			}
+			continue
 		}
 		named = append(named, s)
+	}
+	if changed != nil {
+		return actualChanged, *changed
 	}
 	if len(named) == 1 {
 		return actualMoved, named[0]
