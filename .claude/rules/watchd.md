@@ -115,12 +115,16 @@ fast path checks every active endpoint and at most three (`FastCandidates`) othe
 connections the monitor last saw alive, in `orderBest` order - the user's group and subscription
 first, by latency - and none on an address the active server uses: a rotation or a
 block takes the address, so the other names a provider lists on it die with the active one, and
-their dead checks (22 s each) seldom end inside the deadline. Fresh checks share one 30-second
-deadline and the monitor's
-worker pool. Switching requires fresh active-dead/candidate-alive evidence and a working WAN;
-active-dead counts only when the monitor saw the active endpoints die after the main probe last
-succeeded on that same server, so a monitor that cannot reach what main Xray dials (stale stored
-IPs, plain HTTP blocked) never triggers the fast path; the legacy confirmation decides then.
+their dead checks (22 s each) seldom end inside the deadline. The active endpoints are those of
+the entry Xray runs (`exactFastServer`): the entry of the record's choice - its subscription, name
+and kind - at its address and port that carries its mark, or else the first such. A panel can list
+twins of one name, address and port, and each is an endpoint of its own to the monitor; a record
+without `group` takes the first entry there, and with none of its kind there the fast path does
+not apply. Fresh checks share one 30-second deadline and the monitor's worker pool. Switching
+requires fresh active-dead/candidate-alive evidence and a working WAN; active-dead counts only
+when the monitor saw the active endpoints die after the main probe last succeeded on that same
+server, so a monitor that cannot reach what main Xray dials (stale stored IPs, plain HTTP blocked)
+never triggers the fast path; the legacy confirmation decides then.
 Evidence from an old endpoint set, prober/session, activity epoch or completion is not proof.
 The config-lock guard revalidates ownership, subscription identity, inbound ports and evidence.
 Incomplete/invalid monitor evidence falls back to the legacy path, not an invented healthy route.
@@ -281,9 +285,11 @@ out. The rest follow, the group first, each part in the walk's order (`OwnFirst`
 of each subscription in turn). The dead server goes last, after every other candidate, with every
 copy that dials its connection (`endpoint.DialKey`): the server the tick's probe failed on, which
 the message names, even when a fast-path fallback has left Xray on one of the fast path's own
-candidates. Its stored entry can differ from what Xray ran in ways the identity mark ignores - a
-REALITY pick or a ws/httpupgrade Host or path a manual refresh took fresh, new IPs of its host - so
-with nothing else working it is still worth one try, and when it works the message is
+candidates. That entry is the one the fast path reads (`exactFastServer`): the copies that go last
+with it dial the connection Xray ran, not that of a twin on its address and port. Its stored entry
+can differ from what Xray ran in ways the identity mark ignores - a REALITY pick or a ws/httpupgrade
+Host or path a manual refresh took fresh, new IPs of its host - so with nothing else working it is
+still worth one try, and when it works the message is
 `Xray server <s> changed; Xray follows it`. An entry of another kind on its address and port - a
 panel's fallback inbound - goes last with it but is another server: when it works, the message is
 the replacement's, with both kinds. The candidates the fast path is done with stay out

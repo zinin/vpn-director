@@ -82,16 +82,37 @@ func copyFastServer(s vpnconfig.Server) vpnconfig.Server {
 	return s
 }
 
+// exactFastServer is the entry Xray runs for the record a: an entry of its
+// choice (vpnconfig.SameChoice: its subscription, name and kind) at its
+// address and port - the one that carries its identity mark, or else the
+// first. A panel can list twins of one name, address and port, inbounds of
+// other kinds behind one port or one kind with other keys, and each is an
+// endpoint of its own to the monitor: the fast path reads the death of the
+// twin Xray runs, and a replacement tries that twin's connection last. A
+// record without a group knows no kind, and one without a mark takes the
+// first such entry. With no entry of a's kind there, there is none: the
+// legacy rules and the actuality check decide.
 func exactFastServer(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (vpnconfig.Server, bool) {
 	if a == nil || a.Name == "" || a.Address == "" || a.Port == 0 {
 		return vpnconfig.Server{}, false
 	}
-	for _, s := range vpnconfig.AllServers(subs) {
-		if s.Subscription == a.Subscription && s.Name == a.Name && s.Address == a.Address && s.Port == a.Port {
+	servers := vpnconfig.AllServers(subs)
+	first := -1
+	for i, s := range servers {
+		if s.Address != a.Address || s.Port != a.Port || !vpnconfig.SameChoice(a, s) {
+			continue
+		}
+		if a.Identity == "" || vpnconfig.IdentityMark(s) == a.Identity {
 			return copyFastServer(s), true
 		}
+		if first < 0 {
+			first = i
+		}
 	}
-	return vpnconfig.Server{}, false
+	if first < 0 {
+		return vpnconfig.Server{}, false
+	}
+	return copyFastServer(servers[first]), true
 }
 
 func fastCandidatePresent(subs []vpnconfig.Subscription, s vpnconfig.Server) bool {

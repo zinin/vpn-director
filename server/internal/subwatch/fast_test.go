@@ -1727,3 +1727,76 @@ func TestFastFailover_TriesTheUsersGroupFirst(t *testing.T) {
 		t.Fatalf("written %v, want Backup first", healthLabels(s.written))
 	}
 }
+
+// A panel can list twins of one name, address and port: inbounds of other
+// kinds behind one port, or the same kind with other keys. Each is its own
+// endpoint to the monitor, so the entry the fast path reads is the twin Xray
+// runs: of the record's kind, with its mark, else the first of its kind. A twin
+// of another kind alone is not it. A record without a group or a mark knows
+// neither, and takes the first twin.
+func TestExactFastServer_FindsTheTwinXrayRuns(t *testing.T) {
+	oslo := fastServer("Oslo", "oslo.example", "203.0.113.10")
+	rekeyed := oslo
+	rekeyed.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+	ss := ssServer("Oslo", "203.0.113.10")
+	ss.Address, ss.Port = oslo.Address, oslo.Port
+	record := vpnconfig.NewActiveServer(oslo)
+	legacy := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Oslo", Address: "oslo.example", Port: 443}
+	alpha := func(servers ...vpnconfig.Server) []vpnconfig.Subscription {
+		return []vpnconfig.Subscription{{ID: "alpha", Name: "Alpha", Servers: servers}}
+	}
+	cases := []struct {
+		name string
+		subs []vpnconfig.Subscription
+		a    *vpnconfig.ActiveServer
+		want *vpnconfig.Server // nil: none
+	}{
+		{"another kind listed first", alpha(ss, oslo), record, &oslo},
+		{"other keys of the kind listed first", alpha(rekeyed, oslo), record, &oslo},
+		{"no twin with the mark: the first of the kind", alpha(ss, rekeyed), record, &rekeyed},
+		{"another kind alone", alpha(ss), record, nil},
+		{"a record without a group or a mark", alpha(ss, oslo), legacy, &ss},
+	}
+	for _, tc := range cases {
+		got, ok := exactFastServer(tc.subs, tc.a)
+		switch {
+		case tc.want == nil && ok:
+			t.Errorf("%s: found %s (%s), want none", tc.name, got.Name, got.Group())
+		case tc.want != nil && (!ok || !reflect.DeepEqual(got, *tc.want)):
+			t.Errorf("%s: found %v: %s (%s) %s, want %s (%s) %s", tc.name, ok, got.Name, got.Group(), got.Outbound, tc.want.Name, tc.want.Group(), tc.want.Outbound)
+		}
+	}
+}
+
+// A panel's fallback inbound, "Oslo" over Shadowsocks on Oslo's own host and
+// port, is listed before the vless+tls Oslo that Xray runs. The fast path
+// reads Oslo's endpoints, not the twin's: Oslo's death switches Xray at the
+// first miss, and the twin's, with Oslo alive, switches nothing.
+func TestFast_ReadsTheEvidenceOfTheTwinXrayRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		osloDied bool // Oslo's endpoints died; otherwise the twin's did
+		written  []string
+	}{
+		{"Oslo died, the twin alive", true, []string{"Backup@backup.example"}},
+		{"the twin died, Oslo alive", false, []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newFastFixture(t)
+			oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+			twin := ssServer("Oslo", oslo.IPs[0])
+			twin.Address, twin.Port, twin.IPs = oslo.Address, oslo.Port, oslo.IPs
+			s.f.subs[0].Servers = []vpnconfig.Server{twin, oslo, backup}
+			s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, oslo)
+			dead, alive := []vpnconfig.Server{oslo}, []vpnconfig.Server{twin, backup}
+			if !tc.osloDied {
+				dead, alive = []vpnconfig.Server{twin}, []vpnconfig.Server{oslo, backup}
+			}
+			s.setHealthOf(dead, alive)
+			s.w.Tick(context.Background())
+			if got := writtenNames(s.written); !reflect.DeepEqual(got, tc.written) {
+				t.Fatalf("written %v, want %v", got, tc.written)
+			}
+		})
+	}
+}

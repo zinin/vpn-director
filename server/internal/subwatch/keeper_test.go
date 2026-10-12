@@ -329,6 +329,37 @@ func TestKeeper_AFallbackTwinOnTheDeadServersAddressIsNoFollow(t *testing.T) {
 	}
 }
 
+// Xray ran the vless+tls Oslo, listed after a Shadowsocks fallback inbound on
+// its host and port, and Oslo-2 - another name on Oslo's very connection - dies
+// with it. Once the death is confirmed, the replacement leaves Oslo's
+// connection for last, not the twin's: Backup takes over, and the connection
+// that died costs no restart.
+func TestKeeper_TheConnectionOfTheTwinThatDiedGoesLast(t *testing.T) {
+	s := newKeeperFixture(t)
+	s.w.Health = nil
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	twin := ssServer("Oslo", oslo.IPs[0])
+	twin.Address, twin.Port, twin.IPs = oslo.Address, oslo.Port, oslo.IPs
+	alias := oslo
+	alias.Name = "Oslo-2"
+	s.f.subs[0].Servers = []vpnconfig.Server{twin, oslo, alias, backup}
+	// Only Backup works.
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if n := len(s.written); n > 0 && s.written[n-1].Name == "Backup" {
+			return nil
+		}
+		return errProbe
+	}
+	tickUntilDead(s.w, s.f)
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) || s.restarts != 1 {
+		t.Fatalf("written %v, restarts %d; want Backup alone", got, s.restarts)
+	}
+	if want := []string{"Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
 // With fresh evidence the fast path replaces the server within a tick, with
 // its own message.
 func TestKeeper_FastEvidenceSwitchesAtOnce(t *testing.T) {
