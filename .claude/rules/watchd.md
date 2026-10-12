@@ -297,7 +297,11 @@ ends that wait: the next failed run backs off 10 minutes again. The watch never 
 alive servers for latency alone.
 
 `RecordWalkedServer` keeps the user's choice in `preferred_server`, a vanished one included, so its
-group stays the reference across a restart. The return runs in both modes and looks every
+group stays the reference across a restart. The choice is its subscription and name, as everywhere
+the watch matches it. A replacement that lands on another entry of that name - one of the several a
+vanished choice can leave behind, or a twin of another group - is taken for the choice itself:
+nothing is kept in `preferred_server`, that entry's group becomes the reference, and no return
+brings Xray back to the group the user chose. The return runs in both modes and looks every
 `ReturnCheck`: with valid evidence it goes back once the monitor has held the preferred server
 alive for `ReturnAlive` (5 minutes); without evidence the TCP look applies (`telegram-bot.md`).
 While the preferred server is not back and Xray runs another group than the user's, a look with

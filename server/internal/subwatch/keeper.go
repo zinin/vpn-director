@@ -249,15 +249,20 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // orders the candidates too: a follow that failed recorded the same choice,
 // which walkOrder still finds by its name, and the write after it keeps the
 // record it left in preferred_server (RecordWalkedServer), as does a write of
-// the fast path's. It leaves out each copy in tried with the copies that dial
-// its connection (endpoint.DialKey): spec 4.5 leaves out the servers already
-// tried in the attempt. dead - every copy of it, and every copy that dials the
-// same connection, which shares its fate - goes last, after every other
-// candidate, rather than out: its stored entry can differ from what Xray ran
-// in ways the identity mark ignores - a REALITY pick or a ws or httpupgrade
-// Host or path a manual refresh took fresh, new IPs of its host - so with
-// nothing else working it is still worth one try. It sends msg with was, the
-// server replaced, and the server found; a copy of dead that works sends
+// the fast path's. That holds for a server of another name only:
+// RecordWalkedServer matches the choice by its subscription and name, so a
+// candidate of the choice's name - one of the several entries of that name a
+// choice that left its list can leave behind, or a twin of another group - is
+// taken for the choice, and its group becomes the reference. It leaves out
+// each copy in tried with the copies that dial its connection
+// (endpoint.DialKey): spec 4.5 leaves out the servers already tried in the
+// attempt. dead - every copy of it, and every copy that dials the same
+// connection, which shares its fate - goes last, after every other candidate,
+// rather than out: its stored entry can differ from what Xray ran in ways the
+// identity mark ignores - a REALITY pick or a ws or httpupgrade Host or path a
+// manual refresh took fresh, new IPs of its host - so with nothing else
+// working it is still worth one try. It sends msg with was, the server
+// replaced, and the server found; a copy of dead that works sends
 // msgFollowedChanged instead, since Xray then runs dead's current entry. With
 // none working it says so once a run and backs the next attempt off. Every
 // caller has asked replacementWaits first: with the WAN down none would work.
