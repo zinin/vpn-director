@@ -133,12 +133,17 @@ server's subscription: two subscriptions can name a server alike, and only the
 one in the chosen subscription is the running one. A record from before
 subscriptions has no `subscription` and matches no server. No credential goes
 in: `/api/config` hands this file to the browser, so the UUID and the REALITY
-material stay out. It is absent, and `active` is `null`, until something
-selects a server.
+material stay out. The record also carries `identity` (a hash of the server's
+outbound without the picks a panel makes at random, which names no credential)
+and `group` (its protocol and security): watchd tells by them a server that
+changed in place from one that is current, and tries a replacement of the
+user's group first (`watchd.md`). It is absent, and `active` is `null`, until
+something selects a server.
 
 `xray.preferred_server`, in the same fields, is the server the user chose
-while watchd's subscription walk has `active_server` on another one (see
-`telegram-bot.md`). A selection is a new choice, so all three Go paths clear it
+while watchd - its subscription walk, the fast path or the keeper - has
+`active_server` on another one (see `telegram-bot.md` and `watchd.md`).
+A selection is a new choice, so all three Go paths clear it
 and `configure.sh` deletes it; the delete of its subscription clears it too,
 from the daemons and from `import_server_list.sh` alike.
 

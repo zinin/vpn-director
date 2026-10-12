@@ -82,7 +82,7 @@ cd server && go run ./cmd/watchd --dev
 | `server/cmd/webui/main.go` | Web UI daemon: HTTPS server, DI, dev mode |
 | `server/cmd/watchd/` | `vpn-director-watchd`: monitoring, subscription automation and queue, one socket-owned runtime |
 | `server/internal/monitor/` | Endpoint checks, `vpn-director-probe`, schedule, WAN guard and fresh failover evidence |
-| `server/internal/subwatch/` | Watchd's SOCKS probe, subscription walk, failover, preferred return, pending restore and periodic subscription refresh |
+| `server/internal/subwatch/` | Watchd's SOCKS probe, subscription walk, failover, preferred return, pending restore, periodic subscription refresh, and the keeper that holds Xray on a working server |
 | `server/internal/watchcompat/` | Read-only capability gate for installed and running bot executables |
 | `server/internal/notifications/` | Watchd's durable events, per-chat delivery progress and subscription-health transitions |
 | `server/internal/watchdapi/` | Unix IPC: independent monitor/watch status, recipient sync, pending events and ack |

@@ -21,7 +21,7 @@ server/cmd/watchd/main.go          # flags, logging, readers, DI; self-update ru
 server/cmd/watchd/runtime.go       # socket ownership, monitor/watch/queue start and drain
 server/cmd/watchd/watch.go         # shared netpath readiness, generation, compatibility gate
 server/cmd/watchd/health.go        # subscription-health event producer
-server/internal/subwatch/         # fast/legacy failover, walk, preferred return, pending restore, periodic refresh
+server/internal/subwatch/         # fast/legacy failover, walk, preferred return, pending restore, periodic refresh, keeper
 server/internal/watchcompat/      # read-only installed/running bot capability checks
 server/internal/notifications/    # sole-writer durable events and per-chat progress
 server/internal/endpoint/          # PerAddress, ServerForDial, DialKey, Key, Keys, WANControls
@@ -111,8 +111,9 @@ silently disarm clients. With no subscriptions, existing failover/restore intent
 but the watch starts no new subscription-driven failover. Paused clients are excluded.
 
 Every 30 seconds the watch checks HTTPS 204 through the main Xray SOCKS port. After a miss, the
-fast path checks every active endpoint and at most three other distinct, previously live
-connections in hybrid walk order, none on an address the active server uses: a rotation or a
+fast path checks every active endpoint and at most three (`FastCandidates`) other distinct
+connections the monitor last saw alive, in `orderBest` order - the user's group and subscription
+first, by latency - and none on an address the active server uses: a rotation or a
 block takes the address, so the other names a provider lists on it die with the active one, and
 their dead checks (22 s each) seldom end inside the deadline. Fresh checks share one 30-second
 deadline and the monitor's
@@ -129,14 +130,20 @@ the return write for such a failure.
 
 The legacy path confirms death after 1 minute of proven TCP unreachability with a working WAN,
 otherwise 3 minutes. It remains available with monitoring disabled/unavailable. UDP/QUIC-only
-outbounds do not gain false TCP proof. The walk keeps `OwnFirst=3`, then round-robins subscriptions;
-with valid monitor evidence the endpoints the monitor last saw alive go first and those Xray
-rejected in the current generation are skipped;
+outbounds do not gain false TCP proof. The walk orders its candidates with `orderBest`, as the fast
+path does (see "Keeping Xray on a working server"): with valid monitor evidence the endpoints the
+monitor holds alive go first, the user's group and subscription first and each tier by latency,
+and those Xray rejected in the current generation are skipped; the rest keep the walk's order,
+`OwnFirst=3` and then one server of each subscription in turn, the user's group first;
 `endpoint.PerAddress` and `DialKey` deduplicate connections rather than provider labels. A refresh
 that fails keeps the previous list; deleted/relinked subscriptions cannot be republished by an
-old download. Preferred return waits 5 minutes, retries at 10–30 minutes, holds success for
-30 minutes and stops after four failed returns. Details of the shared watch algorithms are in
-`telegram-bot.md` and the `subwatch` modules; the process owner is watchd.
+old download. Preferred return looks every 5 minutes: with valid monitor evidence it goes back once
+the monitor has held the preferred server alive for 5 minutes (`ReturnAlive`), otherwise by the
+TCP look; while that server is not back and Xray runs another group than the user's, a server of
+the user's group alive as long is taken instead. Returns of both kinds retry at 10–30 minutes, end
+their backoff once one has held for 30 minutes and stop after four failed returns. Details of the
+shared watch algorithms are in `telegram-bot.md` and the `subwatch` modules; the process owner is
+watchd.
 
 Only RFC1918 IPv4 clients/CIDRs that `vpnconfig.TDCarries` accepts can enter Tunnel Director
 failover. Other Xray clients remain on Xray, not direct WAN. Staging retains Xray membership
@@ -156,12 +163,14 @@ client changes also invalidate stale writes. Recovery must preserve make-before-
 
 `(*Watch).StartRefresh` (`subwatch/refresh.go`) downloads every subscription with a link every
 `monitor.subscription_refresh` (`5m` by default, `"0"` off, a value below `1m` the default with a
-WARN), whatever `monitor.enabled` says: the failover walk wants current lists too. Its first round
-starts a minute after watchd, each next one an interval after the previous one ended, and a round
-that stands down looks again a minute later. A round stands down while VPN Director is stopped, the
-compatibility gate is closed, or the watch handles an Xray failure - its probe failing
-(`failSince`), an apply of its own pending, a `xray.failover` or a `xray.pending_restore`: the wave
-refreshes then.
+WARN), whatever `monitor.enabled` says: the failover walk and the keeper want current lists too. Its
+first round starts a minute after watchd, each next one an interval after the previous one ended,
+and a round that stands down looks again a minute later. A round stands down (`refreshStandsDown`)
+while VPN Director is stopped, the compatibility gate is closed, or the watch handles an Xray
+failure - an apply of its own pending, a `xray.failover` or a `xray.pending_restore`, and, while
+the watch is armed, its probe failing (`failSince`): the wave refreshes then. In keeper mode no
+wave runs, so a failing probe does not stand the refresh down: the keeper's next attempt works from
+the lists as they are now.
 
 It downloads outside the tick through the wave's fetcher (`SubscriptionFetcher.FetchList`: the WAN,
 then the tunnel; every listed server, without addresses where the host did not resolve), each
@@ -205,6 +214,79 @@ manual refresh renames it from another daemon: Xray dying within about 30 s of t
 next successful probe, leaves that episode to the legacy confirmation. A stored REALITY pick that
 the server's admin removes, or a ws or httpupgrade `host` or `path` the operator really moves,
 leaves the stored copy dead until a manual refresh or the wave, which take fresh copies.
+
+## Keeping Xray on a working server
+
+The watch keeps Xray on a working server whether or not anybody is on Xray. Armed, it works as
+described above, with the check below between episodes. Not armed, but with `xray.active_server`
+naming a server of a subscription, its tick runs in keeper mode (`subwatch/keeper.go`): it probes
+Xray through SOCKS every 30 s and confirms a death by the same rules - the fast path's evidence,
+the unreachable streak, `DeadAfter` - but moves no client and runs no wave. The fast path switches
+as it does with clients; a death it does not switch away from - confirmed by the legacy rules, or
+with none of its candidates working - the keeper replaces (`replaceDead`). The periodic refresh
+keeps the lists current, and keeps running while the probe fails (`refreshStandsDown`); with
+`subscription_refresh` at `"0"` the keeper works from the lists as they are. The keeper does
+nothing while VPN Director is stopped, the gate is closed, no server of a subscription is selected,
+or the monitor reports `no_xray`.
+
+Between episodes, in both modes, the tick checks the selected server against its list
+(`followActive`, `classifyActive`). An episode - the probe failing (`failSince`), an apply of the
+watch's own pending (`pendingApply`), a `xray.failover` or a `xray.pending_restore` - owns the
+record while it lasts. `active_server` carries `identity` (`vpnconfig.IdentityMark`: the first
+16 hex digits of a SHA-256 of the loose identity, `looseIdentity` above) and `group`
+(`Server.Group`: protocol and security, lowercased as Xray reads them, such as `vless+reality`).
+Every Go writer fills them in through `vpnconfig.RecordActiveServer`; a rename moves only the
+name. The record is current while an entry of its subscription with its name, address and port
+carries its mark - a panel can list twins of one name, address and port, and the user may run any
+of them - or, for a record without a mark (`configure.sh`'s, an older daemon's), while such an
+entry is listed. It changed in place when such entries are listed but none carries the mark, and
+the first of them is followed; it moved when there is none and exactly one entry has its name;
+anything else - the subscription deleted, no entry of the name, several - means it left its list.
+A changed or moved server is followed; one that left, or whose new entry does not answer either,
+is replaced. The check reads the lists as a refresh left them: a server the periodic refresh moved
+is followed at the next tick.
+
+A replacement tries the candidates in `orderBest` order (`subwatch/best.go`), the same order the
+fast path and the walk use. Its reference is the user's choice (`refFor`): `preferred_server`, else
+`active_server`, with the record's `group`, or its listed entry's for a record written without
+one. With valid monitor evidence the endpoints the monitor holds alive go first, in tiers: the
+group in the choice's subscription, the group in the other subscriptions, other groups in the
+subscription, other groups elsewhere, each by latency; endpoints the monitor rejected are left
+out. The rest follow, the group first, each part in the walk's order (`OwnFirst`, then one server
+of each subscription in turn). The dead server is left out too, with every copy that dials its
+connection (`endpoint.DialKey`). Each candidate - each connection once - goes through the walk's
+guarded write (`switcher.to`), `restart xray-process`, 3 s and the SOCKS probe.
+
+Each keeper action - a follow and the replacement after it, a replacement of a server that left its
+list or died - has one fence, the record it started from (`newSwitcher`): a Web UI, `/xray` or
+wizard selection made at any point of it ends the action, with nothing more written and no
+message, and so do a stop and a closed gate. A replacement after a fast-path attempt runs under the
+fast path's ownership, as `failOutbound` does: it consumes the death proof first, as the wave's
+publication does for the walk, and once that ownership is refused - a selection, a stop, the gate,
+changed inbound ports or subscription links - the action ends just as quietly. A run in which no
+candidate works leaves Xray on the last one it wrote, if any, sends
+`No working Xray server found; Xray stays on <s>` once until Xray works again, and backs off
+`KeeperRetry` (10 minutes, doubling to `KeeperRetryMax`, 30): until then there is no check, and in
+keeper mode no switch after a death, the fast path's included. A working probe, in either mode,
+ends that wait: the next failed run backs off 10 minutes again. The watch never switches between
+alive servers for latency alone.
+
+`RecordWalkedServer` keeps the user's choice in `preferred_server`, a vanished one included, so its
+group stays the reference across a restart. The return runs in both modes and looks every
+`ReturnCheck`: with valid evidence it goes back once the monitor has held the preferred server
+alive for `ReturnAlive` (5 minutes); without evidence the TCP look applies (`telegram-bot.md`).
+While the preferred server is not back and Xray runs another group than the user's, a look with
+valid evidence takes the best server of the user's group instead - the one `orderBest` puts first
+among those the monitor has held alive for `ReturnAlive`, through its addresses alive that long:
+one server per attempt. It switches, rolls back and backs off like any return, and
+`preferred_server` stays. A return of either kind that has held for `ReturnHold` (30 minutes) ends
+the return backoff, and both kinds count toward `ReturnFailsMax`.
+
+Each of these switches sends one message, past `notify`'s one-per-kind deduplication:
+`Xray server <s> moved; Xray follows it`, `… changed; Xray follows it`,
+`… left its subscription; Xray switched to <s>`, `… is not answering; Xray switched to <s>`,
+`Xray back on a <group> server <s>`, `<s>` being `<subscription> / <server>`; the failover, the
+fast path and the return to the preferred server keep their messages. No line names a link.
 
 ## Durable notifications
 
