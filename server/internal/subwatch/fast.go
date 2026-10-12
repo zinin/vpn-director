@@ -42,6 +42,12 @@ type fastAttempt struct {
 	Config  *vpnconfig.VPNDirectorConfig
 	Outcome fastOutcome
 	Guard   func(*vpnconfig.VPNDirectorConfig) error
+	// Tried is, for a fallback, every candidate the attempt is done with:
+	// each it switched to whose restart or probe failed, and each its fresh
+	// checks found dead. A replacement after the fallback leaves them out.
+	// Config then names the last candidate written, if any, rather than the
+	// server that died.
+	Tried []vpnconfig.Server
 	// Err is what ended an attempt that did not switch; nil when the fast
 	// path did not apply.
 	Err error
@@ -420,6 +426,8 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		return finish(err)
 	}
 	var usable []fastChoice
+	// tried is what a fallback hands the keeper's replacement to leave out.
+	var tried []vpnconfig.Server
 	incomplete := false
 	for i, c := range choices {
 		if choiceErrors[i] != nil || w.Health.ValidateEvidence(c.evidence, []string{c.key}) != nil {
@@ -430,6 +438,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		case fastEvidenceStatus(c.evidence, []string{c.key}, watchdapi.StatusAlive):
 			usable = append(usable, c)
 		case fastEvidenceStatus(c.evidence, []string{c.key}, watchdapi.StatusDead):
+			tried = append(tried, c.server)
 		default:
 			incomplete = true
 		}
@@ -485,6 +494,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 				return finish(restartErr)
 			}
 			slog.Warn("Xray restart failed", "server", c.server.Name, watchErrorAttr(restartErr))
+			tried = append(tried, c.server)
 			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
@@ -502,6 +512,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 				return finish(probeErr)
 			}
 			slog.Info("Server probe failed", "server", c.server.Name, "ips", c.server.IPs, watchErrorAttr(probeErr))
+			tried = append(tried, c.server)
 			continue
 		}
 		slog.Info("Fast failover switched Xray to a live server", "server", c.server.Name, "ips", c.server.IPs, "from", active.Name)
@@ -521,7 +532,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	if err != nil {
 		return finish(err)
 	}
-	return fastAttempt{Config: current, Outcome: fastFallback, Guard: guard}
+	return fastAttempt{Config: current, Outcome: fastFallback, Guard: guard, Tried: tried}
 }
 
 // A scoped fallback carries ownership through its applies, refresh and walk.

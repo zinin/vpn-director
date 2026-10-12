@@ -83,15 +83,18 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 		w.resetFail()
 		return
 	case fastFallback:
-		w.replaceDead(ctx, attempt.Config, "monitor", attempt.Guard)
+		w.replaceDead(ctx, attempt.Config, cfg.Xray.ActiveServer, attempt.Tried, "monitor", attempt.Guard)
 		return
 	}
+	// The death is decided on the record this tick read; an attempt that wrote
+	// a candidate before it ended leaves attempt.Config naming that one.
+	died := cfg.Xray.ActiveServer
 	cfg = attempt.Config
 	if now.Sub(w.failSince) < DeadAfter {
 		w.checkReach(ctx, cfg)
 	}
 	if reason := w.deadReason(now); reason != "" {
-		w.replaceDead(ctx, cfg, reason, attempt.Guard)
+		w.replaceDead(ctx, cfg, died, nil, reason, attempt.Guard)
 	}
 }
 
@@ -147,7 +150,7 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			return false
 		}
 		slog.Info("The Xray server left its subscription; replacing it", "server", was)
-		w.replaceActive(ctx, cfg, subs, sw, nil, msgReplacedGone, was)
+		w.replaceActive(ctx, cfg, subs, sw, nil, nil, msgReplacedGone, was)
 		return true
 	}
 	msg := msgFollowedMoved
@@ -166,23 +169,27 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	if w.replacementWaits(ctx) {
 		return true
 	}
-	w.replaceActive(ctx, cfg, subs, sw, &entry, msgReplacedDead, was)
+	w.replaceActive(ctx, cfg, subs, sw, &entry, nil, msgReplacedDead, was)
 	return true
 }
 
-// replaceDead replaces the server active_server names once its death is
-// confirmed: nobody to move, so no tunnel and no wave. The action's fence is
-// cfg, the record the death was confirmed on - after the fast path, a read its
-// ownership validated - and never a later read: a selection committed since
-// refuses the first write. guard is the fast path's ownership when it got that
-// far (fastAttempt.Guard), and the replacement writes under it as
-// failOutbound's fallback does: the owner checks and records each write, its
-// port snapshot stays guarded, and a refusal ends the action - nothing more is
-// written, said or backed off. While the WAN is down it waits
-// (replacementWaits), and the returns are not settled either: a WAN outage is
-// no death of the server a return went back to.
-func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, reason string, guard func(*vpnconfig.VPNDirectorConfig) error) {
-	if cfg == nil || cfg.Xray.ActiveServer == nil || w.replacementWaits(ctx) {
+// replaceDead replaces died - the server active_server named when the tick's
+// probe failed, the record its death was decided on - once that death is
+// confirmed: nobody to move, so no tunnel and no wave. The message and the log
+// name died, and the replacement leaves it out together with tried, the
+// candidates the fast path is done with (fastAttempt.Tried). The action's
+// fence is cfg: the tick's record, or after the fast path a read its ownership
+// validated, which names the last candidate the fast path wrote, if it wrote
+// one - and never a later read: a selection committed since refuses the first
+// write. guard is the fast path's ownership when it got that far
+// (fastAttempt.Guard), and the replacement writes under it as failOutbound's
+// fallback does: the owner checks and records each write, its port snapshot
+// stays guarded, and a refusal ends the action - nothing more is written, said
+// or backed off. While the WAN is down it waits (replacementWaits), and the
+// returns are not settled either: a WAN outage is no death of the server a
+// return went back to.
+func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, died *vpnconfig.ActiveServer, tried []vpnconfig.Server, reason string, guard func(*vpnconfig.VPNDirectorConfig) error) {
+	if cfg == nil || cfg.Xray.ActiveServer == nil || died == nil || w.replacementWaits(ctx) {
 		return
 	}
 	previousGuard, previousRefused := w.outboundGuard, w.outboundRefused
@@ -205,27 +212,28 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		w.returnDeath = w.failSince
 		w.returnAfterDeath()
 	}
-	a := cfg.Xray.ActiveServer
-	was := label(subscriptionNames(subs), a.Subscription, a.Name)
+	was := label(subscriptionNames(subs), died.Subscription, died.Name)
 	slog.Info("Xray outbound declared dead; replacing the server", "server", was, "reason", reason)
 	var dead *vpnconfig.Server
-	if s, ok := exactFastServer(subs, a); ok {
+	if s, ok := exactFastServer(subs, died); ok {
 		dead = &s
 	}
-	w.replaceActive(ctx, cfg, subs, w.newSwitcher(cfg, subs), dead, msgReplacedDead, was)
+	w.replaceActive(ctx, cfg, subs, w.newSwitcher(cfg, subs), dead, tried, msgReplacedDead, was)
 }
 
 // replaceActive switches Xray to the best working server (spec 4.3) through
 // sw, the action's fence. cfg is the record the action started from, and it
 // orders the candidates too: a follow that failed recorded the same choice,
 // which walkOrder still finds by its name, and the write after it keeps the
-// record it left in preferred_server (RecordWalkedServer). It leaves out dead -
-// every copy of it, and every copy that dials the same connection
-// (endpoint.DialKey), which dies with it. It sends msg with was, the server
-// replaced, and the server found. With none working it says so once a run and
-// backs the next attempt off. Every caller has asked replacementWaits first:
-// with the WAN down none would work.
-func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, msg, was string) {
+// record it left in preferred_server (RecordWalkedServer), as does a write of
+// the fast path's. It leaves out dead - every copy of it, and every copy that
+// dials the same connection (endpoint.DialKey), which dies with it - and each
+// copy in tried with the copies that dial its connection: spec 4.5 leaves out
+// the server that died and the servers already tried in the attempt. It sends
+// msg with was, the server replaced, and the server found. With none working
+// it says so once a run and backs the next attempt off. Every caller has asked
+// replacementWaits first: with the WAN down none would work.
+func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, sw *switcher, dead *vpnconfig.Server, tried []vpnconfig.Server, msg, was string) {
 	if w.mutationEnded(ctx) {
 		return
 	}
@@ -234,20 +242,18 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 		chosen = cfg.Xray.ActiveServer
 	}
 	order, _ := walkOrder(subs, chosen)
-	deadKeys := map[string]bool{}
+	left := map[string]bool{}
 	if dead != nil {
 		for _, c := range endpoint.PerAddress([]vpnconfig.Server{*dead}) {
-			if key := endpoint.DialKey(c); key != "" {
-				deadKeys[key] = true
-			}
+			left[leftKey(c)] = true
 		}
+	}
+	for _, c := range tried {
+		left[leftKey(c)] = true
 	}
 	var copies []vpnconfig.Server
 	for _, c := range endpoint.PerAddress(order) {
-		if dead != nil && serverID(c) == serverID(*dead) {
-			continue
-		}
-		if key := endpoint.DialKey(c); key != "" && deadKeys[key] {
+		if (dead != nil && serverID(c) == serverID(*dead)) || left[leftKey(c)] {
 			continue
 		}
 		copies = append(copies, c)
@@ -274,6 +280,18 @@ func (w *Watch) replaceActive(ctx context.Context, cfg *vpnconfig.VPNDirectorCon
 	}
 	slog.Warn("No working Xray server found", "stays", stays)
 	w.say(fmt.Sprintf(msgNoWorking, stays))
+}
+
+// leftKey tells apart the copies a replacement leaves out: by what a copy
+// dials (endpoint.DialKey), which every copy that dies with it shares, or -
+// for a legacy record, which has no DialKey and is never taken for another -
+// by the copy itself, its server and address. The NUL keeps the two kinds
+// apart: a DialKey is an outbound's JSON.
+func leftKey(c vpnconfig.Server) string {
+	if key := endpoint.DialKey(c); key != "" {
+		return key
+	}
+	return "\x00" + serverID(c) + "\x1f" + dialIP(c)
 }
 
 // replacementWaits reports whether a keeper replacement has to wait for the

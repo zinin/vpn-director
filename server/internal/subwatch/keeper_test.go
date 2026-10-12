@@ -3,6 +3,7 @@ package subwatch
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -524,23 +525,76 @@ func TestKeeper_ASelectionDuringTheLastProbeEndsTheRun(t *testing.T) {
 	}
 }
 
+// addUnchecked lists server in Alpha with no state at the monitor: it is no
+// candidate of the fast path, which takes only what the monitor last saw
+// alive, and a replacement tries it after the servers held alive.
+func (s *fastFixture) addUnchecked(server vpnconfig.Server) {
+	s.f.subs[0].Servers = append(s.f.subs[0].Servers, server)
+}
+
 // The fast path proved Oslo dead and found no candidate alive in its fresh
 // checks: the keeper replaces Oslo under the fast path's ownership (Ruling
 // T5-R2), which checks and records the keeper's write, so the switch goes on
-// to its restart and probe.
+// to its restart and probe. Backup, which the fresh check found dead, is left
+// out with Oslo (Ruling F-R2), and Third takes over.
 func TestKeeper_TheFastPathsFallbackIsReplacedUnderItsOwnership(t *testing.T) {
 	s := newKeeperFixture(t)
+	s.addUnchecked(fastServer("Third", "third.example", "198.51.100.30"))
 	s.passThenMiss(time.Second)
 	key := s.candidateKey()
 	backup := s.h.fresh.Endpoints[key]
 	backup.Status = watchdapi.StatusDead
 	s.h.fresh.Endpoints[key] = backup
 	s.w.Tick(context.Background())
-	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) || s.restarts != 1 {
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Third@third.example"}) || s.restarts != 1 {
 		t.Fatalf("written %v, restarts %d", got, s.restarts)
 	}
-	if want := []string{"Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
+	if want := []string{"Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Third"}; !reflect.DeepEqual(s.f.notes, want) {
 		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
+// After a fast-path fallback the server that died is the one the tick's probe
+// failed on, not the candidate the fast path left Xray on (Ruling F-R2): the
+// message names Oslo, and the replacement leaves out Oslo and every candidate
+// the fast path tried - Backup, whose probe or restart failed, and Spare,
+// which its fresh check found dead. Third, which the fast path neither tried
+// nor proved dead, takes over: nothing is written twice.
+func TestKeeper_AFastFallbackReplacesTheServerThatDied(t *testing.T) {
+	for _, failed := range []string{"probe", "restart"} {
+		t.Run("Backup's "+failed+" failed", func(t *testing.T) {
+			s := newKeeperFixture(t)
+			s.f.subs[0].Servers = append(s.f.subs[0].Servers, fastServer("Spare", "spare.example", "198.51.100.25"))
+			s.setHealth()
+			s.addUnchecked(fastServer("Third", "third.example", "198.51.100.30"))
+			s.passThenMiss(time.Second)
+			spare := endpoint.Keys(cloneSubs(s.f.subs)[0].Servers[2])[0]
+			state := s.h.fresh.Endpoints[spare]
+			state.Status = watchdapi.StatusDead
+			s.h.fresh.Endpoints[spare] = state
+			restart := s.w.RestartXray
+			s.w.RestartXray = func() error {
+				err := restart()
+				if failed == "restart" && s.written[len(s.written)-1].Name == "Backup" {
+					return errors.New("synthetic restart failure")
+				}
+				return err
+			}
+			s.w.Probe = func(context.Context, int) error {
+				s.probes++
+				if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Third" {
+					return nil
+				}
+				return errProbe
+			}
+			s.w.Tick(context.Background())
+			if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example", "Third@third.example"}) || s.restarts != 2 {
+				t.Fatalf("written %v, restarts %d; want the fast path's Backup, then Third alone", got, s.restarts)
+			}
+			if want := []string{"Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Third"}; !reflect.DeepEqual(s.f.notes, want) {
+				t.Fatalf("notes %v, want %v", s.f.notes, want)
+			}
+		})
 	}
 }
 
@@ -626,9 +680,11 @@ func TestTick_AWorkingProbeEndsTheKeeperBackoff(t *testing.T) {
 
 // The replacement consumes the fast path's death proof (Ruling T5-R4): checks
 // the monitor completes while the keeper switches make the proof stale, and
-// the switch still goes through, proved by its own probe.
+// the switch still goes through, proved by its own probe. Backup, proved dead,
+// is left out (Ruling F-R2): Third is the switch.
 func TestKeeper_AStaleDeathProofDoesNotStopTheReplacement(t *testing.T) {
 	s := newKeeperFixture(t)
+	s.addUnchecked(fastServer("Third", "third.example", "198.51.100.30"))
 	s.passThenMiss(time.Second)
 	key := s.candidateKey()
 	backup := s.h.fresh.Endpoints[key]
@@ -643,10 +699,10 @@ func TestKeeper_AStaleDeathProofDoesNotStopTheReplacement(t *testing.T) {
 		return generated, seq, err
 	}
 	s.w.Tick(context.Background())
-	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) || s.restarts != 1 {
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Third@third.example"}) || s.restarts != 1 {
 		t.Fatalf("written %v, restarts %d; a stale proof must not stop the replacement", got, s.restarts)
 	}
-	if want := []string{"Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
+	if want := []string{"Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Third"}; !reflect.DeepEqual(s.f.notes, want) {
 		t.Fatalf("notes %v, want %v", s.f.notes, want)
 	}
 }
@@ -654,9 +710,10 @@ func TestKeeper_AStaleDeathProofDoesNotStopTheReplacement(t *testing.T) {
 // The fast path's ownership itself refuses during the replacement - the inbound
 // ports change - and the action ends there (Ruling T5-R4): nothing more is
 // written or restarted, nothing is said, nothing backs off, and no refused
-// candidate logs a warning. The fast path tried Backup, and the keeper tries
-// Oslo's two addresses; the refusal comes at the restart after a write, at the
-// next write after a probe, or after the last probe.
+// candidate logs a warning. The fast path tried Backup, which the keeper leaves
+// out with Oslo (Ruling F-R2), and the keeper tries the two addresses of
+// Third; the refusal comes at the restart after a write, at the next write
+// after a probe, or after the last probe.
 func TestKeeper_ARefusedOwnershipEndsTheReplacement(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -665,12 +722,15 @@ func TestKeeper_ARefusedOwnershipEndsTheReplacement(t *testing.T) {
 		names    []string
 		restarts int
 	}{
-		{"at the restart", true, "", []string{"Backup@backup.example", "Oslo@oslo.example"}, 1},
-		{"at the next write", false, "203.0.113.10", []string{"Backup@backup.example", "Oslo@oslo.example"}, 2},
-		{"after the last probe", false, "203.0.113.11", []string{"Backup@backup.example", "Oslo@oslo.example", "Oslo@oslo.example"}, 3},
+		{"at the restart", true, "", []string{"Backup@backup.example", "Third@third.example"}, 1},
+		{"at the next write", false, "198.51.100.30", []string{"Backup@backup.example", "Third@third.example"}, 2},
+		{"after the last probe", false, "198.51.100.31", []string{"Backup@backup.example", "Third@third.example", "Third@third.example"}, 3},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newKeeperFixture(t)
+			third := fastServer("Third", "third.example", "198.51.100.30")
+			third.IPs = []string{"198.51.100.30", "198.51.100.31"}
+			s.addUnchecked(third)
 			s.passThenMiss(time.Second)
 			log := captureLog(t)
 			changePorts := func() {
