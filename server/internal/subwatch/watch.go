@@ -1066,7 +1066,9 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 	return failed, published > 0 || len(failed) == 0
 }
 
-// walk prioritizes current monitor health within walkOrder, trying each address
+// walk tries the servers of subs in orderBest order - with valid monitor
+// evidence the copies the monitor holds alive first, by tier and latency, and
+// the rest with the user's group first, each part in walkOrder - each address
 // once per outbound (endpoint.DialKey). A main probe decides when the clients
 // return to Xray. With none live it returns Xray to the chosen server and backs
 // the next wave off.
@@ -1126,8 +1128,9 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 			pending = append(pending, c)
 		}
 		remaining = pending
-		// Rejected entries stay pending so later evidence can admit them again;
-		// the user's group goes first, the alive by latency (orderBest).
+		// Rejected entries stay pending so later evidence can admit them again.
+		// The alive go first, by tier and latency; the rest follow with the
+		// user's group first, in walk order (orderBest).
 		ordered := w.bestWalkOrder(remaining, cfg, ref)
 		if len(ordered) == 0 {
 			break

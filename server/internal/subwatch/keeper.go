@@ -98,8 +98,8 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	}
 }
 
-// followActive is the actuality check (spec 4.2, as owner decision C1 amends
-// it): in both modes, a tick whose probe failed compares the selected server
+// followActive is the actuality check of spec 4.2, made only while the probe
+// fails: in both modes, a tick whose probe failed compares the selected server
 // with its list before the death rules - on every such tick, so a server the
 // periodic refresh moves while Xray is already failing is followed too. A
 // server that changed in place or moved is followed; one whose new entry does
@@ -295,13 +295,13 @@ func leftKey(c vpnconfig.Server) string {
 }
 
 // replacementWaits reports whether a keeper replacement has to wait for the
-// WAN (Ruling F-R1): with the WAN down every candidate fails its probe, each
-// after an Xray restart, and the run ends in a "No working Xray server found"
-// that blames the servers - the armed watch walks nothing when every download
-// failed, for the same reason. Waiting switches nothing, backs nothing off and
-// says nothing; the log says so once an episode, since the death rules come
-// back here on every tick past DeadAfter. The fast path and the unreachable
-// rule confirm a death only with the WAN working, and the check passes there.
+// WAN: with the WAN down every candidate fails its probe, each after an Xray
+// restart, and the run ends in a "No working Xray server found" that blames
+// the servers - the armed watch walks nothing when every download failed, for
+// the same reason. Waiting switches nothing, backs nothing off and says
+// nothing; the log says so once an episode, since the death rules come back
+// here on every tick past DeadAfter. The fast path and the unreachable rule
+// confirm a death only with the WAN working, and the check passes there.
 func (w *Watch) replacementWaits(ctx context.Context) bool {
 	if !w.wanDown(ctx) {
 		return false

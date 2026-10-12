@@ -11,8 +11,8 @@ const (
 	// nothing to keep.
 	actualUnknown actuality = iota
 	// actualCurrent is an entry of the record's name, address and port with
-	// its mark, or any such entry when the record has no mark; for a record
-	// without an address and a port, any entry of its name.
+	// the record's mark, or any such entry when the record has no mark; for a
+	// record without an address and a port, any entry of its name.
 	actualCurrent
 	// actualChanged is entries of the record's name, address and port, all
 	// with another mark: new keys or a new UUID behind the same name and
