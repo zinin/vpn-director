@@ -624,7 +624,7 @@ func TestMutation_IncompatibleAndCancellationEndWalkAndReturn(t *testing.T) {
 				if route == "walk" {
 					w.walk(context.Background(), cfg, subs)
 				} else {
-					w.tryReturn(context.Background(), cfg, subs, servers, endpoint.PerAddress(servers[:1]))
+					w.tryReturn(context.Background(), cfg, subs, servers, endpoint.PerAddress(servers[:1]), "")
 				}
 				if generations != 1 || restarts != 0 || f.applies != 0 || len(f.notes) != 0 {
 					t.Errorf("generations %d, restarts %d, applies %d, notes %v; a terminal refusal must end the attempt", generations, restarts, f.applies, f.notes)

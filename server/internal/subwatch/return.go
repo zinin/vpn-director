@@ -5,15 +5,19 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sort"
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
+	"github.com/zinin/vpn-director/server/internal/monitor"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
+	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
 
 const (
 	// ReturnCheck is how often a healthy watch looks whether the server the
-	// user chose accepts TCP again while a walk has another one running.
+	// user chose, or a server of its group, can take Xray back while the
+	// watch has another one running.
 	ReturnCheck = 5 * time.Minute
 	// ReturnRetry is the wait after a return whose probe failed - an address
 	// can accept TCP and still refuse the proxy - doubling up to ReturnRetryMax.
@@ -30,11 +34,19 @@ const (
 	// for as long as the block lasts. A new death, a selection or a restart of
 	// watchd starts the returns over.
 	ReturnFailsMax = 4
+	// ReturnAlive is how long the monitor has to hold a server alive before
+	// Xray goes back to it - to the preferred server, or to the user's group:
+	// a server that has just come back is often gone again within minutes.
+	ReturnAlive = 5 * time.Minute
 )
 
-// maybeReturn takes Xray back to the server the user chose once a walk has left
-// another one running and the chosen one accepts TCP again - or, for a server
-// no TCP dial can see, once its turn comes round. It runs after a probe that
+// maybeReturn takes Xray back to the server the user chose once the watch has
+// left another one running and the chosen one is back: with fresh monitor
+// evidence, once the monitor has held it alive for ReturnAlive; without, once
+// it accepts TCP again - or, for a server no TCP dial can see, once its turn
+// comes round. While it is not back and Xray runs a server of another group,
+// it takes Xray to the best server of the user's group the monitor has held
+// alive as long, and preferred_server stays. It runs after a probe that
 // passed, with no failover and no restore apply outstanding, and looks every
 // ReturnCheck - after a failed return, ReturnRetry and longer. After
 // ReturnFailsMax failed attempts in a row the returns stop.
@@ -51,7 +63,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		}
 		return
 	}
-	if w.LoadSubscriptions == nil || w.Reachable == nil || w.Generate == nil {
+	if w.LoadSubscriptions == nil || w.Generate == nil {
 		return
 	}
 	if w.returnFails >= ReturnFailsMax {
@@ -78,21 +90,68 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		return
 	}
 	servers := vpnconfig.AllServers(subs)
-	i := chosenIndex(servers, preferred)
-	if i < 0 {
+	// With fresh evidence the monitor's look is the look: alive for
+	// ReturnAlive. Without it, the TCP look as before - a server no TCP dial
+	// can see is switched to on its turn, the attempt the only check there is.
+	ev, fresh := w.walkEvidence(servers, cfg)
+	var candidates []vpnconfig.Server
+	if i := chosenIndex(servers, preferred); i >= 0 {
+		copies := endpoint.PerAddress(servers[i : i+1])
+		switch {
+		case fresh:
+			candidates = aliveFor(copies, ev, now, ReturnAlive)
+		case w.Reachable == nil:
+		case tcpChecked(servers[i]):
+			candidates = w.reachable(ctx, dialable(copies))
+		default:
+			candidates = dialable(copies)
+		}
+	}
+	if ctx.Err() != nil || w.mutationEnded(ctx) {
 		return
 	}
-	// A server no TCP dial can see is returned to without one: the attempt
-	// itself is then the only check there is, and a failed one backs the next
-	// off as any other does.
-	candidates := dialable(endpoint.PerAddress(servers[i : i+1]))
-	if tcpChecked(servers[i]) {
-		candidates = w.reachable(ctx, candidates)
-	}
-	if len(candidates) == 0 || ctx.Err() != nil || w.mutationEnded(ctx) {
+	if len(candidates) > 0 {
+		w.tryReturn(ctx, cfg, subs, servers, candidates, "")
 		return
 	}
-	w.tryReturn(ctx, cfg, subs, servers, candidates)
+	// The preferred server is not back, but Xray may run another group than
+	// the user's: a server of that group alive for ReturnAlive is the nearer
+	// choice. preferred_server stays, and the return to it still comes.
+	activeGroup := active.Group
+	if activeGroup == "" {
+		if j := chosenIndex(servers, active); j >= 0 {
+			activeGroup = servers[j].Group()
+		}
+	}
+	if !fresh || preferred.Group == "" || activeGroup == "" || activeGroup == preferred.Group {
+		return
+	}
+	ref := bestRef{Subscription: preferred.Subscription, Group: preferred.Group}
+	var group []vpnconfig.Server
+	for _, c := range aliveFor(endpoint.PerAddress(servers), ev, now, ReturnAlive) {
+		if c.Group() == ref.Group {
+			group = append(group, c)
+		}
+	}
+	if len(group) > 0 {
+		w.tryReturn(ctx, cfg, subs, servers, orderBest(group, ref, ev, true), ref.Group)
+	}
+}
+
+// aliveFor is the copies the monitor has held alive for at least d at now,
+// fastest first, ties in the order given.
+func aliveFor(copies []vpnconfig.Server, ev monitor.Evidence, now time.Time, d time.Duration) []vpnconfig.Server {
+	var out []vpnconfig.Server
+	for _, c := range copies {
+		st, ok := ev.Endpoints[endpoint.Key(c)]
+		if ok && st.Status == watchdapi.StatusAlive && !st.Since.After(now.Add(-d)) {
+			out = append(out, c)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return ev.Endpoints[endpoint.Key(out[i])].LatencyMS < ev.Endpoints[endpoint.Key(out[j])].LatencyMS
+	})
+	return out
 }
 
 // tryReturn switches Xray to each candidate copy of the preferred server in
@@ -104,8 +163,9 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 // it, and the attempt ends there. A switch to the preferred server is refused
 // too once its subscription is deleted; nobody else wrote, so the attempt
 // fails as a dead one does, and goes back to the server that ran before if it
-// has left it.
-func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, servers, candidates []vpnconfig.Server) {
+// has left it. With group set, the candidates are servers of the user's group,
+// not the preferred server: the messages say so, and preferred_server stays.
+func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.Subscription, servers, candidates []vpnconfig.Server, group string) {
 	before := cfg.Xray.ActiveServer
 	links := make(map[string]string, len(subs))
 	for _, s := range subs {
@@ -125,7 +185,11 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 		return
 	}
 	w.setStatusAction("returning")
-	slog.Info("Returning to the preferred server", "server", candidates[0].Name, "from", before.Name)
+	if group == "" {
+		slog.Info("Returning to the preferred server", "server", candidates[0].Name, "from", before.Name)
+	} else {
+		slog.Info("Returning to a server of the preferred group", "group", group, "server", candidates[0].Name, "from", before.Name)
+	}
 	for _, c := range candidates {
 		live, ended, gone := sw.to(ctx, c, true)
 		if ended {
@@ -141,11 +205,16 @@ func (w *Watch) tryReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig,
 			if w.mutationEnded(ctx) || w.endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq)) {
 				return
 			}
-			slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
 			w.lastPicked = &c
 			w.lastReturn = w.Now()
 			w.returnSeq = sw.seq
-			w.notify(noteReturned, fmt.Sprintf(msgReturned, label(names, c.Subscription, c.Name)))
+			if group == "" {
+				slog.Info("Xray returned to the preferred server", "server", c.Name, "ips", c.IPs)
+				w.notify(noteReturned, fmt.Sprintf(msgReturned, label(names, c.Subscription, c.Name)))
+			} else {
+				slog.Info("Xray returned to a server of the preferred group", "group", group, "server", c.Name, "ips", c.IPs)
+				w.say(fmt.Sprintf(msgBackToGroup, group, label(names, c.Subscription, c.Name)))
+			}
 			return
 		}
 	}

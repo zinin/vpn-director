@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
+	"github.com/zinin/vpn-director/server/internal/monitor"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchcompat"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
@@ -542,5 +543,140 @@ func TestKeeper_ARefusedOwnershipEndsTheReplacement(t *testing.T) {
 				t.Fatalf("notes %v, next attempt %v, log:\n%s\na refused ownership says, backs off and warns of nothing", s.f.notes, s.w.keeperNotBefore, log)
 			}
 		})
+	}
+}
+
+// setStates replaces the monitor's view: every endpoint of each named server
+// takes the state given.
+func (s *fastFixture) setStates(states map[string]watchdapi.EndpointState) {
+	e := monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{}}
+	for _, sub := range cloneSubs(s.f.subs) {
+		for _, server := range sub.Servers {
+			if st, ok := states[server.Name]; ok {
+				for _, key := range endpoint.Keys(server) {
+					e.Endpoints[key] = st
+				}
+			}
+		}
+	}
+	s.h = &fastHealth{cached: e, fresh: copyFastEvidence(e, nil), invalid: map[string]bool{}}
+	s.w.Health = s.h
+}
+
+func aliveSince(since time.Time, ms int64) watchdapi.EndpointState {
+	return watchdapi.EndpointState{Status: watchdapi.StatusAlive, LatencyMS: ms, Since: since, CheckedAt: since}
+}
+
+// newReturnKeeper is the keeper fixture running Backup after Oslo, the user's
+// choice, died: Xray works, and the return looks every ReturnCheck.
+func newReturnKeeper(t *testing.T) *fastFixture {
+	t.Helper()
+	s := newKeeperFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.f.cfg.Xray.PreferredServer = vpnconfig.NewActiveServer(oslo)
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, backup)
+	s.w.Probe = func(context.Context, int) error { s.probes++; return nil }
+	return s
+}
+
+// The monitor has held Oslo alive for six minutes: Xray goes back to it.
+func TestMaybeReturn_AfterFiveMinutesAliveReturns(t *testing.T) {
+	s := newReturnKeeper(t)
+	s.setStates(map[string]watchdapi.EndpointState{
+		"Oslo": aliveSince(s.f.now.Add(-6*time.Minute), 40), "Backup": aliveSince(s.f.now.Add(-time.Hour), 17),
+	})
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@oslo.example"}) || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v", got, s.f.cfg.Xray.PreferredServer)
+	}
+	if want := []string{"Xray back on the preferred server Alpha / Oslo"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
+// Alive for two minutes is not yet a server to go back to.
+func TestMaybeReturn_TwoMinutesAliveIsNotEnough(t *testing.T) {
+	s := newReturnKeeper(t)
+	s.setStates(map[string]watchdapi.EndpointState{
+		"Oslo": aliveSince(s.f.now.Add(-2*time.Minute), 40), "Backup": aliveSince(s.f.now.Add(-time.Hour), 17),
+	})
+	s.w.Tick(context.Background())
+	if len(s.written) != 0 {
+		t.Fatalf("written %v", writtenNames(s.written))
+	}
+}
+
+// Xray runs a Shadowsocks server while Oslo, the user's vless+tls choice, is
+// dead: once Backup, of Oslo's group, has been alive five minutes, Xray goes
+// there, and Oslo stays the choice to return to.
+func TestMaybeReturn_BackToTheUsersGroup(t *testing.T) {
+	s := newReturnKeeper(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	shadow := ssServer("Shadow", "198.51.100.40")
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, shadow, backup}
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, shadow)
+	s.setStates(map[string]watchdapi.EndpointState{
+		"Oslo":   {Status: watchdapi.StatusDead, Since: s.f.now.Add(-time.Hour)},
+		"Shadow": aliveSince(s.f.now.Add(-time.Hour), 5),
+		"Backup": aliveSince(s.f.now.Add(-6*time.Minute), 17),
+	})
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
+		t.Fatalf("written %v", got)
+	}
+	if p := s.f.cfg.Xray.PreferredServer; p == nil || p.Name != "Oslo" {
+		t.Fatalf("preferred %+v, want Oslo kept", p)
+	}
+	if want := []string{"Xray back on a vless+tls server Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
+// aliveFor keeps a copy the monitor has held alive for d or longer - exactly d
+// included - fastest first, ties in the order given; a copy alive for less, a
+// dead one and one the monitor does not know are left out.
+func TestAliveFor(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	a := fastServer("A", "a.example", "198.51.100.1")
+	b := fastServer("B", "b.example", "198.51.100.2")
+	c := fastServer("C", "c.example", "198.51.100.3")
+	young := fastServer("Young", "young.example", "198.51.100.4")
+	dead := fastServer("Dead", "dead.example", "198.51.100.5")
+	unknown := fastServer("Unknown", "unknown.example", "198.51.100.6")
+	ev := monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{
+		endpoint.Key(a):     aliveSince(now.Add(-ReturnAlive), 30),
+		endpoint.Key(b):     aliveSince(now.Add(-time.Hour), 10),
+		endpoint.Key(c):     aliveSince(now.Add(-time.Hour), 30),
+		endpoint.Key(young): aliveSince(now.Add(-ReturnAlive+time.Second), 1),
+		endpoint.Key(dead):  {Status: watchdapi.StatusDead, Since: now.Add(-time.Hour)},
+	}}
+	got := aliveFor([]vpnconfig.Server{a, young, b, dead, c, unknown}, ev, now, ReturnAlive)
+	if names := bestNames(got); !reflect.DeepEqual(names, []string{"B", "A", "C"}) {
+		t.Fatalf("aliveFor %v, want [B A C]", names)
+	}
+}
+
+// Back to the group goes by the order of a replacement (spec 4.6): a server of
+// the group in the user's subscription before a faster one elsewhere.
+func TestMaybeReturn_BackToTheGroupPrefersTheUsersSubscription(t *testing.T) {
+	s := newReturnKeeper(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	shadow := ssServer("Shadow", "198.51.100.40")
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, shadow, backup}
+	s.f.subs = append(s.f.subs, vpnconfig.Subscription{ID: "beta", Name: "Beta", URL: "https://beta.example/list",
+		Servers: []vpnconfig.Server{fastServer("Faster", "faster.example", "198.51.100.30")}})
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, shadow)
+	s.setStates(map[string]watchdapi.EndpointState{
+		"Oslo":   {Status: watchdapi.StatusDead, Since: s.f.now.Add(-time.Hour)},
+		"Shadow": aliveSince(s.f.now.Add(-time.Hour), 5),
+		"Backup": aliveSince(s.f.now.Add(-6*time.Minute), 17),
+		"Faster": aliveSince(s.f.now.Add(-6*time.Minute), 3),
+	})
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
+		t.Fatalf("written %v, want Backup of the user's subscription before Beta / Faster", got)
+	}
+	if want := []string{"Xray back on a vless+tls server Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
 	}
 }
