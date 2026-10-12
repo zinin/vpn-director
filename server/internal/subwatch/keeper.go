@@ -44,14 +44,12 @@ func (w *Watch) keeps(cfg *vpnconfig.VPNDirectorConfig, subs int) bool {
 // keep is a tick in keeper mode. There is nobody to move into a tunnel and no
 // wave to run: the periodic refresh keeps the lists current, and keeps running
 // while the probe fails (refreshStandsDown), so each attempt works from the
-// lists as they are. A server that moved or changed is followed, and one that
-// left its subscription or died is replaced, at once. A death is confirmed by
-// the armed tick's rules (spec 4.4): the fast path's evidence, the unreachable
+// lists as they are. Once the probe fails, a server that moved or changed is
+// followed, and one that left its subscription is replaced, at once
+// (followActive); one still listed is replaced once the armed tick's rules
+// confirm its death (spec 4.4): the fast path's evidence, the unreachable
 // streak, or DeadAfter.
 func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
-	if w.followActive(ctx, cfg) {
-		return
-	}
 	w.setStatusAction("probe")
 	err := w.Probe(ctx, w.socksPort(cfg))
 	if w.mutationEnded(ctx) {
@@ -70,6 +68,9 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.failSince.IsZero() {
 		w.failSince = now
 		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+	}
+	if w.followActive(ctx, cfg) {
+		return
 	}
 	if now.Before(w.keeperNotBefore) {
 		return
@@ -94,22 +95,33 @@ func (w *Watch) keep(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	}
 }
 
-// followActive is the actuality check (spec 4.2), made between episodes in
-// both modes. A server that changed in place or moved is followed; one whose
-// new entry does not answer either, and one that left its subscription, are
-// replaced. The whole action has one fence, the record the check classified: a
-// replacement after a follow that failed carries on from the follow's write,
-// and a selection the user commits meanwhile ends it. It reports whether it
-// acted - switched, tried and backed off, or was ended - and the tick then
-// ends.
+// followActive is the actuality check (spec 4.2, as owner decision C1 amends
+// it): in both modes, a tick whose probe failed compares the selected server
+// with its list before the death rules - on every such tick, so a server the
+// periodic refresh moves while Xray is already failing is followed too. A
+// server that changed in place or moved is followed; one whose new entry does
+// not answer either, and one that left its subscription, are replaced. The
+// whole action has one fence, the record the check classified: a replacement
+// after a follow that failed carries on from the follow's write, and a
+// selection the user commits meanwhile ends it. It reports whether it acted -
+// switched, tried and backed off, or was ended - and the tick then ends.
 //
-// During an episode it does nothing: while the probe fails, xray.failover or
-// xray.pending_restore is recorded, or an apply of the watch's own is pending
-// (spec 4.2). The episode's own logic owns the record then - the death rules
-// and the walk pick the server, a restore finishes on the one its probe
-// passed - and a switch of the check's own would cut across it.
+// While the probe passes it does nothing: a working Xray is left alone. A
+// panel that picks a host's address or SNI at random for each download -
+// Marzban draws both from a list, or salts a '*' - reads as a server that
+// moved or changed at every refresh, and acting on it would restart Xray, cut
+// the open connections of every client on it and send a message each round.
+// So would a refresh that does not follow renames, which reads a renamed
+// server as gone, and the deletion of the running server's subscription,
+// after which the Web UI promises that Xray keeps running it. A server that
+// really moved stops answering at its old address, and the next probe brings
+// the check in. Nor does it act while xray.failover or xray.pending_restore
+// is recorded, or an apply of the watch's own is pending: that episode's own
+// logic owns the record then - the walk picks the server, a restore finishes
+// on the one its probe passed - and a switch of the check's own would cut
+// across it.
 func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) bool {
-	if cfg == nil || !w.failSince.IsZero() || w.pendingApply || cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil {
+	if cfg == nil || w.failSince.IsZero() || w.pendingApply || cfg.Xray.Failover != nil || cfg.Xray.PendingRestore != nil {
 		return false
 	}
 	if cfg.Xray.ActiveServer == nil || w.Generate == nil || w.Probe == nil ||

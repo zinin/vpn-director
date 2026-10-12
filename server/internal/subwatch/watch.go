@@ -354,11 +354,6 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.resetFail()
 		return
 	}
-	// Between episodes the selected server is checked against its list: one
-	// that moved, changed or left it is followed or replaced before Xray dies.
-	if w.followActive(ctx, cfg) {
-		return
-	}
 
 	_, socks := vpnconfig.XrayInboundPorts(cfg)
 	if socks == 0 {
@@ -385,6 +380,12 @@ func (w *Watch) Tick(ctx context.Context) {
 	if w.failSince.IsZero() {
 		w.failSince = now
 		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+	}
+	// The probe failed: a selected server that moved, changed or left its list
+	// is followed or replaced before the death rules, as the keeper does. While
+	// Xray works the check leaves it alone (followActive).
+	if w.followActive(ctx, cfg) {
+		return
 	}
 	attempt := w.fastFailover(ctx, cfg)
 	switch attempt.Outcome {
