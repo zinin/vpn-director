@@ -211,6 +211,18 @@ func (f *fastSelection) choiceGuard(w *Watch, ctx context.Context, c fastChoice)
 	}
 }
 
+// proofConsumed retires the death proof once something has acted on it: a
+// publication that replaces its inputs, or the keeper's replacement that
+// begins on it. Ownership - the selection, the ports, the links, a stop and
+// the gate - still fences every write after it, and each server tried is
+// proved by its own probe. A proof kept on would refuse that work as soon as
+// the monitor checks one of its keys again.
+func (f *fastSelection) proofConsumed() {
+	f.proofRequired = false
+	f.refreshed = true
+	f.last, f.recorded, f.fallbackProofs = nil, nil, nil
+}
+
 // Only the transaction's returned seq belongs to this operation.
 func (f *fastSelection) record(s vpnconfig.Server, seq int, err error) {
 	if err != nil {

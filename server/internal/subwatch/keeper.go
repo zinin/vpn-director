@@ -156,8 +156,8 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 // refuses the first write. guard is the fast path's ownership when it got that
 // far (fastAttempt.Guard), and the replacement writes under it as
 // failOutbound's fallback does: the owner checks and records each write, its
-// port snapshot stays guarded, and what it refuses is neither written nor
-// said.
+// port snapshot stays guarded, and a refusal ends the action - nothing more is
+// written, said or backed off.
 func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, reason string, guard func(*vpnconfig.VPNDirectorConfig) error) {
 	if cfg == nil || cfg.Xray.ActiveServer == nil {
 		return
@@ -165,6 +165,14 @@ func (w *Watch) replaceDead(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	previousGuard, previousRefused := w.outboundGuard, w.outboundRefused
 	w.outboundGuard, w.outboundRefused = guard, nil
 	defer func() { w.outboundGuard, w.outboundRefused = previousGuard, previousRefused }()
+	if w.outboundGuard != nil && w.fastOwned != nil {
+		// The replacement acts on the death the proof established, as the
+		// armed walk does once a publication has replaced the proof's inputs:
+		// ownership fences it from here, and each candidate's own probe proves
+		// it. A proof kept on would refuse the switch at the monitor's next
+		// check of a proof key.
+		w.fastOwned.proofConsumed()
+	}
 	subs, err := w.loadSubscriptions()
 	if err != nil || len(subs) == 0 || w.mutationEnded(ctx) || w.outboundAllowedNow() != nil {
 		return
@@ -261,8 +269,9 @@ func (w *Watch) newSwitcher(cfg *vpnconfig.VPNDirectorConfig, subs []vpnconfig.S
 // working, through sw - the action's fence, carried from write to write - and
 // sends message for it. It skips a copy whose endpoint.DialKey it tried
 // already, and the copies of a subscription deleted meanwhile. ended is a
-// stop, a closed gate or a selection the user made since the action began:
-// nothing more may be written.
+// stop, a closed gate, a selection the user made since the action began, or a
+// fallback's ownership that refused (outboundAllowedNow), as failOutbound ends
+// on it: nothing more may be written, said or backed off.
 func (w *Watch) switchAmong(ctx context.Context, sw *switcher, candidates []vpnconfig.Server, message func(vpnconfig.Server) string) (switched, ended bool) {
 	seen, gone := map[string]bool{}, map[string]bool{}
 	w.setStatusAction("switch")
@@ -303,8 +312,9 @@ func (w *Watch) switchAmong(ctx context.Context, sw *switcher, candidates []vpnc
 	}
 	// A selection committed during the last probe ends the action as well, as
 	// the walk looks before it reports no live server: the run did not fail
-	// on the user's server.
-	return false, w.mutationEnded(ctx) || w.endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq))
+	// on the user's server. So does an ownership that stopped holding then.
+	return false, w.mutationEnded(ctx) || w.outboundAllowedNow() != nil ||
+		w.endsWalk(w.walkOwnsNow(sw.started, sw.lastRecorded, sw.seq))
 }
 
 // resetKeeper ends a run of keeper attempts: Xray works, and the next failure

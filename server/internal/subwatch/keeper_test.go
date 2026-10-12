@@ -466,3 +466,81 @@ func TestTick_AWorkingProbeEndsTheKeeperBackoff(t *testing.T) {
 		t.Fatalf("notes %v, want %v", s.f.notes, want)
 	}
 }
+
+// The replacement consumes the fast path's death proof (Ruling T5-R4): checks
+// the monitor completes while the keeper switches make the proof stale, and
+// the switch still goes through, proved by its own probe.
+func TestKeeper_AStaleDeathProofDoesNotStopTheReplacement(t *testing.T) {
+	s := newKeeperFixture(t)
+	s.passThenMiss(time.Second)
+	key := s.candidateKey()
+	backup := s.h.fresh.Endpoints[key]
+	backup.Status = watchdapi.StatusDead
+	s.h.fresh.Endpoints[key] = backup
+	generate := s.w.Generate
+	s.w.Generate = func(server vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+		generated, seq, err := generate(server, guard)
+		for _, proved := range append(s.activeKeys(), key) {
+			s.h.invalidate(proved)
+		}
+		return generated, seq, err
+	}
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) || s.restarts != 1 {
+		t.Fatalf("written %v, restarts %d; a stale proof must not stop the replacement", got, s.restarts)
+	}
+	if want := []string{"Xray server Alpha / Oslo is not answering; Xray switched to Alpha / Backup"}; !reflect.DeepEqual(s.f.notes, want) {
+		t.Fatalf("notes %v, want %v", s.f.notes, want)
+	}
+}
+
+// The fast path's ownership itself refuses during the replacement - the inbound
+// ports change - and the action ends there (Ruling T5-R4): nothing more is
+// written or restarted, nothing is said, nothing backs off, and no refused
+// candidate logs a warning. The fast path tried Backup, and the keeper tries
+// Oslo's two addresses; the refusal comes at the restart after a write, at the
+// next write after a probe, or after the last probe.
+func TestKeeper_ARefusedOwnershipEndsTheReplacement(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		written  bool   // the ports change right after the keeper's first write,
+		probed   string // or while the probe of the copy on this address waits
+		names    []string
+		restarts int
+	}{
+		{"at the restart", true, "", []string{"Backup@backup.example", "Oslo@oslo.example"}, 1},
+		{"at the next write", false, "203.0.113.10", []string{"Backup@backup.example", "Oslo@oslo.example"}, 2},
+		{"after the last probe", false, "203.0.113.11", []string{"Backup@backup.example", "Oslo@oslo.example", "Oslo@oslo.example"}, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newKeeperFixture(t)
+			s.passThenMiss(time.Second)
+			log := captureLog(t)
+			changePorts := func() {
+				s.f.cfg.Advanced = map[string]interface{}{"xray": map[string]interface{}{"socks_port": float64(22346)}}
+			}
+			s.w.Probe = func(context.Context, int) error { // nothing answers, Backup in the fast path neither
+				s.probes++
+				if len(s.written) > 1 && s.written[len(s.written)-1].IPs[0] == tc.probed {
+					changePorts()
+				}
+				return errProbe
+			}
+			generate := s.w.Generate
+			s.w.Generate = func(server vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+				generated, seq, err := generate(server, guard)
+				if tc.written && s.generateCalls == 2 {
+					changePorts()
+				}
+				return generated, seq, err
+			}
+			s.w.Tick(context.Background())
+			if got := writtenNames(s.written); !reflect.DeepEqual(got, tc.names) || s.restarts != tc.restarts {
+				t.Fatalf("written %v, restarts %d; want %v and %d", got, s.restarts, tc.names, tc.restarts)
+			}
+			if len(s.f.notes) != 0 || !s.w.keeperNotBefore.IsZero() || strings.Contains(log.String(), "level=WARN") {
+				t.Fatalf("notes %v, next attempt %v, log:\n%s\na refused ownership says, backs off and warns of nothing", s.f.notes, s.w.keeperNotBefore, log)
+			}
+		})
+	}
+}

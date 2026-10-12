@@ -190,12 +190,13 @@ type switcher struct {
 // Nothing was written for it, and nobody else wrote either, so the way back
 // stays open - and is not held to that check itself: it is the server that
 // ran. live is a probe that passed; ended is a write the guard refused for a
-// stop or a newer selection, a restart a stop skipped, or a stop or a cancelled
-// tick that ended the attempt, after which nothing more may be written. A
-// timeout of the switch's own while the tick runs is a failed switch. It writes
-// through generateWalked: under a fallback's ownership - the keeper's
-// replacement after the fast path - the owner checks and records the write, as
-// it does the walk's; without one that is Generate.
+// stop or a newer selection, a write or a restart a fallback's ownership
+// refused, a restart a stop skipped, or a stop or a cancelled tick that ended
+// the attempt, after which nothing more may be written. A timeout of the
+// switch's own while the tick runs is a failed switch. It writes through
+// generateWalked: under a fallback's ownership - the keeper's replacement
+// after the fast path - the owner checks and records the write, as it does the
+// walk's; without one that is Generate, and nothing is refused that way.
 func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live, ended, gone bool) {
 	w := s.w
 	if ctx.Err() != nil || w.mutationEnded(ctx) {
@@ -206,7 +207,9 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		sub, link = c.Subscription, s.links[c.Subscription]
 	}
 	generated, seq, err := w.generateWalked(c, w.walkGuard(sub, link, s.started, s.lastRecorded, s.seq, ctx))
-	if w.endsWalk(err) {
+	// Once a fallback's ownership refuses, nothing more may be written under
+	// it: the attempt ends, as failOutbound ends on the same check.
+	if w.endsWalk(err) || (err != nil && w.outboundAllowedNow() != nil) {
 		return false, true, false
 	}
 	if errors.Is(err, vpnconfig.ErrSubscriptionGone) {
@@ -225,7 +228,7 @@ func (s *switcher) to(ctx context.Context, c vpnconfig.Server, holds bool) (live
 		return false, true, false
 	}
 	if err := w.restartXray(); err != nil {
-		if w.endsWalk(err) || w.mutationEnded(ctx) {
+		if w.endsWalk(err) || w.mutationEnded(ctx) || w.outboundAllowedNow() != nil {
 			return false, true, false
 		}
 		slog.Warn("Xray restart failed", "server", c.Name, watchErrorAttr(err))

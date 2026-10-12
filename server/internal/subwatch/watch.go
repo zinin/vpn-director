@@ -1048,9 +1048,7 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 			published++
 			if w.outboundGuard != nil && w.fastOwned != nil {
 				// This publication replaces the inputs of the completed death proof.
-				w.fastOwned.proofRequired = false
-				w.fastOwned.refreshed = true
-				w.fastOwned.last, w.fastOwned.recorded, w.fastOwned.fallbackProofs = nil, nil, nil
+				w.fastOwned.proofConsumed()
 			}
 			slog.Info("Subscription refreshed", "subscription", s.Name, "servers", len(results[i].servers))
 		case w.mutationInterrupted(err):
