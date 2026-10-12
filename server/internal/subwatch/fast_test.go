@@ -275,7 +275,11 @@ func TestFast_FirstFailureSwitchesWithoutClientMove(t *testing.T) {
 	if !reflect.DeepEqual(s.f.cfg.Xray.Servers, []string{"203.0.113.10", "203.0.113.11", "198.51.100.20"}) {
 		t.Fatalf("TPROXY bypass endpoints changed: %v", s.f.cfg.Xray.Servers)
 	}
-	wantActive := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8}
+	// The record carries the mark and group of the subscription's entry, not
+	// of the copy Xray dials with the address in its outbound.
+	backup := s.f.subs[0].Servers[1]
+	wantActive := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8,
+		Identity: vpnconfig.IdentityMark(backup), Group: backup.Group()}
 	wantPreferred := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Oslo", Address: "oslo.example", Port: 443}
 	if !reflect.DeepEqual(s.f.cfg.Xray.ActiveServer, wantActive) || !reflect.DeepEqual(s.f.cfg.Xray.PreferredServer, wantPreferred) {
 		t.Fatalf("active %+v, preferred %+v; automatic selection must preserve the original choice", s.f.cfg.Xray.ActiveServer, s.f.cfg.Xray.PreferredServer)
@@ -1612,7 +1616,9 @@ func TestFast_GuardedGenerationPortSnapshot(t *testing.T) {
 				t.Errorf("persisted ports %d/%d, want %d/%d; automatic transition overwrote the settings change", tp, socks, tc.changed.TProxy, tc.changed.Socks)
 			}
 			assertFastAssignments(t, cfg)
-			wantActive := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8}
+			backup := s.f.subs[0].Servers[1]
+			wantActive := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8,
+				Identity: vpnconfig.IdentityMark(backup), Group: backup.Group()}
 			wantPreferred := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Oslo", Address: "oslo.example", Port: 443}
 			if !reflect.DeepEqual(cfg.Xray.ActiveServer, wantActive) || !reflect.DeepEqual(cfg.Xray.PreferredServer, wantPreferred) {
 				t.Errorf("active %+v, preferred %+v; preserve the own record and original choice", cfg.Xray.ActiveServer, cfg.Xray.PreferredServer)

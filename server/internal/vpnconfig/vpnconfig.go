@@ -184,13 +184,21 @@ type ActiveServer struct {
 	// server differ in nothing else, so it is what lets the subscription walk
 	// tell a choice made while it was busy from the one it started out with.
 	Seq int `json:"seq,omitempty"`
+	// Identity is IdentityMark of the server the record was written from, and
+	// Group its Group. watchd tells by them a server that changed in place or
+	// moved from one that is current, and picks a replacement of the user's
+	// group. configure.sh and older daemons write records without them; such a
+	// record is checked by name, address and port.
+	Identity string `json:"identity,omitempty"`
+	Group    string `json:"group,omitempty"`
 }
 
 // NewActiveServer records the fields of s that identify it to a reader. The
 // rest - UUID, REALITY keys - would put credentials in a file the Web UI hands
-// out over /api/config.
+// out over /api/config; the mark is a hash that names none of them.
 func NewActiveServer(s Server) *ActiveServer {
-	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port, Subscription: s.Subscription}
+	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port, Subscription: s.Subscription,
+		Identity: IdentityMark(s), Group: s.Group()}
 }
 
 // ActiveSeq is the write counter a carries, and zero for no record at all or
