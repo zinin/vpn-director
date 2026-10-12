@@ -1073,6 +1073,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		links[s.ID] = s.URL
 	}
 	order, chosenFirst := walkOrder(subs, chosen)
+	ref := refFor(cfg, vpnconfig.AllServers(subs))
 	var preferred *vpnconfig.Server
 	if chosenFirst {
 		preferred = &order[0]
@@ -1107,8 +1108,9 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 			pending = append(pending, c)
 		}
 		remaining = pending
-		// Rejected entries stay pending so later evidence can admit them again.
-		ordered := w.healthWalkOrder(remaining, cfg)
+		// Rejected entries stay pending so later evidence can admit them again;
+		// the user's group goes first, the alive by latency (orderBest).
+		ordered := w.bestWalkOrder(remaining, cfg, ref)
 		if len(ordered) == 0 {
 			break
 		}

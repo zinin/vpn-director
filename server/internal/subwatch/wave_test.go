@@ -631,11 +631,13 @@ func TestWalk_HealthyFirstStillProbesMain(t *testing.T) {
 
 		r.tick()
 
+		// The alive go first by latency: Alive2 at 1 ms, Alive1's second address
+		// at the evidence's 17 ms, its first at 900 ms; then the walk's order.
 		want := []string{
 			"probe Preferred",
-			"generate Alive1@203.0.113.13", "restart", "settle", "probe Alive1",
-			"generate Alive1@203.0.113.33", "restart", "settle", "probe Alive1",
 			"generate Alive2@203.0.113.14", "restart", "settle", "probe Alive2",
+			"generate Alive1@203.0.113.33", "restart", "settle", "probe Alive1",
+			"generate Alive1@203.0.113.13", "restart", "settle", "probe Alive1",
 			"generate Preferred@203.0.113.10", "restart", "settle", "probe Preferred",
 			"generate Unknown@203.0.113.11", "restart", "settle", "probe Unknown",
 		}
