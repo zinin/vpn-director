@@ -214,7 +214,7 @@ func (s *fastFixture) setHealth() {
 	s.w.Health = s.h
 	// The main probe last worked on the active server a minute before the
 	// monitor saw it die, so its dead is proof (diedAfterProbeOK).
-	s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(active)
+	s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = s.f.now.Add(-time.Minute), activeID(active), recordMark(active)
 }
 
 // passThenMiss runs a tick whose main probe passes on the active server, has
@@ -231,7 +231,7 @@ func (s *fastFixture) passThenMiss(died time.Duration) {
 		}
 		return errProbe
 	}
-	s.w.probeOKAt, s.w.probeOKActive = time.Time{}, ""
+	s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = time.Time{}, "", ""
 	s.w.Tick(context.Background())
 	for _, key := range s.activeKeys() {
 		for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
@@ -275,7 +275,11 @@ func TestFast_FirstFailureSwitchesWithoutClientMove(t *testing.T) {
 	if !reflect.DeepEqual(s.f.cfg.Xray.Servers, []string{"203.0.113.10", "203.0.113.11", "198.51.100.20"}) {
 		t.Fatalf("TPROXY bypass endpoints changed: %v", s.f.cfg.Xray.Servers)
 	}
-	wantActive := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8}
+	// The record carries the mark and group of the subscription's entry, not
+	// of the copy Xray dials with the address in its outbound.
+	backup := s.f.subs[0].Servers[1]
+	wantActive := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8,
+		Identity: vpnconfig.IdentityMark(backup), Group: backup.Group()}
 	wantPreferred := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Oslo", Address: "oslo.example", Port: 443}
 	if !reflect.DeepEqual(s.f.cfg.Xray.ActiveServer, wantActive) || !reflect.DeepEqual(s.f.cfg.Xray.PreferredServer, wantPreferred) {
 		t.Fatalf("active %+v, preferred %+v; automatic selection must preserve the original choice", s.f.cfg.Xray.ActiveServer, s.f.cfg.Xray.PreferredServer)
@@ -381,9 +385,9 @@ func TestFast_NoWorkingProbeOfTheActiveServerIsNoProof(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s := newFastFixture(t)
 			kinds := fastLogKinds(t)
-			s.w.probeOKAt, s.w.probeOKActive = time.Time{}, ""
+			s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = time.Time{}, "", ""
 			if tc.worked != nil {
-				s.w.probeOKAt, s.w.probeOKActive = s.f.now.Add(-time.Minute), activeID(tc.worked)
+				s.w.probeOKAt, s.w.probeOKActive, s.w.probeOKMark = s.f.now.Add(-time.Minute), activeID(tc.worked), recordMark(tc.worked)
 			}
 			s.w.Tick(context.Background())
 			if len(s.h.requests()) == 0 {
@@ -409,9 +413,13 @@ func TestFast_OrderDedupAndBudget(t *testing.T) {
 	nearby.IPs = []string{"198.51.100.20", "198.51.100.20", "198.51.100.21"}
 	beta := fastServer("Beta", "beta.example", "192.0.2.30")
 	gamma := fastServer("Gamma", "gamma.example", "192.0.2.40")
+	// Overflow is past OwnFirst, so the walk puts it after Beta and Gamma. It is
+	// alive in the user's group and subscription, so the fast path takes it
+	// before them (orderBest).
+	overflow := fastServer("Overflow", "overflow.example", "198.51.100.22")
 	s.f.subs = []vpnconfig.Subscription{
 		{ID: "gamma", Name: "Gamma", URL: "https://gamma.example/list", Servers: []vpnconfig.Server{gamma}},
-		{ID: "alpha", Name: "Alpha", URL: "https://alpha.example/list", Servers: []vpnconfig.Server{active, alias, nearby, fastServer("Overflow", "overflow.example", "198.51.100.22")}},
+		{ID: "alpha", Name: "Alpha", URL: "https://alpha.example/list", Servers: []vpnconfig.Server{active, alias, nearby, overflow}},
 		{ID: "beta", Name: "Beta", URL: "https://beta.example/list", Servers: []vpnconfig.Server{beta}},
 	}
 	s.setHealth()
@@ -466,7 +474,7 @@ func TestFast_OrderDedupAndBudget(t *testing.T) {
 	wantCandidates := map[string]bool{
 		endpoint.Key(endpoint.PerAddress([]vpnconfig.Server{nearby})[0]): true,
 		endpoint.Key(endpoint.PerAddress([]vpnconfig.Server{nearby})[2]): true,
-		endpoint.Key(beta): true,
+		endpoint.Key(overflow): true,
 	}
 	seen, activeCalls, controls := make(map[string]bool), 0, 0
 	var shared time.Time
@@ -505,8 +513,8 @@ func TestFast_OrderDedupAndBudget(t *testing.T) {
 	for _, server := range s.written {
 		dialed = append(dialed, server.Subscription+"/"+server.Name+"/"+endpoint.ServerForDial(server).Address)
 	}
-	if !reflect.DeepEqual(dialed, []string{"alpha/Nearby/198.51.100.20", "alpha/Nearby/198.51.100.21", "beta/Beta/192.0.2.30"}) || s.restarts != 3 || s.f.applies != 0 {
-		t.Fatalf("dialed %v, restart %d, apply %d; preserve OwnFirst/walkOrder/PerAddress despite parallel completion", dialed, s.restarts, s.f.applies)
+	if !reflect.DeepEqual(dialed, []string{"alpha/Nearby/198.51.100.20", "alpha/Nearby/198.51.100.21", "alpha/Overflow/198.51.100.22"}) || s.restarts != 3 || s.f.applies != 0 {
+		t.Fatalf("dialed %v, restart %d, apply %d; preserve orderBest/PerAddress order despite parallel completion", dialed, s.restarts, s.f.applies)
 	}
 	assertFastAssignments(t, s.f.cfg)
 }
@@ -563,8 +571,18 @@ func TestFast_InconclusiveUsesLegacy(t *testing.T) {
 		{"fresh active generation invalidated", func(s *fastFixture) { s.h.invalidate(s.activeKeys()[0]) }},
 		{"fresh candidate generation invalidated", func(s *fastFixture) { s.h.invalidate(s.candidateKey()) }},
 		{"missing active selection", func(s *fastFixture) { s.f.cfg.Xray.ActiveServer = nil }},
-		{"same name but rotated active address", func(s *fastFixture) { s.f.cfg.Xray.ActiveServer.Address = "rotated.example" }},
-		{"no matching active subscription", func(s *fastFixture) { s.f.cfg.Xray.ActiveServer.Subscription = "missing" }},
+		// Once the probe fails the actuality check follows or replaces a
+		// record its list no longer has, before the fast path (spec 4.2, owner
+		// decision C1). The fast path meets one while the backoff of a keeper
+		// run that found nothing working holds that check back.
+		{"same name but rotated active address", func(s *fastFixture) {
+			s.f.cfg.Xray.ActiveServer.Address = "rotated.example"
+			s.w.keeperNotBefore = s.f.now.Add(KeeperRetry)
+		}},
+		{"no matching active subscription", func(s *fastFixture) {
+			s.f.cfg.Xray.ActiveServer.Subscription = "missing"
+			s.w.keeperNotBefore = s.f.now.Add(KeeperRetry)
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1612,7 +1630,9 @@ func TestFast_GuardedGenerationPortSnapshot(t *testing.T) {
 				t.Errorf("persisted ports %d/%d, want %d/%d; automatic transition overwrote the settings change", tp, socks, tc.changed.TProxy, tc.changed.Socks)
 			}
 			assertFastAssignments(t, cfg)
-			wantActive := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8}
+			backup := s.f.subs[0].Servers[1]
+			wantActive := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Backup", Address: "backup.example", Port: 443, Seq: 8,
+				Identity: vpnconfig.IdentityMark(backup), Group: backup.Group()}
 			wantPreferred := &vpnconfig.ActiveServer{Subscription: "a1b2c3d4", Name: "Oslo", Address: "oslo.example", Port: 443}
 			if !reflect.DeepEqual(cfg.Xray.ActiveServer, wantActive) || !reflect.DeepEqual(cfg.Xray.PreferredServer, wantPreferred) {
 				t.Errorf("active %+v, preferred %+v; preserve the own record and original choice", cfg.Xray.ActiveServer, cfg.Xray.PreferredServer)
@@ -1685,4 +1705,150 @@ func TestFast_CandidatesAvoidTheActiveServersAddresses(t *testing.T) {
 		t.Fatalf("generate %d, restart %d, active %+v; want the switch to the server on another address", s.generateCalls, s.restarts, s.f.cfg.Xray.ActiveServer)
 	}
 	assertFastAssignments(t, s.f.cfg)
+}
+
+// A Shadowsocks server listed before the VLESS backup, and faster, is still
+// tried after it: the fast path takes the user's group first.
+func TestFastFailover_TriesTheUsersGroupFirst(t *testing.T) {
+	s := newFastFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, ssServer("Shadow", "198.51.100.40"), backup}
+	s.setHealth()
+	for _, key := range endpoint.Keys(ssServer("Shadow", "198.51.100.40")) {
+		for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
+			st := endpoints[key]
+			st.LatencyMS = 5
+			endpoints[key] = st
+		}
+	}
+	s.passThenMiss(time.Second)
+	s.w.Tick(context.Background())
+	if len(s.written) == 0 || s.written[0].Name != "Backup" {
+		t.Fatalf("written %v, want Backup first", healthLabels(s.written))
+	}
+}
+
+// A panel can list twins of one name, address and port: inbounds of other
+// kinds behind one port, or the same kind with other keys. Each is its own
+// endpoint to the monitor, so the entry the fast path reads is the twin Xray
+// runs: of the record's kind, with its mark. A twin of another kind is not it,
+// nor one with other keys: with no twin of its mark, Xray runs an outbound the
+// list no longer has. A record without a group or a mark knows neither, and
+// takes the first twin.
+func TestExactFastServer_FindsTheTwinXrayRuns(t *testing.T) {
+	oslo := fastServer("Oslo", "oslo.example", "203.0.113.10")
+	rekeyed := oslo
+	rekeyed.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+	ss := ssServer("Oslo", "203.0.113.10")
+	ss.Address, ss.Port = oslo.Address, oslo.Port
+	record := vpnconfig.NewActiveServer(oslo)
+	legacy := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Oslo", Address: "oslo.example", Port: 443}
+	alpha := func(servers ...vpnconfig.Server) []vpnconfig.Subscription {
+		return []vpnconfig.Subscription{{ID: "alpha", Name: "Alpha", Servers: servers}}
+	}
+	cases := []struct {
+		name string
+		subs []vpnconfig.Subscription
+		a    *vpnconfig.ActiveServer
+		want *vpnconfig.Server // nil: none
+	}{
+		{"another kind listed first", alpha(ss, oslo), record, &oslo},
+		{"other keys of the kind listed first", alpha(rekeyed, oslo), record, &oslo},
+		{"no twin with the mark", alpha(ss, rekeyed), record, nil},
+		{"another kind alone", alpha(ss), record, nil},
+		{"a record without a group or a mark", alpha(ss, oslo), legacy, &ss},
+	}
+	for _, tc := range cases {
+		got, ok := exactFastServer(tc.subs, tc.a)
+		switch {
+		case tc.want == nil && ok:
+			t.Errorf("%s: found %s (%s), want none", tc.name, got.Name, got.Group())
+		case tc.want != nil && (!ok || !reflect.DeepEqual(got, *tc.want)):
+			t.Errorf("%s: found %v: %s (%s) %s, want %s (%s) %s", tc.name, ok, got.Name, got.Group(), got.Outbound, tc.want.Name, tc.want.Group(), tc.want.Outbound)
+		}
+	}
+}
+
+// A panel's fallback inbound, "Oslo" over Shadowsocks on Oslo's own host and
+// port, is listed before the vless+tls Oslo that Xray runs. The fast path
+// reads Oslo's endpoints, not the twin's: Oslo's death switches Xray at the
+// first miss, and the twin's, with Oslo alive, switches nothing.
+func TestFast_ReadsTheEvidenceOfTheTwinXrayRuns(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		osloDied bool // Oslo's endpoints died; otherwise the twin's did
+		written  []string
+	}{
+		{"Oslo died, the twin alive", true, []string{"Backup@backup.example"}},
+		{"the twin died, Oslo alive", false, []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := newFastFixture(t)
+			oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+			twin := ssServer("Oslo", oslo.IPs[0])
+			twin.Address, twin.Port, twin.IPs = oslo.Address, oslo.Port, oslo.IPs
+			s.f.subs[0].Servers = []vpnconfig.Server{twin, oslo, backup}
+			s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, oslo)
+			dead, alive := []vpnconfig.Server{oslo}, []vpnconfig.Server{twin, backup}
+			if !tc.osloDied {
+				dead, alive = []vpnconfig.Server{twin}, []vpnconfig.Server{oslo, backup}
+			}
+			s.setHealthOf(dead, alive)
+			s.w.Tick(context.Background())
+			if got := writtenNames(s.written); !reflect.DeepEqual(got, tc.written) {
+				t.Fatalf("written %v, want %v", got, tc.written)
+			}
+		})
+	}
+}
+
+// The main probe passes on Oslo, and the user then selects its Shadowsocks
+// twin of the same name, address and port. The twin has never passed the main
+// probe: a death of its endpoints the monitor sees after Oslo's probe proves
+// nothing, and one miss switches nothing - the legacy confirmation decides.
+func TestFast_AProbeOfOneTwinIsNoProofForTheOther(t *testing.T) {
+	s := newFastFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	twin := ssServer("Oslo", oslo.IPs[0])
+	twin.Address, twin.Port, twin.IPs = oslo.Address, oslo.Port, oslo.IPs
+	s.f.subs[0].Servers = []vpnconfig.Server{oslo, twin, backup}
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, oslo)
+	s.setHealthOf(nil, []vpnconfig.Server{oslo, twin, backup})
+	healthy := true
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if healthy || len(s.written) > 0 {
+			return nil
+		}
+		return errProbe
+	}
+	s.w.Tick(context.Background())
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, twin)
+	for _, key := range endpoint.Keys(twin) {
+		for _, endpoints := range []map[string]watchdapi.EndpointState{s.h.cached.Endpoints, s.h.fresh.Endpoints} {
+			state := endpoints[key]
+			state.Status, state.Since, state.LatencyMS, state.Fails, state.Error = watchdapi.StatusDead, s.f.now.Add(10*time.Second), 0, 1, "timeout"
+			endpoints[key] = state
+		}
+	}
+	healthy = false
+	s.f.now = s.f.now.Add(ProbeInterval)
+	s.w.Tick(context.Background())
+	s.assertNoMutation(t)
+}
+
+// A refresh gave Oslo new keys in place, and Xray still runs the old ones: no
+// entry carries the record's mark. The monitor's dead of the new entry says
+// nothing of the outbound Xray runs, and one miss switches nothing - from the
+// second the actuality check follows the new entry.
+func TestFast_TheDeathOfAnEntryWithOtherKeysIsNoProof(t *testing.T) {
+	s := newFastFixture(t)
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.f.cfg.Xray.ActiveServer = vpnconfig.RecordActiveServer(s.f.cfg.Xray.ActiveServer, oslo)
+	rekeyed := oslo
+	rekeyed.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+	s.f.subs[0].Servers = []vpnconfig.Server{rekeyed, backup}
+	s.setHealthOf([]vpnconfig.Server{rekeyed}, []vpnconfig.Server{backup})
+	s.w.Tick(context.Background())
+	s.assertNoMutation(t)
 }

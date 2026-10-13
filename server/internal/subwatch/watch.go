@@ -114,8 +114,11 @@ type Watch struct {
 	mu                sync.Mutex
 	failSince         time.Time // zero => last probe succeeded
 	failSeq           int       // active_server's write counter when failSince was set: the record that began to fail
+	ownSeq            int       // active_server's write counter of the record the watch last wrote itself (generate)
+	failedProbes      int       // probes failed since failSince was set: the actuality check waits for two, a single miss being the common transient
 	probeOKAt         time.Time // when the main SOCKS probe last succeeded,
-	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on
+	probeOKActive     string    // and the activeID of cfg.Xray.ActiveServer it succeeded on,
+	probeOKMark       string    // and that record's kind and mark (recordMark): twins of one activeID are two servers
 	fastLogged        time.Time // failSince of the episode whose fast attempt was last logged as not switching
 	downChecks        int       // checks since failSince that found the active server down; -1 once one did not
 	lastImport        time.Time
@@ -134,13 +137,18 @@ type Watch struct {
 	lastFallbackCheck time.Time                     // last platform lookup for a committed failover's tunnel
 	fallbackDownSince time.Time                     // since when that tunnel is no exit; zero while it is one
 	running           bool
-	returnNotBefore   time.Time                            // no look for the preferred server before this
+	returnNotBefore   time.Time                            // no look for the preferred server or its group before this
 	returnRetry       time.Duration                        // wait after the last failed return; zero before any
 	returnFails       int                                  // returns in a row that failed; at ReturnFailsMax the returns stop
 	lastReturn        time.Time                            // when the last return proved live; zero once it held for ReturnHold or a death followed it
 	returnSeq         int                                  // active_server's write counter the last return left
+	returnGroup       string                               // the preferred group whose server the last return went to; "" for the preferred server itself
 	returnDeath       time.Time                            // failSince of the last death the returns were settled at
 	lastPicked        *vpnconfig.Server                    // the copy the walk picked or a return proved, with the address it ran on
+	keeperNotBefore   time.Time                            // no keeper switch before this: the backoff after a run that found nothing working
+	keeperRetry       time.Duration                        // the current keeper backoff; zero before any
+	keeperFailNoted   bool                                 // "No working Xray server found" sent for this run of failures
+	keeperWANNoted    time.Time                            // failSince of the episode whose replacement was logged as waiting for the WAN
 	after             func(time.Duration) <-chan time.Time // StartRefresh's waits; nil is time.After
 }
 
@@ -227,7 +235,11 @@ func (w *Watch) Tick(ctx context.Context) {
 	subs := w.subscriptionCount()
 	// A restore whose last apply failed is work the watch has started, as a
 	// failover is: neither waits for a subscription or for Xray clients.
-	if !vpnconfig.Armed(cfg, subs) && !w.pendingApply {
+	// A watch with nobody on Xray still keeps Xray on a working server
+	// (keeper mode, spec 4.1); one without a server to keep does nothing.
+	armed := vpnconfig.Armed(cfg, subs) || w.pendingApply
+	keeper := !armed && w.keeps(cfg, subs)
+	if !armed && !keeper {
 		w.resetFail()
 		return
 	}
@@ -250,6 +262,10 @@ func (w *Watch) Tick(ctx context.Context) {
 		}
 		endWatch()
 	}()
+	if keeper {
+		w.keep(ctx, cfg)
+		return
+	}
 	if !w.reconciled {
 		w.reconciled = true
 		// The move is written before Apply, and a process that stopped in
@@ -354,19 +370,26 @@ func (w *Watch) Tick(ctx context.Context) {
 	}
 	if err == nil {
 		w.probeOKAt = w.Now()
-		w.probeOKActive = activeID(cfg.Xray.ActiveServer)
+		w.probeOKActive, w.probeOKMark = activeID(cfg.Xray.ActiveServer), recordMark(cfg.Xray.ActiveServer)
 		w.resetFail()
 		w.importRetry = 0
 		w.lastRouteKind = noteNone
 		w.lastImportKind = noteNone
+		w.resetKeeper()
 		w.maybeReturn(ctx, cfg)
 		return
 	}
 
 	now := w.Now()
-	if w.failSince.IsZero() {
-		w.failSince = now
-		w.failSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+	w.missed(cfg, now)
+	// The probe failed: from the second failure in a row, a selected server
+	// that moved or changed is followed before the death rules, as the keeper
+	// does. One that left its list, or whose new entry does not answer
+	// either, is not replaced here: the death rules move the clients into a
+	// tunnel first (spec 4.4), and the wave and the walk pick the server.
+	// While Xray works the check leaves it alone (followActive).
+	if w.followActive(ctx, cfg, true) {
+		return
 	}
 	attempt := w.fastFailover(ctx, cfg)
 	switch attempt.Outcome {
@@ -732,33 +755,55 @@ func activeID(a *vpnconfig.ActiveServer) string {
 	return a.Subscription + "\x1f" + a.Name + "\x1f" + a.Address + "\x1f" + strconv.Itoa(a.Port)
 }
 
+// recordMark is the kind and the identity mark of the record a, which tell
+// apart the twins of one name, address and port that one activeID covers.
+func recordMark(a *vpnconfig.ActiveServer) string {
+	if a == nil {
+		return ""
+	}
+	return a.Group + "\x1f" + a.Identity
+}
+
 func serverID(s vpnconfig.Server) string {
 	return s.Subscription + "\x1f" + s.Name + "\x1f" + s.Address + "\x1f" + strconv.Itoa(s.Port)
 }
 
 // chosenIndex is where servers has the server a names: the entry of its
-// subscription with its name, address and port, or else the first entry of its
-// subscription with its name - a subscription that rotates endpoints gives a
-// name a new address every day, and the name is what the user chose. Another
-// subscription's server of the same name is never it. -1 when the list has
+// choice (vpnconfig.SameChoice: its subscription, name and kind) at its address
+// and port, or else the first entry of its choice - a subscription that rotates
+// endpoints gives a name a new address every day, and the name and the kind are
+// what the user chose. Another subscription's server of the same name is never
+// it, nor a server of another kind: a panel can give one name to several
+// inbounds. Among the entries of its choice in either place, one with a's
+// identity mark comes first: a panel can list twins of one name, address, port
+// and kind with other keys, and the user may run either. -1 when the list has
 // neither.
 func chosenIndex(servers []vpnconfig.Server, a *vpnconfig.ActiveServer) int {
 	if a == nil || a.Name == "" {
 		return -1
 	}
-	byName := -1
+	// rank: 0 at a's address and port with its mark, 1 there without it, 2
+	// elsewhere with its mark, 3 elsewhere without it.
+	best, rank := -1, 4
 	for i, s := range servers {
-		if s.Subscription != a.Subscription || s.Name != a.Name {
+		if !vpnconfig.SameChoice(a, s) {
 			continue
 		}
+		r := 2
 		if sameServer(s, a) {
-			return i
+			r = 0
 		}
-		if byName < 0 {
-			byName = i
+		if a.Identity == "" || vpnconfig.IdentityMark(s) != a.Identity {
+			r++
+		}
+		if r < rank {
+			best, rank = i, r
+		}
+		if rank == 0 {
+			break
 		}
 	}
-	return byName
+	return best
 }
 
 // pickOrder is servers with the one chosen names moved to the front.
@@ -1031,9 +1076,7 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 			published++
 			if w.outboundGuard != nil && w.fastOwned != nil {
 				// This publication replaces the inputs of the completed death proof.
-				w.fastOwned.proofRequired = false
-				w.fastOwned.refreshed = true
-				w.fastOwned.last, w.fastOwned.recorded, w.fastOwned.fallbackProofs = nil, nil, nil
+				w.fastOwned.proofConsumed()
 			}
 			slog.Info("Subscription refreshed", "subscription", s.Name, "servers", len(results[i].servers))
 		case w.mutationInterrupted(err):
@@ -1048,7 +1091,9 @@ func (w *Watch) refreshSubscriptions(ctx context.Context, subs []vpnconfig.Subsc
 	return failed, published > 0 || len(failed) == 0
 }
 
-// walk prioritizes current monitor health within walkOrder, trying each address
+// walk tries the servers of subs in orderBest order - with valid monitor
+// evidence the copies the monitor holds alive first, by tier and latency, and
+// the rest with the user's group first, each part in walkOrder - each address
 // once per outbound (endpoint.DialKey). A main probe decides when the clients
 // return to Xray. With none live it returns Xray to the chosen server and backs
 // the next wave off.
@@ -1073,6 +1118,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		links[s.ID] = s.URL
 	}
 	order, chosenFirst := walkOrder(subs, chosen)
+	ref := refFor(cfg, vpnconfig.AllServers(subs))
 	var preferred *vpnconfig.Server
 	if chosenFirst {
 		preferred = &order[0]
@@ -1108,7 +1154,9 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		}
 		remaining = pending
 		// Rejected entries stay pending so later evidence can admit them again.
-		ordered := w.healthWalkOrder(remaining, cfg)
+		// The alive go first, by tier and latency; the rest follow with the
+		// user's group first, in walk order (orderBest).
+		ordered := w.bestWalkOrder(remaining, cfg, ref)
 		if len(ordered) == 0 {
 			break
 		}
@@ -1696,7 +1744,26 @@ func (w *Watch) retryOrSwitchFallback(ctx context.Context, cfg *vpnconfig.VPNDir
 // unreachable checks that can shorten them - start again from its next miss.
 func (w *Watch) resetFail() {
 	w.failSince = time.Time{}
+	w.failedProbes = 0
 	w.downChecks = 0
+}
+
+// missed counts a failed probe of the server the record cfg names. The first
+// miss begins a failure episode, and so does the first miss of a record the
+// watch did not write since the episode began - a selection in the Web UI,
+// /xray or the wizard: the user's server gets a confirmation of its own, the
+// full DeadAfter and the two misses in a row the actuality check waits for,
+// not what is left of the server it replaced. The watch's own writes in an
+// episode - a follow, a replacement, the fast path's - leave it counting.
+func (w *Watch) missed(cfg *vpnconfig.VPNDirectorConfig, now time.Time) {
+	seq := vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+	if !w.failSince.IsZero() && seq != w.failSeq && seq != w.ownSeq {
+		w.resetFail()
+	}
+	if w.failSince.IsZero() {
+		w.failSince, w.failSeq = now, seq
+	}
+	w.failedProbes++
 }
 
 // deadReason is why an outbound failing since failSince counts as dead at now,

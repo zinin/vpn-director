@@ -730,6 +730,35 @@ func TestRecordWalkedServer_TheSameNameInAnotherSubscriptionIsAMove(t *testing.T
 	}
 }
 
+// A panel lists Oslo over VLESS-REALITY and over Trojan. A walk that moves from
+// the user's REALITY Oslo to the Trojan one has left the choice, and the record
+// keeps it aside with its kind; back on the REALITY Oslo at a new address, the
+// walk is back on the choice.
+func TestRecordWalkedServer_ASameNamedServerOfAnotherKindIsAMove(t *testing.T) {
+	oslo := reality("Oslo", "www.example.com", "aa11")
+	oslo.Subscription = "0a1b2c3d"
+	cfg := &VPNDirectorConfig{}
+	cfg.Xray.ActiveServer = RecordActiveServer(&ActiveServer{Seq: 4}, oslo)
+
+	RecordWalkedServer(cfg, Server{Subscription: "0a1b2c3d", Name: "Oslo", Address: "de.example", Port: 443, Outbound: trojanTo("de.example")})
+
+	p := cfg.Xray.PreferredServer
+	if p == nil || p.Name != "Oslo" || p.Group != "vless+reality" || p.Seq != 0 {
+		t.Fatalf("preferred %+v, want the user's REALITY Oslo", p)
+	}
+	if a := cfg.Xray.ActiveServer; a.Group != "trojan" || a.Seq != 6 {
+		t.Fatalf("active %+v, want the Trojan Oslo one write on", a)
+	}
+
+	rotated := oslo
+	rotated.Address, rotated.Outbound = "nl.example", realityOutbound("nl.example", "www.example.com", "aa11")
+	RecordWalkedServer(cfg, rotated)
+
+	if cfg.Xray.PreferredServer != nil {
+		t.Fatalf("preferred %+v, want none: the REALITY Oslo is the choice", cfg.Xray.PreferredServer)
+	}
+}
+
 func TestNewActiveServer_RecordsTheSubscription(t *testing.T) {
 	a := NewActiveServer(Server{Subscription: "0a1b2c3d", Name: "Oslo", Address: "a.example.com", Port: 443, UUID: "secret"})
 

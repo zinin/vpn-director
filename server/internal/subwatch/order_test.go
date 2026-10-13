@@ -110,6 +110,23 @@ func TestWalkOrder_TheSameNameInAnotherSubscriptionIsNotTheChoice(t *testing.T) 
 	}
 }
 
+// Oslo's entry at the record's address is gone, and the list names Oslo twice:
+// a Shadowsocks twin first, then the user's kind at a new address. The walk
+// starts from the user's kind, not from the first entry of the name.
+func TestWalkOrder_TheChoicesKindFirstAmongEntriesOfItsName(t *testing.T) {
+	twin := ssServer("Oslo", "198.51.100.40")
+	rotated := fastServer("Oslo", "oslo-2.example", "203.0.113.20")
+	backup := fastServer("Backup", "backup.example", "198.51.100.20")
+	subs := []vpnconfig.Subscription{{ID: "alpha", Name: "Alpha", Servers: []vpnconfig.Server{twin, backup, rotated}}}
+	chosen := vpnconfig.RecordActiveServer(nil, fastServer("Oslo", "oslo.example", "203.0.113.10"))
+
+	order, first := walkOrder(subs, chosen)
+
+	if !first || order[0].Address != "oslo-2.example" {
+		t.Fatalf("first %v, order %v; want the vless+tls Oslo first", first, healthLabels(order))
+	}
+}
+
 func TestWalkOrder_MarksEachServerWithItsSubscription(t *testing.T) {
 	subs := []vpnconfig.Subscription{orderSub("aaaaaaaa", 2), orderSub("bbbbbbbb", 1)}
 

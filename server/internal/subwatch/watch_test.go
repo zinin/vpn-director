@@ -2304,6 +2304,44 @@ func TestChosenIndex_TheNameFallbackStaysInItsSubscription(t *testing.T) {
 	}
 }
 
+// A panel can list a Shadowsocks inbound under the user's server's name, even
+// at its address and port. It is never the choice of a vless+tls record: the
+// entry of the record's kind is, wherever it is now. A record without a group
+// knows no kind and keeps the name rule.
+func TestChosenIndex_AnEntryOfAnotherKindIsNotTheChoice(t *testing.T) {
+	twin := ssServer("Oslo", "198.51.100.40")
+	twin.Address, twin.Port = "oslo.example", 443
+	rotated := fastServer("Oslo", "oslo-2.example", "203.0.113.20")
+	servers := []vpnconfig.Server{twin, rotated}
+	record := vpnconfig.RecordActiveServer(nil, fastServer("Oslo", "oslo.example", "203.0.113.10"))
+
+	if i := chosenIndex(servers, record); i != 1 {
+		t.Fatalf("chosenIndex %d, want 1: the vless+tls Oslo", i)
+	}
+	legacy := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Oslo", Address: "oslo.example", Port: 443}
+	if i := chosenIndex(servers, legacy); i != 0 {
+		t.Fatalf("chosenIndex %d for a record without a group, want 0: its name, address and port", i)
+	}
+}
+
+// A panel can list twins of one name, address, port and kind with other keys -
+// two inbounds behind one front under one remark - and the user may run either.
+// The record's mark tells which: the walk starts from that twin, and the return
+// goes back to it. A record without a mark takes the first, as before.
+func TestChosenIndex_TheTwinWithTheRecordsMarkFirst(t *testing.T) {
+	oslo := fastServer("Oslo", "oslo.example", "203.0.113.10")
+	twin := oslo
+	twin.Outbound = json.RawMessage(strings.Replace(string(oslo.Outbound), "000000000010", "000000000011", 1))
+	servers := []vpnconfig.Server{twin, oslo}
+	if i := chosenIndex(servers, vpnconfig.NewActiveServer(oslo)); i != 1 {
+		t.Fatalf("chosenIndex %d, want 1: the twin with the record's mark", i)
+	}
+	legacy := &vpnconfig.ActiveServer{Subscription: "alpha", Name: "Oslo", Address: "oslo.example", Port: 443}
+	if i := chosenIndex(servers, legacy); i != 0 {
+		t.Fatalf("chosenIndex %d for a record without a mark, want 0", i)
+	}
+}
+
 // The walk starts from the name the user chose at the address it has today, and
 // an all-dead wave returns config.json to that server, not to the last one tried.
 func TestTick_TheChosenNameIsTriedFirstAtItsNewAddress(t *testing.T) {

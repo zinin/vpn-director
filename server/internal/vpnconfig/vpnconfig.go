@@ -184,13 +184,21 @@ type ActiveServer struct {
 	// server differ in nothing else, so it is what lets the subscription walk
 	// tell a choice made while it was busy from the one it started out with.
 	Seq int `json:"seq,omitempty"`
+	// Identity is IdentityMark of the server the record was written from, and
+	// Group its Group. watchd tells by them a server that changed in place or
+	// moved from one that is current, and picks a replacement of the user's
+	// group. configure.sh and older daemons write records without them; such a
+	// record is checked by name, address and port.
+	Identity string `json:"identity,omitempty"`
+	Group    string `json:"group,omitempty"`
 }
 
 // NewActiveServer records the fields of s that identify it to a reader. The
 // rest - UUID, REALITY keys - would put credentials in a file the Web UI hands
-// out over /api/config.
+// out over /api/config; the mark is a hash that names none of them.
 func NewActiveServer(s Server) *ActiveServer {
-	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port, Subscription: s.Subscription}
+	return &ActiveServer{Name: s.Name, Address: s.Address, Port: s.Port, Subscription: s.Subscription,
+		Identity: IdentityMark(s), Group: s.Group()}
 }
 
 // ActiveSeq is the write counter a carries, and zero for no record at all or
@@ -217,15 +225,16 @@ func RecordActiveServer(prev *ActiveServer, s Server) *ActiveServer {
 // The walk tries servers nobody chose, and one cut short - the bot restarted, a
 // stop - leaves active_server on one of them. So the server the user chose is
 // kept in preferred_server from the first record that leaves its choice until
-// one comes back to it. A new address under the same name is no move away: a
-// subscription that rotates endpoints gives a name one every day. The same
-// name in another subscription is another server.
+// one comes back to it. A new address under the same name and kind is no move
+// away: a subscription that rotates endpoints gives a name one every day. The
+// same name in another subscription, or of another kind, is another server
+// (SameChoice).
 func RecordWalkedServer(cfg *VPNDirectorConfig, s Server) {
 	x := &cfg.Xray
 	switch {
-	case x.PreferredServer != nil && sameChoice(x.PreferredServer, s):
+	case x.PreferredServer != nil && SameChoice(x.PreferredServer, s):
 		x.PreferredServer = nil
-	case x.PreferredServer == nil && x.ActiveServer != nil && !sameChoice(x.ActiveServer, s):
+	case x.PreferredServer == nil && x.ActiveServer != nil && !SameChoice(x.ActiveServer, s):
 		chosen := *x.ActiveServer
 		chosen.Seq = 0
 		x.PreferredServer = &chosen
@@ -233,9 +242,51 @@ func RecordWalkedServer(cfg *VPNDirectorConfig, s Server) {
 	x.ActiveServer = RecordActiveServer(x.ActiveServer, s)
 }
 
-// sameChoice reports whether a names the choice s is: its subscription and its name.
-func sameChoice(a *ActiveServer, s Server) bool {
-	return a.Subscription == s.Subscription && a.Name == s.Name
+// SameChoice reports whether s is the server the record a names as a choice:
+// its subscription, its name and its kind (Group). A panel can give one name
+// to several inbounds - Oslo over VLESS-REALITY and over Shadowsocks - and a
+// server of another kind fares otherwise on a censored path, so it is another
+// server. A record without a group - configure.sh's, an older daemon's, or one
+// whose outbound does not parse - knows no kind, and its subscription and name
+// decide.
+func SameChoice(a *ActiveServer, s Server) bool {
+	return a != nil && a.Subscription == s.Subscription && a.Name == s.Name &&
+		(a.Group == "" || s.Group() == a.Group)
+}
+
+// SameChoiceRecord is SameChoice for the server another record b names: b's
+// group stands for its kind. a is the choice, so a b without a group is not of
+// a's kind when a has one.
+func SameChoiceRecord(a, b *ActiveServer) bool {
+	return a != nil && b != nil && a.Subscription == b.Subscription && a.Name == b.Name &&
+		(a.Group == "" || b.Group == a.Group)
+}
+
+// RecordedIndex is the index in servers - the list of a's subscription - of
+// the server the record a was written from: one with its name, address and
+// port, of its kind (Group), that carries its identity mark, or else the
+// first such. A panel can list twins of one name, address and port -
+// inbounds of other kinds behind one port, or one kind with other keys - and
+// only the kind and the mark tell which one the record names. A record
+// without a group knows no kind, and one without a mark takes the first such.
+// -1 when servers has none.
+func RecordedIndex(a *ActiveServer, servers []Server) int {
+	if a == nil {
+		return -1
+	}
+	first := -1
+	for i, s := range servers {
+		if s.Name != a.Name || s.Address != a.Address || s.Port != a.Port || (a.Group != "" && s.Group() != a.Group) {
+			continue
+		}
+		if a.Identity == "" || IdentityMark(s) == a.Identity {
+			return i
+		}
+		if first < 0 {
+			first = i
+		}
+	}
+	return first
 }
 
 // ClientInfo represents a VPN client with its route and pause status.

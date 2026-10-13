@@ -427,7 +427,8 @@ func TestMutation_GateAfterWaitDoesNotPublishOrAnnounce(t *testing.T) {
 			}
 			f := &fake{cfg: cfg, probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 			w := runningWatch(f.watch())
-			w.failSince = f.now.Add(-3 * time.Minute)
+			// The record has been failing for three minutes: the episode is its own.
+			w.failSince, w.failSeq = f.now.Add(-3*time.Minute), vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 			var incompatible atomic.Bool
 			w.CanMutate = mutationGate(&incompatible)
 			waits, saves, generations, restarts := 0, 0, 0, 0
@@ -564,7 +565,7 @@ func TestMutation_PollRefusedAtTheTickEndKeepsTheFailureClock(t *testing.T) {
 	f := &fake{cfg: mutationConfig(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	w := runningWatch(f.watch())
 	start := f.now.Add(-time.Minute)
-	w.failSince = start
+	w.failSince, w.failSeq = start, vpnconfig.ActiveSeq(f.cfg.Xray.ActiveServer)
 	var block, refused atomic.Bool
 	var tick context.Context
 	inflight := make(chan struct{})
@@ -624,7 +625,7 @@ func TestMutation_IncompatibleAndCancellationEndWalkAndReturn(t *testing.T) {
 				if route == "walk" {
 					w.walk(context.Background(), cfg, subs)
 				} else {
-					w.tryReturn(context.Background(), cfg, subs, servers, endpoint.PerAddress(servers[:1]))
+					w.tryReturn(context.Background(), cfg, subs, servers, endpoint.PerAddress(servers[:1]), "")
 				}
 				if generations != 1 || restarts != 0 || f.applies != 0 || len(f.notes) != 0 {
 					t.Errorf("generations %d, restarts %d, applies %d, notes %v; a terminal refusal must end the attempt", generations, restarts, f.applies, f.notes)

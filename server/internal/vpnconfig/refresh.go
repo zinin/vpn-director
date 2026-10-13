@@ -238,10 +238,12 @@ func restoreSubscription(update ConfigUpdate, files SubscriptionFiles, before, w
 // pending_restore.active, together - a restore compares active_server with
 // pending_restore.active whole, and one that found them different would
 // discard its intent as superseded by a new selection. A record names the
-// first stored server with its name, address and port; pairs pairs fresh with
-// stored (pairServers). Address and port belong to the identity, so only the
-// name moves, and seq stays: a rename is no selection, and the watch must not
-// take it for one. A record whose server left the list stays as it is.
+// stored server it was written from (RecordedIndex: its name, address and
+// port, its kind and its mark) - a panel can list twins of one name, address
+// and port, and the rename of one is no rename of the other; pairs pairs fresh
+// with stored (pairServers). Address and port belong to the identity, so only
+// the name moves, and seq stays: a rename is no selection, and the watch must
+// not take it for one. A record whose server left the list stays as it is.
 func followRenames(cfg *VPNDirectorConfig, id string, stored, fresh []Server, pairs []int) []RecordRename {
 	renamed := map[int]string{}
 	for fi, si := range pairs {
@@ -257,15 +259,9 @@ func followRenames(cfg *VPNDirectorConfig, id string, stored, fresh []Server, pa
 		if a == nil || a.Subscription != id {
 			return
 		}
-		for si, s := range stored {
-			if s.Name != a.Name || s.Address != a.Address || s.Port != a.Port {
-				continue
-			}
-			if name, ok := renamed[si]; ok {
-				out = append(out, RecordRename{Record: record, From: a.Name, To: name, Address: a.Address, Port: a.Port})
-				a.Name = name
-			}
-			return
+		if name, ok := renamed[RecordedIndex(a, stored)]; ok {
+			out = append(out, RecordRename{Record: record, From: a.Name, To: name, Address: a.Address, Port: a.Port})
+			a.Name = name
 		}
 	}
 	follow("active_server", cfg.Xray.ActiveServer)

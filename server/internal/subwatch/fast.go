@@ -42,6 +42,12 @@ type fastAttempt struct {
 	Config  *vpnconfig.VPNDirectorConfig
 	Outcome fastOutcome
 	Guard   func(*vpnconfig.VPNDirectorConfig) error
+	// Tried is, for a fallback, every candidate the attempt is done with:
+	// each it switched to whose restart or probe failed, and each its fresh
+	// checks found dead. A replacement after the fallback leaves them out.
+	// Config then names the last candidate written, if any, rather than the
+	// server that died.
+	Tried []vpnconfig.Server
 	// Err is what ended an attempt that did not switch; nil when the fast
 	// path did not apply.
 	Err error
@@ -76,16 +82,32 @@ func copyFastServer(s vpnconfig.Server) vpnconfig.Server {
 	return s
 }
 
+// exactFastServer is the entry Xray runs for the record a: the server of its
+// subscription it was written from (vpnconfig.RecordedIndex: its name, address
+// and port, its kind and its mark). A panel can list twins of one name,
+// address and port, inbounds of other kinds behind one port or one kind with
+// other keys, and each is an endpoint of its own to the monitor: the fast path
+// reads the death of the twin Xray runs, and a replacement tries that twin's
+// connection last. With no entry of a's kind there, or none that carries a's
+// mark - new keys in place, which Xray does not run until the actuality check
+// follows them - the monitor has no evidence of what Xray runs, and there is
+// none: the legacy rules and the actuality check decide. A record without a
+// mark takes the first entry of its kind.
 func exactFastServer(subs []vpnconfig.Subscription, a *vpnconfig.ActiveServer) (vpnconfig.Server, bool) {
 	if a == nil || a.Name == "" || a.Address == "" || a.Port == 0 {
 		return vpnconfig.Server{}, false
 	}
-	for _, s := range vpnconfig.AllServers(subs) {
-		if s.Subscription == a.Subscription && s.Name == a.Name && s.Address == a.Address && s.Port == a.Port {
-			return copyFastServer(s), true
-		}
+	i := vpnconfig.FindSubscription(subs, a.Subscription)
+	if i < 0 {
+		return vpnconfig.Server{}, false
 	}
-	return vpnconfig.Server{}, false
+	j := vpnconfig.RecordedIndex(a, subs[i].Servers)
+	if j < 0 || (a.Identity != "" && vpnconfig.IdentityMark(subs[i].Servers[j]) != a.Identity) {
+		return vpnconfig.Server{}, false
+	}
+	s := subs[i].Servers[j]
+	s.Subscription = subs[i].ID
+	return copyFastServer(s), true
 }
 
 func fastCandidatePresent(subs []vpnconfig.Subscription, s vpnconfig.Server) bool {
@@ -211,6 +233,18 @@ func (f *fastSelection) choiceGuard(w *Watch, ctx context.Context, c fastChoice)
 	}
 }
 
+// proofConsumed retires the death proof once something has acted on it: a
+// publication that replaces its inputs, or the keeper's replacement that
+// begins on it. Ownership - the selection, the ports, the links, a stop and
+// the gate - still fences every write after it, and each server tried is
+// proved by its own probe. A proof kept on would refuse that work as soon as
+// the monitor checks one of its keys again.
+func (f *fastSelection) proofConsumed() {
+	f.proofRequired = false
+	f.refreshed = true
+	f.last, f.recorded, f.fallbackProofs = nil, nil, nil
+}
+
 // Only the transaction's returned seq belongs to this operation.
 func (f *fastSelection) record(s vpnconfig.Server, seq int, err error) {
 	if err != nil {
@@ -250,8 +284,11 @@ func (w *Watch) fastGuardNow(ctx context.Context, guard func(*vpnconfig.VPNDirec
 
 // The monitor dials stored IPs over plain HTTP, main Xray may dial a hostname: its dead proves a death
 // only if it came after main Xray last worked on this server, else the legacy confirmation decides.
+// This server is the record's twin too, by its kind and mark: a twin of one name, address and port
+// the user selected since has not passed the main probe because the other one did.
 func (w *Watch) diedAfterProbeOK(cfg *vpnconfig.VPNDirectorConfig, e monitor.Evidence, keys []string) bool {
-	if w.probeOKAt.IsZero() || w.probeOKActive != activeID(cfg.Xray.ActiveServer) {
+	a := cfg.Xray.ActiveServer
+	if w.probeOKAt.IsZero() || w.probeOKActive != activeID(a) || w.probeOKMark != recordMark(a) {
 		return false
 	}
 	for _, key := range keys {
@@ -315,7 +352,11 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		activeAddresses[endpoint.ServerForDial(c).Address] = true
 	}
 	var choices []fastChoice
-	for _, s := range endpoint.PerAddress(order) {
+	// The alive copies in the user's group and subscription first, by latency
+	// (orderBest): a server of another group can answer a check and carry
+	// nothing.
+	ref := refFor(cfg, vpnconfig.AllServers(subs))
+	for _, s := range orderBest(endpoint.PerAddress(order), ref, cached, true) {
 		key := endpoint.Key(s)
 		if seen[key] {
 			continue
@@ -404,6 +445,8 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		return finish(err)
 	}
 	var usable []fastChoice
+	// tried is what a fallback hands the keeper's replacement to leave out.
+	var tried []vpnconfig.Server
 	incomplete := false
 	for i, c := range choices {
 		if choiceErrors[i] != nil || w.Health.ValidateEvidence(c.evidence, []string{c.key}) != nil {
@@ -414,6 +457,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		case fastEvidenceStatus(c.evidence, []string{c.key}, watchdapi.StatusAlive):
 			usable = append(usable, c)
 		case fastEvidenceStatus(c.evidence, []string{c.key}, watchdapi.StatusDead):
+			tried = append(tried, c.server)
 		default:
 			incomplete = true
 		}
@@ -439,7 +483,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 			owner.ports = &ports
 		}
 		w.setStatusAction("switch")
-		generated, seq, err := w.Generate(c.server, candidateGuard)
+		generated, seq, err := w.generate(c.server, candidateGuard)
 		if w.mutationEnded(ctx) || fastTerminal(err) || errors.Is(err, errFastEvidence) {
 			return finish(err)
 		}
@@ -469,6 +513,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 				return finish(restartErr)
 			}
 			slog.Warn("Xray restart failed", "server", c.server.Name, watchErrorAttr(restartErr))
+			tried = append(tried, c.server)
 			continue
 		}
 		w.AfterRestart(SettleAfterRestart)
@@ -486,6 +531,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 				return finish(probeErr)
 			}
 			slog.Info("Server probe failed", "server", c.server.Name, "ips", c.server.IPs, watchErrorAttr(probeErr))
+			tried = append(tried, c.server)
 			continue
 		}
 		slog.Info("Fast failover switched Xray to a live server", "server", c.server.Name, "ips", c.server.IPs, "from", active.Name)
@@ -505,7 +551,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	if err != nil {
 		return finish(err)
 	}
-	return fastAttempt{Config: current, Outcome: fastFallback, Guard: guard}
+	return fastAttempt{Config: current, Outcome: fastFallback, Guard: guard, Tried: tried}
 }
 
 // A scoped fallback carries ownership through its applies, refresh and walk.
@@ -523,9 +569,22 @@ func (w *Watch) outboundAllowedNow() error {
 	return err
 }
 
+// generate writes s as the running server through Generate - every write of
+// the record the watch makes goes through here - and remembers the write
+// counter of a record it saved (ownSeq): the failure episode it was written in
+// goes on, where a record the watch did not write begins one of its own
+// (missed).
+func (w *Watch) generate(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
+	generated, seq, err := w.Generate(s, guard)
+	if generated && err == nil {
+		w.ownSeq = seq
+	}
+	return generated, seq, err
+}
+
 func (w *Watch) generateWalked(s vpnconfig.Server, guard func(*vpnconfig.VPNDirectorConfig) error) (bool, int, error) {
 	if w.outboundGuard == nil {
-		return w.Generate(s, guard)
+		return w.generate(s, guard)
 	}
 	if err := w.outboundAllowedNow(); err != nil {
 		return false, 0, err
@@ -555,7 +614,7 @@ func (w *Watch) generateWalked(s vpnconfig.Server, guard func(*vpnconfig.VPNDire
 		}
 		return w.mutationAllowed()
 	}
-	generated, seq, err := w.Generate(s, combined)
+	generated, seq, err := w.generate(s, combined)
 	if generated && w.fastOwned != nil {
 		w.fastOwned.record(s, seq, err)
 	}

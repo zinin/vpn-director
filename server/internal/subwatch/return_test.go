@@ -1031,9 +1031,15 @@ func TestReturn_HealthOrderingPreservesBackoffAndChoice(t *testing.T) {
 		r := newReturnRig(returnServers())
 		servers := returnServers()
 		e := orderTestEvidence(r.f.now, map[string]watchdapi.Status{
-			endpoint.Key(servers[0]): watchdapi.StatusDead,
+			endpoint.Key(servers[0]): watchdapi.StatusAlive,
 			endpoint.Key(servers[1]): watchdapi.StatusAlive,
 		})
+		// With fresh evidence the monitor's look decides whether a return is
+		// tried (spec 4.6): it has held Oslo alive for an hour, so every look
+		// lets the attempt go ahead, and the SOCKS probe decides it as before.
+		oslo := e.Endpoints[endpoint.Key(servers[0])]
+		oslo.Since = r.f.now.Add(-time.Hour)
+		e.Endpoints[endpoint.Key(servers[0])] = oslo
 		r.w.Health = &fastHealth{cached: e, fresh: copyFastEvidence(e, nil), invalid: make(map[string]bool)}
 		return r
 	}
@@ -1082,6 +1088,9 @@ func TestReturn_HealthOrderingPreservesBackoffAndChoice(t *testing.T) {
 		if !reflect.DeepEqual(r.f.cfg.Xray.PreferredServer, wantPreferred) || !r.w.returnNotBefore.Equal(start.Add(5*time.Minute)) || r.f.cfg.Xray.Failover != nil {
 			t.Fatalf("preferred %+v, next return %v, failover %+v", r.f.cfg.Xray.PreferredServer, r.w.returnNotBefore, r.f.cfg.Xray.Failover)
 		}
+		// The monitor sees Preferred come back as the walk ends: by the
+		// scheduled look it has held it alive for ReturnAlive (spec 4.6).
+		r.setHealth(map[string]watchdapi.Status{"Preferred": watchdapi.StatusAlive, "Healthy": watchdapi.StatusAlive})
 		r.f.now = start.Add(5*time.Minute - time.Second)
 		r.tick()
 		if len(r.generated) != 1 {
