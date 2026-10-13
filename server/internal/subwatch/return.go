@@ -32,8 +32,9 @@ const (
 	// ReturnHold of one included - before the watch stops trying. An address
 	// that accepts TCP and keeps refusing the proxy, a blocked endpoint, would
 	// otherwise cost every Xray client a few dead seconds every ReturnRetryMax
-	// for as long as the block lasts. A new death, a selection, a held return or
-	// a restart of watchd starts the returns over.
+	// for as long as the block lasts. The count is the preferred server's: the
+	// death of a server the watch switched to itself leaves it. A selection, a
+	// held return or a restart of watchd starts the returns over.
 	ReturnFailsMax = 4
 	// ReturnAlive is how long the monitor has to hold a server alive before
 	// Xray goes back to it - to the preferred server, or to the user's group:
@@ -409,23 +410,28 @@ func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, l
 	return out
 }
 
-// returnAfterDeath settles the returns at a death. A death is a new episode,
-// and whatever the returns backed off to is done with - unless it started
-// within ReturnHold of a return, on the record that return wrote: the server
-// it went back to - the preferred server, or a server of its group - has
-// failed again, and the death counts as a failed return, so a server that
-// flaps is not returned to every few minutes. A selection since the return
-// wrote another record - the same server selected again too - and the death
-// of the user's new choice starts the returns over.
+// returnAfterDeath settles the returns at a death. The count is the preferred
+// server's: a death that starts within ReturnHold of a return, on the record
+// that return wrote, is a failed return - the server it went back to, the
+// preferred server or a server of its group, has failed again - so a server
+// that flaps is not returned to every few minutes; the same record dying later
+// held, and the returns start over. The death of any other record - one the
+// watch switched to itself: a replacement's, the fast path's, the walk's, a
+// follow's - says nothing about the preferred server and leaves the count and
+// the wait as they are. A selection since the return wrote another record, so
+// its death is not the return's either.
 func (w *Watch) returnAfterDeath() {
-	if !w.lastReturn.IsZero() && w.failSeq == w.returnSeq && w.failSince.Sub(w.lastReturn) < ReturnHold {
+	switch {
+	case w.lastReturn.IsZero() || w.failSeq != w.returnSeq:
+		// Not the record a return wrote: nothing about the preferred server.
+	case w.failSince.Sub(w.lastReturn) < ReturnHold:
 		if w.returnGroup == "" {
 			slog.Info("The preferred server died soon after the return; counted as a failed return", "after", w.failSince.Sub(w.lastReturn))
 		} else {
 			slog.Info("The server of the preferred group died soon after the return; counted as a failed return", "group", w.returnGroup, "after", w.failSince.Sub(w.lastReturn))
 		}
 		w.backOffReturn(w.returnGroup)
-	} else {
+	default:
 		w.returnRetry = 0
 		w.returnFails = 0
 		w.returnNotBefore = time.Time{}
@@ -448,9 +454,9 @@ func (w *Watch) backOffReturn(group string) {
 	w.returnNotBefore = w.Now().Add(w.returnRetry)
 	if w.returnFails >= ReturnFailsMax {
 		if group == "" {
-			slog.Info("Returns to the preferred server stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "failed", w.returnFails)
+			slog.Info("Returns to the preferred server stopped after failed attempts; a selection or a watchd restart starts them again", "failed", w.returnFails)
 		} else {
-			slog.Info("Returns to the preferred server and its group stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "group", group, "failed", w.returnFails)
+			slog.Info("Returns to the preferred server and its group stopped after failed attempts; a selection or a watchd restart starts them again", "group", group, "failed", w.returnFails)
 		}
 		return
 	}

@@ -574,10 +574,10 @@ func TestKeeper_AFailedFollowsCopiesAreNotTriedAgain(t *testing.T) {
 
 // The actuality check's replacements settle the returns once per death, as
 // replaceDead and failOutbound do: as far as Xray goes, a server that left its
-// subscription, or whose followed entry does not answer either, died. With no
-// return within ReturnHold the death starts the returns over, those stopped at
-// ReturnFailsMax included; within ReturnHold of a return, on the record that
-// return wrote, it counts as a failed return and backs the next one off.
+// subscription, or whose followed entry does not answer either, died. Within
+// ReturnHold of a return, on the record that return wrote, the death counts as
+// a failed return and backs the next one off. The death of a record the watch
+// wrote itself leaves the count as it was, stopped returns included.
 func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 	for _, kind := range []struct {
 		name    string
@@ -600,17 +600,20 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 		}, []string{"Oslo@oslo-2.example", "Backup@backup.example"}},
 	} {
 		t.Run(kind.name, func(t *testing.T) {
-			t.Run("no return within ReturnHold", func(t *testing.T) {
+			t.Run("a record the watch wrote", func(t *testing.T) {
 				s := newKeeperFixture(t)
 				kind.change(s)
-				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax // the returns had stopped
+				// The watch put Xray on Oslo itself, and the returns had stopped.
+				s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer)
+				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax
 				s.missOnce(t)
 				s.w.Tick(context.Background())
 				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
 					t.Fatalf("written %v, want %v", got, kind.written)
 				}
-				if s.w.returnFails != 0 || s.w.returnRetry != 0 {
-					t.Fatalf("returnFails %d, returnRetry %v; a new death starts the returns over", s.w.returnFails, s.w.returnRetry)
+				if s.w.returnFails != ReturnFailsMax || s.w.returnRetry != ReturnRetryMax {
+					t.Fatalf("returnFails %d, returnRetry %v; the death of a server the watch switched to says nothing about the preferred server",
+						s.w.returnFails, s.w.returnRetry)
 				}
 			})
 			t.Run("a return within ReturnHold", func(t *testing.T) {
@@ -629,6 +632,36 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// The KN-4521 runs the keeper. Backup, which the watch put in Oslo's place
+// after returns to Oslo had failed, dies, and the keeper replaces it the legacy
+// way - Oslo first, still dead, then Spare: a death no return wrote, and the
+// count of failed returns to Oslo stays.
+func TestKeeper_AReplacementsDeathKeepsTheCountOfFailedReturns(t *testing.T) {
+	s := newReturnKeeper(t) // Xray on Backup, Oslo preferred
+	s.f.subs[0].Servers = append(s.f.subs[0].Servers, fastServer("Spare", "spare.example", "198.51.100.30"))
+	s.w.Health = nil
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Backup
+	s.w.returnFails, s.w.returnRetry = 2, 2*ReturnRetry
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Spare" {
+			return nil
+		}
+		return errProbe // Backup has died, and Oslo is still dead
+	}
+	tickUntilDead(s.w, s.f)
+	names := writtenNames(s.written)
+	if len(names) == 0 || names[0] != "Oslo@oslo.example" || names[len(names)-1] != "Spare@spare.example" {
+		t.Fatalf("written %v, want Oslo tried first and Spare last", names)
+	}
+	if p := s.f.cfg.Xray.PreferredServer; p == nil || p.Name != "Oslo" {
+		t.Fatalf("preferred %+v, want Oslo kept", p)
+	}
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Backup's death says nothing about Oslo", s.w.returnFails, s.w.returnRetry)
 	}
 }
 

@@ -104,6 +104,29 @@ func (r *returnRig) attempts() int {
 	return n
 }
 
+// ownWrite has the watch write s as the running server the way its walk, fast
+// path or replacement does - through generate - so the record is the watch's
+// own, and Xray runs s's first address.
+func (r *returnRig) ownWrite(t *testing.T, s vpnconfig.Server) {
+	t.Helper()
+	if generated, _, err := r.w.generate(s, nil); !generated || err != nil {
+		t.Fatalf("writing %s: generated %v, error %v", s.Name, generated, err)
+	}
+}
+
+// osloLooks counts the TCP looks at Oslo's address from now on.
+func (r *returnRig) osloLooks() *int {
+	looks := 0
+	reachable := r.w.Reachable
+	r.w.Reachable = func(ctx context.Context, ip string, port int) bool {
+		if ip == osloIP {
+			looks++
+		}
+		return reachable(ctx, ip, port)
+	}
+	return &looks
+}
+
 func TestTick_ReturnsToThePreferredServerOnceItAnswers(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
@@ -234,7 +257,10 @@ func TestTick_ASelectionStartsStoppedReturnsOver(t *testing.T) {
 	}
 }
 
-func TestTick_ADeathStartsStoppedReturnsOver(t *testing.T) {
+// Stopped returns stay stopped when the server the watch runs dies: Madrid,
+// which the failed returns went back to, says nothing about Oslo. Once Madrid
+// works again, the watch does not look at Oslo.
+func TestTick_StoppedReturnsStayStoppedThroughADeath(t *testing.T) {
 	r := newReturnRig(returnServers())
 	failReturns(t, r)
 	r.live[madridIP] = false // Madrid dies
@@ -244,8 +270,17 @@ func TestTick_ADeathStartsStoppedReturnsOver(t *testing.T) {
 	if r.f.cfg.Xray.Failover == nil {
 		t.Fatal("no failover")
 	}
-	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
-		t.Fatalf("returnFails %d, returnRetry %v; a death starts the returns over", r.w.returnFails, r.w.returnRetry)
+	if r.w.returnFails != ReturnFailsMax || r.w.returnRetry != ReturnRetryMax {
+		t.Fatalf("returnFails %d, returnRetry %v; Madrid's death leaves the returns stopped", r.w.returnFails, r.w.returnRetry)
+	}
+	r.live[madridIP] = true // Madrid works again, and the clients come back to Xray
+	looks := r.osloLooks()
+	tickFor(r.w, r.f, time.Hour)
+	if r.f.cfg.Xray.Failover != nil {
+		t.Fatal("the clients must be back on Xray")
+	}
+	if *looks != 0 || r.attempts() != ReturnFailsMax {
+		t.Fatalf("%d looks at Oslo, %d attempts; the returns have stopped", *looks, r.attempts())
 	}
 }
 
@@ -589,23 +624,28 @@ func TestTick_RollbackStartsWithTheRememberedAddressAnImportDropped(t *testing.T
 	}
 }
 
-func TestTick_ADeathStartsTheReturnsOver(t *testing.T) {
+// The returns belong to the preferred server. Madrid, the server a failed
+// return went back to, dies: a death no return wrote, which says nothing about
+// Oslo, and the count, the backoff and the wait stay.
+func TestTick_ADeathOfAnotherServerKeepsTheBackoff(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
 	r.live[madridIP] = true
 	r.f.plat = connected("ovpnc2")
 	r.tick() // a failed return: the next waits ReturnRetry
-	if r.w.returnRetry != ReturnRetry {
-		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; want a failed return", r.w.returnFails, r.w.returnRetry)
 	}
+	next := r.w.returnNotBefore
 	r.live[madridIP] = false // Madrid dies
 	r.f.now = r.f.now.Add(ProbeInterval)
 	tickUntilDead(r.w, r.f)
 	if r.f.cfg.Xray.Failover == nil {
 		t.Fatal("no failover")
 	}
-	if r.w.returnRetry != 0 {
-		t.Fatalf("returnRetry %v; a death starts the returns over", r.w.returnRetry)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry || !r.w.returnNotBefore.Equal(next) {
+		t.Fatalf("returnFails %d, returnRetry %v, next return %v; Madrid's death keeps the count and the wait of %v",
+			r.w.returnFails, r.w.returnRetry, r.w.returnNotBefore, next)
 	}
 }
 
@@ -816,6 +856,50 @@ func TestTick_ADeathSoonAfterAReturnCountsTowardTheCap(t *testing.T) {
 	}
 	if looks != 0 {
 		t.Fatalf("%d looks at Oslo; the returns have stopped", looks)
+	}
+}
+
+// The KN-4521 on 2026-10-13: every return to a flaky preferred server died
+// within minutes, and the death of the replacement in between started the count
+// over, so the returns never stopped. The count is Oslo's: Madrid's death leaves
+// it, and the next failed return waits twice as long.
+func TestTick_AReplacementsDeathKeepsTheCountOfFailedReturns(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP], r.live[osloIP] = true, true
+	r.f.plat = connected("ovpnc2")
+	r.tick()                                    // the return: Oslo runs again
+	r.up[osloIP], r.live[osloIP] = false, false // and dies again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 1 {
+		t.Fatalf("returnFails %d; Oslo's death soon after the return is a failed return", r.w.returnFails)
+	}
+	// A walk puts Madrid in Oslo's place, and the clients come back to Xray.
+	r.ownWrite(t, returnServers()[1])
+	r.live[madridIP] = true
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if r.f.cfg.Xray.Failover != nil {
+		t.Fatal("the clients must be back on Xray")
+	}
+	// Madrid dies in its turn: a death no return wrote.
+	r.live[madridIP] = false
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Madrid's death says nothing about Oslo", r.w.returnFails, r.w.returnRetry)
+	}
+	// Madrid comes back, and Oslo accepts TCP but refuses the proxy: the next
+	// return fails, and the one after it waits twice as long.
+	r.live[madridIP] = true
+	r.up[osloIP] = true
+	attempts := r.attempts()
+	for end := r.f.now.Add(time.Hour); r.attempts() == attempts && r.f.now.Before(end); r.f.now = r.f.now.Add(ProbeInterval) {
+		r.tick()
+	}
+	if r.attempts() != attempts+1 || r.w.returnFails != 2 || r.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("%d attempts, returnFails %d, returnRetry %v; want the second failed return, backed off %v",
+			r.attempts()-attempts, r.w.returnFails, r.w.returnRetry, 2*ReturnRetry)
 	}
 }
 
