@@ -74,14 +74,15 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		// Xray runs the user's choice, or nothing is left to return to. A switch
 		// of the watch's own - the fast path, a replacement, the walk - can put
 		// Xray back on the choice while returns to it have failed: that counts
-		// as a return, so a choice that dies again soon after is one more failed
-		// return, and one that holds for ReturnHold ends the count above. A
-		// selection gets here with the count ended (noteSelection), and with no
-		// count there is nothing to hold.
+		// as a return, and the log says so, so a choice that dies again soon
+		// after is one more failed return, and one that holds for ReturnHold ends
+		// the count above. A selection gets here with the count ended
+		// (noteSelection), and with no count there is nothing to hold.
 		if w.lastReturn.IsZero() && w.returnFails > 0 && cfg != nil && cfg.Xray.ActiveServer != nil {
 			w.lastReturn = w.Now()
 			w.returnSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
 			w.returnGroup = ""
+			slog.Info("Xray is back on the preferred server without a return; counted as a return until it has held", "server", cfg.Xray.ActiveServer.Name, "failed", w.returnFails, "hold", ReturnHold)
 		}
 		return
 	}
@@ -481,8 +482,11 @@ func (w *Watch) noteSelection(cfg *vpnconfig.VPNDirectorConfig) {
 // backOffReturn holds the next attempt back after a return that failed:
 // ReturnRetry, then twice the last wait, ReturnRetryMax at most. After
 // ReturnFailsMax failures in a row there is no next attempt: the returns stop,
-// to the preferred server and to its group alike. group is the preferred group
-// when the return that failed went to a server of it, and the log names it.
+// to the preferred server and to its group alike, and the log says so once. A
+// death of the preferred server soon after Xray got back to it without a
+// return still counts past the cap (maybeReturn), but it stops nothing new.
+// group is the preferred group when the return that failed went to a server of
+// it, and the log names it.
 func (w *Watch) backOffReturn(group string) {
 	w.returnFails++
 	if w.returnRetry == 0 {
@@ -492,10 +496,12 @@ func (w *Watch) backOffReturn(group string) {
 	}
 	w.returnNotBefore = w.Now().Add(w.returnRetry)
 	if w.returnFails >= ReturnFailsMax {
-		if group == "" {
-			slog.Info("Returns to the preferred server stopped after failed attempts; a selection or a watchd restart starts them again", "failed", w.returnFails)
-		} else {
-			slog.Info("Returns to the preferred server and its group stopped after failed attempts; a selection or a watchd restart starts them again", "group", group, "failed", w.returnFails)
+		if w.returnFails == ReturnFailsMax {
+			if group == "" {
+				slog.Info("Returns to the preferred server stopped after failed attempts; a selection, a watchd restart or Xray holding on it starts them again", "failed", w.returnFails, "hold", ReturnHold)
+			} else {
+				slog.Info("Returns to the preferred server and its group stopped after failed attempts; a selection, a watchd restart or Xray holding on the preferred server starts them again", "group", group, "failed", w.returnFails, "hold", ReturnHold)
+			}
 		}
 		return
 	}

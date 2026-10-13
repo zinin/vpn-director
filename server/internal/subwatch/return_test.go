@@ -1066,6 +1066,45 @@ func TestTick_XrayHeldOnTheChoiceEndsTheCount(t *testing.T) {
 	}
 }
 
+// Xray back on the preferred server without a return says so once in the log,
+// so that a later "died soon after the return" refers to something there.
+func TestTick_XrayBackOnTheChoiceWithoutAReturnIsLoggedOnce(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.tick()                          // a failed return: the next waits ReturnRetry
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	log := captureLog(t)
+	tickFor(r.w, r.f, 2*ProbeInterval)
+	if n := strings.Count(log.String(), "Xray is back on the preferred server without a return"); n != 1 {
+		t.Fatalf("%d such lines in the log:\n%s\nwant one, when the watch takes Xray on Oslo for a return", n, log)
+	}
+}
+
+// Stopped returns say so once. A death of the preferred server soon after Xray
+// got back to it without a return still counts past the cap, but it stops
+// nothing that had not stopped already.
+func TestTick_StoppedReturnsAreLoggedOnce(t *testing.T) {
+	r := newReturnRig(returnServers())
+	log := captureLog(t)
+	failReturns(t, r)                 // the fourth failed return stops the returns
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	r.up[osloIP], r.live[osloIP] = false, false // and Oslo dies again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != ReturnFailsMax+1 {
+		t.Fatalf("returnFails %d, want %d: Oslo's death soon after Xray got back to it counts", r.w.returnFails, ReturnFailsMax+1)
+	}
+	if n := strings.Count(log.String(), "Returns to the preferred server stopped"); n != 1 {
+		t.Fatalf("%d stop lines in the log:\n%s\nwant one, when the returns stopped", n, log)
+	}
+}
+
 func TestTick_NoReturnToAPreferredServerWithoutAnAddress(t *testing.T) {
 	servers := returnServers()
 	servers[0].IPs = nil // oslo.example resolved to nothing at the import
