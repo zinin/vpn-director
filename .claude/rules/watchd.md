@@ -144,10 +144,14 @@ and those Xray rejected in the current generation are skipped; the rest keep the
 `endpoint.PerAddress` and `DialKey` deduplicate connections rather than provider labels. A refresh
 that fails keeps the previous list; deleted/relinked subscriptions cannot be republished by an
 old download. Preferred return looks every 5 minutes: with valid monitor evidence it goes back once
-the monitor has held the preferred server alive for 5 minutes (`ReturnAlive`), otherwise by the
-TCP look; while that server is not back and Xray runs another group than the user's, a server of
-the user's group alive as long is taken instead. Returns of both kinds retry at 10–30 minutes, end
-their backoff once one has held for 30 minutes and stop after four failed returns. Details of the
+the monitor has held the preferred server alive for 5 minutes (`ReturnAlive`); while the monitor is
+on and OK but holds nothing valid for the servers yet, the look waits for the next tick; with
+monitoring off or a monitor that is not OK, the TCP look decides. While that server is not back and
+Xray runs another group than the user's, a server of the user's group alive as long is taken
+instead. Returns of both kinds retry at 10–30 minutes, end their backoff once one has held for 30
+minutes and stop after four failed returns. The count is the preferred server's: the death of a
+server the watch switched to itself leaves it, and a selection or a watchd restart starts it over
+(see "Keeping Xray on a working server"). Details of the
 shared watch algorithms are in `telegram-bot.md` and the `subwatch` modules; the process owner is
 watchd.
 
@@ -345,13 +349,28 @@ inbounds, and a replacement that lands on a same-named entry of another kind has
 which `preferred_server` keeps. A record without `group` (`configure.sh`'s, an older daemon's)
 knows no kind and goes by subscription and name. The return runs in both modes and looks every
 `ReturnCheck`: with valid evidence it goes back once the monitor has held the preferred server
-alive for `ReturnAlive` (5 minutes); without evidence the TCP look applies (`telegram-bot.md`).
-While the preferred server is not back and Xray runs another group than the user's, a look with
-valid evidence takes the best server of the user's group instead - the one `orderBest` puts first
-among those the monitor has held alive for `ReturnAlive`, through its addresses alive that long:
-one server per attempt. It switches, rolls back and backs off like any return, and
-`preferred_server` stays. A return of either kind that has held for `ReturnHold` (30 minutes) ends
-the return backoff, and both kinds count toward `ReturnFailsMax`.
+alive for `ReturnAlive` (5 minutes). A list publication that changes the monitor's endpoint set
+leaves the monitor OK but without evidence for 20 to 30 seconds while a new prober checks the new
+set; a look then waits for the next tick (`walkEvidence` reports `waiting`), since the TCP look
+would skip `ReturnAlive`. With monitoring off or a monitor that is not OK the TCP look applies
+(`telegram-bot.md`). While the preferred server is not back and Xray runs another group than the
+user's, a look with valid evidence takes the best server of the user's group instead - the one
+`orderBest` puts first among those the monitor has held alive for `ReturnAlive`, through its
+addresses alive that long: one server per attempt. It switches, rolls back and backs off like any
+return, and `preferred_server` stays. A return of either kind that has held for `ReturnHold` (30
+minutes) ends the return backoff, and both kinds count toward `ReturnFailsMax`.
+
+The count of failed returns is the user's choice's. A death that starts within `ReturnHold` of a
+return, on the record that return wrote, counts against it (`returnAfterDeath`); the death of any
+other record - a replacement's, the fast path's, the walk's, a follow's - leaves the count, the
+backoff and the wait as they are. The fast path, a replacement or the walk can put Xray back on
+the user's choice itself, since they rank its group and subscription first: with failed returns
+counted, the first look that finds Xray there takes that for a return, so a death within
+`ReturnHold` is one more failed return and a hold ends the count. A selection starts the returns
+over at the first tick that reads it (`noteSelection`: a record the watch did not write, told by
+`active_server.seq` against `ownSeq` as `missed` tells it), and so does a watchd restart. Returns
+stopped at `ReturnFailsMax` stay stopped until then, or until Xray has held on the choice for
+`ReturnHold`.
 
 Each of these switches sends one message, past `notify`'s one-per-kind deduplication:
 `Xray server <s> moved; Xray follows it`, `… changed; Xray follows it`,
