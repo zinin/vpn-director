@@ -966,21 +966,25 @@ func TestTick_AReplacementsDeathKeepsTheCountOfFailedReturns(t *testing.T) {
 	}
 }
 
-// With no preferred server left - a selection clears it - what the failed
-// returns backed off to is done with.
-func TestTick_NoPreferredServerStartsTheReturnsOver(t *testing.T) {
+// With no preferred server left - its subscription was deleted - what the
+// failed returns counted ends once Xray has held on the server it runs for
+// ReturnHold: nothing tells that server from a choice Xray got back to.
+func TestTick_NoPreferredServerEndsTheCountOnceXrayHolds(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
 	r.live[madridIP] = true
-	r.tick() // a failed return: the next waits ReturnRetry
-	if r.w.returnRetry != ReturnRetry {
-		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
-	}
-	r.f.cfg.Xray.PreferredServer = nil
+	r.tick()                           // a failed return: the next waits ReturnRetry
+	r.f.cfg.Xray.PreferredServer = nil // its subscription was deleted
 	r.f.now = r.f.now.Add(ProbeInterval)
+	start := r.f.now
 	r.tick()
-	if r.w.returnRetry != 0 {
-		t.Fatalf("returnRetry %v; with no preferred server the returns start over", r.w.returnRetry)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; the count waits for Xray to hold", r.w.returnFails, r.w.returnRetry)
+	}
+	r.f.now = start.Add(ReturnHold)
+	r.tick()
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+		t.Fatalf("returnFails %d, returnRetry %v; Xray has held for %v", r.w.returnFails, r.w.returnRetry, ReturnHold)
 	}
 }
 
@@ -1010,6 +1014,54 @@ func TestTick_AReturnEndsTheBackoffOnceItHasHeld(t *testing.T) {
 	r.tick()
 	if r.w.returnRetry != 0 {
 		t.Fatalf("returnRetry %v; the return held for %v", r.w.returnRetry, ReturnHold)
+	}
+}
+
+// The watch's own switch can put Xray back on the preferred server - the fast
+// path or a replacement takes it as the best server alive - while returns to it
+// have failed. That counts as a return: Oslo's death soon after is one more
+// failed return.
+func TestTick_XrayBackOnTheChoiceWithoutAReturnCountsAsOne(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.tick()                          // a failed return: the next waits ReturnRetry
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if r.f.cfg.Xray.PreferredServer != nil || r.w.returnFails != 1 {
+		t.Fatalf("preferred %+v, returnFails %d; want Oslo running and the count kept", r.f.cfg.Xray.PreferredServer, r.w.returnFails)
+	}
+	r.up[osloIP], r.live[osloIP] = false, false // Oslo dies again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 2 || r.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death soon after Xray went back to it is a failed return",
+			r.w.returnFails, r.w.returnRetry)
+	}
+}
+
+// Once Xray has held on the preferred server for ReturnHold, the count ends, as
+// after a return that held - stopped returns included.
+func TestTick_XrayHeldOnTheChoiceEndsTheCount(t *testing.T) {
+	r := newReturnRig(returnServers())
+	failReturns(t, r)                 // the returns to Oslo have stopped
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	r.f.now = r.f.now.Add(ProbeInterval)
+	start := r.f.now
+	r.tick()
+	r.f.now = start.Add(ReturnHold - ProbeInterval)
+	r.tick()
+	if r.w.returnFails != ReturnFailsMax {
+		t.Fatalf("returnFails %d before Oslo has held %v", r.w.returnFails, ReturnHold)
+	}
+	r.f.now = start.Add(ReturnHold)
+	r.tick()
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo has held %v", r.w.returnFails, r.w.returnRetry, ReturnHold)
 	}
 }
 

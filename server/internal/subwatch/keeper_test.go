@@ -1759,3 +1759,47 @@ func TestMaybeReturn_AHeldGroupReturnEndsTheBackoff(t *testing.T) {
 			writtenNames(s.written), s.w.returnFails)
 	}
 }
+
+// The KN-4521 again: with returns to Oslo failed, Backup - the server the watch
+// runs - dies, and the fast path takes Oslo, alive again. Xray is back on the
+// user's choice without a return; Oslo dies within ReturnHold, and that counts
+// as one more failed return.
+func TestKeeper_AFastSwitchBackToTheChoiceCountsAsAReturn(t *testing.T) {
+	s := newReturnKeeper(t) // Xray on Backup, Oslo preferred
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Backup
+	s.w.returnFails, s.w.returnRetry = 1, ReturnRetry
+	dead := "Backup"
+	running := func() string {
+		if len(s.written) == 0 {
+			return "Backup"
+		}
+		return s.written[len(s.written)-1].Name
+	}
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if running() == dead {
+			return errProbe
+		}
+		return nil
+	}
+	s.setHealthOf([]vpnconfig.Server{backup}, []vpnconfig.Server{oslo})
+	s.w.Tick(context.Background()) // Backup's probe fails; the fast path switches to Oslo
+	if got := writtenNames(s.written); len(got) == 0 || got[len(got)-1] != "Oslo@oslo.example" || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v; want the fast path on Oslo", got, s.f.cfg.Xray.PreferredServer)
+	}
+	s.f.now = s.f.now.Add(ProbeInterval)
+	s.w.Tick(context.Background()) // Oslo works: the first look takes it for a return
+	if s.w.lastReturn.IsZero() || s.w.returnFails != 1 {
+		t.Fatalf("lastReturn %v, returnFails %d; Xray back on the choice counts as a return", s.w.lastReturn, s.w.returnFails)
+	}
+	// Oslo dies again a few minutes later; the keeper confirms it the legacy way.
+	dead = "Oslo"
+	s.w.Health = nil
+	s.f.now = s.f.now.Add(2 * time.Minute)
+	tickUntilDead(s.w, s.f)
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death soon after Xray got back to it is a failed return",
+			s.w.returnFails, s.w.returnRetry)
+	}
+}

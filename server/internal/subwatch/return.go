@@ -26,7 +26,9 @@ const (
 	// ReturnHold is how long the server a return went back to - the preferred
 	// server, or a server of its group - has to keep working for the return to
 	// count as held: a death that starts within it counts as a failed return,
-	// and only a held return ends the backoff.
+	// and only a held return ends the backoff. A switch of the watch's own that
+	// puts Xray back on the preferred server while returns to it have failed
+	// counts as a return here (maybeReturn).
 	ReturnHold = 30 * time.Minute
 	// ReturnFailsMax is how many returns in a row may fail - a death within
 	// ReturnHold of one included - before the watch stops trying. An address
@@ -52,7 +54,9 @@ const (
 // passed, with no failover and no restore apply outstanding, and looks every
 // ReturnCheck - after a failed return, ReturnRetry and longer. After
 // ReturnFailsMax failed attempts in a row the returns stop; a return of either
-// kind that has held for ReturnHold ends that count and its wait.
+// kind that has held for ReturnHold ends that count and its wait. Xray back on
+// the user's choice by a switch of the watch's own counts as a return while
+// failed returns are counted.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.mutationEnded(ctx) {
 		return
@@ -66,11 +70,17 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		w.lastReturn = time.Time{}
 	}
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
-		// Nothing to return to. A return clears preferred_server too, and its
-		// backoff waits until it has held; without one, the backoff ends now.
-		if w.lastReturn.IsZero() {
-			w.returnRetry = 0
-			w.returnFails = 0
+		// Xray runs the user's choice, or nothing is left to return to. A switch
+		// of the watch's own - the fast path, a replacement, the walk - can put
+		// Xray back on the choice while returns to it have failed: that counts
+		// as a return, so a choice that dies again soon after is one more failed
+		// return, and one that holds for ReturnHold ends the count above. A
+		// selection gets here with the count ended (noteSelection), and with no
+		// count there is nothing to hold.
+		if w.lastReturn.IsZero() && w.returnFails > 0 && cfg != nil && cfg.Xray.ActiveServer != nil {
+			w.lastReturn = w.Now()
+			w.returnSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+			w.returnGroup = ""
 		}
 		return
 	}
