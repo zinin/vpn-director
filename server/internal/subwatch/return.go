@@ -46,17 +46,18 @@ const (
 
 // maybeReturn takes Xray back to the server the user chose once the watch has
 // left another one running and the chosen one is back: with fresh monitor
-// evidence, once the monitor has held it alive for ReturnAlive; without, once
-// it accepts TCP again - or, for a server no TCP dial can see, once its turn
-// comes round. While it is not back and Xray runs a server of another group,
-// it takes Xray to the best server of the user's group the monitor has held
-// alive as long, and preferred_server stays. It runs after a probe that
-// passed, with no failover and no restore apply outstanding, and looks every
-// ReturnCheck - after a failed return, ReturnRetry and longer. After
-// ReturnFailsMax failed attempts in a row the returns stop; a return of either
-// kind that has held for ReturnHold ends that count and its wait. Xray back on
-// the user's choice by a switch of the watch's own counts as a return while
-// failed returns are counted.
+// evidence, once the monitor has held it alive for ReturnAlive; while the
+// monitor is on and OK without evidence yet, at a later look; without the
+// monitor, once it accepts TCP again - or, for a server no TCP dial can see,
+// once its turn comes round. While it is not back and Xray runs a server of
+// another group, it takes Xray to the best server of the user's group the
+// monitor has held alive as long, and preferred_server stays. It runs after a
+// probe that passed, with no failover and no restore apply outstanding, and
+// looks every ReturnCheck - after a failed return, ReturnRetry and longer.
+// After ReturnFailsMax failed attempts in a row the returns stop; a return of
+// either kind that has held for ReturnHold ends that count and its wait. Xray
+// back on the user's choice by a switch of the watch's own counts as a return
+// while failed returns are counted.
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.mutationEnded(ctx) {
 		return
@@ -103,6 +104,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if now.Before(w.returnNotBefore) {
 		return
 	}
+	notBefore := w.returnNotBefore
 	w.returnNotBefore = now.Add(ReturnCheck)
 	subs, err := w.loadSubscriptions()
 	if w.mutationEnded(ctx) {
@@ -114,9 +116,18 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	}
 	servers := vpnconfig.AllServers(subs)
 	// With fresh evidence the monitor's look is the look: alive for
-	// ReturnAlive. Without it, the TCP look as before - a server no TCP dial
-	// can see is switched to on its turn, the attempt the only check there is.
-	ev, fresh := w.walkEvidence(servers, cfg)
+	// ReturnAlive. While the monitor is on and OK without evidence for these
+	// servers yet - a list publication gave it new endpoints or a new prober,
+	// whose checks come in within half a minute - the look waits, and the next
+	// tick looks again: the TCP look would skip ReturnAlive. Without the
+	// monitor, the TCP look as before - a server no TCP dial can see is
+	// switched to on its turn, the attempt the only check there is.
+	ev, fresh, waiting := w.walkEvidence(servers, cfg)
+	if waiting {
+		w.returnNotBefore = notBefore
+		slog.Debug("Return to the preferred server put off; the monitor has no evidence yet")
+		return
+	}
 	var candidates []vpnconfig.Server
 	if i := chosenIndex(servers, preferred); i >= 0 {
 		copies := endpoint.PerAddress(servers[i : i+1])

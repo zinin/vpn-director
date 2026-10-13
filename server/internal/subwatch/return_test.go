@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
+	"github.com/zinin/vpn-director/server/internal/monitor"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
@@ -1460,5 +1461,114 @@ func TestReturn_HealthOrderingPreservesBackoffAndChoice(t *testing.T) {
 				t.Fatalf("events %v, candidate probes %d, notes %v, want %v / %d without another attempt or notification", r.events, candidateProbes, r.f.notes, want, wantProbes)
 			}
 		})
+	}
+}
+
+// A list publication gave the monitor new endpoints, and while it checks them it
+// is OK with no evidence for the servers: the return waits for it - no TCP look,
+// no switch - and looks again at the next tick rather than ReturnCheck later.
+// Once the monitor holds Oslo alive for ReturnAlive, Xray goes back.
+func TestTick_TheReturnWaitsWhileTheMonitorRechecks(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	h := &fastHealth{cached: monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{}}, invalid: map[string]bool{}}
+	r.w.Health = h
+	looks := r.osloLooks()
+	r.tick()
+	if len(r.events) != 0 || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks at Oslo; the monitor is re-checking", r.events, *looks)
+	}
+	h.cached.Endpoints[endpoint.Key(returnServers()[0])] = aliveSince(r.f.now.Add(-time.Hour), 40)
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks; want %v at the next tick, on the monitor's evidence", r.events, *looks, want)
+	}
+}
+
+// A check that completed while the evidence was read fails its validation: the
+// monitor is OK all the same, and the return waits for the next tick.
+func TestTick_TheReturnWaitsForEvidenceThatValidates(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	key := endpoint.Key(returnServers()[0])
+	h := &fastHealth{cached: monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{
+		key: aliveSince(r.f.now.Add(-time.Hour), 40),
+	}}, invalid: map[string]bool{key: true}}
+	r.w.Health = h
+	looks := r.osloLooks()
+	r.tick()
+	if len(r.events) != 0 || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks at Oslo; the evidence did not validate", r.events, *looks)
+	}
+	delete(h.invalid, key)
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v at the next tick", r.events, want)
+	}
+}
+
+// Guard. Without the monitor - monitoring off, or a monitor in any state but
+// OK - the TCP look decides the return, as before.
+func TestTick_TheReturnTakesTheTCPLookWithoutTheMonitor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		state    watchdapi.State
+		disabled bool
+	}{
+		{name: "WAN down", state: watchdapi.StateWANDown},
+		{name: "prober error", state: watchdapi.StateProberError},
+		{name: "no Xray", state: watchdapi.StateNoXray},
+		{name: "monitor stopped", state: watchdapi.StateStopped},
+		{name: "monitor disabled", state: watchdapi.StateDisabled},
+		{name: "monitor not running", state: watchdapi.StateNotRunning},
+		{name: "monitoring off in the config", state: watchdapi.StateOK, disabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReturnRig(returnServers())
+			r.up[osloIP] = true
+			r.live[osloIP] = true
+			r.w.Health = &fastHealth{cached: monitor.Evidence{State: tc.state, Endpoints: map[string]watchdapi.EndpointState{}}, invalid: map[string]bool{}}
+			if tc.disabled {
+				enabled := false
+				r.f.cfg.Monitor = &vpnconfig.MonitorConfig{Enabled: &enabled}
+			}
+			r.tick()
+			if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+				t.Fatalf("events %v, want %v: without the monitor the TCP look decides", r.events, want)
+			}
+		})
+	}
+}
+
+// Guard (Review Focus 5). The RT-AX86U on 2026-10-13: a list publication gave
+// Oslo a new key while the monitor already knows Madrid again. The evidence is
+// fresh and Oslo is not in it: no TCP look and no return until the monitor has
+// held Oslo's new key alive for ReturnAlive.
+func TestTick_AReKeyedPreferredServerWaitsForReturnAlive(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	h := &fastHealth{cached: monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{
+		endpoint.Key(returnServers()[1]): aliveSince(r.f.now.Add(-time.Hour), 17),
+	}}, invalid: map[string]bool{}}
+	r.w.Health = h
+	looks := r.osloLooks()
+	start := r.f.now
+	r.tick()
+	// The monitor checks Oslo's new key at the next tick: alive from then on.
+	h.cached.Endpoints[endpoint.Key(returnServers()[0])] = aliveSince(start.Add(ProbeInterval), 40)
+	r.f.now = start.Add(ReturnCheck)
+	r.tick()
+	if len(r.events) != 0 || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks; Oslo has been alive less than %v", r.events, *looks, ReturnAlive)
+	}
+	r.f.now = start.Add(2 * ReturnCheck)
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks; want %v once Oslo has been alive %v", r.events, *looks, want, ReturnAlive)
 	}
 }

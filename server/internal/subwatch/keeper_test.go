@@ -1548,6 +1548,27 @@ func TestMaybeReturn_TwoMinutesAliveIsNotEnough(t *testing.T) {
 	}
 }
 
+// Both routers run the keeper: its return waits for the monitor the same way,
+// and looks again at the next tick.
+func TestMaybeReturn_WaitsWhileTheMonitorRechecks(t *testing.T) {
+	s := newReturnKeeper(t)
+	s.setStates(map[string]watchdapi.EndpointState{}) // OK, nothing checked yet
+	looks := 0
+	s.w.Reachable = func(context.Context, string, int) bool { looks++; return true }
+	s.w.Tick(context.Background())
+	if len(s.written) != 0 || looks != 0 {
+		t.Fatalf("written %v, %d TCP looks; the monitor is re-checking", writtenNames(s.written), looks)
+	}
+	s.setStates(map[string]watchdapi.EndpointState{
+		"Oslo": aliveSince(s.f.now.Add(-6*time.Minute), 40), "Backup": aliveSince(s.f.now.Add(-time.Hour), 17),
+	})
+	s.f.now = s.f.now.Add(ProbeInterval)
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@oslo.example"}) || looks != 0 {
+		t.Fatalf("written %v, %d TCP looks; want Oslo at the next tick, on the monitor's evidence", got, looks)
+	}
+}
+
 // Xray runs Oslo's Shadowsocks twin, a server of the same name and another
 // kind, while Oslo, the user's vless+tls choice, waits in preferred_server. The
 // twin is not the preferred server: once Oslo has been alive five minutes, Xray
