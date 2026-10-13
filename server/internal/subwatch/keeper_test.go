@@ -518,6 +518,41 @@ func TestKeeper_AFollowedEntryThatDoesNotAnswerIsReplaced(t *testing.T) {
 	}
 }
 
+// A follow whose entry does not answer either goes on as a replacement, and
+// the watchd log says so, as every other replacement does: between the
+// follow's line and the switch's, one INFO line names the server replaced.
+func TestKeeper_AFailedFollowLogsTheReplacement(t *testing.T) {
+	s := newKeeperFixture(t)
+	s.f.subs[0].Servers[0] = fastServer("Oslo", "oslo-2.example", "203.0.113.30")
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Backup" {
+			return nil
+		}
+		return errProbe
+	}
+	records := logRecords(t)
+	s.missOnce(t)
+	s.w.Tick(context.Background())
+	var got []string
+	for _, r := range records() {
+		switch msg, _ := r["msg"].(string); msg {
+		case "The Xray server moved or changed; following it", "Xray switched to a working server":
+			got = append(got, msg)
+		case "Following the Xray server did not work; replacing it":
+			got = append(got, fmt.Sprintf("%s: %v %v", msg, r["level"], r["server"]))
+		}
+	}
+	want := []string{
+		"The Xray server moved or changed; following it",
+		"Following the Xray server did not work; replacing it: INFO Alpha / Oslo",
+		"Xray switched to a working server",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("log %q, want %q", got, want)
+	}
+}
+
 // The copies a failed follow has just tried stay out of the replacement after
 // it, though their server is the dead one that goes last: with Backup not
 // answering either, the run ends without writing them again.

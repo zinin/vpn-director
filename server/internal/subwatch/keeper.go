@@ -213,6 +213,10 @@ func (w *Watch) followActive(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 	if w.replacementWaits(ctx) {
 		return true
 	}
+	// The log says why a server that was followed is replaced, as it does for
+	// one that left its subscription or died: the switch's own line names only
+	// the server found.
+	slog.Info("Following the Xray server did not work; replacing it", "server", was)
 	// The returns settle once per death, as in replaceDead and failOutbound.
 	if !w.returnDeath.Equal(w.failSince) {
 		w.returnDeath = w.failSince

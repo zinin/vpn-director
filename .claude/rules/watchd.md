@@ -276,7 +276,8 @@ entry of its choice is listed elsewhere; anything else - the subscription delete
 choice, several - means it left its list. A record without `group` knows no kind and goes by
 subscription and name. A changed or moved
 server is followed. In keeper mode one that left, or whose new entry does not answer either, is
-replaced. With clients on Xray the check only follows and leaves such a server to the death rules:
+replaced, and an INFO line says why (`Following the Xray server did not work; replacing it` for
+the latter). With clients on Xray the check only follows and leaves such a server to the death rules:
 they move the clients into a tunnel first, and the wave and the walk then pick the server (spec 4.4
 leaves a death with clients to that failover), where a replacement would keep them on a dead Xray
 for a restart per candidate. After a follow whose entry does not answer, the tick ends on the
