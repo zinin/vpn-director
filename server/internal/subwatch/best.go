@@ -100,15 +100,18 @@ func orderBest(copies []vpnconfig.Server, ref bestRef, ev monitor.Evidence, ok b
 // walkEvidence is the monitor's evidence for ordering servers, and whether it
 // may: monitoring on, its state OK and every key of servers it knows still
 // valid. Missing keys stay unknown; an empty validation request would mean the
-// whole monitor set.
-func (w *Watch) walkEvidence(servers []vpnconfig.Server, cfg *vpnconfig.VPNDirectorConfig) (monitor.Evidence, bool) {
+// whole monitor set. waiting is a monitor that is on and OK with nothing valid
+// for servers yet - a new endpoint set or prober whose first checks have not
+// come in, or a check that completed while the evidence was read - which a
+// look that needs the monitor waits for rather than look without it.
+func (w *Watch) walkEvidence(servers []vpnconfig.Server, cfg *vpnconfig.VPNDirectorConfig) (ev monitor.Evidence, fresh, waiting bool) {
 	if len(servers) == 0 || w.Health == nil ||
 		(cfg != nil && cfg.Monitor != nil && cfg.Monitor.Enabled != nil && !*cfg.Monitor.Enabled) {
-		return monitor.Evidence{}, false
+		return monitor.Evidence{}, false, false
 	}
 	evidence := w.Health.Evidence()
 	if evidence.State != watchdapi.StateOK {
-		return monitor.Evidence{}, false
+		return monitor.Evidence{}, false, false
 	}
 	keys := make([]string, 0, len(servers))
 	seen := make(map[string]bool, len(servers))
@@ -120,14 +123,14 @@ func (w *Watch) walkEvidence(servers []vpnconfig.Server, cfg *vpnconfig.VPNDirec
 		}
 	}
 	if len(keys) == 0 || w.Health.ValidateEvidence(evidence, keys) != nil {
-		return monitor.Evidence{}, false
+		return monitor.Evidence{}, false, true
 	}
-	return evidence, true
+	return evidence, true, false
 }
 
 // bestWalkOrder is orderBest on the monitor's evidence for servers, when it may
 // order them.
 func (w *Watch) bestWalkOrder(servers []vpnconfig.Server, cfg *vpnconfig.VPNDirectorConfig, ref bestRef) []vpnconfig.Server {
-	ev, ok := w.walkEvidence(servers, cfg)
+	ev, ok, _ := w.walkEvidence(servers, cfg)
 	return orderBest(servers, ref, ev, ok)
 }

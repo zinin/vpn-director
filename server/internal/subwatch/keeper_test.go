@@ -574,10 +574,11 @@ func TestKeeper_AFailedFollowsCopiesAreNotTriedAgain(t *testing.T) {
 
 // The actuality check's replacements settle the returns once per death, as
 // replaceDead and failOutbound do: as far as Xray goes, a server that left its
-// subscription, or whose followed entry does not answer either, died. With no
-// return within ReturnHold the death starts the returns over, those stopped at
-// ReturnFailsMax included; within ReturnHold of a return, on the record that
-// return wrote, it counts as a failed return and backs the next one off.
+// subscription, or whose followed entry does not answer either, died. Within
+// ReturnHold of a return, on the record that return wrote, the death counts as
+// a failed return and backs the next one off. The death of a record the watch
+// wrote itself leaves the count as it was, stopped returns included. A record
+// the user selected started the returns over when the watch first read it.
 func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 	for _, kind := range []struct {
 		name    string
@@ -600,17 +601,34 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 		}, []string{"Oslo@oslo-2.example", "Backup@backup.example"}},
 	} {
 		t.Run(kind.name, func(t *testing.T) {
-			t.Run("no return within ReturnHold", func(t *testing.T) {
+			t.Run("a record the watch wrote", func(t *testing.T) {
 				s := newKeeperFixture(t)
 				kind.change(s)
-				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax // the returns had stopped
+				// The watch put Xray on Oslo itself, and the returns had stopped.
+				s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer)
+				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax
+				s.missOnce(t)
+				s.w.Tick(context.Background())
+				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
+					t.Fatalf("written %v, want %v", got, kind.written)
+				}
+				if s.w.returnFails != ReturnFailsMax || s.w.returnRetry != ReturnRetryMax {
+					t.Fatalf("returnFails %d, returnRetry %v; the death of a server the watch switched to says nothing about the preferred server",
+						s.w.returnFails, s.w.returnRetry)
+				}
+			})
+			t.Run("a selected record", func(t *testing.T) {
+				s := newKeeperFixture(t)
+				kind.change(s)
+				// The user selected Oslo after returns to an earlier choice had stopped.
+				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax
 				s.missOnce(t)
 				s.w.Tick(context.Background())
 				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
 					t.Fatalf("written %v, want %v", got, kind.written)
 				}
 				if s.w.returnFails != 0 || s.w.returnRetry != 0 {
-					t.Fatalf("returnFails %d, returnRetry %v; a new death starts the returns over", s.w.returnFails, s.w.returnRetry)
+					t.Fatalf("returnFails %d, returnRetry %v; the selection started the returns over", s.w.returnFails, s.w.returnRetry)
 				}
 			})
 			t.Run("a return within ReturnHold", func(t *testing.T) {
@@ -618,6 +636,7 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 				kind.change(s)
 				// A minute ago a return wrote the record that fails now.
 				s.w.lastReturn, s.w.returnSeq = s.f.now.Add(-time.Minute), vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer)
+				s.w.ownSeq = s.w.returnSeq
 				s.missOnce(t)
 				s.w.Tick(context.Background())
 				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
@@ -629,6 +648,36 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// The KN-4521 runs the keeper. Backup, which the watch put in Oslo's place
+// after returns to Oslo had failed, dies, and the keeper replaces it the legacy
+// way - Oslo first, still dead, then Spare: a death no return wrote, and the
+// count of failed returns to Oslo stays.
+func TestKeeper_AReplacementsDeathKeepsTheCountOfFailedReturns(t *testing.T) {
+	s := newReturnKeeper(t) // Xray on Backup, Oslo preferred
+	s.f.subs[0].Servers = append(s.f.subs[0].Servers, fastServer("Spare", "spare.example", "198.51.100.30"))
+	s.w.Health = nil
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Backup
+	s.w.returnFails, s.w.returnRetry = 2, 2*ReturnRetry
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if len(s.written) > 0 && s.written[len(s.written)-1].Name == "Spare" {
+			return nil
+		}
+		return errProbe // Backup has died, and Oslo is still dead
+	}
+	tickUntilDead(s.w, s.f)
+	names := writtenNames(s.written)
+	if len(names) == 0 || names[0] != "Oslo@oslo.example" || names[len(names)-1] != "Spare@spare.example" {
+		t.Fatalf("written %v, want Oslo tried first and Spare last", names)
+	}
+	if p := s.f.cfg.Xray.PreferredServer; p == nil || p.Name != "Oslo" {
+		t.Fatalf("preferred %+v, want Oslo kept", p)
+	}
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Backup's death says nothing about Oslo", s.w.returnFails, s.w.returnRetry)
 	}
 }
 
@@ -1499,6 +1548,27 @@ func TestMaybeReturn_TwoMinutesAliveIsNotEnough(t *testing.T) {
 	}
 }
 
+// Both routers run the keeper: its return waits for the monitor the same way,
+// and looks again at the next tick.
+func TestMaybeReturn_WaitsWhileTheMonitorRechecks(t *testing.T) {
+	s := newReturnKeeper(t)
+	s.setStates(map[string]watchdapi.EndpointState{}) // OK, nothing checked yet
+	looks := 0
+	s.w.Reachable = func(context.Context, string, int) bool { looks++; return true }
+	s.w.Tick(context.Background())
+	if len(s.written) != 0 || looks != 0 {
+		t.Fatalf("written %v, %d TCP looks; the monitor is re-checking", writtenNames(s.written), looks)
+	}
+	s.setStates(map[string]watchdapi.EndpointState{
+		"Oslo": aliveSince(s.f.now.Add(-6*time.Minute), 40), "Backup": aliveSince(s.f.now.Add(-time.Hour), 17),
+	})
+	s.f.now = s.f.now.Add(ProbeInterval)
+	s.w.Tick(context.Background())
+	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Oslo@oslo.example"}) || looks != 0 {
+		t.Fatalf("written %v, %d TCP looks; want Oslo at the next tick, on the monitor's evidence", got, looks)
+	}
+}
+
 // Xray runs Oslo's Shadowsocks twin, a server of the same name and another
 // kind, while Oslo, the user's vless+tls choice, waits in preferred_server. The
 // twin is not the preferred server: once Oslo has been alive five minutes, Xray
@@ -1677,10 +1747,14 @@ func TestMaybeReturn_BackToTheGroupOfAPreferredRecordWithoutOne(t *testing.T) {
 // new count, and the returns go on instead of stopping at ReturnFailsMax.
 func TestMaybeReturn_AHeldGroupReturnEndsTheBackoff(t *testing.T) {
 	s := newGroupReturnKeeper(t)
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Shadow
 	s.w.returnFails, s.w.returnRetry = ReturnFailsMax-1, ReturnRetryMax
 	s.w.Tick(context.Background()) // back on Backup, of Oslo's group
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
 		t.Fatalf("written %v", got)
+	}
+	if s.w.returnFails != ReturnFailsMax-1 {
+		t.Fatalf("returnFails %d; the count stands until the return has held", s.w.returnFails)
 	}
 	// Backup has held. The monitor has Oslo back, but its probe fails.
 	s.f.now = s.f.now.Add(ReturnHold)
@@ -1704,5 +1778,140 @@ func TestMaybeReturn_AHeldGroupReturnEndsTheBackoff(t *testing.T) {
 	if tries != 4 || s.w.returnFails != 2 {
 		t.Fatalf("written %v, returnFails %d; want two returns to Oslo's two addresses, counted anew",
 			writtenNames(s.written), s.w.returnFails)
+	}
+}
+
+// The KN-4521 again: with returns to Oslo failed, Backup - the server the watch
+// runs - dies, and the fast path takes Oslo, alive again. Xray is back on the
+// user's choice without a return; Oslo dies within ReturnHold, and that counts
+// as one more failed return.
+func TestKeeper_AFastSwitchBackToTheChoiceCountsAsAReturn(t *testing.T) {
+	s := newReturnKeeper(t) // Xray on Backup, Oslo preferred
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Backup
+	s.w.returnFails, s.w.returnRetry = 1, ReturnRetry
+	dead := "Backup"
+	running := func() string {
+		if len(s.written) == 0 {
+			return "Backup"
+		}
+		return s.written[len(s.written)-1].Name
+	}
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		if running() == dead {
+			return errProbe
+		}
+		return nil
+	}
+	s.setHealthOf([]vpnconfig.Server{backup}, []vpnconfig.Server{oslo})
+	s.w.Tick(context.Background()) // Backup's probe fails; the fast path switches to Oslo
+	if got := writtenNames(s.written); len(got) == 0 || got[len(got)-1] != "Oslo@oslo.example" || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v; want the fast path on Oslo", got, s.f.cfg.Xray.PreferredServer)
+	}
+	s.f.now = s.f.now.Add(ProbeInterval)
+	s.w.Tick(context.Background()) // Oslo works: the switch was taken for a return
+	if s.w.lastReturn.IsZero() || s.w.returnFails != 1 {
+		t.Fatalf("lastReturn %v, returnFails %d; Xray back on the choice counts as a return", s.w.lastReturn, s.w.returnFails)
+	}
+	// Oslo dies again a few minutes later; the keeper confirms it the legacy way.
+	dead = "Oslo"
+	s.w.Health = nil
+	s.f.now = s.f.now.Add(2 * time.Minute)
+	tickUntilDead(s.w, s.f)
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death soon after Xray got back to it is a failed return",
+			s.w.returnFails, s.w.returnRetry)
+	}
+}
+
+// newLandingKeeper is the return keeper after a failed return to Oslo, the
+// user's choice: Xray runs Backup, which the watch put there, the monitor holds
+// Backup dead and Oslo alive, and the probe fails on whichever server Xray was
+// last switched to while die names it - Backup, to begin with.
+func newLandingKeeper(t *testing.T) (s *fastFixture, die func(names ...string)) {
+	t.Helper()
+	s = newReturnKeeper(t) // Xray on Backup, Oslo preferred
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Backup
+	s.w.returnFails, s.w.returnRetry = 1, ReturnRetry
+	dead := map[string]bool{"Backup": true}
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		running := "Backup"
+		if len(s.written) > 0 {
+			running = s.written[len(s.written)-1].Name
+		}
+		if dead[running] {
+			return errProbe
+		}
+		return nil
+	}
+	s.setHealthOf([]vpnconfig.Server{backup}, []vpnconfig.Server{oslo})
+	return s, func(names ...string) {
+		dead = map[string]bool{}
+		for _, name := range names {
+			dead[name] = true
+		}
+	}
+}
+
+// The fast path puts Xray back on Oslo while returns to it have failed, and
+// Oslo dies before the next probe passes. The switch is the return: no look
+// comes before that death - a look follows a probe that passed - and the death
+// would count for nothing.
+func TestKeeper_AFastSwitchBackToTheChoiceCountsFromTheSwitch(t *testing.T) {
+	s, die := newLandingKeeper(t)
+	s.w.Tick(context.Background()) // Backup's probe fails; the fast path switches to Oslo
+	if got := writtenNames(s.written); len(got) == 0 || got[len(got)-1] != "Oslo@oslo.example" || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v; want the fast path on Oslo", got, s.f.cfg.Xray.PreferredServer)
+	}
+	// Oslo dies before the next probe; the keeper confirms it the legacy way.
+	die("Oslo")
+	s.w.Health = nil
+	s.f.now = s.f.now.Add(ProbeInterval)
+	tickUntilDead(s.w, s.f)
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death right after the fast path put Xray back on it is a failed return",
+			s.w.returnFails, s.w.returnRetry)
+	}
+}
+
+// The KN-4521's own path: the keeper's legacy replacement of a dead Backup
+// takes Oslo, its first candidate, while returns to Oslo have failed, and Oslo
+// dies before the next probe passes. As after the fast path, the switch is the
+// return and the death one more failed return.
+func TestKeeper_AReplacementOntoTheChoiceCountsFromTheSwitch(t *testing.T) {
+	s, die := newLandingKeeper(t)
+	s.w.Health = nil        // the legacy confirmation, then the replacement
+	tickUntilDead(s.w, s.f) // Backup dies; the replacement takes Oslo
+	if got := writtenNames(s.written); len(got) == 0 || got[len(got)-1] != "Oslo@oslo.example" || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v; want the replacement on Oslo", got, s.f.cfg.Xray.PreferredServer)
+	}
+	die("Oslo")
+	s.f.now = s.f.now.Add(ProbeInterval)
+	tickUntilDead(s.w, s.f)
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death right after the replacement put Xray back on it is a failed return",
+			s.w.returnFails, s.w.returnRetry)
+	}
+}
+
+// The replacement tries Oslo first, and Oslo fails the switch's probe: Xray
+// lands on Third, and nothing is taken for a return. Third holding for
+// ReturnHold says nothing about Oslo and leaves the count of failed returns
+// to it.
+func TestKeeper_AReplacementPastTheChoiceIsNoReturn(t *testing.T) {
+	s, die := newLandingKeeper(t)
+	s.f.subs[0].Servers = append(s.f.subs[0].Servers, fastServer("Third", "third.example", "198.51.100.30"))
+	s.w.Health = nil // the legacy confirmation, then the replacement; no look finds Oslo back
+	die("Backup", "Oslo")
+	tickUntilDead(s.w, s.f) // Backup dies; the replacement tries Oslo, then Third
+	if got := writtenNames(s.written); len(got) < 2 || got[0] != "Oslo@oslo.example" || got[len(got)-1] != "Third@third.example" {
+		t.Fatalf("written %v; want the replacement past Oslo onto Third", got)
+	}
+	tickFor(s.w, s.f, ReturnHold+ProbeInterval)
+	if s.w.returnFails != 1 {
+		t.Fatalf("returnFails %d after Third held %v; Xray on Third is no return to Oslo", s.w.returnFails, ReturnHold)
 	}
 }

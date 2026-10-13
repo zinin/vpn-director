@@ -144,6 +144,7 @@ type Watch struct {
 	returnSeq         int                                  // active_server's write counter the last return left
 	returnGroup       string                               // the preferred group whose server the last return went to; "" for the preferred server itself
 	returnDeath       time.Time                            // failSince of the last death the returns were settled at
+	selectedSeq       int                                  // active_server's write counter of the last selection the returns started over at: a record the watch read and had not written
 	lastPicked        *vpnconfig.Server                    // the copy the walk picked or a return proved, with the address it ran on
 	keeperNotBefore   time.Time                            // no keeper switch before this: the backoff after a run that found nothing working
 	keeperRetry       time.Duration                        // the current keeper backoff; zero before any
@@ -231,6 +232,7 @@ func (w *Watch) Tick(ctx context.Context) {
 		w.resetFail()
 		return
 	}
+	w.noteSelection(cfg)
 	w.pendingRestore = cfg.Xray.PendingRestore
 	subs := w.subscriptionCount()
 	// A restore whose last apply failed is work the watch has started, as a
@@ -1221,6 +1223,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		if w.walkEnded(w.walkOwnsNow(started, lastRecorded, lastSeq)) {
 			return
 		}
+		w.landedOnChoice(nil, lastSeq)
 		// Only a committed failover left Xray. Staged clients never left, so
 		// "back on Xray" would be a false message. The restore does not look
 		// at the subscription (spec 5.4): the server runs and answers.

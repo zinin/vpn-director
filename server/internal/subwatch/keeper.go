@@ -490,6 +490,7 @@ func (w *Watch) switchAmong(ctx context.Context, sw *switcher, candidates []vpnc
 		w.lastRouteKind, w.lastImportKind = noteNone, noteNone
 		w.resetKeeper()
 		slog.Info("Xray switched to a working server", "server", c.Name, "ips", c.IPs)
+		w.landedOnChoice(nil, sw.seq)
 		w.say(message(c))
 		return true, false
 	}

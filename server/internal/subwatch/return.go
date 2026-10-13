@@ -26,14 +26,17 @@ const (
 	// ReturnHold is how long the server a return went back to - the preferred
 	// server, or a server of its group - has to keep working for the return to
 	// count as held: a death that starts within it counts as a failed return,
-	// and only a held return ends the backoff.
+	// and only a held return ends the backoff. A switch of the watch's own that
+	// puts Xray back on the preferred server while returns to it have failed
+	// counts as a return here (landedOnChoice).
 	ReturnHold = 30 * time.Minute
 	// ReturnFailsMax is how many returns in a row may fail - a death within
 	// ReturnHold of one included - before the watch stops trying. An address
 	// that accepts TCP and keeps refusing the proxy, a blocked endpoint, would
 	// otherwise cost every Xray client a few dead seconds every ReturnRetryMax
-	// for as long as the block lasts. A new death, a selection, a held return or
-	// a restart of watchd starts the returns over.
+	// for as long as the block lasts. The count is the preferred server's: the
+	// death of a server the watch switched to itself leaves it. A selection, a
+	// held return or a restart of watchd starts the returns over.
 	ReturnFailsMax = 4
 	// ReturnAlive is how long the monitor has to hold a server alive before
 	// Xray goes back to it - to the preferred server, or to the user's group:
@@ -43,15 +46,18 @@ const (
 
 // maybeReturn takes Xray back to the server the user chose once the watch has
 // left another one running and the chosen one is back: with fresh monitor
-// evidence, once the monitor has held it alive for ReturnAlive; without, once
-// it accepts TCP again - or, for a server no TCP dial can see, once its turn
-// comes round. While it is not back and Xray runs a server of another group,
-// it takes Xray to the best server of the user's group the monitor has held
-// alive as long, and preferred_server stays. It runs after a probe that
-// passed, with no failover and no restore apply outstanding, and looks every
-// ReturnCheck - after a failed return, ReturnRetry and longer. After
-// ReturnFailsMax failed attempts in a row the returns stop; a return of either
-// kind that has held for ReturnHold ends that count and its wait.
+// evidence, once the monitor has held it alive for ReturnAlive; while the
+// monitor is on and OK without evidence yet, at a later look; without the
+// monitor, once it accepts TCP again - or, for a server no TCP dial can see,
+// once its turn comes round. While it is not back and Xray runs a server of
+// another group, it takes Xray to the best server of the user's group the
+// monitor has held alive as long, and preferred_server stays. It runs after a
+// probe that passed, with no failover and no restore apply outstanding, and
+// looks every ReturnCheck - after a failed return, ReturnRetry and longer.
+// After ReturnFailsMax failed attempts in a row the returns stop; a return of
+// either kind that has held for ReturnHold ends that count and its wait. Xray
+// back on the user's choice by a switch of the watch's own counts as a return
+// while failed returns are counted (landedOnChoice).
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.mutationEnded(ctx) {
 		return
@@ -65,11 +71,16 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 		w.lastReturn = time.Time{}
 	}
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
-		// Nothing to return to. A return clears preferred_server too, and its
-		// backoff waits until it has held; without one, the backoff ends now.
-		if w.lastReturn.IsZero() {
-			w.returnRetry = 0
-			w.returnFails = 0
+		// Xray runs the user's choice, or nothing is left to return to. A switch
+		// of the watch's own that put Xray back on the choice while returns to it
+		// have failed counted as a return once its probe passed
+		// (landedOnChoice). A write of its own without a probe - the walk's way
+		// back to the preferred server when it finds nothing live - counts from
+		// here, the first look that finds Xray working there. A selection gets
+		// here with the count ended (noteSelection), and with no count there is
+		// nothing to hold.
+		if cfg != nil {
+			w.landedOnChoice(cfg, vpnconfig.ActiveSeq(cfg.Xray.ActiveServer))
 		}
 		return
 	}
@@ -92,6 +103,7 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	if now.Before(w.returnNotBefore) {
 		return
 	}
+	notBefore := w.returnNotBefore
 	w.returnNotBefore = now.Add(ReturnCheck)
 	subs, err := w.loadSubscriptions()
 	if w.mutationEnded(ctx) {
@@ -103,9 +115,18 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	}
 	servers := vpnconfig.AllServers(subs)
 	// With fresh evidence the monitor's look is the look: alive for
-	// ReturnAlive. Without it, the TCP look as before - a server no TCP dial
-	// can see is switched to on its turn, the attempt the only check there is.
-	ev, fresh := w.walkEvidence(servers, cfg)
+	// ReturnAlive. While the monitor is on and OK without evidence for these
+	// servers yet - a list publication gave it new endpoints or a new prober,
+	// whose checks come in within half a minute - the look waits, and the next
+	// tick looks again: the TCP look would skip ReturnAlive. Without the
+	// monitor, the TCP look as before - a server no TCP dial can see is
+	// switched to on its turn, the attempt the only check there is.
+	ev, fresh, waiting := w.walkEvidence(servers, cfg)
+	if waiting {
+		w.returnNotBefore = notBefore
+		slog.Debug("Return to the preferred server put off; the monitor has no evidence yet")
+		return
+	}
 	var candidates []vpnconfig.Server
 	if i := chosenIndex(servers, preferred); i >= 0 {
 		copies := endpoint.PerAddress(servers[i : i+1])
@@ -409,23 +430,28 @@ func rollbackOrder(servers []vpnconfig.Server, before *vpnconfig.ActiveServer, l
 	return out
 }
 
-// returnAfterDeath settles the returns at a death. A death is a new episode,
-// and whatever the returns backed off to is done with - unless it started
-// within ReturnHold of a return, on the record that return wrote: the server
-// it went back to - the preferred server, or a server of its group - has
-// failed again, and the death counts as a failed return, so a server that
-// flaps is not returned to every few minutes. A selection since the return
-// wrote another record - the same server selected again too - and the death
-// of the user's new choice starts the returns over.
+// returnAfterDeath settles the returns at a death. The count is the preferred
+// server's: a death that starts within ReturnHold of a return, on the record
+// that return wrote, is a failed return - the server it went back to, the
+// preferred server or a server of its group, has failed again - so a server
+// that flaps is not returned to every few minutes; the same record dying later
+// held, and the returns start over. The death of any other record - one the
+// watch switched to itself: a replacement's, the fast path's, the walk's, a
+// follow's - says nothing about the preferred server and leaves the count and
+// the wait as they are. A selection since the return wrote another record, so
+// its death is not the return's either.
 func (w *Watch) returnAfterDeath() {
-	if !w.lastReturn.IsZero() && w.failSeq == w.returnSeq && w.failSince.Sub(w.lastReturn) < ReturnHold {
+	switch {
+	case w.lastReturn.IsZero() || w.failSeq != w.returnSeq:
+		// Not the record a return wrote: nothing about the preferred server.
+	case w.failSince.Sub(w.lastReturn) < ReturnHold:
 		if w.returnGroup == "" {
 			slog.Info("The preferred server died soon after the return; counted as a failed return", "after", w.failSince.Sub(w.lastReturn))
 		} else {
 			slog.Info("The server of the preferred group died soon after the return; counted as a failed return", "group", w.returnGroup, "after", w.failSince.Sub(w.lastReturn))
 		}
 		w.backOffReturn(w.returnGroup)
-	} else {
+	default:
 		w.returnRetry = 0
 		w.returnFails = 0
 		w.returnNotBefore = time.Time{}
@@ -433,11 +459,61 @@ func (w *Watch) returnAfterDeath() {
 	w.lastReturn = time.Time{}
 }
 
+// landedOnChoice takes a switch of the watch's own that put Xray back on the
+// user's choice - the fast path's, a replacement's, the walk's, once its probe
+// passed - for a return while returns to the choice have failed, from the
+// switch itself: a choice that dies again before the next probe passes is one
+// more failed return, as the death of a return is (returnAfterDeath), and one
+// that holds for ReturnHold ends the count (maybeReturn). The next look comes
+// only after a probe that passed, and a choice that died before then would
+// count for nothing. seq is the counter the switch's record moved to, and
+// cfg the config after the switch, or nil to read it - read only while there
+// is a count to keep. Xray is on the choice while that record is active_server
+// and preferred_server is gone: RecordWalkedServer clears it there. A return
+// already counting is left as it is.
+func (w *Watch) landedOnChoice(cfg *vpnconfig.VPNDirectorConfig, seq int) {
+	if !w.lastReturn.IsZero() || w.returnFails == 0 {
+		return
+	}
+	if cfg == nil && w.LoadVPN != nil {
+		if read, err := w.LoadVPN(); err == nil {
+			cfg = read
+		}
+	}
+	if cfg == nil || cfg.Xray.PreferredServer != nil || cfg.Xray.ActiveServer == nil ||
+		vpnconfig.ActiveSeq(cfg.Xray.ActiveServer) != seq {
+		return
+	}
+	w.lastReturn, w.returnSeq, w.returnGroup = w.Now(), seq, ""
+	slog.Info("Xray is back on the preferred server without a return; counted as a return until it has held", "server", cfg.Xray.ActiveServer.Name, "failed", w.returnFails, "hold", ReturnHold)
+}
+
+// noteSelection starts the returns over at a record the watch did not write: a
+// selection in the Web UI, /xray, the wizard or configure.sh - the same server
+// selected again too, since every write moves the counter - or the record a
+// previous process left, which the restart has started over anyway. What the
+// returns counted is the old choice's, and the user's new choice starts with
+// none: a selected server that never passes a probe would otherwise hand the
+// old count on at its death. Once per record (selectedSeq), at the first tick
+// that reads it, before the tick acts.
+func (w *Watch) noteSelection(cfg *vpnconfig.VPNDirectorConfig) {
+	seq := vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+	if seq == w.ownSeq || seq == w.selectedSeq {
+		return
+	}
+	w.selectedSeq = seq
+	w.returnFails, w.returnRetry = 0, 0
+	w.returnNotBefore, w.lastReturn = time.Time{}, time.Time{}
+}
+
 // backOffReturn holds the next attempt back after a return that failed:
 // ReturnRetry, then twice the last wait, ReturnRetryMax at most. After
 // ReturnFailsMax failures in a row there is no next attempt: the returns stop,
-// to the preferred server and to its group alike. group is the preferred group
-// when the return that failed went to a server of it, and the log names it.
+// to the preferred server and to its group alike, and the log says so once. A
+// death of the preferred server soon after Xray got back to it without a
+// return still counts past the cap (landedOnChoice), but it stops nothing new.
+// group is the preferred group when the return that failed went to a server of
+// it, and the log names it.
 func (w *Watch) backOffReturn(group string) {
 	w.returnFails++
 	if w.returnRetry == 0 {
@@ -447,10 +523,12 @@ func (w *Watch) backOffReturn(group string) {
 	}
 	w.returnNotBefore = w.Now().Add(w.returnRetry)
 	if w.returnFails >= ReturnFailsMax {
-		if group == "" {
-			slog.Info("Returns to the preferred server stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "failed", w.returnFails)
-		} else {
-			slog.Info("Returns to the preferred server and its group stopped after failed attempts; a new death, a selection or a watchd restart starts them again", "group", group, "failed", w.returnFails)
+		if w.returnFails == ReturnFailsMax {
+			if group == "" {
+				slog.Info("Returns to the preferred server stopped after failed attempts; a selection, a watchd restart or Xray holding on it starts them again", "failed", w.returnFails, "hold", ReturnHold)
+			} else {
+				slog.Info("Returns to the preferred server and its group stopped after failed attempts; a selection, a watchd restart or Xray holding on the preferred server starts them again", "group", group, "failed", w.returnFails, "hold", ReturnHold)
+			}
 		}
 		return
 	}

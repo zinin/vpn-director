@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/zinin/vpn-director/server/internal/endpoint"
+	"github.com/zinin/vpn-director/server/internal/monitor"
 	"github.com/zinin/vpn-director/server/internal/vpnconfig"
 	"github.com/zinin/vpn-director/server/internal/watchdapi"
 )
@@ -102,6 +103,29 @@ func (r *returnRig) attempts() int {
 		}
 	}
 	return n
+}
+
+// ownWrite has the watch write s as the running server the way its walk, fast
+// path or replacement does - through generate - so the record is the watch's
+// own, and Xray runs s's first address.
+func (r *returnRig) ownWrite(t *testing.T, s vpnconfig.Server) {
+	t.Helper()
+	if generated, _, err := r.w.generate(s, nil); !generated || err != nil {
+		t.Fatalf("writing %s: generated %v, error %v", s.Name, generated, err)
+	}
+}
+
+// osloLooks counts the TCP looks at Oslo's address from now on.
+func (r *returnRig) osloLooks() *int {
+	looks := 0
+	reachable := r.w.Reachable
+	r.w.Reachable = func(ctx context.Context, ip string, port int) bool {
+		if ip == osloIP {
+			looks++
+		}
+		return reachable(ctx, ip, port)
+	}
+	return &looks
 }
 
 func TestTick_ReturnsToThePreferredServerOnceItAnswers(t *testing.T) {
@@ -209,32 +233,30 @@ func failReturns(t *testing.T, r *returnRig) time.Time {
 	return start
 }
 
-// A selection starts stopped returns over: once a walk leaves another server
-// running again, the next attempt comes at its time.
+// A selection starts stopped returns over, the wait included: once Xray runs
+// another server than the user's again, the next look comes at once.
 func TestTick_ASelectionStartsStoppedReturnsOver(t *testing.T) {
 	r := newReturnRig(returnServers())
-	start := failReturns(t, r)
-	r.f.cfg.Xray.PreferredServer = nil // a selection clears it
+	failReturns(t, r)
+	selectServer(r.f, returnServers()[1]) // the user selects Madrid, which runs
 	r.f.now = r.f.now.Add(ProbeInterval)
 	r.tick()
-	if r.w.returnFails != 0 {
-		t.Fatalf("returnFails %d; a selection starts the returns over", r.w.returnFails)
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 || !r.w.returnNotBefore.IsZero() {
+		t.Fatalf("returnFails %d, returnRetry %v, next return %v; a selection starts the returns over",
+			r.w.returnFails, r.w.returnRetry, r.w.returnNotBefore)
 	}
 	r.f.cfg.Xray.PreferredServer = &vpnconfig.ActiveServer{Name: "Oslo", Address: "oslo.example", Port: 443}
-	// The last failure, 60 minutes in, set the next attempt 30 minutes later.
-	r.f.now = start.Add(90*time.Minute - time.Second)
-	r.tick()
-	if n := r.attempts(); n != ReturnFailsMax {
-		t.Fatalf("attempts %d before its time, want %d", n, ReturnFailsMax)
-	}
-	r.f.now = start.Add(90 * time.Minute)
+	r.f.now = r.f.now.Add(ProbeInterval)
 	r.tick()
 	if n := r.attempts(); n != ReturnFailsMax+1 {
-		t.Fatalf("attempts %d at its time, want %d", n, ReturnFailsMax+1)
+		t.Fatalf("attempts %d, want %d: the next look comes at once", n, ReturnFailsMax+1)
 	}
 }
 
-func TestTick_ADeathStartsStoppedReturnsOver(t *testing.T) {
+// Stopped returns stay stopped when the server the watch runs dies: Madrid,
+// which the failed returns went back to, says nothing about Oslo. Once Madrid
+// works again, the watch does not look at Oslo.
+func TestTick_StoppedReturnsStayStoppedThroughADeath(t *testing.T) {
 	r := newReturnRig(returnServers())
 	failReturns(t, r)
 	r.live[madridIP] = false // Madrid dies
@@ -244,8 +266,17 @@ func TestTick_ADeathStartsStoppedReturnsOver(t *testing.T) {
 	if r.f.cfg.Xray.Failover == nil {
 		t.Fatal("no failover")
 	}
-	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
-		t.Fatalf("returnFails %d, returnRetry %v; a death starts the returns over", r.w.returnFails, r.w.returnRetry)
+	if r.w.returnFails != ReturnFailsMax || r.w.returnRetry != ReturnRetryMax {
+		t.Fatalf("returnFails %d, returnRetry %v; Madrid's death leaves the returns stopped", r.w.returnFails, r.w.returnRetry)
+	}
+	r.live[madridIP] = true // Madrid works again, and the clients come back to Xray
+	looks := r.osloLooks()
+	tickFor(r.w, r.f, time.Hour)
+	if r.f.cfg.Xray.Failover != nil {
+		t.Fatal("the clients must be back on Xray")
+	}
+	if *looks != 0 || r.attempts() != ReturnFailsMax {
+		t.Fatalf("%d looks at Oslo, %d attempts; the returns have stopped", *looks, r.attempts())
 	}
 }
 
@@ -589,23 +620,28 @@ func TestTick_RollbackStartsWithTheRememberedAddressAnImportDropped(t *testing.T
 	}
 }
 
-func TestTick_ADeathStartsTheReturnsOver(t *testing.T) {
+// The returns belong to the preferred server. Madrid, the server a failed
+// return went back to, dies: a death no return wrote, which says nothing about
+// Oslo, and the count, the backoff and the wait stay.
+func TestTick_ADeathOfAnotherServerKeepsTheBackoff(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
 	r.live[madridIP] = true
 	r.f.plat = connected("ovpnc2")
 	r.tick() // a failed return: the next waits ReturnRetry
-	if r.w.returnRetry != ReturnRetry {
-		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; want a failed return", r.w.returnFails, r.w.returnRetry)
 	}
+	next := r.w.returnNotBefore
 	r.live[madridIP] = false // Madrid dies
 	r.f.now = r.f.now.Add(ProbeInterval)
 	tickUntilDead(r.w, r.f)
 	if r.f.cfg.Xray.Failover == nil {
 		t.Fatal("no failover")
 	}
-	if r.w.returnRetry != 0 {
-		t.Fatalf("returnRetry %v; a death starts the returns over", r.w.returnRetry)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry || !r.w.returnNotBefore.Equal(next) {
+		t.Fatalf("returnFails %d, returnRetry %v, next return %v; Madrid's death keeps the count and the wait of %v",
+			r.w.returnFails, r.w.returnRetry, r.w.returnNotBefore, next)
 	}
 }
 
@@ -696,6 +732,82 @@ func TestTick_ADeathSoonAfterASelectionThatFollowedAReturnIsNoFailedReturn(t *te
 				t.Fatalf("returnFails %d, returnRetry %v; the selected server's death is no failed return", r.w.returnFails, r.w.returnRetry)
 			}
 		})
+	}
+}
+
+// A selection is the user's new choice: what the returns to the old one counted
+// is done with at the first tick that reads it - within ReturnHold of a return
+// too, and for the server already running, selected again.
+func TestTick_ASelectionStartsTheReturnsOverAtOnce(t *testing.T) {
+	for _, choice := range []string{"another server", "the same server"} {
+		t.Run(choice, func(t *testing.T) {
+			r := newReturnRig(returnServers())
+			r.up[osloIP] = true
+			r.live[madridIP] = true
+			r.tick() // a failed return: the next waits ReturnRetry
+			r.live[osloIP] = true
+			r.f.now = r.f.now.Add(ReturnRetry)
+			r.tick() // the next attempt: Oslo works now
+			if r.w.returnFails != 1 || r.w.lastReturn.IsZero() {
+				t.Fatalf("returnFails %d, lastReturn %v; want the return waiting to hold and the count kept", r.w.returnFails, r.w.lastReturn)
+			}
+			selected := returnServers()[1]
+			if choice == "the same server" {
+				selected = returnServers()[0]
+			}
+			selectServer(r.f, selected)
+			r.running = dialIP(selected)
+			r.f.now = r.f.now.Add(ProbeInterval)
+			r.tick()
+			if r.w.returnFails != 0 || r.w.returnRetry != 0 || !r.w.returnNotBefore.IsZero() || !r.w.lastReturn.IsZero() {
+				t.Fatalf("returnFails %d, returnRetry %v, next return %v, lastReturn %v; a selection starts the returns over",
+					r.w.returnFails, r.w.returnRetry, r.w.returnNotBefore, r.w.lastReturn)
+			}
+		})
+	}
+}
+
+// A selected server that never passes a probe dies before any look: the
+// returns start over all the same, or its death would hand the count of the old
+// choice on to the new one.
+func TestTick_ASelectedServerThatNeverWorksStartsTheReturnsOver(t *testing.T) {
+	r := newReturnRig(returnServers())
+	failReturns(t, r)                     // the returns to Oslo have stopped
+	selectServer(r.f, returnServers()[0]) // the user selects Oslo, which refuses the proxy
+	r.running = osloIP
+	r.f.plat = connected("ovpnc2")
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.f.cfg.Xray.Failover == nil {
+		t.Fatal("no failover")
+	}
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+		t.Fatalf("returnFails %d, returnRetry %v; the selection started the returns over", r.w.returnFails, r.w.returnRetry)
+	}
+}
+
+// A selection the user makes while the clients are on the fallback tunnel
+// starts the returns over at the next tick, before the failover goes on: the
+// tick notes it before it acts.
+func TestTick_ASelectionDuringAFailoverStartsTheReturnsOver(t *testing.T) {
+	r := newReturnRig(returnServers())
+	failReturns(t, r)        // the returns to Oslo have stopped
+	r.live[madridIP] = false // Madrid dies: the clients go to the tunnel
+	r.f.plat = connected("ovpnc2")
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.f.cfg.Xray.Failover == nil || r.w.returnFails != ReturnFailsMax {
+		t.Fatalf("failover %+v, returnFails %d; want the clients on the tunnel and the returns stopped", r.f.cfg.Xray.Failover, r.w.returnFails)
+	}
+	selectServer(r.f, returnServers()[0]) // the user selects Oslo meanwhile
+	r.running = osloIP
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if r.f.cfg.Xray.Failover == nil {
+		t.Fatal("Oslo still refuses the proxy: the clients stay on the tunnel")
+	}
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+		t.Fatalf("returnFails %d, returnRetry %v; the selection started the returns over", r.w.returnFails, r.w.returnRetry)
 	}
 }
 
@@ -799,41 +911,81 @@ func TestTick_ADeathSoonAfterAReturnCountsTowardTheCap(t *testing.T) {
 		t.Fatalf("returnFails %d, want %d", r.w.returnFails, ReturnFailsMax)
 	}
 	// A walk puts Madrid in Oslo's place, and the clients come back to Xray.
-	vpnconfig.RecordWalkedServer(r.f.cfg, returnServers()[1])
-	r.running = madridIP
+	r.ownWrite(t, returnServers()[1])
 	r.live[madridIP] = true
-	looks := 0
-	reachable := r.w.Reachable
-	r.w.Reachable = func(ctx context.Context, ip string, port int) bool {
-		if ip == osloIP {
-			looks++
-		}
-		return reachable(ctx, ip, port)
-	}
+	looks := r.osloLooks()
 	tickFor(r.w, r.f, time.Hour)
 	if r.f.cfg.Xray.Failover != nil {
 		t.Fatal("the clients must be back on Xray")
 	}
-	if looks != 0 {
-		t.Fatalf("%d looks at Oslo; the returns have stopped", looks)
+	if *looks != 0 {
+		t.Fatalf("%d looks at Oslo; the returns have stopped", *looks)
 	}
 }
 
-// With no preferred server left - a selection clears it - what the failed
-// returns backed off to is done with.
-func TestTick_NoPreferredServerStartsTheReturnsOver(t *testing.T) {
+// The KN-4521 on 2026-10-13: every return to a flaky preferred server died
+// within minutes, and the death of the replacement in between started the count
+// over, so the returns never stopped. The count is Oslo's: Madrid's death leaves
+// it, and the next failed return waits twice as long.
+func TestTick_AReplacementsDeathKeepsTheCountOfFailedReturns(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP], r.live[osloIP] = true, true
+	r.f.plat = connected("ovpnc2")
+	r.tick()                                    // the return: Oslo runs again
+	r.up[osloIP], r.live[osloIP] = false, false // and dies again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 1 {
+		t.Fatalf("returnFails %d; Oslo's death soon after the return is a failed return", r.w.returnFails)
+	}
+	// A walk puts Madrid in Oslo's place, and the clients come back to Xray.
+	r.ownWrite(t, returnServers()[1])
+	r.live[madridIP] = true
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if r.f.cfg.Xray.Failover != nil {
+		t.Fatal("the clients must be back on Xray")
+	}
+	// Madrid dies in its turn: a death no return wrote.
+	r.live[madridIP] = false
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Madrid's death says nothing about Oslo", r.w.returnFails, r.w.returnRetry)
+	}
+	// Madrid comes back, and Oslo accepts TCP but refuses the proxy: the next
+	// return fails, and the one after it waits twice as long.
+	r.live[madridIP] = true
+	r.up[osloIP] = true
+	attempts := r.attempts()
+	for end := r.f.now.Add(time.Hour); r.attempts() == attempts && r.f.now.Before(end); r.f.now = r.f.now.Add(ProbeInterval) {
+		r.tick()
+	}
+	if r.attempts() != attempts+1 || r.w.returnFails != 2 || r.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("%d attempts, returnFails %d, returnRetry %v; want the second failed return, backed off %v",
+			r.attempts()-attempts, r.w.returnFails, r.w.returnRetry, 2*ReturnRetry)
+	}
+}
+
+// With no preferred server left - its subscription was deleted - what the
+// failed returns counted ends once Xray has held on the server it runs for
+// ReturnHold: nothing tells that server from a choice Xray got back to.
+func TestTick_NoPreferredServerEndsTheCountOnceXrayHolds(t *testing.T) {
 	r := newReturnRig(returnServers())
 	r.up[osloIP] = true
 	r.live[madridIP] = true
-	r.tick() // a failed return: the next waits ReturnRetry
-	if r.w.returnRetry != ReturnRetry {
-		t.Fatalf("returnRetry %v, want %v", r.w.returnRetry, ReturnRetry)
-	}
-	r.f.cfg.Xray.PreferredServer = nil
+	r.tick()                           // a failed return: the next waits ReturnRetry
+	r.f.cfg.Xray.PreferredServer = nil // its subscription was deleted
 	r.f.now = r.f.now.Add(ProbeInterval)
+	start := r.f.now
 	r.tick()
-	if r.w.returnRetry != 0 {
-		t.Fatalf("returnRetry %v; with no preferred server the returns start over", r.w.returnRetry)
+	if r.w.returnFails != 1 || r.w.returnRetry != ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; the count waits for Xray to hold", r.w.returnFails, r.w.returnRetry)
+	}
+	r.f.now = start.Add(ReturnHold)
+	r.tick()
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+		t.Fatalf("returnFails %d, returnRetry %v; Xray has held for %v", r.w.returnFails, r.w.returnRetry, ReturnHold)
 	}
 }
 
@@ -863,6 +1015,120 @@ func TestTick_AReturnEndsTheBackoffOnceItHasHeld(t *testing.T) {
 	r.tick()
 	if r.w.returnRetry != 0 {
 		t.Fatalf("returnRetry %v; the return held for %v", r.w.returnRetry, ReturnHold)
+	}
+}
+
+// The watch's own switch can put Xray back on the preferred server - the fast
+// path or a replacement takes it as the best server alive - while returns to it
+// have failed. That counts as a return: Oslo's death soon after is one more
+// failed return.
+func TestTick_XrayBackOnTheChoiceWithoutAReturnCountsAsOne(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.tick()                          // a failed return: the next waits ReturnRetry
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if r.f.cfg.Xray.PreferredServer != nil || r.w.returnFails != 1 {
+		t.Fatalf("preferred %+v, returnFails %d; want Oslo running and the count kept", r.f.cfg.Xray.PreferredServer, r.w.returnFails)
+	}
+	r.up[osloIP], r.live[osloIP] = false, false // Oslo dies again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 2 || r.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death soon after Xray went back to it is a failed return",
+			r.w.returnFails, r.w.returnRetry)
+	}
+}
+
+// The walk after Madrid's death takes Oslo first while returns to it have
+// failed, and Oslo dies before the next probe passes: the walk's switch is the
+// return, as the fast path's and the keeper's are, and the death one more
+// failed return.
+func TestTick_AWalkOntoTheChoiceCountsFromTheSwitch(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP], r.up[madridIP] = true, true
+	r.live[madridIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.tick() // a failed return: Xray goes back to Madrid
+	r.w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) { return returnServers(), nil }
+	r.live[madridIP], r.live[osloIP] = false, true // Madrid dies, and Oslo works again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f) // the clients move to the tunnel, the walk takes Oslo, and they come back
+	if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Oslo" || r.f.cfg.Xray.PreferredServer != nil || r.f.cfg.Xray.Failover != nil {
+		t.Fatalf("active %+v, preferred %+v, failover %+v; want the walk on Oslo and the clients back on Xray",
+			a, r.f.cfg.Xray.PreferredServer, r.f.cfg.Xray.Failover)
+	}
+	r.live[osloIP] = false // Oslo dies before the next probe passes
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 2 || r.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death right after the walk put Xray back on it is a failed return",
+			r.w.returnFails, r.w.returnRetry)
+	}
+}
+
+// Once Xray has held on the preferred server for ReturnHold, the count ends, as
+// after a return that held - stopped returns included.
+func TestTick_XrayHeldOnTheChoiceEndsTheCount(t *testing.T) {
+	r := newReturnRig(returnServers())
+	failReturns(t, r)                 // the returns to Oslo have stopped
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	r.f.now = r.f.now.Add(ProbeInterval)
+	start := r.f.now
+	r.tick()
+	r.f.now = start.Add(ReturnHold - ProbeInterval)
+	r.tick()
+	if r.w.returnFails != ReturnFailsMax {
+		t.Fatalf("returnFails %d before Oslo has held %v", r.w.returnFails, ReturnHold)
+	}
+	r.f.now = start.Add(ReturnHold)
+	r.tick()
+	if r.w.returnFails != 0 || r.w.returnRetry != 0 {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo has held %v", r.w.returnFails, r.w.returnRetry, ReturnHold)
+	}
+}
+
+// Xray back on the preferred server without a return says so once in the log,
+// so that a later "died soon after the return" refers to something there.
+func TestTick_XrayBackOnTheChoiceWithoutAReturnIsLoggedOnce(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[madridIP] = true
+	r.tick()                          // a failed return: the next waits ReturnRetry
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	log := captureLog(t)
+	tickFor(r.w, r.f, 2*ProbeInterval)
+	if n := strings.Count(log.String(), "Xray is back on the preferred server without a return"); n != 1 {
+		t.Fatalf("%d such lines in the log:\n%s\nwant one, when the watch takes Xray on Oslo for a return", n, log)
+	}
+}
+
+// Stopped returns say so once. A death of the preferred server soon after Xray
+// got back to it without a return still counts past the cap, but it stops
+// nothing that had not stopped already.
+func TestTick_StoppedReturnsAreLoggedOnce(t *testing.T) {
+	r := newReturnRig(returnServers())
+	log := captureLog(t)
+	failReturns(t, r)                 // the fourth failed return stops the returns
+	r.ownWrite(t, returnServers()[0]) // the fast path takes Oslo, alive again
+	r.live[osloIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	r.up[osloIP], r.live[osloIP] = false, false // and Oslo dies again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != ReturnFailsMax+1 {
+		t.Fatalf("returnFails %d, want %d: Oslo's death soon after Xray got back to it counts", r.w.returnFails, ReturnFailsMax+1)
+	}
+	if n := strings.Count(log.String(), "Returns to the preferred server stopped"); n != 1 {
+		t.Fatalf("%d stop lines in the log:\n%s\nwant one, when the returns stopped", n, log)
 	}
 }
 
@@ -1261,5 +1527,114 @@ func TestReturn_HealthOrderingPreservesBackoffAndChoice(t *testing.T) {
 				t.Fatalf("events %v, candidate probes %d, notes %v, want %v / %d without another attempt or notification", r.events, candidateProbes, r.f.notes, want, wantProbes)
 			}
 		})
+	}
+}
+
+// A list publication gave the monitor new endpoints, and while it checks them it
+// is OK with no evidence for the servers: the return waits for it - no TCP look,
+// no switch - and looks again at the next tick rather than ReturnCheck later.
+// Once the monitor holds Oslo alive for ReturnAlive, Xray goes back.
+func TestTick_TheReturnWaitsWhileTheMonitorRechecks(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	h := &fastHealth{cached: monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{}}, invalid: map[string]bool{}}
+	r.w.Health = h
+	looks := r.osloLooks()
+	r.tick()
+	if len(r.events) != 0 || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks at Oslo; the monitor is re-checking", r.events, *looks)
+	}
+	h.cached.Endpoints[endpoint.Key(returnServers()[0])] = aliveSince(r.f.now.Add(-time.Hour), 40)
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks; want %v at the next tick, on the monitor's evidence", r.events, *looks, want)
+	}
+}
+
+// A check that completed while the evidence was read fails its validation: the
+// monitor is OK all the same, and the return waits for the next tick.
+func TestTick_TheReturnWaitsForEvidenceThatValidates(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	key := endpoint.Key(returnServers()[0])
+	h := &fastHealth{cached: monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{
+		key: aliveSince(r.f.now.Add(-time.Hour), 40),
+	}}, invalid: map[string]bool{key: true}}
+	r.w.Health = h
+	looks := r.osloLooks()
+	r.tick()
+	if len(r.events) != 0 || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks at Oslo; the evidence did not validate", r.events, *looks)
+	}
+	delete(h.invalid, key)
+	r.f.now = r.f.now.Add(ProbeInterval)
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+		t.Fatalf("events %v, want %v at the next tick", r.events, want)
+	}
+}
+
+// Guard. Without the monitor - monitoring off, or a monitor in any state but
+// OK - the TCP look decides the return, as before.
+func TestTick_TheReturnTakesTheTCPLookWithoutTheMonitor(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		state    watchdapi.State
+		disabled bool
+	}{
+		{name: "WAN down", state: watchdapi.StateWANDown},
+		{name: "prober error", state: watchdapi.StateProberError},
+		{name: "no Xray", state: watchdapi.StateNoXray},
+		{name: "monitor stopped", state: watchdapi.StateStopped},
+		{name: "monitor disabled", state: watchdapi.StateDisabled},
+		{name: "monitor not running", state: watchdapi.StateNotRunning},
+		{name: "monitoring off in the config", state: watchdapi.StateOK, disabled: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newReturnRig(returnServers())
+			r.up[osloIP] = true
+			r.live[osloIP] = true
+			r.w.Health = &fastHealth{cached: monitor.Evidence{State: tc.state, Endpoints: map[string]watchdapi.EndpointState{}}, invalid: map[string]bool{}}
+			if tc.disabled {
+				enabled := false
+				r.f.cfg.Monitor = &vpnconfig.MonitorConfig{Enabled: &enabled}
+			}
+			r.tick()
+			if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) {
+				t.Fatalf("events %v, want %v: without the monitor the TCP look decides", r.events, want)
+			}
+		})
+	}
+}
+
+// Guard (Review Focus 5). The RT-AX86U on 2026-10-13: a list publication gave
+// Oslo a new key while the monitor already knows Madrid again. The evidence is
+// fresh and Oslo is not in it: no TCP look and no return until the monitor has
+// held Oslo's new key alive for ReturnAlive.
+func TestTick_AReKeyedPreferredServerWaitsForReturnAlive(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP] = true
+	r.live[osloIP] = true
+	h := &fastHealth{cached: monitor.Evidence{State: watchdapi.StateOK, Endpoints: map[string]watchdapi.EndpointState{
+		endpoint.Key(returnServers()[1]): aliveSince(r.f.now.Add(-time.Hour), 17),
+	}}, invalid: map[string]bool{}}
+	r.w.Health = h
+	looks := r.osloLooks()
+	start := r.f.now
+	r.tick()
+	// The monitor checks Oslo's new key at the next tick: alive from then on.
+	h.cached.Endpoints[endpoint.Key(returnServers()[0])] = aliveSince(start.Add(ProbeInterval), 40)
+	r.f.now = start.Add(ReturnCheck)
+	r.tick()
+	if len(r.events) != 0 || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks; Oslo has been alive less than %v", r.events, *looks, ReturnAlive)
+	}
+	r.f.now = start.Add(2 * ReturnCheck)
+	r.tick()
+	if want := []string{"Oslo@" + osloIP, "restart"}; !reflect.DeepEqual(r.events, want) || *looks != 0 {
+		t.Fatalf("events %v, %d TCP looks; want %v once Oslo has been alive %v", r.events, *looks, want, ReturnAlive)
 	}
 }
