@@ -577,7 +577,8 @@ func TestKeeper_AFailedFollowsCopiesAreNotTriedAgain(t *testing.T) {
 // subscription, or whose followed entry does not answer either, died. Within
 // ReturnHold of a return, on the record that return wrote, the death counts as
 // a failed return and backs the next one off. The death of a record the watch
-// wrote itself leaves the count as it was, stopped returns included.
+// wrote itself leaves the count as it was, stopped returns included. A record
+// the user selected started the returns over when the watch first read it.
 func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 	for _, kind := range []struct {
 		name    string
@@ -616,11 +617,26 @@ func TestKeeper_AnActualityReplacementSettlesTheReturns(t *testing.T) {
 						s.w.returnFails, s.w.returnRetry)
 				}
 			})
+			t.Run("a selected record", func(t *testing.T) {
+				s := newKeeperFixture(t)
+				kind.change(s)
+				// The user selected Oslo after returns to an earlier choice had stopped.
+				s.w.returnFails, s.w.returnRetry = ReturnFailsMax, ReturnRetryMax
+				s.missOnce(t)
+				s.w.Tick(context.Background())
+				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
+					t.Fatalf("written %v, want %v", got, kind.written)
+				}
+				if s.w.returnFails != 0 || s.w.returnRetry != 0 {
+					t.Fatalf("returnFails %d, returnRetry %v; the selection started the returns over", s.w.returnFails, s.w.returnRetry)
+				}
+			})
 			t.Run("a return within ReturnHold", func(t *testing.T) {
 				s := newKeeperFixture(t)
 				kind.change(s)
 				// A minute ago a return wrote the record that fails now.
 				s.w.lastReturn, s.w.returnSeq = s.f.now.Add(-time.Minute), vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer)
+				s.w.ownSeq = s.w.returnSeq
 				s.missOnce(t)
 				s.w.Tick(context.Background())
 				if got := writtenNames(s.written); !reflect.DeepEqual(got, kind.written) {
@@ -1710,10 +1726,14 @@ func TestMaybeReturn_BackToTheGroupOfAPreferredRecordWithoutOne(t *testing.T) {
 // new count, and the returns go on instead of stopping at ReturnFailsMax.
 func TestMaybeReturn_AHeldGroupReturnEndsTheBackoff(t *testing.T) {
 	s := newGroupReturnKeeper(t)
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Shadow
 	s.w.returnFails, s.w.returnRetry = ReturnFailsMax-1, ReturnRetryMax
 	s.w.Tick(context.Background()) // back on Backup, of Oslo's group
 	if got := writtenNames(s.written); !reflect.DeepEqual(got, []string{"Backup@backup.example"}) {
 		t.Fatalf("written %v", got)
+	}
+	if s.w.returnFails != ReturnFailsMax-1 {
+		t.Fatalf("returnFails %d; the count stands until the return has held", s.w.returnFails)
 	}
 	// Backup has held. The monitor has Oslo back, but its probe fails.
 	s.f.now = s.f.now.Add(ReturnHold)

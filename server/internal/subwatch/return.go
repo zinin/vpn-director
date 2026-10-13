@@ -439,6 +439,24 @@ func (w *Watch) returnAfterDeath() {
 	w.lastReturn = time.Time{}
 }
 
+// noteSelection starts the returns over at a record the watch did not write: a
+// selection in the Web UI, /xray, the wizard or configure.sh - the same server
+// selected again too, since every write moves the counter - or the record a
+// previous process left, which the restart has started over anyway. What the
+// returns counted is the old choice's, and the user's new choice starts with
+// none: a selected server that never passes a probe would otherwise hand the
+// old count on at its death. Once per record (selectedSeq), at the first tick
+// that reads it, before the tick acts.
+func (w *Watch) noteSelection(cfg *vpnconfig.VPNDirectorConfig) {
+	seq := vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
+	if seq == w.ownSeq || seq == w.selectedSeq {
+		return
+	}
+	w.selectedSeq = seq
+	w.returnFails, w.returnRetry = 0, 0
+	w.returnNotBefore, w.lastReturn = time.Time{}, time.Time{}
+}
+
 // backOffReturn holds the next attempt back after a return that failed:
 // ReturnRetry, then twice the last wait, ReturnRetryMax at most. After
 // ReturnFailsMax failures in a row there is no next attempt: the returns stop,
