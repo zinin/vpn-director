@@ -1223,6 +1223,7 @@ func (w *Watch) walk(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig, subs
 		if w.walkEnded(w.walkOwnsNow(started, lastRecorded, lastSeq)) {
 			return
 		}
+		w.landedOnChoice(nil, lastSeq)
 		// Only a committed failover left Xray. Staged clients never left, so
 		// "back on Xray" would be a false message. The restore does not look
 		// at the subscription (spec 5.4): the server runs and answers.

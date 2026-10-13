@@ -28,7 +28,7 @@ const (
 	// count as held: a death that starts within it counts as a failed return,
 	// and only a held return ends the backoff. A switch of the watch's own that
 	// puts Xray back on the preferred server while returns to it have failed
-	// counts as a return here (maybeReturn).
+	// counts as a return here (landedOnChoice).
 	ReturnHold = 30 * time.Minute
 	// ReturnFailsMax is how many returns in a row may fail - a death within
 	// ReturnHold of one included - before the watch stops trying. An address
@@ -57,7 +57,7 @@ const (
 // After ReturnFailsMax failed attempts in a row the returns stop; a return of
 // either kind that has held for ReturnHold ends that count and its wait. Xray
 // back on the user's choice by a switch of the watch's own counts as a return
-// while failed returns are counted.
+// while failed returns are counted (landedOnChoice).
 func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfig) {
 	if w.mutationEnded(ctx) {
 		return
@@ -72,17 +72,15 @@ func (w *Watch) maybeReturn(ctx context.Context, cfg *vpnconfig.VPNDirectorConfi
 	}
 	if cfg == nil || cfg.Xray.PreferredServer == nil {
 		// Xray runs the user's choice, or nothing is left to return to. A switch
-		// of the watch's own - the fast path, a replacement, the walk - can put
-		// Xray back on the choice while returns to it have failed: that counts
-		// as a return, and the log says so, so a choice that dies again soon
-		// after is one more failed return, and one that holds for ReturnHold ends
-		// the count above. A selection gets here with the count ended
-		// (noteSelection), and with no count there is nothing to hold.
-		if w.lastReturn.IsZero() && w.returnFails > 0 && cfg != nil && cfg.Xray.ActiveServer != nil {
-			w.lastReturn = w.Now()
-			w.returnSeq = vpnconfig.ActiveSeq(cfg.Xray.ActiveServer)
-			w.returnGroup = ""
-			slog.Info("Xray is back on the preferred server without a return; counted as a return until it has held", "server", cfg.Xray.ActiveServer.Name, "failed", w.returnFails, "hold", ReturnHold)
+		// of the watch's own that put Xray back on the choice while returns to it
+		// have failed counted as a return once its probe passed
+		// (landedOnChoice). A write of its own without a probe - the walk's way
+		// back to the preferred server when it finds nothing live - counts from
+		// here, the first look that finds Xray working there. A selection gets
+		// here with the count ended (noteSelection), and with no count there is
+		// nothing to hold.
+		if cfg != nil {
+			w.landedOnChoice(cfg, vpnconfig.ActiveSeq(cfg.Xray.ActiveServer))
 		}
 		return
 	}
@@ -461,6 +459,35 @@ func (w *Watch) returnAfterDeath() {
 	w.lastReturn = time.Time{}
 }
 
+// landedOnChoice takes a switch of the watch's own that put Xray back on the
+// user's choice - the fast path's, a replacement's, the walk's, once its probe
+// passed - for a return while returns to the choice have failed, from the
+// switch itself: a choice that dies again before the next probe passes is one
+// more failed return, as the death of a return is (returnAfterDeath), and one
+// that holds for ReturnHold ends the count (maybeReturn). The next look comes
+// only after a probe that passed, and a choice that died before then would
+// count for nothing. seq is the counter the switch's record moved to, and
+// cfg the config after the switch, or nil to read it - read only while there
+// is a count to keep. Xray is on the choice while that record is active_server
+// and preferred_server is gone: RecordWalkedServer clears it there. A return
+// already counting is left as it is.
+func (w *Watch) landedOnChoice(cfg *vpnconfig.VPNDirectorConfig, seq int) {
+	if !w.lastReturn.IsZero() || w.returnFails == 0 {
+		return
+	}
+	if cfg == nil && w.LoadVPN != nil {
+		if read, err := w.LoadVPN(); err == nil {
+			cfg = read
+		}
+	}
+	if cfg == nil || cfg.Xray.PreferredServer != nil || cfg.Xray.ActiveServer == nil ||
+		vpnconfig.ActiveSeq(cfg.Xray.ActiveServer) != seq {
+		return
+	}
+	w.lastReturn, w.returnSeq, w.returnGroup = w.Now(), seq, ""
+	slog.Info("Xray is back on the preferred server without a return; counted as a return until it has held", "server", cfg.Xray.ActiveServer.Name, "failed", w.returnFails, "hold", ReturnHold)
+}
+
 // noteSelection starts the returns over at a record the watch did not write: a
 // selection in the Web UI, /xray, the wizard or configure.sh - the same server
 // selected again too, since every write moves the counter - or the record a
@@ -484,7 +511,7 @@ func (w *Watch) noteSelection(cfg *vpnconfig.VPNDirectorConfig) {
 // ReturnFailsMax failures in a row there is no next attempt: the returns stop,
 // to the preferred server and to its group alike, and the log says so once. A
 // death of the preferred server soon after Xray got back to it without a
-// return still counts past the cap (maybeReturn), but it stops nothing new.
+// return still counts past the cap (landedOnChoice), but it stops nothing new.
 // group is the preferred group when the return that failed went to a server of
 // it, and the log names it.
 func (w *Watch) backOffReturn(group string) {

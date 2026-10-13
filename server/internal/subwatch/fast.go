@@ -542,6 +542,7 @@ func (w *Watch) fastFailover(ctx context.Context, cfg *vpnconfig.VPNDirectorConf
 		picked := copyFastServer(c.server)
 		w.lastPicked = &picked
 		w.settled()
+		w.landedOnChoice(current, seq)
 		w.lastRouteKind, w.lastImportKind = noteNone, noteNone
 		w.setStatusConfig(current)
 		w.notify(noteRestored, fmt.Sprintf("Xray switched to server %s", label(subscriptionNames(subs), c.server.Subscription, c.server.Name)))

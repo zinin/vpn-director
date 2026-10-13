@@ -1044,6 +1044,33 @@ func TestTick_XrayBackOnTheChoiceWithoutAReturnCountsAsOne(t *testing.T) {
 	}
 }
 
+// The walk after Madrid's death takes Oslo first while returns to it have
+// failed, and Oslo dies before the next probe passes: the walk's switch is the
+// return, as the fast path's and the keeper's are, and the death one more
+// failed return.
+func TestTick_AWalkOntoTheChoiceCountsFromTheSwitch(t *testing.T) {
+	r := newReturnRig(returnServers())
+	r.up[osloIP], r.up[madridIP] = true, true
+	r.live[madridIP] = true
+	r.f.plat = connected("ovpnc2")
+	r.tick() // a failed return: Xray goes back to Madrid
+	r.w.Fetch = func(context.Context, string) ([]vpnconfig.Server, error) { return returnServers(), nil }
+	r.live[madridIP], r.live[osloIP] = false, true // Madrid dies, and Oslo works again
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f) // the clients move to the tunnel, the walk takes Oslo, and they come back
+	if a := r.f.cfg.Xray.ActiveServer; a == nil || a.Name != "Oslo" || r.f.cfg.Xray.PreferredServer != nil || r.f.cfg.Xray.Failover != nil {
+		t.Fatalf("active %+v, preferred %+v, failover %+v; want the walk on Oslo and the clients back on Xray",
+			a, r.f.cfg.Xray.PreferredServer, r.f.cfg.Xray.Failover)
+	}
+	r.live[osloIP] = false // Oslo dies before the next probe passes
+	r.f.now = r.f.now.Add(ProbeInterval)
+	tickUntilDead(r.w, r.f)
+	if r.w.returnFails != 2 || r.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death right after the walk put Xray back on it is a failed return",
+			r.w.returnFails, r.w.returnRetry)
+	}
+}
+
 // Once Xray has held on the preferred server for ReturnHold, the count ends, as
 // after a return that held - stopped returns included.
 func TestTick_XrayHeldOnTheChoiceEndsTheCount(t *testing.T) {

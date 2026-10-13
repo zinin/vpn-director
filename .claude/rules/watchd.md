@@ -368,12 +368,15 @@ return, on the record that return wrote, counts against it (`returnAfterDeath`);
 other record - a replacement's, the fast path's, the walk's, a follow's - leaves the count, the
 backoff and the wait as they are. The fast path, a replacement or the walk can put Xray back on
 the user's choice itself, since they rank its group and subscription first: with failed returns
-counted, the first look that finds Xray there takes that for a return, and an INFO line says so; a
-death within `ReturnHold` is one more failed return, and a hold ends the count. A selection starts
-the returns over at the first tick that reads it (`noteSelection`: a record the watch did not
-write, told by `active_server.seq` against `ownSeq` as `missed` tells it), and so does a watchd
-restart. Returns stopped at `ReturnFailsMax` stay stopped until then, or until Xray has held on
-the choice for `ReturnHold`; the log says so once, when they stop.
+counted, such a switch counts as a return from the moment its probe passes (`landedOnChoice`), and
+an INFO line says so; a death within `ReturnHold`, one before the next probe included, is one more
+failed return, and a hold ends the count. A write of the watch's own without a probe - the walk's
+way back to the preferred server when it finds nothing live - counts from the first look that
+finds Xray working there. A selection starts the returns over at the first tick that reads it
+(`noteSelection`: a record the watch did not write, told by `active_server.seq` against `ownSeq`
+as `missed` tells it), and so does a watchd restart. Returns stopped at `ReturnFailsMax` stay
+stopped until then, or until Xray has held on the choice for `ReturnHold`; the log says so once,
+when they stop.
 
 Each of these switches sends one message, past `notify`'s one-per-kind deduplication:
 `Xray server <s> moved; Xray follows it`, `… changed; Xray follows it`,

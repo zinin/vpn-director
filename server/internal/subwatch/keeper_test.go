@@ -1810,7 +1810,7 @@ func TestKeeper_AFastSwitchBackToTheChoiceCountsAsAReturn(t *testing.T) {
 		t.Fatalf("written %v, preferred %+v; want the fast path on Oslo", got, s.f.cfg.Xray.PreferredServer)
 	}
 	s.f.now = s.f.now.Add(ProbeInterval)
-	s.w.Tick(context.Background()) // Oslo works: the first look takes it for a return
+	s.w.Tick(context.Background()) // Oslo works: the switch was taken for a return
 	if s.w.lastReturn.IsZero() || s.w.returnFails != 1 {
 		t.Fatalf("lastReturn %v, returnFails %d; Xray back on the choice counts as a return", s.w.lastReturn, s.w.returnFails)
 	}
@@ -1822,5 +1822,96 @@ func TestKeeper_AFastSwitchBackToTheChoiceCountsAsAReturn(t *testing.T) {
 	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
 		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death soon after Xray got back to it is a failed return",
 			s.w.returnFails, s.w.returnRetry)
+	}
+}
+
+// newLandingKeeper is the return keeper after a failed return to Oslo, the
+// user's choice: Xray runs Backup, which the watch put there, the monitor holds
+// Backup dead and Oslo alive, and the probe fails on whichever server Xray was
+// last switched to while die names it - Backup, to begin with.
+func newLandingKeeper(t *testing.T) (s *fastFixture, die func(names ...string)) {
+	t.Helper()
+	s = newReturnKeeper(t) // Xray on Backup, Oslo preferred
+	oslo, backup := s.f.subs[0].Servers[0], s.f.subs[0].Servers[1]
+	s.w.ownSeq = vpnconfig.ActiveSeq(s.f.cfg.Xray.ActiveServer) // the watch put Xray on Backup
+	s.w.returnFails, s.w.returnRetry = 1, ReturnRetry
+	dead := map[string]bool{"Backup": true}
+	s.w.Probe = func(context.Context, int) error {
+		s.probes++
+		running := "Backup"
+		if len(s.written) > 0 {
+			running = s.written[len(s.written)-1].Name
+		}
+		if dead[running] {
+			return errProbe
+		}
+		return nil
+	}
+	s.setHealthOf([]vpnconfig.Server{backup}, []vpnconfig.Server{oslo})
+	return s, func(names ...string) {
+		dead = map[string]bool{}
+		for _, name := range names {
+			dead[name] = true
+		}
+	}
+}
+
+// The fast path puts Xray back on Oslo while returns to it have failed, and
+// Oslo dies before the next probe passes. The switch is the return: no look
+// comes before that death - a look follows a probe that passed - and the death
+// would count for nothing.
+func TestKeeper_AFastSwitchBackToTheChoiceCountsFromTheSwitch(t *testing.T) {
+	s, die := newLandingKeeper(t)
+	s.w.Tick(context.Background()) // Backup's probe fails; the fast path switches to Oslo
+	if got := writtenNames(s.written); len(got) == 0 || got[len(got)-1] != "Oslo@oslo.example" || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v; want the fast path on Oslo", got, s.f.cfg.Xray.PreferredServer)
+	}
+	// Oslo dies before the next probe; the keeper confirms it the legacy way.
+	die("Oslo")
+	s.w.Health = nil
+	s.f.now = s.f.now.Add(ProbeInterval)
+	tickUntilDead(s.w, s.f)
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death right after the fast path put Xray back on it is a failed return",
+			s.w.returnFails, s.w.returnRetry)
+	}
+}
+
+// The KN-4521's own path: the keeper's legacy replacement of a dead Backup
+// takes Oslo, its first candidate, while returns to Oslo have failed, and Oslo
+// dies before the next probe passes. As after the fast path, the switch is the
+// return and the death one more failed return.
+func TestKeeper_AReplacementOntoTheChoiceCountsFromTheSwitch(t *testing.T) {
+	s, die := newLandingKeeper(t)
+	s.w.Health = nil        // the legacy confirmation, then the replacement
+	tickUntilDead(s.w, s.f) // Backup dies; the replacement takes Oslo
+	if got := writtenNames(s.written); len(got) == 0 || got[len(got)-1] != "Oslo@oslo.example" || s.f.cfg.Xray.PreferredServer != nil {
+		t.Fatalf("written %v, preferred %+v; want the replacement on Oslo", got, s.f.cfg.Xray.PreferredServer)
+	}
+	die("Oslo")
+	s.f.now = s.f.now.Add(ProbeInterval)
+	tickUntilDead(s.w, s.f)
+	if s.w.returnFails != 2 || s.w.returnRetry != 2*ReturnRetry {
+		t.Fatalf("returnFails %d, returnRetry %v; Oslo's death right after the replacement put Xray back on it is a failed return",
+			s.w.returnFails, s.w.returnRetry)
+	}
+}
+
+// The replacement tries Oslo first, and Oslo fails the switch's probe: Xray
+// lands on Third, and nothing is taken for a return. Third holding for
+// ReturnHold says nothing about Oslo and leaves the count of failed returns
+// to it.
+func TestKeeper_AReplacementPastTheChoiceIsNoReturn(t *testing.T) {
+	s, die := newLandingKeeper(t)
+	s.f.subs[0].Servers = append(s.f.subs[0].Servers, fastServer("Third", "third.example", "198.51.100.30"))
+	s.w.Health = nil // the legacy confirmation, then the replacement; no look finds Oslo back
+	die("Backup", "Oslo")
+	tickUntilDead(s.w, s.f) // Backup dies; the replacement tries Oslo, then Third
+	if got := writtenNames(s.written); len(got) < 2 || got[0] != "Oslo@oslo.example" || got[len(got)-1] != "Third@third.example" {
+		t.Fatalf("written %v; want the replacement past Oslo onto Third", got)
+	}
+	tickFor(s.w, s.f, ReturnHold+ProbeInterval)
+	if s.w.returnFails != 1 {
+		t.Fatalf("returnFails %d after Third held %v; Xray on Third is no return to Oslo", s.w.returnFails, ReturnHold)
 	}
 }
