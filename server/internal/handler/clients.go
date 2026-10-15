@@ -654,9 +654,12 @@ func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, conf
 // listed as down has no route in its table, and Tunnel Director refuses what
 // the client would send through it until it is up (the block rule after the
 // tunnel's lookup rule). A configured tunnel the platform does not list -
-// "(unknown)": a typo, a connection deleted in the router, RCI silent - refuses
-// its clients the same way until it is listed. Excluded destinations go direct
-// either way. main is Tunnel Director's own route, which no platform lists.
+// "(unknown)": a typo, a connection deleted in the router - refuses its clients
+// the same way until it is listed. While RCI is silent every KeeneticOS tunnel
+// reads as unknown, and one whose route the platform still installs by its
+// naming convention (WireguardN) keeps routing its clients; the question cannot
+// tell that case apart. Excluded destinations go direct either way. main is
+// Tunnel Director's own route, which no platform lists.
 func moveQuestion(info vpnconfig.PlatformInfo, route, ip string) string {
 	if route == "main" {
 		return ""

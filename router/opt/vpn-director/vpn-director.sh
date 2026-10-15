@@ -470,7 +470,9 @@ cmd_update() {
 # Called after every tunnel_apply. With an interface tunnel applied (lib/iftunnel.sh's record) and
 # no marker, it schedules "ensure-routes" every minute and leaves the marker; with none and the
 # marker, it drops both. The marker lives in /tmp, as Merlin's cru jobs do, so the first apply
-# after a reboot schedules the job again, and an upgrade gets it with its first apply. A cron
+# after a reboot schedules the job again, and an upgrade gets it with its first apply. KeeneticOS's
+# cron.d job survives a reboot and the marker does not, so there an apply without interface tunnels
+# after a reboot leaves the job in place: it exits quietly every minute until "cron remove". A cron
 # that refuses the job costs a WARN and no marker - the next apply tries again - never the apply.
 ###################################################################################################
 _routes_cron_sync() {

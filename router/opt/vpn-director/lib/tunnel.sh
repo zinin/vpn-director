@@ -571,9 +571,11 @@ _tunnel_emit_client() {
     local excl excl_set
     while IFS= read -r excl; do
         [[ -n $excl ]] || continue
-        # An address or a CIDR returns its destination as it stands, anything
-        # else names a set. is_ipv4_net is iptables' own reading - no leading
-        # zeros - so "203.0.113.010" falls through to the set lookup and its WARN.
+        # An address or a CIDR returns its destination as it stands, an IPv6
+        # entry is skipped, and anything else names a set. iptables reads a
+        # leading zero as octal ("010" is 8); is_ipv4_net takes only what
+        # iptables reads as written, so "203.0.113.010" falls through to the set
+        # lookup and its WARN.
         if is_ipv4_net "$excl"; then
             if ! ensure_fw_rule -q mangle "$chain" -s "$client" -d "$excl" -j RETURN; then
                 warnings=1
@@ -867,7 +869,8 @@ _tunnel_tables_write() {
 # -------------------------------------------------------------------------------------------------
 # tunnel_status - show tunnel director status
 # -------------------------------------------------------------------------------------------------
-# Displays TUN_DIR chain rules, ip rules, and configured tunnels.
+# Displays TUN_DIR chain rules, ip rules, and configured tunnels, then the interface tunnels the
+# last apply recorded: each one's table, route, and NAT and MSS rules (iftunnel_status).
 # -------------------------------------------------------------------------------------------------
 tunnel_status() {
     _tunnel_init
@@ -975,8 +978,11 @@ tunnel_clients() {
 # tunnel_stop - remove chain, ip rules and tunnel tables
 # -------------------------------------------------------------------------------------------------
 # Removes TUN_DIR chain, all associated ip rules and the tunnel tables this
-# module owns. Where the firmware owns them, the platform may only clear a
-# default route Tunnel Director left in a table it no longer uses.
+# module owns. An interface tunnel loses its route and its NAT and MSS rules
+# too (vpd_tunnel_table_release), and the record ensure-routes reads
+# (IFTUNNEL_STATE_FILE) goes. Where the firmware owns the tables, the platform
+# may only clear a default route Tunnel Director left in a table it no longer
+# uses.
 # -------------------------------------------------------------------------------------------------
 tunnel_stop() {
     _tunnel_init
@@ -1044,17 +1050,20 @@ tunnel_stop() {
 # TUN_DIR_FORCE_REBUILD=1 rebuilds even when the state reads up to date ("restart").
 #
 # A failure that ends the apply - rc 1 before any rule is touched (a tunnels value that is no
-# object, no LAN interface, no PREROUTING position), or errexit - ends vpn-director.sh before its
-# prune. A refused rule, a swap that did not take over every interface, a tunnel the platform does
-# not list cost their clients and return 0, and TUNNEL_UNCARRIED names those clients: the ones the
-# live TUN_DIR may not mark or route when this returns. On a rebuild, the clients of a tunnel that
-# got no slot, of a slot whose route or ip rule is not in place, every client _tunnel_emit_client
-# did not carry, and every client when the swap did not take over every interface; on the
-# up-to-date path, the clients of a slot whose route or rule did not go back in, every client when
-# a jump did not, and the clients outside RFC1918, which no path marks. The failover clients count
-# as clients of their tunnel. A client of main is never reported: main is no tunnel, and a client
-# of it that TUN_DIR does not mark still goes direct (_tunnel_not_carried_on). A full apply keeps
-# those of them Xray still has in XRAY_CLIENTS (tproxy_prune).
+# object, a pref_base and mark field whose block rules would reach main's rule at 32766, no LAN
+# interface, no PREROUTING position), or errexit - ends vpn-director.sh before its prune. A refused
+# rule, a swap that did not take over every interface, a tunnel the platform does not list cost
+# their clients and return 0, and TUNNEL_UNCARRIED names those clients: the ones the live TUN_DIR
+# may not mark or route when this returns. On a rebuild, the clients of a tunnel the platform does
+# not list - it keeps a slot, and its clients are reported even when its route went in - and of one
+# the mark field has no room for, of a slot whose route or ip rule is not in place, every client
+# _tunnel_emit_client did not carry, and every client when the swap did not take over every
+# interface; on the up-to-date path, the clients of a slot whose route or rule did not go back in,
+# every client when a jump did not, and the clients outside RFC1918, which no path marks. The
+# failover clients count as clients of their tunnel. A client of main is never reported: main is
+# no tunnel, and a client of it that TUN_DIR does not mark still goes direct
+# (_tunnel_not_carried_on). A full apply keeps those of them Xray still has in XRAY_CLIENTS
+# (tproxy_prune).
 # -------------------------------------------------------------------------------------------------
 tunnel_apply() {
     # Before anything else: a run never hands on what an earlier one reported.

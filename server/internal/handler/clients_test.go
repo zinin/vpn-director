@@ -926,8 +926,10 @@ func TestClientsHandler_HandleAddRoute_RefusesATunnelForAnAddressTunnelDirectorC
 }
 
 // A configured tunnel the platform does not list - "(unknown)" on the keyboard:
-// a typo, a connection deleted in the router, RCI silent - refuses its clients
-// until it is listed. The move asks first, as for a tunnel that is down.
+// a typo, a connection deleted in the router - refuses its clients until it is
+// listed; while RCI is silent, one whose route the platform still installs by
+// its naming convention (KeeneticOS's WireguardN) keeps routing them. The move
+// asks first, as for a tunnel that is down.
 func TestClientsHandler_MoveToAnUnknownTunnelAsksFirst(t *testing.T) {
 	sender := &mockSenderClients{}
 	config := &mockConfigClients{vpnConfig: moveCfg()}
