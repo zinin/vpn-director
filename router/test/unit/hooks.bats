@@ -179,6 +179,30 @@ setup_merlin_hook_env() {
     [ ! -e "$BATS_TEST_TMPDIR/apply.log" ]
 }
 
+# The firmware rebuilds nat on its own - a WAN coming up, a port forward
+# changed - and the rebuild takes the MASQUERADE of every interface tunnel.
+@test "nat-start: re-applies, queued behind a running apply" {
+    setup_merlin_hook_env
+    run_hook "$MERLIN_HOOKS/nat-start"
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output "--wait apply"
+}
+
+@test "nat-start: is POSIX sh and executable in the tree" {
+    [ -x "$MERLIN_HOOKS/nat-start" ]
+    head -n1 "$MERLIN_HOOKS/nat-start" | grep -qx '#!/bin/sh'
+    sh -n "$MERLIN_HOOKS/nat-start"
+}
+
+# install.sh and the updater ship what files.manifest lists, by tag. KeeneticOS
+# runs no nat-start: its netfilter.d hook already applies after a rebuild of nat.
+@test "nat-start: ships to Asuswrt-Merlin only" {
+    run awk '$2 == "router/jffs/scripts/nat-start" { print $1 }' "$PROJECT_ROOT/files.manifest"
+    assert_success
+    assert_output "merlin"
+}
+
 # ------------------------------------------------------------------- common
 
 @test "hooks: exit 0 and log when the CLI is not installed" {

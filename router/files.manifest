@@ -35,6 +35,7 @@ common   router/opt/etc/init.d/S98vpn-director-webui
 common   router/opt/etc/init.d/S98vpn-director-watchd
 merlin   router/jffs/scripts/firewall-start
 merlin   router/jffs/scripts/wan-event
+merlin   router/jffs/scripts/nat-start
 keenetic router/opt/etc/ndm/netfilter.d/50-vpn-director.sh
 keenetic router/opt/etc/ndm/wan.d/50-vpn-director.sh
 keenetic router/opt/etc/ndm/iflayerchanged.d/50-vpn-director.sh

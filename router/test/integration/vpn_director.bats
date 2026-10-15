@@ -734,6 +734,149 @@ run_stubbed_cli() {
     assert_output --partial "cron install|remove"
 }
 
+@test "vpn-director: help lists ensure-routes" {
+    run "$SCRIPTS_DIR/vpn-director.sh" --help
+    assert_output --partial "ensure-routes"
+}
+
+# ============================================================================
+# ensure-routes: the route an interface tunnel lost comes back within a minute
+# ============================================================================
+
+# run_ensure_routes - cmd_ensure_routes with cmd_apply noting what it was asked
+# for; the record of the applied interface tunnels, the links and the routes are
+# the test's.
+run_ensure_routes() {
+    export VPD_STOPPED_FILE="${VPD_STOPPED_FILE:-$BATS_TEST_TMPDIR/stopped}"
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    run bash -c '
+        script=$1 calls=$2
+        shift 2
+        source "$script" --source-only "$@"
+        cmd_apply() { echo "cmd_apply COMPONENT=$COMPONENT UNLESS_STOPPED=$UNLESS_STOPPED" >> "$calls"; }
+        cmd_ensure_routes
+    ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" ensure-routes
+}
+
+@test "vpn-director: ensure-routes is quiet when no interface tunnel is applied" {
+    run_ensure_routes
+    assert_success
+    refute_output
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+@test "vpn-director: ensure-routes applies Tunnel Director when an interface is UP without its route" {
+    printf 'awg1 2001\n' > "$BATS_TEST_TMPDIR/iftunnels"
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    run_ensure_routes
+    assert_success
+    assert_output --partial "Interface tunnel back without its route: awg1; applying Tunnel Director"
+    run cat "$BATS_TEST_TMPDIR/calls"
+    assert_output "cmd_apply COMPONENT=tunnel UNLESS_STOPPED=1"
+}
+
+@test "vpn-director: ensure-routes leaves a route that is in place alone" {
+    printf 'awg1 2001\n' > "$BATS_TEST_TMPDIR/iftunnels"
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    ip route replace default dev awg1 table 2001
+    run_ensure_routes
+    assert_success
+    refute_output
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# Review Focus 4: S51awg1 sets the interface UP last, and a route through it is
+# refused until then; the next minute finds it UP.
+@test "vpn-director: ensure-routes waits for an interface that is not UP yet" {
+    printf 'awg1 2001\n' > "$BATS_TEST_TMPDIR/iftunnels"
+    ip_links "awg1 <POINTOPOINT,NOARP> 1280"
+    run_ensure_routes
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+@test "vpn-director: ensure-routes does nothing once stop has run" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf '1\n' > "$VPD_STOPPED_FILE"
+    printf 'awg1 2001\n' > "$BATS_TEST_TMPDIR/iftunnels"
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    run_ensure_routes
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/calls" ]
+}
+
+# An apply that holds the lock does the same work, so ensure-routes does not
+# queue behind it. The test holds the CLI's lock on FD 201.
+@test "vpn-director: ensure-routes leaves the work to an apply that holds the lock" {
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    exec 201>"/var/lock/vpn-director.lock"
+    flock -n 201
+    run "$SCRIPTS_DIR/vpn-director.sh" ensure-routes
+    flock -u 201
+    assert_success
+    assert_output --partial "Another instance is already running"
+}
+
+# ============================================================================
+# The cron job of ensure-routes follows the interface tunnels
+# ============================================================================
+
+@test "vpn-director: an apply with an interface tunnel schedules ensure-routes every minute, once" {
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    export IFTUNNEL_CRON_MARKER="$BATS_TEST_TMPDIR/routes_cron"
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    : > /tmp/bats_cru_calls.log
+    run_stubbed_cli apply
+    assert_success
+    local vpd_dir
+    vpd_dir="$(cd "$SCRIPTS_DIR" && pwd)"
+    grep -qF "cru a vpn_director_routes * * * * * $vpd_dir/vpn-director.sh ensure-routes" /tmp/bats_cru_calls.log
+    [ -e "$IFTUNNEL_CRON_MARKER" ]
+
+    : > /tmp/bats_cru_calls.log
+    run_stubbed_cli apply tunnel
+    assert_success
+    refute grep -q 'vpn_director_routes' /tmp/bats_cru_calls.log
+}
+
+@test "vpn-director: an apply with no interface tunnel left drops the route check" {
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    export IFTUNNEL_CRON_MARKER="$BATS_TEST_TMPDIR/routes_cron"
+    : > "$IFTUNNEL_CRON_MARKER"
+    : > /tmp/bats_cru_calls.log
+    run_stubbed_cli update
+    assert_success
+    grep -qF "cru d vpn_director_routes" /tmp/bats_cru_calls.log
+    [ ! -e "$IFTUNNEL_CRON_MARKER" ]
+}
+
+@test "vpn-director: a cron that refuses the route check costs a WARN, not the apply" {
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    export IFTUNNEL_CRON_MARKER="$BATS_TEST_TMPDIR/routes_cron"
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    printf '#!/bin/bash\nexit 1\n' > "$BATS_TEST_TMPDIR/bin/cru"
+    chmod +x "$BATS_TEST_TMPDIR/bin/cru"
+    PATH="$BATS_TEST_TMPDIR/bin:$PATH" run_stubbed_cli apply
+    assert_success
+    assert_output --partial "Could not schedule the route check of the interface tunnels"
+    [ ! -e "$IFTUNNEL_CRON_MARKER" ]
+}
+
+@test "vpn-director: cron remove drops the route check with the daily update" {
+    export IFTUNNEL_CRON_MARKER="$BATS_TEST_TMPDIR/routes_cron"
+    : > "$IFTUNNEL_CRON_MARKER"
+    : > /tmp/bats_cru_calls.log
+    run "$SCRIPTS_DIR/vpn-director.sh" cron remove
+    assert_success
+    grep -qF "cru d vpn_director_routes" /tmp/bats_cru_calls.log
+    grep -qF "cru d vpn_director_update" /tmp/bats_cru_calls.log
+    [ ! -e "$IFTUNNEL_CRON_MARKER" ]
+}
+
 # A restart stops nothing: every apply swaps its chains and sets in whole, where
 # a stop took the routing away until the apply put it back.
 @test "vpn-director: restart rebuilds in place and stops nothing" {
