@@ -129,7 +129,9 @@ shutdown, durable notification and recovery contracts.
   `awg1` an Entware script brings up): Tunnel Director gives it table 2000+idx, its route, NAT
   and MSS (`lib/iftunnel.sh`); `ensure-routes` puts a route its re-creation took back
 - A tunnel whose table holds no route refuses its clients' traffic (a `prohibit` rule per slot
-  after the lookup range); one the platform does not list keeps a slot that refuses its clients
+  after the lookup range); one the platform does not list keeps a slot whose block rule refuses
+  its clients while its table has no route (KeeneticOS keeps routing `WireguardN` while RCI is
+  silent)
 - `exclude` takes IPv4 addresses and CIDRs beside country codes
 - Optional `gateway` is the OpenVPN next hop; ignored on WireGuard. On Merlin it
   is also what fills ovpncN when the server does not push redirect-gateway.

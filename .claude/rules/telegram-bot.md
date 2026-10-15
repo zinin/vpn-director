@@ -170,7 +170,8 @@ current route; « Back (`clients:rm_no`). A route button (`clients:to:<route>:<i
 `vpnconfig.MoveClient` under the config lock and one `Apply`, and the message shows the list again.
 A tap on the route the client is on alone moves nothing and asks nothing: the list comes back. A
 tunnel that is down asks first — "Move anyway" (`clients:toyes:<route>:<ip>`) or Cancel — and so
-does an "(unknown)" one, which refuses its clients until the platform lists it: "`<route>` is not
+does an "(unknown)" one, which refuses its clients until the platform lists it, unless the platform
+still routes it (KeeneticOS keeps routing a `WireguardN` while RCI is silent): "`<route>` is not
 on the router's tunnel list: until it is, Tunnel Director blocks the traffic `<ip>` would send
 through it (excluded destinations still go direct). Move anyway?"; the question for a tunnel that
 is down says the same with "is down: until it is up". A Tunnel Director route (any but xray) is

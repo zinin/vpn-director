@@ -10,7 +10,7 @@ Module location: `lib/tunnel.sh`
 
 ## Overview
 
-Routes LAN client traffic through VPN tunnels. All traffic goes through the tunnel except destinations in exclude lists (country ipsets).
+Routes LAN client traffic through VPN tunnels. All traffic goes through the tunnel except destinations in exclude lists (country ipsets, IPv4 addresses and CIDRs).
 
 ## Configuration Format
 
@@ -44,7 +44,7 @@ Routes LAN client traffic through VPN tunnels. All traffic goes through the tunn
 | Field | Description |
 |-------|-------------|
 | `interfaces` | Linux interfaces Tunnel Director may route through beside the firmware's tunnels; a tunnel key equal to one of them is an interface tunnel (see "Interface tunnels") |
-| Tunnel key | A tunnel id `platform_tunnels` lists (Merlin: `wgcN` from `/etc/iproute2/rt_tables`, and `ovpncN` while its OpenVPN client is in "VPN Director (policy rules)" mode, plus `main`; Keenetic: `OpenVPNN`, `WireguardN` from RCI, plus `main`); see "Which tunnels the platform lists" |
+| Tunnel key | A tunnel id `platform_tunnels` lists (Merlin: `wgcN` from `/etc/iproute2/rt_tables`, and `ovpncN` while its OpenVPN client is in "VPN Director (policy rules)" mode, plus `main`; Keenetic: `OpenVPNN`, `WireguardN` from RCI, plus `main`), or a kept name of `interfaces`; see "Which tunnels the platform lists" and "Interface tunnels" |
 | `clients` | Array of LAN IPs/CIDRs (RFC1918 only) |
 | `exclude` | Array of country codes, IPv4 addresses and CIDRs; a client's traffic to them goes direct |
 | `gateway` | Optional. OpenVPN next hop; ignored on WireGuard. On Merlin it fills ovpncN when the server does not push redirect-gateway |
@@ -58,7 +58,8 @@ Routes LAN client traffic through VPN tunnels. All traffic goes through the tunn
 
 ## Which tunnels the platform lists
 
-`platform_tunnels` lists the tunnels Tunnel Director may route through. On Merlin that is every
+`platform_tunnels` lists the firmware's tunnels Tunnel Director may route through; `vpd_tunnels`
+adds the interface tunnels (see "Interface tunnels"). On Merlin the platform's list is every
 `wgcN` in `rt_tables`, and an `ovpncN` only while its OpenVPN client's "Redirect Internet traffic
 through tunnel" (nvram `vpn_clientN_rgw`) is "VPN Director (policy rules)" (`2`). In "No" (`0`, or
 unset: the firmware reads an empty value as 0) and "Yes (all)" (`1`) the firmware adds
@@ -98,10 +99,12 @@ rules and the slot's block rule: `Tunnel 'ovpnc1' is not on the platform's list:
 is not in VPN Director mode ("Redirect Internet traffic through tunnel" is "No"); its clients are
 refused`, or `Tunnel 'wgc9' is not a tunnel this platform knows; its clients are refused`. When the
 layer still names its table - KeeneticOS's `WireguardN` by its naming convention while RCI is
-silent, Merlin's `ovpncN` - its route and lookup rule go in as for a listed tunnel, and the
-platform decides about the route (Merlin refuses `ovpncN` in "No" mode). When it names none - a
-typo, an interface taken off `tunnel_director.interfaces` - the slot keeps the block rule alone,
-and the lookup rule and table a known past left go (`_tunnel_routeless`, `_tunnel_unroute`).
+silent, Merlin's `ovpncN` - its route and lookup rule are ensured as for a listed tunnel, and the
+platform decides about the route: KeeneticOS still installs the route of a `WireguardN`, whose
+clients keep flowing; Merlin refuses `ovpncN` in every mode but VPN Director, and in "No" mode also
+takes out a default Tunnel Director left there. When it names none - for a typo, as a rule - or the tunnel is
+an interface taken off `tunnel_director.interfaces`, the slot keeps the block rule alone, and the
+lookup rule and table a known past left go (`_tunnel_routeless`, `_tunnel_unroute`).
 `route not installed: <reason>; its clients are refused` is the warning for a recorded tunnel on
 the up-to-date branch. A configuration that gives such a tunnel clients records no hash, as one
 with a typo in the id does: every apply rebuilds in place and repeats the warning, and the first
@@ -115,9 +118,12 @@ records the hash: it has nothing to carry.
 interface an Entware init script brings up. `lib/iftunnel.sh` checks the list once per run
 (`iftunnel_init`): a name is kept when it is 1-15 characters of `A-Za-z0-9_.-` (not `.` or `..`)
 and is not `main`, an id `platform_tunnels` lists, a LAN interface or the WAN; each rejected name
-logs one WARN, `tunnel_director.interfaces: <reason>; ignored`, and a tunnel key that names it is
+logs one WARN, `tunnel_director.interfaces: <reason>; ignored`, and is no interface tunnel: a
+tunnel key that names `main` or an id `platform_tunnels` lists stays that, and any other is
 unknown. The core reaches every tunnel through the `vpd_*` layer of the same file: a kept name goes
-to `iftunnel_*`, any other id to the platform contract, which describes the firmware alone.
+to `iftunnel_*`, and so do the table and the release of an interface the last apply recorded and
+the list no longer names; any other id goes to the platform contract, which describes the firmware
+alone.
 
 An interface tunnel gets:
 
@@ -149,18 +155,19 @@ any tunnel. `status tunnel` shows each one's table, route and rules.
 
 ## The kill switch
 
-Every slot but `main`'s has two ip rules: the lookup rule at `pref_base + idx` and, right after the
-lookup range, the block rule at `pref_base + field_max + idx` (16639-16893 with the defaults):
-`fwmark <mark>/<mask> prohibit`. When the tunnel's table holds no route - the interface is missing
-or down, the route never went in, the firmware flushed the table - the lookup falls through to the
-block rule, never to `main`, and the client gets ICMP "administratively prohibited". Exclusions
-return ahead of the mark, so an excluded destination still goes direct.
+Every slot but `main`'s has two ip rules (one with no table to route through, the block rule
+alone): the lookup rule at `pref_base + idx` and, right after the lookup range, the block rule at
+`pref_base + field_max + idx` (16639-16893 with the defaults): `fwmark <mark>/<mask> prohibit`.
+When the tunnel's table holds no route - the interface is missing or down, the route never went in,
+the firmware flushed the table - the lookup falls through to the block rule, never to `main`, and
+the client gets ICMP "administratively prohibited". Exclusions return ahead of the mark, so an
+excluded destination still goes direct.
 
 A tunnel that carries nothing refuses everything its clients send that is not excluded, private
 networks beyond the LAN that only `main` knows included: a guest network, the modem on the WAN
 side, the clients of the router's own VPN server. An interface tunnel's table holds only its
-default route, so while the interface is up such traffic goes into the tunnel. Put such CIDRs in
-the tunnel's `exclude`.
+default route, and so does every Tunnel Director table on KeeneticOS, so while such a tunnel is up
+that traffic goes into it. Put such CIDRs in the tunnel's `exclude`.
 
 A rebuild puts each slot's block rule in before its route and lookup rule; the up-to-date path
 ensures it beside the lookup rule (`_tunnel_block_ensure`), which is how a router an earlier
@@ -181,13 +188,18 @@ PREROUTING
           ├─ src 192.168.50.0/24 -> PPE                  (Keenetic only)
           ├─ src 192.168.50.0/24 -> MARK 0x10000 (wgc1)
           ├─ src 192.168.1.5 + dst <country> -> RETURN
-          ├─ src 192.168.1.5 + dst 203.0.113.7 -> RETURN (an address in exclude)
           ├─ src 192.168.1.5 -> PPE                      (Keenetic only)
-          └─ src 192.168.1.5 -> MARK 0x20000 (ovpnc1)
+          ├─ src 192.168.1.5 -> MARK 0x20000 (ovpnc1)
+          ├─ ...                                         (OpenVPN0: MARK 0x30000)
+          ├─ src 192.168.1.30 + dst <country> -> RETURN
+          ├─ src 192.168.1.30 + dst 203.0.113.7 -> RETURN (an address in exclude)
+          ├─ src 192.168.1.30 -> PPE                     (Keenetic only)
+          └─ src 192.168.1.30 -> MARK 0x40000 (awg1)
 ```
 
-The routing table for each tunnel comes from `platform_tunnel_table` (Merlin: the
-id from `rt_tables`; Keenetic: `KEENETIC_TABLE_BASE + idx`). `platform_tunnel_offload_target`
+The routing table for each tunnel comes from `vpd_tunnel_table`: `IFTUNNEL_TABLE_BASE + idx` for
+an interface tunnel, the platform's `platform_tunnel_table` for any other id (Merlin: the id from
+`rt_tables`; Keenetic: `KEENETIC_TABLE_BASE + idx`). `platform_tunnel_offload_target`
 prints `PPE` on Keenetic (nothing, rc 1 on Merlin); `tunnel.sh` places that target
 inside `TUN_DIR` with the identical match immediately before `MARK`.
 
@@ -206,8 +218,9 @@ Default: bits 16-23 (8 bits = 255 tunnels max)
 
 ## Stable slots and the rebuild in place
 
-A tunnel's slot `idx` gives its mark (`(idx + 1) << mark_shift`), its ip rule preference
-(`pref_base + idx`) and, on Keenetic, its table (`2000 + idx`). `_tunnel_collect_applied` reads the
+A tunnel's slot `idx` gives its mark (`(idx + 1) << mark_shift`), its ip rule preferences
+(`pref_base + idx`, and `pref_base + field_max + idx` for the block rule) and, on Keenetic and for
+an interface tunnel, its table (`2000 + idx`). `_tunnel_collect_applied` reads the
 previous layout from `TUN_DIR_TABLES`: a tunnel in it keeps its idx, and a tunnel new to the layout
 takes the lowest idx that neither the previous nor the new layout holds, so an apply never reuses a
 slot it frees. The chain keeps the JSON order (the failover clients first), so the first match still
@@ -216,12 +229,14 @@ its first client or lost its last shifted the mark, preference and table of ever
 
 A rebuild no longer starts with `tunnel_stop`:
 
-1. Routing first, for every tunnel of the new layout. A new slot's table is released, its route
-   ensured and its ip rule replaced; a kept slot's route and rule are only ensured
-   (`_tunnel_rule_ensure` leaves a correct rule alone), and its table is never released.
+1. Routing first, for every tunnel of the new layout, each slot but `main`'s starting with its
+   block rule ("The kill switch"). A new slot's table is released, its route ensured and its
+   lookup rule replaced; a kept slot's route and rule are only ensured (`_tunnel_rule_ensure`
+   leaves a correct rule alone), and its table is never released. A slot with no table to route
+   through keeps the block rule alone ("Which tunnels the platform lists").
 2. `TUN_DIR_NEW` is built (`_tunnel_build_chain`) and swapped in by `swap_fw_chain`.
-3. Every slot the new layout dropped loses its ip rule (only when it is ours) and its table
-   (`_tunnel_slot_release`) — after the swap, when no packet carries its mark.
+3. Every slot the new layout dropped loses its lookup and block rules (only when they are ours)
+   and its table (`_tunnel_slot_release`) — after the swap, when no packet carries its mark.
 4. The hash and `failover_ready` are recorded. `TUN_DIR_TABLES` holds the union of both layouts
    from step 1 to step 3, and the new layout after.
 
@@ -338,7 +353,7 @@ are among them. A client the rebuild skips (no IPv4 address, outside RFC1918) is
 too: looking for its rule would rebuild the chain on every apply.
 
 A rebuild releases the table of a new slot right before it ensures the route
-(`platform_tunnel_table_release`, then `platform_tunnel_route_ensure`): an apply that died after
+(`vpd_tunnel_table_release`, then `vpd_tunnel_route_ensure`): an apply that died after
 ensuring a route but before recording its slot — an earlier version recorded the slots last — left
 that route with no record at all, and the next apply, handing the index to a tunnel whose route
 cannot be installed, would otherwise send its clients through the previous owner's tunnel. A kept
@@ -368,13 +383,13 @@ slot's table is never released: it is carrying traffic.
 
 | Function | Purpose |
 |----------|---------|
-| `_tunnel_init()` | Initialize module state (valid tables from `platform_tunnels`, fwmark helpers) |
-| `_tunnel_table_allowed(id)` | Check the tunnel id is one `platform_tunnels` lists |
+| `_tunnel_init()` | Initialize module state (`iftunnel_init`, valid tables from `vpd_tunnels`, fwmark helpers) |
+| `_tunnel_table_allowed(id)` | Check the tunnel id is one `vpd_tunnels` lists: the platform's tunnels, the kept interfaces, `main` |
 | `_tunnel_ensure_routes()` | Re-install the routes of the applied tunnels (used when nothing needs rebuilding) |
 | `_tunnel_marks_present()` | Does `TUN_DIR` still hold every client's MARK rule; one that is gone makes the apply a rebuild |
 | `_tunnel_collect_applied(prev)` | The slot of every tunnel of the new layout: kept from `prev`, or the lowest idx neither layout holds |
 | `_tunnel_build_chain(chain)` | `swap_fw_chain`'s build_fn: every client's rules, the failover clients first |
-| `_tunnel_slot_release(idx, tunnel)` | Drop the ip rule (ours only) and the table of a slot the layout dropped |
+| `_tunnel_slot_release(idx, tunnel)` | Drop the lookup and block rules (ours only) and the table of a slot the layout dropped |
 | `_tunnel_block_ensure(idx, tunnel)` | The slot's block rule, put back when it is gone |
 | `_tunnel_route_warn(tunnel)` | The warning for a route that did not go in, with the layer's reason |
 | `_tunnel_routeless(tunnel, idx)` | Has a tunnel the platform does not list no table to route through? |
@@ -386,7 +401,7 @@ slot's table is never released: it is carrying traffic.
 | `_tunnel_not_carried_non_rfc1918()` | Add every client of a tunnel outside RFC1918 (the up-to-date path) |
 
 **Module state variables**:
-- `_tunnel_valid_tables` - space-separated tunnel ids from `platform_tunnels`
+- `_tunnel_valid_tables` - space-separated tunnel ids from `vpd_tunnels`
 - `_tunnel_mark_field_max` - max tunnels that fit in fwmark field (default: 255)
 - `_tunnel_mark_mask_hex` - hex string of `TUN_DIR_MARK_MASK`
 

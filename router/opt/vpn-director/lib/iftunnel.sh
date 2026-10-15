@@ -46,10 +46,10 @@ _iftunnel_warn() {
 # A name is kept when the kernel would take it (1-15 characters of A-Za-z0-9_.-, not "." or "..")
 # and nothing else claims it: not main, not a tunnel the platform lists, not a LAN interface, not
 # the WAN (checked only when the platform names one). A rejected name logs one WARN and is no
-# tunnel: a tunnel key that names it is one the platform does not know. A name listed twice
-# counts once. Call it in the shell that goes on to use the list - tunnel.sh does, in
-# _tunnel_init - so the WARNs come once and every $(iftunnel_*) or $(vpd_*) after it finds the
-# list checked.
+# interface tunnel: a tunnel key that names main or a tunnel the platform lists stays that, and
+# any other is one the platform does not know. A name listed twice counts once. Call it in the
+# shell that goes on to use the list - tunnel.sh does, in _tunnel_init - so the WARNs come once
+# and every $(iftunnel_*) or $(vpd_*) after it finds the list checked.
 # -------------------------------------------------------------------------------------------------
 iftunnel_init() {
     local raw="${TUN_DIR_INTERFACES:-}" name reason platform_ids lan wan

@@ -300,7 +300,7 @@ Tunnel Director also routes through a Linux interface no firmware manages - an A
 }
 ```
 
-A tunnel with no route in its table - down, its interface re-created, not on the platform's list - refuses its clients' traffic instead of sending it out through the WAN; excluded destinations still go direct. Traffic to private networks beyond the LAN that only the router's main routing table knows - a guest network, the modem on the WAN side, the clients of the router's own VPN server - is refused too, and an interface tunnel's table holds only its default route, so while it is up such traffic goes into the tunnel; put those networks in the tunnel's `exclude`.
+A tunnel with no route in its table - down, or its interface re-created - refuses its clients' traffic instead of sending it out through the WAN; excluded destinations still go direct. A tunnel the platform does not list - a typo in its name, say - refuses its clients the same way, unless the platform still routes it: KeeneticOS keeps routing a `WireguardN` while RCI is silent. Traffic to private networks beyond the LAN that only the router's main routing table knows - a guest network, the modem on the WAN side, the clients of the router's own VPN server - is refused too, and the table of an interface tunnel, like every Tunnel Director table on KeeneticOS, holds only its default route, so while such a tunnel is up that traffic goes into it; put those networks in the tunnel's `exclude`.
 
 ### Changing a client's route
 

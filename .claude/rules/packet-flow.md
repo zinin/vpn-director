@@ -93,7 +93,8 @@ A full apply (`apply`, `update`, `restart`) moves every client make-before-break
 Xray wins over TUN_DIR (above). A client moving from Xray to a tunnel stays proxied until step 3
 lets it go, when TUN_DIR already marks it; a client moving the other way is proxied from step 1,
 before TUN_DIR lets it go in step 2. A Tunnel Director failure that stops the apply (a tunnels value
-that is no object, no LAN interface, no PREROUTING position) ends the run before step 3. One that
+that is no object, block rules that would reach main's rule at 32766, no LAN interface, no
+PREROUTING position) ends the run before step 3. One that
 costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
 tunnel the platform does not list, a slot whose route or ip rule is not in place, a client outside
 RFC1918 - and step 2 reports the clients it cost. Step 3 keeps each of them that `XRAY_CLIENTS`
@@ -287,9 +288,9 @@ Typically (one LAN interface):
 ### IP Rules
 
 ```bash
-# For each TD rule; the table is the one platform_tunnel_table names for the tunnel id
-# (Merlin: the id from rt_tables; Keenetic: 2000+idx, route re-installed by
-# platform_tunnel_route_ensure):
+# For each TD rule; the table is the one vpd_tunnel_table names for the tunnel id
+# (an interface tunnel: 2000+idx; otherwise platform_tunnel_table's: Merlin the id from
+# rt_tables, Keenetic 2000+idx), its route re-installed by vpd_tunnel_route_ensure:
 ip rule add pref {16384 + idx} fwmark {mark}/{mask} table {wgc1|ovpnc1|main|2000}
 ```
 
@@ -412,7 +413,7 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | `lib/platform/keenetic.sh` | `platform_tunnel_route_ensure()` | `ip route replace` into `2000+idx` |
 | `lib/platform/keenetic.sh` | `platform_tproxy_extra_rules()` | `ACCEPT` at mangle INPUT pos 1 |
 | `lib/tunnel.sh` | PREROUTING jump with mark check | First-match-wins |
-| `lib/tunnel.sh` | ip rule creation | Fwmark → `platform_tunnel_table` |
+| `lib/tunnel.sh` | ip rule creation | Fwmark → `vpd_tunnel_table` |
 | `lib/tunnel.sh` | `_tunnel_ensure_routes()` | Re-install tunnel routes on an apply with no rebuild |
 | `lib/tunnel.sh` | `_tunnel_marks_present()` | Rebuild when a client's MARK rule is gone (Merlin's firewall start flushes every mangle chain) |
 | `lib/platform/keenetic.sh` | `platform_tunnel_offload_target()` | `PPE` — takes a marked flow out of the firmware fast path |

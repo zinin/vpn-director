@@ -471,9 +471,10 @@ cmd_update() {
 # no marker, it schedules "ensure-routes" every minute and leaves the marker; with none and the
 # marker, it drops both. The marker lives in /tmp, as Merlin's cru jobs do, so the first apply
 # after a reboot schedules the job again, and an upgrade gets it with its first apply. KeeneticOS's
-# cron.d job survives a reboot and the marker does not, so there an apply without interface tunnels
-# after a reboot leaves the job in place: it exits quietly every minute until "cron remove". A cron
-# that refuses the job costs a WARN and no marker - the next apply tries again - never the apply.
+# cron.d job outlives a reboot that skips S99's stop (its "cron remove"), and the marker does not:
+# an apply without interface tunnels after such a reboot leaves the job in place, and it exits
+# quietly every minute until "cron remove". A cron that refuses the job costs a WARN and no
+# marker - the next apply tries again - never the apply.
 ###################################################################################################
 _routes_cron_sync() {
     local cron_req
