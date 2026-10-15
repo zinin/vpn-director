@@ -2483,6 +2483,16 @@ load_awg1() {
     refute_line --partial '16640:'
 }
 
+@test "tunnel_status: lists the block rules beside the lookup rules" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    run tunnel_status
+    assert_success
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
 @test "tunnel_apply: a new slot's block rule goes in before its lookup rule" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
     ip() {
@@ -2632,18 +2642,26 @@ load_awg1() {
 # Review Focus 2: awg1 taken off tunnel_director.interfaces while its tunnel
 # keeps clients. The platform does not know it, and its table would carry them
 # on into awg1: the lookup rule and the route go, with the NAT and MSS rules,
-# and the block rule refuses the clients.
+# and the block rule refuses the clients. The refusal rests on the client's
+# MARK, which stays: without it the client would leave through the WAN.
 @test "tunnel_apply: an interface taken off the list stops routing and its clients are refused" {
     load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
     run tunnel_apply
     assert_success
     run ip route show table 2000
     assert_output "default dev awg1"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+    [ -f "$TUN_DIR_HASH" ]
 
     TUN_DIR_INTERFACES=""
     run tunnel_apply
     assert_success
     assert_output --partial "Tunnel 'awg1' is not a tunnel this platform knows; its clients are refused"
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
     run ip rule show
     refute_line --partial '16384:'
     assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
@@ -2651,9 +2669,12 @@ load_awg1() {
     refute_output
     run iptables -t nat -S POSTROUTING
     refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
     run cat "$TUN_DIR_TABLES"
     assert_output "0 awg1"
     [ ! -e "$IFTUNNEL_STATE_FILE" ]
+    [ ! -f "$TUN_DIR_HASH" ]
     [ ! -s "$BATS_IPT_DIR/live_flushes" ]
 }
 
@@ -2674,12 +2695,14 @@ load_awg1() {
     assert_equal "${#lines[@]}" 4
 }
 
+# Skipped, the entry costs the client nothing else: it is still marked.
 @test "tunnel_apply: an IPv6 exclusion is skipped with a WARN" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["2001:db8::/32"]}}'
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
     assert_output --partial "Tunnel 'wgc1': exclusion '2001:db8::/32' is IPv6; Tunnel Director routes IPv4 only, skipping it"
+    assert_output --partial "Added: client=192.168.1.30 tunnel=wgc1 mark=0x10000"
     refute grep -q '2001:db8' /tmp/bats_iptables_calls.log
 }
 

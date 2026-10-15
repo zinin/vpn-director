@@ -898,10 +898,11 @@ tunnel_status() {
         printf '\n'
     fi
 
-    # Show IP rules
+    # Show IP rules: the lookup rules and the block rules, which refuse a mark whose table has no
+    # route (the kill switch).
     printf '%s\n' "--- IP Rules (fwmark-based) ---"
     local ip_rules
-    ip_rules=$(ip rule show 2>/dev/null | grep -E "fwmark.*lookup" || true)
+    ip_rules=$(ip rule show 2>/dev/null | grep -E "fwmark.*(lookup|prohibit)" || true)
 
     if [[ -z $ip_rules ]]; then
         printf '%s\n' "No fwmark-based ip rules found."
