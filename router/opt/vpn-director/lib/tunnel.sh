@@ -1190,12 +1190,14 @@ tunnel_apply() {
             log -l ERROR "Tunnel Director: cannot write $TUN_DIR_TABLES; the next apply rebuilds"
             return 1
         }
+        # The record of the interface tunnels is rewritten only once the dropped
+        # slots are released: until then the last apply's record is what tells a
+        # release that an id the list no longer names was an interface tunnel. A
+        # rebuild whose swap did not finish keeps it for the next apply, which is
+        # a rebuild too, since this one records no hash.
+        iftunnel_state_write "$TUN_DIR_TABLES" ||
+            log -l WARN "Tunnel Director: cannot write $IFTUNNEL_STATE_FILE; ensure-routes does not see the interface tunnels"
     fi
-
-    # The record of the interface tunnels, after the releases above: a release
-    # reads the last apply's record to know an interface the list no longer names.
-    iftunnel_state_write "$TUN_DIR_TABLES" ||
-        log -l WARN "Tunnel Director: cannot write $IFTUNNEL_STATE_FILE; ensure-routes does not see the interface tunnels"
 
     # 4. The hash is what makes the next apply take the up-to-date branch, so it
     # is recorded only when every configured tunnel was applied, every client

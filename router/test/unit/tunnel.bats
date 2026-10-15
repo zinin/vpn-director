@@ -2410,6 +2410,37 @@ load_awg1() {
     assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
 }
 
+# A rebuild whose swap did not finish releases no slot; the next apply - a
+# rebuild too, as this one records no hash - releases them. Only the last
+# apply's record tells that release an id the list no longer names was an
+# interface tunnel, so the record waits for it: rewritten here, it lost awg1,
+# and awg1's lookup rule, route and MASQUERADE outlived the release.
+@test "tunnel_apply: a rebuild whose swap did not finish keeps the record of an interface that left the list" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+
+    eval "real_$(declare -f swap_fw_chain)"
+    swap_fw_chain() { return 3; }
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    run cat "$IFTUNNEL_STATE_FILE"
+    assert_output "awg1 2000"
+
+    swap_fw_chain() { real_swap_fw_chain "$@"; }
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial 'lookup 2000'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
 @test "tunnel_stop: releases an interface tunnel - route, NAT, MSS - and its record" {
     load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
     run tunnel_apply
