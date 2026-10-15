@@ -2656,3 +2656,47 @@ load_awg1() {
     [ ! -e "$IFTUNNEL_STATE_FILE" ]
     [ ! -s "$BATS_IPT_DIR/live_flushes" ]
 }
+
+# ============================================================================
+# Addresses and CIDRs in a tunnel's exclude
+# ============================================================================
+
+@test "tunnel_apply: an address or CIDR in exclude returns ahead of the mark, beside the countries" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["ru","203.0.113.7","198.51.100.0/24"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    run grep -- '-A TUN_DIR_NEW' /tmp/bats_iptables_calls.log
+    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m set --match-set ru dst -j RETURN'
+    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 203.0.113.7 -j RETURN'
+    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 198.51.100.0/24 -j RETURN'
+    assert_line --index 3 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_equal "${#lines[@]}" 4
+}
+
+@test "tunnel_apply: an IPv6 exclusion is skipped with a WARN" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["2001:db8::/32"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'wgc1': exclusion '2001:db8::/32' is IPv6; Tunnel Director routes IPv4 only, skipping it"
+    refute grep -q '2001:db8' /tmp/bats_iptables_calls.log
+}
+
+# iptables would read 203.0.113.010 as .8: what is no address as written is no
+# address, and no set by that name exists either.
+@test "tunnel_apply: an address with a leading zero is no address" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["203.0.113.010"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Exclude ipset '203.0.113.010' not found"
+    refute grep -q -- '-d 203.0.113' /tmp/bats_iptables_calls.log
+}
+
+@test "tunnel_get_required_ipsets: an address in exclude asks for no ipset" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["ru","203.0.113.7"]}}'
+    run tunnel_get_required_ipsets
+    assert_success
+    assert_output "ru"
+}

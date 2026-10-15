@@ -531,8 +531,9 @@ _tunnel_collect_applied() {
     done <<< "$tunnels"
 }
 
-# One client's RETURN / offload / MARK in <chain>. Offload sits immediately
-# before MARK with the same match so excluded destinations keep acceleration.
+# One client's RETURNs (country sets, addresses and CIDRs) / offload / MARK in
+# <chain>. Offload sits immediately before MARK with the same match so excluded
+# destinations keep acceleration.
 # warnings, changes, incomplete and offload_target are tunnel_apply's locals
 # (bash dynamic scope); incomplete says a rule did not go in, so the rebuild is
 # not recorded.
@@ -570,6 +571,21 @@ _tunnel_emit_client() {
     local excl excl_set
     while IFS= read -r excl; do
         [[ -n $excl ]] || continue
+        # An address or a CIDR returns its destination as it stands, anything
+        # else names a set. is_ipv4_net is iptables' own reading - no leading
+        # zeros - so "203.0.113.010" falls through to the set lookup and its WARN.
+        if is_ipv4_net "$excl"; then
+            if ! ensure_fw_rule -q mangle "$chain" -s "$client" -d "$excl" -j RETURN; then
+                warnings=1
+                incomplete=1
+            fi
+            continue
+        fi
+        if [[ $excl == *:* ]]; then
+            log -l WARN "Tunnel '$tunnel': exclusion '$excl' is IPv6; Tunnel Director routes IPv4 only, skipping it"
+            warnings=1
+            continue
+        fi
         excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
         if ! _ipset_exists "$excl_set"; then
             log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
