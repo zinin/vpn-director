@@ -110,6 +110,16 @@ use_stateful_ipset() {
     hash -r
 }
 
+# ip_links "<iface> <flags> <mtu>"... - for the rest of the test, the interfaces
+# the ip mock's "link show" knows, one argument each, e.g.
+# "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"; any other name does not exist.
+# Without a call the mock prints nothing for every name. Exported, so the
+# processes a test starts see the same interfaces.
+ip_links() {
+    export BATS_IP_LINKS_FILE="$BATS_TEST_TMPDIR/ip_links"
+    printf '%s\n' "$@" > "$BATS_IP_LINKS_FILE"
+}
+
 # Helper to source config.sh
 load_config() {
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"

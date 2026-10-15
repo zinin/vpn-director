@@ -954,3 +954,16 @@ if [[ ! -f "${BASH_SOURCE[0]%/*}/platform.sh" ]]; then
 fi
 # shellcheck source=platform.sh
 . "${BASH_SOURCE[0]%/*}/platform.sh"
+
+###################################################################################################
+# Interface tunnels and the vpd_* layer (lib/iftunnel.sh)
+###################################################################################################
+# After platform.sh: the layer hands every id that is no interface tunnel to the platform
+# contract. Not optional either, for the reason given above.
+if [[ ! -f "${BASH_SOURCE[0]%/*}/iftunnel.sh" ]]; then
+    log -l ERROR "Interface tunnel library not found: ${BASH_SOURCE[0]%/*}/iftunnel.sh - re-run install.sh to reinstall it"
+    # shellcheck disable=SC2317
+    return 1 2>/dev/null || exit 1
+fi
+# shellcheck source=iftunnel.sh
+. "${BASH_SOURCE[0]%/*}/iftunnel.sh"

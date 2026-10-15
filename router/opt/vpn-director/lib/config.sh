@@ -100,6 +100,12 @@ done < <(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r '
 ')
 unset _tid _gw
 
+# tunnel_director.interfaces, space-separated as written: lib/iftunnel.sh checks
+# the names (it asks the platform, which this file cannot) and tunnel.sh hashes
+# the list as written. The jq program is iftunnel_read_config's; anything but an
+# array of strings loads as no list, never as an error that ends the load.
+TUN_DIR_INTERFACES=$(jq -r '.tunnel_director.interfaces // [] | if type == "array" then .[] | select(type == "string") else empty end' "$VPD_CONFIG_FILE" | tr '\n' ' ' | sed 's/ $//')
+
 IPS_BDR_DIR=$(_cfg '.data_dir')
 
 ###################################################################################################
@@ -141,7 +147,7 @@ BOOT_WAIT_DELAY=$(_cfg '.advanced.boot.wait_delay')
 ###################################################################################################
 readonly \
     VPD_CONFIG_FILE \
-    TUN_DIR_TUNNELS_JSON IPS_BDR_DIR \
+    TUN_DIR_TUNNELS_JSON TUN_DIR_INTERFACES IPS_BDR_DIR \
     XRAY_FAILOVER_TUNNEL XRAY_FAILOVER_CLIENTS \
     XRAY_CLIENTS XRAY_SERVERS XRAY_EXCLUDE_IPS XRAY_EXCLUDE_SETS \
     XRAY_TPROXY_PORT XRAY_ROUTE_TABLE XRAY_RULE_PREF \

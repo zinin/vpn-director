@@ -141,6 +141,22 @@ case "$1" in
     addr)
         [[ ${2:-} == show ]] && _addr_line "${3:-}"
         ;;
+    link)
+        # "ip -o link show <iface>" for the interfaces of BATS_IP_LINKS_FILE, one
+        # "<iface> <flags> <mtu>" per line (ip_links in test_helper.bash). A name
+        # the file does not list does not exist. Without the file every name
+        # prints nothing, as it did before the file existed.
+        if [[ ${2:-} == show && -n ${BATS_IP_LINKS_FILE:-} ]]; then
+            entry=$(awk -v i="${3:-}" '$1 == i { print; exit }' "$BATS_IP_LINKS_FILE" 2>/dev/null)
+            if [[ -z $entry ]]; then
+                echo "Device \"${3:-}\" does not exist." >&2
+                exit 1
+            fi
+            read -r l_name l_flags l_mtu <<< "$entry"
+            printf '9: %s: %s mtu %s qdisc fq_codel state UNKNOWN mode DEFAULT group default qlen 500\\    link/none \n' \
+                "$l_name" "$l_flags" "$l_mtu"
+        fi
+        ;;
     *) exit 0 ;;
 esac
 exit 0
