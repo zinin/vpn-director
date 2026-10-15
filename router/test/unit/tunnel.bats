@@ -2537,6 +2537,20 @@ load_awg1() {
     refute grep -qx 'ip rule del pref 16894' /tmp/bats_ip_calls.log
 }
 
+# tunnel_apply refuses a layout whose block rules would reach main's rule, but
+# stop runs with whatever pref_base the config holds: "ip rule del pref 32766"
+# would take the router's main routing with it, and 32767 its default.
+@test "tunnel_stop: never deletes main's rules, whatever pref_base" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export TUN_DIR_PREF_BASE=32300
+    : > /tmp/bats_ip_calls.log
+    run tunnel_stop
+    assert_success
+    grep -qx 'ip rule del pref 32765' /tmp/bats_ip_calls.log
+    refute grep -qx 'ip rule del pref 32766' /tmp/bats_ip_calls.log
+    refute grep -qx 'ip rule del pref 32767' /tmp/bats_ip_calls.log
+}
+
 @test "tunnel_apply: refuses a layout whose block rules would reach main, before touching a rule" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
     export TUN_DIR_PREF_BASE=32300

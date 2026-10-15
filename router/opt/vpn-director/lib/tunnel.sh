@@ -293,14 +293,15 @@ _tunnel_ensure_routes() {
 # A rebuild records TUN_DIR_HASH even when an "ip rule add" failed, so every
 # later apply lands in the up-to-date branch and this is the only place left to
 # retry. Without it a rule that never went in stays gone until the configuration
-# changes: those clients fall through to main, and for the failover tunnel
-# failover_ready is never written, so the watch keeps its Xray clients on a dead
-# outbound.
+# changes: those clients' marks meet the slot's block rule and are refused - they
+# reach main only where the block rule is missing too - and for the failover
+# tunnel failover_ready is never written, so the watch keeps its Xray clients on
+# a dead outbound.
 #
 # A rule that is in place is left alone. Deleting and re-adding it would open a
-# window in which marked packets fall through to main. Another rule on the
-# preference makes way for it: the range is this module's, as the rebuild and
-# tunnel_stop treat it.
+# window in which marked packets are refused by the block rule, or reach main
+# where that is missing too. Another rule on the preference makes way for it:
+# the range is this module's, as the rebuild and tunnel_stop treat it.
 # -------------------------------------------------------------------------------------------------
 _tunnel_rule_ensure() {
     local idx="$1" tunnel="$2"
@@ -945,12 +946,19 @@ tunnel_stop() {
     fi
 
     # Remove the ip rules in our pref range: the lookup rules, then the block
-    # rules right after them (_tunnel_block_pref).
+    # rules right after them (_tunnel_block_pref). The loop stops short of main's
+    # rule at 32766: tunnel_apply refuses a layout whose block rules would reach
+    # it, but this runs with whatever pref_base the config holds - from "stop",
+    # and from tunnel_apply's no-tunnels branch, ahead of that check - and
+    # "ip rule del pref N" deletes a rule at N, whoever owns it. At 32766 and
+    # 32767 those are main's and the default's: the router's routing would go
+    # with them.
     local pref_base="${TUN_DIR_PREF_BASE:-16384}"
     local max_rules="${_tunnel_mark_field_max:-255}"
     local i
 
     for ((i = 0; i < 2 * max_rules; i++)); do
+        (( pref_base + i < 32766 )) || break
         ip rule del pref $((pref_base + i)) 2>/dev/null || true
     done
 
@@ -1223,7 +1231,8 @@ tunnel_apply() {
             [[ $route_ok -eq 1 ]] || fo_route_ok=0
             [[ $rule_ok -eq 1 ]] || fo_rule_ok=0
         fi
-        # Marked or not, a client of this slot is refused, not carried.
+        # Marked or not, a client of this slot is not carried: its marks are
+        # refused (the block rule), and without one it goes to main.
         if [[ $route_ok -eq 0 || $rule_ok -eq 0 ]]; then
             _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
         fi
