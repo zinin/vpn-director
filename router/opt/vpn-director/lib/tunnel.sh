@@ -9,9 +9,11 @@
 #
 # Dependencies:
 #   - common.sh (log, tmp_file, compute_hash, is_lan_ip, is_ipv4_net, rt_table_label)
-#     and, through it, the platform contract (platform_tunnels, platform_tunnel_table,
-#     platform_tunnel_route_ensure, platform_tunnel_table_release,
-#     platform_tunnel_unlisted_reason, platform_prerouting_base_pos, platform_lan_ifaces)
+#     and, through it, the tunnels of lib/iftunnel.sh's vpd_* layer (vpd_tunnels,
+#     vpd_tunnel_table, vpd_tunnel_route_ensure, vpd_tunnel_table_release,
+#     vpd_tunnel_unlisted_reason; iftunnel_init, iftunnel_state_write, iftunnel_status)
+#     and the platform contract (platform_prerouting_base_pos, platform_lan_ifaces,
+#     platform_tunnel_offload_target)
 #   - firewall.sh (delete_fw_chain, ensure_fw_rule, sync_fw_rule, swap_fw_chain,
 #                  purge_fw_rules, find_fw_rules, fw_chain_exists)
 #   - config.sh (TUN_DIR_TUNNELS_JSON, TUN_DIR_CHAIN, TUN_DIR_PREF_BASE,
@@ -104,18 +106,22 @@ TUNNEL_UNCARRIED=()
 # -------------------------------------------------------------------------------------------------
 # _tunnel_init - initialize module state
 # -------------------------------------------------------------------------------------------------
-# Builds the valid_tables list from platform_tunnels and computes fwmark helpers.
+# Builds the valid_tables list from vpd_tunnels and computes fwmark helpers.
 # Safe to call multiple times (idempotent).
 # -------------------------------------------------------------------------------------------------
 _tunnel_init() {
     # Skip if already initialized
     [[ $_tunnel_initialized -eq 1 ]] && return 0
 
-    # Valid tunnel ids come from the platform (Merlin: wgcN tables from
-    # rt_tables, and ovpncN ones while their OpenVPN client is in VPN Director
-    # mode; Keenetic: OpenVPN*/Wireguard* interfaces), "main" last.
+    # Valid tunnel ids come through the vpd_* layer (lib/iftunnel.sh): the
+    # platform's (Merlin: wgcN tables from rt_tables, and ovpncN ones while
+    # their OpenVPN client is in VPN Director mode; Keenetic: OpenVPN*/Wireguard*
+    # interfaces), then the interfaces of tunnel_director.interfaces, "main"
+    # last. The list is checked here, in this shell, so its WARNs come once and
+    # every $(vpd_*) below finds it checked.
+    iftunnel_init
     local tables_list
-    tables_list="$(platform_tunnels || true)"
+    tables_list="$(vpd_tunnels || true)"
 
     # Single-line, space-separated (for matching)
     _tunnel_valid_tables="$(printf '%s\n' "$tables_list" | xargs)"
@@ -132,7 +138,7 @@ _tunnel_init() {
 # -------------------------------------------------------------------------------------------------
 # _tunnel_table_allowed - check the tunnel id is one the platform lists
 # -------------------------------------------------------------------------------------------------
-# Returns 0 if the id is in _tunnel_valid_tables (built from platform_tunnels), 1 otherwise.
+# Returns 0 if the id is in _tunnel_valid_tables (built from vpd_tunnels), 1 otherwise.
 # -------------------------------------------------------------------------------------------------
 _tunnel_table_allowed() {
     local table="${1:-}"
@@ -248,9 +254,9 @@ _tunnel_not_carried_non_rfc1918() {
 # _tunnel_ensure_routes - re-install the routes of every applied tunnel
 # -------------------------------------------------------------------------------------------------
 # Reads TUN_DIR_TABLES ("<idx> <id>" per line, written by tunnel_apply) and calls
-# platform_tunnel_route_ensure for each, so the route follows the tunnel's
+# vpd_tunnel_route_ensure for each, so the route follows the tunnel's
 # interface state. The platform may refuse a configured tunnel it no longer
-# lists; platform_tunnel_unlisted_reason supplies the warning's reason then.
+# lists; vpd_tunnel_unlisted_reason supplies the warning's reason then.
 # A tunnel whose route or ip rule is not in place routes its marks to main: its
 # clients are not carried (TUNNEL_UNCARRIED).
 # -------------------------------------------------------------------------------------------------
@@ -260,8 +266,8 @@ _tunnel_ensure_routes() {
     while read -r idx tunnel; do
         [[ -n $tunnel ]] || continue
         carried=1
-        if ! platform_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
-            reason="$(platform_tunnel_unlisted_reason "$tunnel")" || reason=""
+        if ! vpd_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
+            reason="$(vpd_tunnel_unlisted_reason "$tunnel")" || reason=""
             if [[ -n $reason ]]; then
                 log -l WARN "Tunnel '$tunnel': route not installed: $reason; Tunnel Director does not route through it"
             else
@@ -303,7 +309,7 @@ _tunnel_rule_ensure() {
     local pref=$((TUN_DIR_PREF_BASE + idx))
     local mark_hex table
     mark_hex=$(_tunnel_mark_hex "$idx")
-    table="$(platform_tunnel_table "$tunnel" "$idx")"
+    table="$(vpd_tunnel_table "$tunnel" "$idx")"
     if _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
         return 0
     fi
@@ -358,7 +364,7 @@ _tunnel_failover_rule_present() {
     [[ -f $TUN_DIR_TABLES ]] || return 1
     idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$TUN_DIR_TABLES")
     [[ -n $idx ]] || return 1
-    table=$(platform_tunnel_table "$XRAY_FAILOVER_TUNNEL" "$idx") || return 1
+    table=$(vpd_tunnel_table "$XRAY_FAILOVER_TUNNEL" "$idx") || return 1
     _tunnel_rule_listed $((TUN_DIR_PREF_BASE + idx)) "$(_tunnel_mark_hex "$idx")" "$table"
 }
 
@@ -444,7 +450,7 @@ _tunnel_collect_applied() {
     while IFS= read -r tunnel; do
         [[ -n $tunnel ]] || continue
         if ! _tunnel_table_allowed "$tunnel"; then
-            reason="$(platform_tunnel_unlisted_reason "$tunnel")" || reason=""
+            reason="$(vpd_tunnel_unlisted_reason "$tunnel")" || reason=""
             if [[ -n $reason ]]; then
                 log -l WARN "Tunnel '$tunnel' is skipped: $reason"
             else
@@ -724,12 +730,12 @@ _tunnel_slot_release() {
     local idx="$1" tunnel="$2" pref mark_hex table
     pref=$((TUN_DIR_PREF_BASE + idx))
     mark_hex=$(_tunnel_mark_hex "$idx")
-    if table="$(platform_tunnel_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
+    if table="$(vpd_tunnel_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
         if ! ip rule del pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
             log -l WARN "Tunnel '$tunnel': the ip rule at pref $pref did not go; it routes a mark nothing sets any more"
         fi
     fi
-    platform_tunnel_table_release "$tunnel" "$idx" || true
+    vpd_tunnel_table_release "$tunnel" "$idx" || true
     log "Tunnel '$tunnel': released slot $idx"
 }
 
@@ -804,6 +810,10 @@ tunnel_status() {
             "Tunnel: \(.key)\n  Clients: \(.value.clients // [] | join(", "))\n  Exclude: \(.value.exclude // [] | join(", "))"
         ' 2>/dev/null || printf '%s\n' "Error: Failed to parse tunnels JSON"
     fi
+    printf '\n'
+
+    printf '%s\n' "--- Interface tunnels ---"
+    iftunnel_status
     printf '\n'
 
     return 0
@@ -893,13 +903,13 @@ tunnel_stop() {
     if [[ -f $TUN_DIR_TABLES ]]; then
         while read -r idx tunnel; do
             [[ -n $tunnel ]] || continue
-            platform_tunnel_table_release "$tunnel" "$idx" || true
+            vpd_tunnel_table_release "$tunnel" "$idx" || true
         done < "$TUN_DIR_TABLES"
         rm -f "$TUN_DIR_TABLES"
     fi
 
     # Clear hash file
-    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY"
+    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY" "$IFTUNNEL_STATE_FILE"
 
     log "Tunnel Director stopped"
     return 0
@@ -963,13 +973,18 @@ tunnel_apply() {
     fi
 
     # Compute config hash for change detection. Failover snapshot clients are
-    # extra MARK rules, not a key reorder, so they belong in the hash. With no
-    # failover, hash only the tunnels JSON so an upgrade does not rebuild TUN_DIR.
-    local new_hash old_hash empty_hash
+    # extra MARK rules, not a key reorder, so they belong in the hash, and so do
+    # the interfaces of tunnel_director.interfaces - as written: the checked list
+    # changes with the platform's answers. With neither, hash only the tunnels
+    # JSON so an upgrade does not rebuild TUN_DIR.
+    local new_hash old_hash empty_hash hash_input="$TUN_DIR_TUNNELS_JSON"
+    if [[ -n ${TUN_DIR_INTERFACES:-} ]]; then
+        hash_input+=$'\n'"interfaces: $TUN_DIR_INTERFACES"
+    fi
     if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]]; then
-        new_hash=$(printf '%s\n%s\n%s' "$TUN_DIR_TUNNELS_JSON" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
+        new_hash=$(printf '%s\n%s\n%s' "$hash_input" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
     else
-        new_hash=$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)
+        new_hash=$(printf '%s' "$hash_input" | compute_hash)
     fi
     empty_hash=$(printf '' | compute_hash)
     old_hash=$(cat "$TUN_DIR_HASH" 2>/dev/null || printf '%s' "$empty_hash")
@@ -1015,6 +1030,8 @@ tunnel_apply() {
         else
             rm -f "$TUN_DIR_FAILOVER_READY"
         fi
+        iftunnel_state_write "$TUN_DIR_TABLES" ||
+            log -l WARN "Tunnel Director: cannot write $IFTUNNEL_STATE_FILE; ensure-routes does not see the interface tunnels"
         log "Rules are applied and up-to-date"
         return 0
     fi
@@ -1097,7 +1114,7 @@ tunnel_apply() {
             # A kept slot is carrying its clients now: its route and its rule
             # are ensured, never released - an empty table is a window in which
             # they fall through to main.
-            if ! platform_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
+            if ! vpd_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
                 log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
                 warnings=1
                 route_ok=0
@@ -1112,15 +1129,15 @@ tunnel_apply() {
             # with no record, and a route_ensure that fails now (interface
             # down) would leave the previous owner's route behind the ip rule
             # installed below. No-op on Merlin.
-            platform_tunnel_table_release "$tunnel" "$tunnel_idx" || true
-            if ! platform_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
+            vpd_tunnel_table_release "$tunnel" "$tunnel_idx" || true
+            if ! vpd_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
                 log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
                 warnings=1
                 route_ok=0
             fi
             # The ip rule goes in even when the route does not: a lookup in an
             # empty table falls through to main.
-            table="$(platform_tunnel_table "$tunnel" "$tunnel_idx")"
+            table="$(vpd_tunnel_table "$tunnel" "$tunnel_idx")"
             pref=$((TUN_DIR_PREF_BASE + tunnel_idx))
             mark_hex=$(_tunnel_mark_hex "$tunnel_idx")
             ip rule del pref "$pref" 2>/dev/null || true
@@ -1174,6 +1191,11 @@ tunnel_apply() {
             return 1
         }
     fi
+
+    # The record of the interface tunnels, after the releases above: a release
+    # reads the last apply's record to know an interface the list no longer names.
+    iftunnel_state_write "$TUN_DIR_TABLES" ||
+        log -l WARN "Tunnel Director: cannot write $IFTUNNEL_STATE_FILE; ensure-routes does not see the interface tunnels"
 
     # 4. The hash is what makes the next apply take the up-to-date branch, so it
     # is recorded only when every configured tunnel was applied, every client

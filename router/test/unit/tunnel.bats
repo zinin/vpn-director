@@ -2313,3 +2313,122 @@ tun11_addressed() {
     assert_output --partial "Failover tunnel 'ovpnc1' is not carrying traffic; Xray membership stays"
     [[ ! -e "$TUN_DIR_FAILOVER_READY" ]]
 }
+
+# ============================================================================
+# Interface tunnels (tunnel_director.interfaces)
+# ============================================================================
+
+# load_awg1 <tunnels JSON> - Tunnel Director with tunnel_director.interfaces =
+# awg1, UP with MTU 1280, on the stateful iptables mock.
+load_awg1() {
+    load_tunnel_module_with "$1"
+    export TUN_DIR_INTERFACES=awg1
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    use_stateful_iptables
+}
+
+@test "tunnel_apply: routes an interface tunnel through table 2000+idx, with its NAT and MSS" {
+    load_awg1 '{"wgc1":{"clients":["192.168.1.5"]},"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x20000/0xff0000 lookup 2001'
+    run ip route show table 2001
+    assert_output "default dev awg1"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000'
+    run cat "$IFTUNNEL_STATE_FILE"
+    assert_output "awg1 2001"
+    [ -f "$TUN_DIR_HASH" ]
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+@test "tunnel_apply: the hash covers tunnel_director.interfaces, and an empty list leaves it as it was" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    assert_equal "$(cat "$TUN_DIR_HASH")" "$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)"
+
+    export TUN_DIR_INTERFACES=awg1
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Configuration changed; rebuilding in place"
+}
+
+@test "tunnel_apply: the up-to-date path puts back the route an interface's re-creation took" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    ip route flush table 2000
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip route show table 2000
+    assert_output "default dev awg1"
+}
+
+# Review Focus 3: Merlin's firewall start empties every mangle chain - the MSS
+# clamps with the marks - and firewall-start applies again.
+@test "tunnel_apply: after Merlin emptied mangle, the rebuild puts the MSS clamps back" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    iptables -t mangle -F
+    run tunnel_apply
+    assert_success
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+# Review Focus 3: a rebuild of nat by the firmware (a WAN coming up, a port
+# forward changed) takes MASQUERADE; nat-start applies, and the up-to-date path
+# puts it back.
+@test "tunnel_apply: after the firmware rebuilt nat, the up-to-date path puts MASQUERADE back" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    iptables -t nat -F
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+}
+
+@test "tunnel_apply: an interface tunnel that is down gets no route, keeps its NAT and reports its clients" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    ip_links "awg1 <POINTOPOINT,NOARP> 1280"
+    tunnel_apply
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.30"
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+}
+
+@test "tunnel_stop: releases an interface tunnel - route, NAT, MSS - and its record" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run tunnel_stop
+    assert_success
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+}
+
+@test "tunnel_status: lists the interface tunnels" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run tunnel_status
+    assert_success
+    assert_output --partial "Interface tunnels"
+    assert_output --partial "awg1: table 2000, route default dev awg1, NAT yes, MSS out yes, MSS in yes"
+}
