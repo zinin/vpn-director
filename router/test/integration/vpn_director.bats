@@ -597,6 +597,19 @@ run_stubbed_cli() {
     echo "$output" | jq -e '.tunnels[2] == {id:"ovpnc1", iface:"tun11", type:"openvpn", connected:false, description:"Office OVPN"}' >/dev/null
 }
 
+@test "vpn-director: platform lists the interfaces of tunnel_director.interfaces after the firmware's tunnels" {
+    local cfg="$BATS_TEST_TMPDIR/vpn-director.json"
+    jq '.tunnel_director.interfaces = ["awg1", "awg2"]' "$TEST_ROOT/fixtures/vpn-director.json" > "$cfg"
+    export VPD_CONFIG_FILE="$cfg"
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    run --separate-stderr "$SCRIPTS_DIR/vpn-director.sh" platform
+    assert_success
+    [ "${#lines[@]}" -eq 1 ]
+    echo "$output" | jq -e '[.tunnels[].id] == ["wgc1","wgc2","ovpnc1","ovpnc2","awg1","awg2"]' >/dev/null
+    echo "$output" | jq -e '.tunnels[4] == {id:"awg1", iface:"awg1", type:"interface", connected:true, description:""}' >/dev/null
+    echo "$output" | jq -e '.tunnels[5] == {id:"awg2", iface:"awg2", type:"interface", connected:false, description:""}' >/dev/null
+}
+
 # An OpenVPN client in "No" or "Yes (all)" routes the whole router through its
 # table, so the platform leaves it out. vpn_client1_rgw is 0 here; every other
 # key comes from the standard mock, and the fixture rt_tables names ovpnc1 and

@@ -326,3 +326,89 @@ AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
     run iftunnel_status
     assert_output "No interface tunnels applied."
 }
+
+# ============================================================================
+# The vpd_* layer
+# ============================================================================
+
+@test "vpd_tunnels: the platform's tunnels, then the interfaces, main last" {
+    load_iftunnel "awg1"
+    iftunnel_init
+    run vpd_tunnels
+    assert_success
+    assert_output $'wgc1\nwgc2\novpnc1\novpnc2\nawg1\nmain'
+}
+
+@test "vpd_tunnels: an incomplete platform inventory still fails, with the interfaces and main" {
+    load_iftunnel "awg1"
+    export RT_TABLES_FILE="$BATS_TEST_TMPDIR/absent"
+    iftunnel_init
+    run vpd_tunnels
+    assert_failure
+    assert_output $'awg1\nmain'
+}
+
+@test "vpd_tunnel_*: an interface goes to iftunnel_*, any other id to the platform" {
+    load_iftunnel "awg1"
+    iftunnel_init
+    ip_links "$AWG1_UP"
+    run vpd_tunnel_table awg1 3
+    assert_output "2003"
+    run vpd_tunnel_table wgc1 3
+    assert_output "wgc1"
+    run vpd_tunnel_iface awg1
+    assert_output "awg1"
+    run vpd_tunnel_iface ovpnc1
+    assert_output "tun11"
+    run vpd_tunnel_info awg1
+    assert_output $'interface\n1'
+    iftunnel_route_ensure() { echo "iftunnel $*"; }
+    platform_tunnel_route_ensure() { echo "platform $*"; }
+    run vpd_tunnel_route_ensure awg1 3 10.0.0.1
+    assert_output "iftunnel awg1 3"
+    run vpd_tunnel_route_ensure wgc1 0 10.0.0.1
+    assert_output "platform wgc1 0 10.0.0.1"
+}
+
+@test "vpd_tunnel_table_release: an interface, one the last apply recorded, and the platform's" {
+    load_iftunnel "awg1"
+    iftunnel_init
+    printf 'awg1 2001\nawg9 2002\n' > "$IFTUNNEL_STATE_FILE"
+    iftunnel_table_release() { echo "iftunnel $*"; }
+    platform_tunnel_table_release() { echo "platform $*"; }
+    run vpd_tunnel_table_release awg1 1
+    assert_output "iftunnel awg1 1"
+    run vpd_tunnel_table_release awg9 2
+    assert_output "iftunnel awg9 2"
+    run vpd_tunnel_table_release wgc1 0
+    assert_output "platform wgc1 0"
+}
+
+# Taken off the list, an interface is no tunnel any more - but its slot still
+# holds a rule into its table until an apply releases it, and that needs the
+# table's number.
+@test "vpd_tunnel_table: an interface the list no longer names keeps its recorded table" {
+    load_iftunnel ""
+    iftunnel_init
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    run vpd_tunnel_table awg1 1
+    assert_output "2001"
+    run vpd_tunnel_retired awg1
+    assert_success
+    TUN_DIR_INTERFACES="awg1"
+    iftunnel_init
+    run vpd_tunnel_retired awg1
+    assert_failure
+    run vpd_tunnel_retired wgc1
+    assert_failure
+}
+
+@test "vpd_tunnel_unlisted_reason: why the list rejected a name, else the platform's answer" {
+    load_iftunnel "br0"
+    iftunnel_init
+    run vpd_tunnel_unlisted_reason br0
+    assert_output "'br0' is a LAN interface"
+    run vpd_tunnel_unlisted_reason wgc9
+    assert_failure
+    refute_output
+}

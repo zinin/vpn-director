@@ -353,3 +353,83 @@ iftunnel_status() {
             "$iface" "$table" "$route" "$nat" "$mss_out" "$mss_in"
     done < "$IFTUNNEL_STATE_FILE"
 }
+
+###################################################################################################
+# vpd_* - the tunnels of Tunnel Director: the firmware's and the interfaces
+# -------------------------------------------------------------------------------------------------
+# The core calls these, never platform_tunnel* directly: an interface of tunnel_director.interfaces
+# goes to iftunnel_*, any other id to the platform contract (lib/platform.sh), with the same
+# arguments and the same answers. The contract keeps describing the firmware alone.
+###################################################################################################
+
+# vpd_tunnels - the platform's tunnels without main, the interfaces, main last. rc 1 when the
+# platform's inventory failed, as platform_tunnels' own: cmd_platform refuses an incomplete list.
+vpd_tunnels() {
+    local list rc=0 id
+    list="$(platform_tunnels)" || rc=$?
+    while IFS= read -r id; do
+        [[ -n $id && $id != main ]] || continue
+        printf '%s\n' "$id"
+    done <<< "$list"
+    iftunnel_list
+    printf '%s\n' main
+    return "$rc"
+}
+
+vpd_tunnel_iface() {
+    if iftunnel_is "${1:-}"; then
+        iftunnel_iface "$1"
+    else
+        platform_tunnel_iface "$@"
+    fi
+}
+
+vpd_tunnel_info() {
+    if iftunnel_is "${1:-}"; then
+        iftunnel_info "$1"
+    else
+        platform_tunnel_info "$@"
+    fi
+}
+
+# vpd_tunnel_table <id> <idx> - an interface's own table. For an interface the list no longer
+# names, the table the last apply recorded for it: its slot still holds a rule into that table
+# until an apply drops it, and the drop has to find the rule.
+vpd_tunnel_table() {
+    local recorded
+    if iftunnel_is "${1:-}"; then
+        iftunnel_table "${2:-}"
+    elif recorded="$(iftunnel_recorded "${1:-}")"; then
+        printf '%s\n' "$recorded"
+    else
+        platform_tunnel_table "$@"
+    fi
+}
+
+vpd_tunnel_route_ensure() {
+    if iftunnel_is "${1:-}"; then
+        iftunnel_route_ensure "$1" "${2:-}"
+    else
+        platform_tunnel_route_ensure "$@"
+    fi
+}
+
+# vpd_tunnel_table_release <id> <idx> - an interface the list no longer names is released as an
+# interface too: its table, its NAT and MSS rules.
+vpd_tunnel_table_release() {
+    if iftunnel_is "${1:-}" || iftunnel_recorded "${1:-}" >/dev/null; then
+        iftunnel_table_release "$1" "${2:-}"
+    else
+        platform_tunnel_table_release "$@"
+    fi
+}
+
+# vpd_tunnel_unlisted_reason <id> - why the list rejected a name, else the platform's reason
+vpd_tunnel_unlisted_reason() {
+    iftunnel_rejected_reason "${1:-}" || platform_tunnel_unlisted_reason "$@"
+}
+
+# vpd_tunnel_retired <id> - an interface the last apply routed and the list no longer names
+vpd_tunnel_retired() {
+    ! iftunnel_is "${1:-}" && iftunnel_recorded "${1:-}" >/dev/null
+}

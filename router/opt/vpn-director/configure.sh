@@ -53,6 +53,11 @@ XRAY_CONFIG_DIR="${XRAY_CONFIG_DIR:-/opt/etc/xray}"
 # into an interactive wizard.
 . "$VPD_DIR/lib/platform.sh"
 
+# Interface tunnels and the vpd_* layer: the interfaces of
+# tunnel_director.interfaces are offered beside the firmware's tunnels. Like
+# platform.sh it needs no common.sh, and it logs nothing without it.
+. "$VPD_DIR/lib/iftunnel.sh"
+
 # Temporary storage for parsed data
 XRAY_CLIENTS_LIST=""
 TUN_DIR_TUNNELS_JSON='{}'
@@ -86,21 +91,30 @@ print_info() {
     printf "${BLUE}[INFO]${NC} %s\n" "$1"
 }
 
+# wizard_interfaces - tunnel_director.interfaces of the config on disk: an
+# interface tunnel is offered like a firmware one.
+wizard_interfaces() {
+    iftunnel_read_config "$VPD_DIR/vpn-director.json"
+}
+
 # wizard_tunnel_choices - the tunnels this router has, one numbered line each
 # ("  N) <id>  <description> (down)"); main is not offered.
 wizard_tunnel_choices() {
     local id info desc connected n=0
+    local TUN_DIR_INTERFACES
+    TUN_DIR_INTERFACES="$(wizard_interfaces)"
+    iftunnel_init
     while IFS= read -r id; do
         [[ -n $id && $id != main ]] || continue
         n=$((n + 1))
         desc=""
         connected=1
-        if info="$(platform_tunnel_info "$id")"; then
+        if info="$(vpd_tunnel_info "$id")"; then
             connected="$(printf '%s\n' "$info" | sed -n 2p)"
             desc="$(printf '%s\n' "$info" | sed -n 3p)"
         fi
         printf '  %d) %s%s%s\n' "$n" "$id" "${desc:+  $desc}" "$([[ $connected == 1 ]] || printf ' (down)')"
-    done < <(platform_tunnels || true)
+    done < <(vpd_tunnels || true)
 }
 
 # wizard_tunnel_by_number <n> - the id at position n of wizard_tunnel_choices,
@@ -109,10 +123,13 @@ wizard_tunnel_choices() {
 # Never fails, whatever the user typed: the caller assigns its output under
 # "set -e", so a non-zero return would abort the wizard instead of asking
 # again - hence [1-9] rather than [0-9], since sed rejects the line address 0
-# with an error, and the trailing "|| true" for a platform_tunnels that fails.
+# with an error, and the trailing "|| true" for a list that fails.
 wizard_tunnel_by_number() {
     [[ ${1:-} =~ ^[1-9][0-9]*$ ]] || return 0
-    platform_tunnels 2>/dev/null | awk 'length && $0 != "main"' | sed -n "${1}p" || true
+    local TUN_DIR_INTERFACES
+    TUN_DIR_INTERFACES="$(wizard_interfaces)"
+    iftunnel_init
+    vpd_tunnels 2>/dev/null | awk 'length && $0 != "main"' | sed -n "${1}p" || true
 }
 
 # shellcheck disable=SC2034  # INPUT_RESULT used by callers

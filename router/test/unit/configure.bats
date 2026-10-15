@@ -634,6 +634,16 @@ two_subscriptions='[
     assert_output "ovpnc1"
 }
 
+@test "wizard_tunnel_choices: offers the interfaces of tunnel_director.interfaces after the platform's tunnels" {
+    load_wizard
+    jq '.tunnel_director.interfaces = ["awg1"]' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    run wizard_tunnel_choices
+    assert_success
+    assert_line --index 4 "  5) awg1 (down)"
+    run wizard_tunnel_by_number 5
+    assert_output "awg1"
+}
+
 # Only the prefix used to be checked, so 192.168.1.1000 went into the config
 # and then into "iptables -s", which refuses it, and 192.168.1.08 into iptables,
 # which reads a leading zero as octal. Tunnel Director carries Xray clients

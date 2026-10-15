@@ -462,7 +462,8 @@ cmd_update() {
 # -------------------------------------------------------------------------------------------------
 # cmd_platform - print the platform facts the daemons need, as one JSON document
 # -------------------------------------------------------------------------------------------------
-# Tunnels are listed without "main"; a tunnel whose interface or info lookup
+# Tunnels are listed without "main" - the firmware's, then the interfaces of
+# tunnel_director.interfaces; a tunnel whose interface or info lookup
 # fails is omitted with a WARN so the rest of the document stays usable. An
 # incomplete tunnel inventory aborts: an empty Merlin list is authoritative
 # to the failover watch. The document is one line: the daemons read the
@@ -472,13 +473,19 @@ cmd_update() {
 cmd_platform() {
     _load_common
 
+    # The interfaces of tunnel_director.interfaces are tunnels as well. This
+    # command takes no lock and loads no config.sh - the daemons run it on every
+    # poll - so it reads the one key it needs.
+    TUN_DIR_INTERFACES="$(iftunnel_read_config "${VPD_CONFIG_FILE:-/opt/vpn-director/vpn-director.json}")"
+    iftunnel_init
+
     local arch wan pw_file lan_json tunnels_json tunnel_ids
     arch="$(uname -m)"
     wan="$(platform_wan_if)" || wan=""
     pw_file="$(platform_password_file)"
     lan_json="$(platform_lan_ifaces | jq -R . | jq -s -c .)"
 
-    if ! tunnel_ids="$(platform_tunnels)"; then
+    if ! tunnel_ids="$(vpd_tunnels)"; then
         log -l ERROR "platform: cannot read tunnel inventory"
         return 1
     fi
@@ -488,11 +495,11 @@ cmd_platform() {
     while IFS= read -r id; do
         [[ -n $id ]] || continue
         [[ $id == main ]] && continue
-        if ! iface="$(platform_tunnel_iface "$id")"; then
+        if ! iface="$(vpd_tunnel_iface "$id")"; then
             log -l WARN "platform: cannot map tunnel '$id' to an interface; omitted"
             continue
         fi
-        if ! info="$(platform_tunnel_info "$id")"; then
+        if ! info="$(vpd_tunnel_info "$id")"; then
             log -l WARN "platform: no info for tunnel '$id'; omitted"
             continue
         fi
