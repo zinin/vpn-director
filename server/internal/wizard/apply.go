@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/zinin/vpn-director/server/internal/service"
 	"github.com/zinin/vpn-director/server/internal/telegram"
@@ -135,6 +136,8 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 				existing.Clients = append(existing.Clients, c.IP)
 				tunnels[c.Route] = existing
 			} else {
+				// The wizard's countries; a tunnel already in the config
+				// keeps its addresses as well, under the lock below.
 				tunnels[c.Route] = vpnconfig.TunnelConfig{
 					Clients: []string{c.IP},
 					Exclude: excl,
@@ -160,9 +163,14 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 		vpnCfg.Xray.ExcludeSets = excl
 		vpnCfg.Xray.ExcludeIPs = excludeIPs
 		vpnCfg.Xray.Servers = vpnconfig.ServerIPs(all)
+		// A tunnel already in the config keeps what the wizard does not ask
+		// for: its gateway, the OpenVPN next hop set by hand, and the
+		// addresses and CIDRs of its exclude, which the kill switch would
+		// refuse once they were gone. The countries are the wizard's.
 		for name, tunnel := range tunnels {
 			if existing, ok := vpnCfg.TunnelDirector.Tunnels[name]; ok {
 				tunnel.Gateway = existing.Gateway
+				tunnel.Exclude = keepAddressExclusions(tunnel.Exclude, existing.Exclude)
 				tunnels[name] = tunnel
 			}
 		}
@@ -239,4 +247,21 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 
 	a.sender.SendPlain(chatID, "Done!")
 	return nil
+}
+
+// keepAddressExclusions returns a tunnel's exclude after a wizard save: the
+// wizard's countries, then each entry of the old exclude that holds '.', ':'
+// or '/' - an IPv4 address, a CIDR, an IPv6 entry; no country code does - once,
+// in its order. Those are what the user put there by hand: a guest network,
+// the modem on the WAN side, a server the tunnel must not carry inside itself
+// (tunnel-director.md, "The kill switch"). A new slice, since every tunnel of
+// the save starts from the same countries slice.
+func keepAddressExclusions(countries, old []string) []string {
+	out := slices.Clone(countries)
+	for _, x := range old {
+		if strings.ContainsAny(x, ".:/") && !slices.Contains(out, x) {
+			out = append(out, x)
+		}
+	}
+	return out
 }

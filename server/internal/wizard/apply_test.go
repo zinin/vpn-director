@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -912,6 +913,63 @@ func TestApplier_Apply_PreservesExistingTunnelGateway(t *testing.T) {
 	}
 	if len(got.Clients) != 1 || got.Clients[0] != "192.168.1.10" {
 		t.Errorf("Clients = %v, want [192.168.1.10]", got.Clients)
+	}
+}
+
+// A tunnel's exclude holds addresses and CIDRs beside the countries - a guest
+// network, the modem, a server the tunnel must not carry inside itself - and
+// the wizard asks for countries only. A save that rebuilt each tunnel from the
+// countries dropped the rest, and the kill switch then refused what the user
+// had sent direct. Each existing tunnel keeps one entry here: on a slice the
+// tunnels shared, each one's append would overwrite the one before.
+func TestApplier_Apply_KeepsTheAddressExclusionsOfAnExistingTunnel(t *testing.T) {
+	configStore := &trackingConfigStore{
+		servers: []vpnconfig.Server{
+			{Name: "Server1", IPs: []string{"1.2.3.4"}},
+		},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{
+			DataDir: "/opt/vpn-director/data",
+			TunnelDirector: vpnconfig.TunnelDirectorConfig{
+				Tunnels: map[string]vpnconfig.TunnelConfig{
+					"wgc1":   {Clients: []string{"192.168.1.1"}, Exclude: []string{"de", "203.0.113.7", "203.0.113.7"}},
+					"wgc2":   {Clients: []string{"192.168.1.2"}, Exclude: []string{"ru", "192.168.101.0/24"}},
+					"ovpnc1": {Clients: []string{"192.168.1.3"}, Exclude: []string{"2001:db8::/32"}},
+				},
+			},
+		},
+	}
+	applier := NewApplier(&trackingManager{}, &trackingSender{}, configStore,
+		&mockVPNDirector{platform: platformWith("wgc1", "wgc2", "ovpnc1", "ovpnc2")}, &mockXrayGenerator{})
+
+	if err := applier.Apply(123, &State{
+		ChatID:      123,
+		Step:        StepConfirm,
+		ServerIndex: 0,
+		Exclusions:  map[string]bool{"ru": true, "ua": true, "by": true},
+		Clients: []ClientRoute{
+			{IP: "192.168.1.10", Route: "wgc1"},
+			{IP: "192.168.1.20", Route: "wgc2"},
+			{IP: "192.168.1.30", Route: "ovpnc1"},
+			{IP: "192.168.1.40", Route: "ovpnc2"},
+		},
+	}); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	// The countries are the wizard's; an address follows them, once.
+	want := map[string][]string{
+		"wgc1":   {"by", "ru", "ua", "203.0.113.7"},
+		"wgc2":   {"by", "ru", "ua", "192.168.101.0/24"},
+		"ovpnc1": {"by", "ru", "ua", "2001:db8::/32"},
+		"ovpnc2": {"by", "ru", "ua"},
+	}
+	tunnels := configStore.savedConfig.TunnelDirector.Tunnels
+	for id, exclude := range want {
+		if got := tunnels[id].Exclude; !slices.Equal(got, exclude) {
+			t.Errorf("%s Exclude = %v, want %v", id, got, exclude)
+		}
+	}
+	if got := configStore.savedConfig.Xray.ExcludeSets; !slices.Equal(got, []string{"by", "ru", "ua"}) {
+		t.Errorf("Xray.ExcludeSets = %v, want [by ru ua]", got)
 	}
 }
 

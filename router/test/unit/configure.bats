@@ -113,6 +113,43 @@ write_subscriptions() {
     assert_output '["192.168.50.20"]'
 }
 
+# A tunnel's exclude holds addresses and CIDRs beside the countries - a guest
+# network, the modem, a server the tunnel must not carry inside itself - and the
+# wizard asks for countries only. The countries are the wizard's; every on-disk
+# entry with a '.', ':' or '/' follows them, once.
+@test "step_generate_configs: keeps the addresses and CIDRs of an existing tunnel's exclude" {
+    load_wizard
+    write_daemon_config
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.50.20"],"exclude":["ru"]},"wgc2":{"clients":["192.168.50.21"],"exclude":["ru"]}}'
+    jq '.tunnel_director.tunnels.wgc1 = {"clients":["192.168.50.99"],"exclude":["de","203.0.113.7","192.168.101.0/24","2001:db8::/32",7,"203.0.113.7"]}' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+    mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.tunnel_director.tunnels.wgc1.exclude' "$VPD_DIR/vpn-director.json"
+    assert_output '["ru","203.0.113.7","192.168.101.0/24","2001:db8::/32"]'
+    run jq -c '.tunnel_director.tunnels.wgc2.exclude' "$VPD_DIR/vpn-director.json"
+    assert_output '["ru"]'
+}
+
+# An exclude that is no array has nothing to keep, and must not end the save:
+# jq's .[] on a string exits 5.
+@test "step_generate_configs: survives an exclude that is no array" {
+    load_wizard
+    write_daemon_config
+    jq '.tunnel_director.tunnels.wgc1 = {"clients":["192.168.50.99"],"exclude":"203.0.113.7"}' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+    mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.tunnel_director.tunnels.wgc1.exclude' "$VPD_DIR/vpn-director.json"
+    assert_output '["ru"]'
+}
+
 # A string in place of the tunnel object is a shape tunnel_apply tolerates with a
 # WARN, so the gateway lookup must not error on it and fail the whole save.
 @test "step_generate_configs: survives a string in place of a tunnel object" {

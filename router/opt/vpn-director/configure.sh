@@ -659,6 +659,12 @@ step_generate_configs() {
     # empty as $gw skips the map item. `//` replaces only null and false,
     # so a tunnels value of the wrong type (an array, say) is mapped to {}
     # by hand: indexing it by key would end the whole save with jq's rc 5.
+    # The same ids keep the addresses and CIDRs of their exclude - a guest
+    # network, the modem, a server the tunnel must not carry inside itself,
+    # which the kill switch would refuse once they were gone - after the
+    # wizard's countries, once each: every entry with a '.', ':' or '/',
+    # which no country code has. contains, not test: Entware's jq has no
+    # regex builtins.
     # The record moves active_server's write counter one on from the record
     # it replaces, as every writer of it does (vpnconfig.RecordActiveServer):
     # the subscription watch tells a selection made since its own record by
@@ -681,13 +687,18 @@ step_generate_configs() {
              $tunnels
              | to_entries
              | map(
-                 (if ($existing[.key] | type) == "object" and ($existing[.key].gateway | type) == "string"
-                  then $existing[.key].gateway
-                  else "" end) as $gw
+                 (if ($existing[.key] | type) == "object" then $existing[.key] else {} end) as $old
+                 | (if ($old.gateway | type) == "string" then $old.gateway else "" end) as $gw
+                 | (if ($old.exclude | type) == "array"
+                    then [$old.exclude[]
+                          | select(type == "string" and (contains(".") or contains(":") or contains("/")))]
+                    else [] end) as $addrs
                  | if (.value | has("gateway") | not) and ($gw != "")
                    then .value += {gateway: $gw}
                    else .
                    end
+                 | .value.exclude = reduce ((.value.exclude // []) + $addrs)[] as $x
+                     ([]; if any(.[]; . == $x) then . else . + [$x] end)
                )
              | from_entries
          )' \
