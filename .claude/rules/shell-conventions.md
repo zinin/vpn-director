@@ -37,7 +37,7 @@ paths: "**/*.sh, jffs/**/*"
 | `strip_comments [text]` | Remove blank lines and # comments |
 | `platform_wan_if` | Active WAN interface (platform contract; `get_active_wan_if` is a wrapper) |
 | `platform_ipv6_enabled` | 1 when IPv6 is enabled (platform contract; `get_ipv6_enabled` is a wrapper) |
-| `platform_tunnels`, `platform_tunnel_table`, `platform_load_module`, `platform_cron_add` | Other platform facts; see `lib/platform.sh` header for the whole contract |
+| `platform_tunnels`, `platform_tunnel_table`, `platform_load_module`, `platform_cron_add` | Other platform facts; see `lib/platform.sh` header for the whole contract. The core asks for tunnels through `vpd_*` (below) |
 | `download_file <url> <dest> [timeout]` | Download with retry (wget/curl fallback) |
 | `log_error_trace <msg>` | Log error with bash stack trace |
 
@@ -46,6 +46,15 @@ paths: "**/*.sh, jffs/**/*"
 **Platform contract**: `common.sh` sources `lib/platform.sh` at its end, so every script that
 sources `common.sh` can call `platform_*`. Firmware-specific facts belong in
 `lib/platform/<name>.sh`; no core module tests `VPD_PLATFORM` itself.
+
+Tunnels are the exception: `common.sh` sources `lib/iftunnel.sh` right after `platform.sh`, and
+the core (`tunnel.sh`, `cmd_platform`, `configure.sh`) reaches tunnels only through its `vpd_*`
+functions. They hand an interface of `tunnel_director.interfaces` to `iftunnel_*` and the
+firmware's tunnels to `platform_*`, with the same arguments and the same answers; the contract
+keeps describing the firmware alone. A call of `platform_tunnels` or of a per-tunnel
+`platform_tunnel_*` from the core would bypass interface tunnels: the platform knows none of them,
+and Tunnel Director would refuse their clients as those of an unknown tunnel.
+`platform_tunnel_offload_target` names no tunnel and stays a direct call.
 
 ## Firewall Utilities (firewall.sh)
 

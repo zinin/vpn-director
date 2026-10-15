@@ -167,7 +167,9 @@ A tunnel that carries nothing refuses everything its clients send that is not ex
 networks beyond the LAN that only `main` knows included: a guest network, the modem on the WAN
 side, the clients of the router's own VPN server. An interface tunnel's table holds only its
 default route, and so does every Tunnel Director table on KeeneticOS, so while such a tunnel is up
-that traffic goes into it. Put such CIDRs in the tunnel's `exclude`.
+that traffic goes into it. Put such CIDRs in the tunnel's `exclude`. Both wizards (`configure.sh`,
+the bot's `/configure`) keep the addresses and CIDRs of every tunnel they give clients - each entry
+with a `.`, `:` or `/` - and set only its countries.
 
 A rebuild puts each slot's block rule in before its route and lookup rule; the up-to-date path
 ensures it beside the lookup rule (`_tunnel_block_ensure`), which is how a router an earlier
@@ -208,7 +210,7 @@ inside `TUN_DIR` with the identical match immediately before `MARK`.
 | JSON Path | Default | Purpose |
 |-----------|---------|---------|
 | `advanced.tunnel_director.chain` | `TUN_DIR` | Chain name |
-| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base |
+| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base. The module owns `pref_base` to `pref_base + 2 × field_max − 1` (`field_max` is 255 with the default mask): the lookup range, then the block range - 16384-16893 with the defaults. Another rule on a preference there makes way for the module's, so a base near the firmware's own rules (Merlin's `ovpncN` rule sits at 10000+N) can delete one of them |
 | `advanced.tunnel_director.mark_mask` | `0x00ff0000` | Fwmark mask |
 | `advanced.tunnel_director.mark_shift` | `16` | Bit position |
 
@@ -268,7 +270,7 @@ tunnel; neither is a leak. Reported, it would stay proxied instead: a client mov
 
 | Path | Reported |
 |------|----------|
-| Rebuild | The clients of a tunnel the platform does not list (it keeps a slot whose block rule refuses them), and of one the mark field has no room for |
+| Rebuild | The clients of a tunnel the platform does not list (it keeps a slot whose block rule refuses them, unless the platform still routes it), and of one the mark field has no room for |
 | Rebuild | The clients of a slot whose route or ip rule is not in place after the routing step, new or kept: its mark meets the block rule |
 | Rebuild | A client `_tunnel_emit_client` skipped as outside RFC1918, or whose MARK rule was refused - or whose offload opt-out was: the fast path then takes its flows past mangle after their first packets |
 | Rebuild | Every client, when `swap_fw_chain` did not take over every interface (rc 2 or 3): an interface still on the old chain marks none of the clients new to it |

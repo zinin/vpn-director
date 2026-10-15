@@ -169,8 +169,11 @@ shutdown, durable notification and recovery contracts.
 - Conditionals: Use `[[ ]]` instead of `[ ]`
 - Logging: `log -l ERROR|WARN|INFO|DEBUG|TRACE "message"`
 - Platform facts (WAN, tunnels, cron, kernel modules) belong behind the `platform_*` functions;
-  core modules never test the platform name. Tests set `VPD_PLATFORM=merlin` through
-  `test_helper.bash`; Keenetic tests export `VPD_PLATFORM=keenetic`
+  core modules never test the platform name. The core reaches tunnels only through the `vpd_*`
+  layer of `lib/iftunnel.sh`, which hands the firmware's tunnels to `platform_*`: a call of
+  `platform_tunnels` or of a per-tunnel `platform_tunnel_*` from the core would bypass interface
+  tunnels. Tests set `VPD_PLATFORM=merlin` through `test_helper.bash`; Keenetic tests export
+  `VPD_PLATFORM=keenetic`
 
 ## Modular Docs
 

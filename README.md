@@ -300,7 +300,7 @@ Tunnel Director also routes through a Linux interface no firmware manages - an A
 }
 ```
 
-A tunnel with no route in its table - down, or its interface re-created - refuses its clients' traffic instead of sending it out through the WAN; excluded destinations still go direct. A tunnel the platform does not list - a typo in its name, say - refuses its clients the same way, unless the platform still routes it: KeeneticOS keeps routing a `WireguardN` while RCI is silent. Traffic to private networks beyond the LAN that only the router's main routing table knows - a guest network, the modem on the WAN side, the clients of the router's own VPN server - is refused too, and the table of an interface tunnel, like every Tunnel Director table on KeeneticOS, holds only its default route, so while such a tunnel is up that traffic goes into it; put those networks in the tunnel's `exclude`.
+A tunnel with no route in its table - down, or its interface re-created - refuses its clients' traffic instead of sending it out through the WAN; excluded destinations still go direct. A tunnel the platform does not list - a typo in its name, say - refuses its clients the same way, unless the platform still routes it: KeeneticOS keeps routing a `WireguardN` while RCI is silent. Traffic to private networks beyond the LAN that only the router's main routing table knows - a guest network, the modem on the WAN side, the clients of the router's own VPN server - is refused too, and the table of an interface tunnel, like every Tunnel Director table on KeeneticOS, holds only its default route, so while such a tunnel is up that traffic goes into it; put those networks in the tunnel's `exclude`. A wizard run (`configure.sh`, the bot's `/configure`) keeps the addresses and CIDRs of every tunnel it gives clients and sets only its country codes.
 
 ### Changing a client's route
 
@@ -339,7 +339,7 @@ This project uses Entware init.d for automatic startup:
 
 On Merlin, to enable user scripts: Administration -> System -> Enable JFFS custom scripts and configs -> Yes
 
-The installer, and every update after it, writes these `/jffs/scripts` hooks in full, over the files that are there, so a router whose other add-ons use the same hooks has to merge them by hand.
+The installer, and every update after it, writes these `/jffs/scripts` hooks in full, over the files that are there, so a router whose other add-ons use the same hooks has to merge them by hand, and a merge does not survive the next update: the updater copies the hooks over it again.
 
 ## Process Monitoring
 
