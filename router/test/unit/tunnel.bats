@@ -1533,10 +1533,13 @@ ip_rule_show_cut_short() {
     run tunnel_apply
     assert_success
     run cat "$BATS_TEST_TMPDIR/order.log"
-    assert_line --index 0 'ip rule del pref 16385'
-    assert_line --index 1 'ip rule add pref 16385 fwmark 0x20000/0xff0000 lookup ovpnc2'
-    assert_line --index 2 'iptables -t mangle -E TUN_DIR_NEW TUN_DIR'
-    assert_line --index 3 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line --index 0 'ip rule del pref 16640'
+    assert_line --index 1 'ip rule add pref 16640 fwmark 0x20000/0xff0000 prohibit'
+    assert_line --index 2 'ip rule del pref 16385'
+    assert_line --index 3 'ip rule add pref 16385 fwmark 0x20000/0xff0000 lookup ovpnc2'
+    assert_line --index 4 'iptables -t mangle -E TUN_DIR_NEW TUN_DIR'
+    assert_line --index 5 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line --index 6 'ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit'
 }
 
 # Review Focus 2: an NDM rebuild deletes our chain and jumps; the ip rules,
@@ -2176,7 +2179,7 @@ tun11_addressed() {
     tunnel_apply
 
     grep -q "Rules are applied and up-to-date" "$LOG_FILE"
-    grep -qF "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\"); Tunnel Director does not route through it" "$LOG_FILE"
+    grep -qF "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\"); its clients are refused" "$LOG_FILE"
     refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
     grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
     run tunnel_uncarried
@@ -2196,7 +2199,7 @@ tun11_addressed() {
     run tunnel_apply
     assert_success
     assert_output --partial "Rules are applied and up-to-date"
-    assert_output --partial "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"Yes (all)\"); Tunnel Director does not route through it"
+    assert_output --partial "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"Yes (all)\"); its clients are refused"
     refute grep -qE 'ip route (replace|del)' /tmp/bats_ip_calls.log
 }
 
@@ -2462,4 +2465,108 @@ load_awg1() {
     assert_success
     assert_output --partial "Interface tunnels"
     assert_output --partial "awg1: table 2000, route default dev awg1, NAT yes, MSS out yes, MSS in yes"
+}
+
+# ============================================================================
+# The kill switch: a mark whose table has no route is refused, never sent to main
+# ============================================================================
+
+@test "tunnel_apply: every slot but main's gets a block rule right after the lookup range" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["192.168.1.6"]},"ovpnc2":{"clients":["192.168.1.7"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    assert_line $'16641:\tfrom all fwmark 0x30000/0xff0000 prohibit'
+    refute_line --partial '16640:'
+}
+
+@test "tunnel_apply: a new slot's block rule goes in before its lookup rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    ip() {
+        if [[ ${1:-} == rule && ( ${2:-} == add || ${2:-} == del ) ]]; then
+            echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/order.log"
+    assert_line --index 0 'ip rule del pref 16639'
+    assert_line --index 1 'ip rule add pref 16639 fwmark 0x10000/0xff0000 prohibit'
+    assert_line --index 2 'ip rule del pref 16384'
+    assert_line --index 3 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+}
+
+# The upgrade: a router an earlier version applied has its hash, its chain and
+# its lookup rules, and no block rule. Its first apply takes the up-to-date path.
+@test "tunnel_apply: the up-to-date path puts a missing block rule back, without a rebuild" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+@test "tunnel_apply: a slot the layout dropped loses its block rule after the swap" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    TUN_DIR_TUNNELS_JSON='{"ovpnc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16639:'
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+}
+
+@test "tunnel_stop: clears the block range with the lookup range" {
+    load_tunnel_module
+    : > /tmp/bats_ip_calls.log
+    run tunnel_stop
+    assert_success
+    grep -qx 'ip rule del pref 16384' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule del pref 16639' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule del pref 16893' /tmp/bats_ip_calls.log
+    refute grep -qx 'ip rule del pref 16894' /tmp/bats_ip_calls.log
+}
+
+@test "tunnel_apply: refuses a layout whose block rules would reach main, before touching a rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export TUN_DIR_PREF_BASE=32300
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "the block rules would reach main's rule (32766)"
+    refute grep -q 'ip rule' /tmp/bats_ip_calls.log
+}
+
+@test "tunnel_apply: a route that does not go in says its clients are refused" {
+    load_tunnel_module
+    platform_tunnel_route_ensure() { return 1; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'wgc1': route not installed (interface down or not mapped?); its clients are refused until it is"
+}
+
+# iproute2 4.4 ends each rule with a space, as it does a lookup rule.
+@test "_tunnel_block_ensure: recognises its rule as iproute2 4.4 prints it" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    _tunnel_init
+    ip() {
+        if [[ $1 == rule && $2 == show ]]; then
+            printf '0:\tfrom all lookup local \n16639:\tfrom all fwmark 0x10000/0xff0000 prohibit \n'
+            return 0
+        fi
+        echo "ip $*" >> "$BATS_TEST_TMPDIR/ip_writes.log"
+    }
+    run _tunnel_block_ensure 0 wgc1
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/ip_writes.log" ]
 }

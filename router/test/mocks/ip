@@ -52,17 +52,20 @@ done
 _pref=""
 _fwmark=""
 _table=""
+_action=""
 
 # _parse_rule_args reads the selectors of "ip rule add|del|show" into globals.
 _parse_rule_args() {
     _pref=""
     _fwmark=""
     _table=""
+    _action=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             pref|priority) _pref="$2"; shift 2 ;;
             fwmark)        _fwmark="$2"; shift 2 ;;
             table|lookup)  _table="$2"; shift 2 ;;
+            prohibit|blackhole|unreachable) _action="$1"; shift ;;
             *)             shift ;;
         esac
     done
@@ -77,9 +80,14 @@ _table_name() {
     printf '%s' "${name:-$1}"
 }
 
-# _rule_line renders the parsed selectors as "ip rule show" would print them.
+# _rule_line renders the parsed selectors as "ip rule show" would print them: an
+# action such as prohibit in place of the lookup.
 _rule_line() {
-    printf '%s:\tfrom all%s lookup %s' "$_pref" "${_fwmark:+ fwmark $_fwmark}" "$(_table_name "$_table")"
+    if [[ -n $_action ]]; then
+        printf '%s:\tfrom all%s %s' "$_pref" "${_fwmark:+ fwmark $_fwmark}" "$_action"
+    else
+        printf '%s:\tfrom all%s lookup %s' "$_pref" "${_fwmark:+ fwmark $_fwmark}" "$(_table_name "$_table")"
+    fi
 }
 
 # _addr_line renders "ip -4 -o addr show <iface>" for the interfaces the
@@ -132,7 +140,7 @@ case "$1" in
                 # The kernel matches every selector it was given, deletes one
                 # rule and fails when none is left - which is what a delete
                 # loop relies on to stop.
-                if [[ -n $_fwmark || -n $_table ]]; then
+                if [[ -n $_fwmark || -n $_table || -n $_action ]]; then
                     target=$(_rule_line)
                     grep -qxF "$target" "$RULES_FILE" 2>/dev/null || {
                         echo "RTNETLINK answers: No such file or directory" >&2
