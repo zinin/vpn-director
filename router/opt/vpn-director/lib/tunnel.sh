@@ -451,9 +451,10 @@ _tunnel_failover_needed() {
 # that neither layout holds: a slot this apply frees still carries marks until the
 # swap, and its ip rule goes only after it. warnings, skipped_unknown and
 # incomplete are tunnel_apply's locals (bash dynamic scope). One pass, so the
-# failover MARK slots cannot drift from the rules. The clients of a tunnel that
-# gets no slot - one the platform does not list, one the mark field has no room
-# for - are not carried (TUNNEL_UNCARRIED).
+# failover MARK slots cannot drift from the rules. A tunnel the platform does not
+# list keeps a slot when it has clients: their MARK rules and the slot's block
+# rule refuse what they would send through it. Its clients are not carried, nor
+# are those of a tunnel the mark field has no room for (TUNNEL_UNCARRIED).
 _tunnel_collect_applied() {
     local prev="${1:-/dev/null}"
     local tunnel tunnel_type clients_type clients idx used tunnels reason
@@ -463,21 +464,31 @@ _tunnel_collect_applied() {
         [[ -n $tunnel ]] || continue
         if ! _tunnel_table_allowed "$tunnel"; then
             reason="$(vpd_tunnel_unlisted_reason "$tunnel")" || reason=""
-            if [[ -n $reason ]]; then
-                log -l WARN "Tunnel '$tunnel' is skipped: $reason"
-            else
-                log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
-            fi
             warnings=1
             # A tunnel with no clients gets no slot whether the platform lists it
             # or not, so there is nothing for a later apply to retry: it does not
             # keep the hash from being recorded.
             clients="$(_tunnel_clients_of "$tunnel")"
-            if [[ -n $clients ]]; then
-                skipped_unknown=1
-                _tunnel_not_carried_on "$tunnel" "$clients"
+            if [[ -z $clients ]]; then
+                if [[ -n $reason ]]; then
+                    log -l WARN "Tunnel '$tunnel' is skipped: $reason"
+                else
+                    log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
+                fi
+                continue
             fi
-            continue
+            # One with clients keeps a slot: their MARK rules and the slot's block
+            # rule refuse what they would send through it. Skipped, they went
+            # unmarked - out through the WAN, every client of every tunnel at once
+            # while KeeneticOS's RCI was silent. The hash stays unrecorded, so the
+            # next apply looks again.
+            if [[ -n $reason ]]; then
+                log -l WARN "Tunnel '$tunnel' is not on the platform's list: $reason; its clients are refused"
+            else
+                log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; its clients are refused"
+            fi
+            skipped_unknown=1
+            _tunnel_not_carried_on "$tunnel" "$clients"
         fi
         tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
         if [[ $tunnel_type != "object" ]]; then
@@ -771,6 +782,29 @@ _tunnel_route_warn() {
     else
         log -l WARN "Tunnel '$1': route not installed (interface down or not mapped?); its clients are refused until it is"
     fi
+}
+
+# _tunnel_routeless <tunnel> <idx> - has a tunnel the platform does not list no table to route
+# through? An interface taken off tunnel_director.interfaces has none - though the layer still
+# names the table the last apply recorded, that table would carry its clients on into the
+# interface - and any other id has none when the layer names no table for it. KeeneticOS's
+# WireguardN and Merlin's ovpncN keep theirs: the platform decides about their routes.
+_tunnel_routeless() {
+    vpd_tunnel_retired "$1" && return 0
+    ! vpd_tunnel_table "$1" "$2" >/dev/null
+}
+
+# _tunnel_unroute <idx> <tunnel> - what a known past left on the slot of a routeless tunnel: its
+# lookup rule (ours only) and its table - for an interface the list no longer names, the route,
+# the NAT and MSS rules too (vpd_tunnel_table_release).
+_tunnel_unroute() {
+    local idx="$1" tunnel="$2" pref mark_hex table
+    pref=$((TUN_DIR_PREF_BASE + idx))
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    if table="$(vpd_tunnel_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
+        ip rule del pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null || true
+    fi
+    vpd_tunnel_table_release "$tunnel" "$idx" || true
 }
 
 # _tunnel_slot_release <idx> <tunnel> - drop the ip rules and the table of a slot
@@ -1187,7 +1221,13 @@ tunnel_apply() {
         # is refused, never sent to main (the kill switch, tunnel-director.md).
         # One that did not go in logged its ERROR; the up-to-date path retries it.
         _tunnel_block_ensure "$tunnel_idx" "$tunnel" || warnings=1
-        if grep -qxF "$tunnel_idx $tunnel" "$prev_tmp"; then
+        if ! _tunnel_table_allowed "$tunnel" && _tunnel_routeless "$tunnel" "$tunnel_idx"; then
+            # Not listed, and no table to route it through - a typo, an
+            # interface taken off tunnel_director.interfaces: the block rule
+            # alone refuses its clients. What a known past left on the slot goes.
+            _tunnel_unroute "$tunnel_idx" "$tunnel"
+            route_ok=0
+        elif grep -qxF "$tunnel_idx $tunnel" "$prev_tmp"; then
             # A kept slot is carrying its clients now: its route and its rule
             # are ensured, never released - an empty table is a window in which
             # they are refused.

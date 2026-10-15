@@ -848,7 +848,8 @@ load_tunnel_module_with() {
     assert_success
     grep -q 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1' /tmp/bats_ip_calls.log
     run cat "$TUN_DIR_TABLES"
-    assert_output "0 wgc1"
+    assert_output $'0 wgc1\n1 wgc9'
+    grep -q 'ip rule add pref 16640 fwmark 0x20000/0xff0000 prohibit' /tmp/bats_ip_calls.log
     [ ! -f "$TUN_DIR_HASH" ]
 }
 
@@ -865,7 +866,7 @@ load_tunnel_module_with() {
     assert_success
     [ ! -f "$TUN_DIR_HASH" ]
     run cat "$TUN_DIR_TABLES"
-    assert_output "0 wgc1"
+    assert_output $'0 wgc1\n1 wgc9'
 
     platform_tunnel_table_release() { echo "release $1 $2" >> "$BATS_TEST_TMPDIR/release.log"; }
     TUN_DIR_TUNNELS_JSON='{"wgc2":{"clients":["192.168.1.5"]}}'
@@ -2216,17 +2217,18 @@ tun11_addressed() {
     [[ ! -f "$TUN_DIR_TABLES" ]]
 }
 
-@test "tunnel_apply: skips an OpenVPN client out of VPN Director mode and says why" {
+@test "tunnel_apply: an OpenVPN client out of VPN Director mode keeps a slot that refuses its clients, and says why" {
     load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
     ovpn_mode 1 0
     : > /tmp/bats_ip_calls.log
     run tunnel_apply
     assert_success
-    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\")"
+    assert_output --partial "Tunnel 'ovpnc1' is not on the platform's list: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\"); its clients are refused"
     refute_output --partial "not a tunnel this platform knows"
     assert_output --partial "not recorded as up-to-date"
     refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
-    refute grep -q 'lookup ovpnc1' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule add pref 16639 fwmark 0x10000/0xff0000 prohibit' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup ovpnc1' /tmp/bats_ip_calls.log
     [[ ! -f "$TUN_DIR_HASH" ]]
 }
 
@@ -2258,10 +2260,10 @@ tun11_addressed() {
 }
 
 # `restart` and `restart tunnel` rebuild with the config unchanged
-# (TUN_DIR_FORCE_REBUILD=1). The client's slot is on record from before the
-# switch; the rebuild gives it none, so the slot is released after the swap -
-# its ip rule, and in "No" mode the default in its table.
-@test "tunnel_apply: a rebuild releases the slot of a client switched out of VPN Director mode" {
+# (TUN_DIR_FORCE_REBUILD=1). The client switched out of VPN Director mode
+# keeps its slot - its clients are refused, not skipped - and in "No" mode the
+# default in its table goes.
+@test "tunnel_apply: a rebuild keeps the slot of a client switched out of VPN Director mode, and its default goes" {
     load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
     run tunnel_apply
     assert_success
@@ -2273,26 +2275,26 @@ tun11_addressed() {
     : > /tmp/bats_ip_calls.log
     run tunnel_apply
     assert_success
-    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
-    grep -qx 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup ovpnc1' /tmp/bats_ip_calls.log
+    assert_output --partial "Tunnel 'ovpnc1' is not on the platform's list: OpenVPN client 1 is not in VPN Director mode"
+    refute grep -qx 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup ovpnc1' /tmp/bats_ip_calls.log
     grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
     run cat "$TUN_DIR_TABLES"
-    refute_output --partial "ovpnc1"
+    assert_output "0 ovpnc1"
 }
 
 # The watch drops Xray membership on failover_ready. A failover tunnel the
-# platform leaves out gets no slot, so no marker goes out and the Xray clients
+# platform leaves out has no route, so no marker goes out and the Xray clients
 # stay proxied. tun11 has an address: listed, the tunnel would be carried.
-@test "tunnel_apply: no slot and no failover_ready for a failover tunnel out of VPN Director mode" {
+@test "tunnel_apply: no failover_ready for a failover tunnel out of VPN Director mode" {
     load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.8"]}}'
     export XRAY_FAILOVER_TUNNEL=ovpnc1 XRAY_FAILOVER_CLIENTS=192.168.1.8
     tun11_addressed
     ovpn_mode 1 0
     run tunnel_apply
     assert_success
-    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
+    assert_output --partial "Tunnel 'ovpnc1' is not on the platform's list: OpenVPN client 1 is not in VPN Director mode"
     run cat "$TUN_DIR_TABLES"
-    refute_output --partial "ovpnc1"
+    assert_output "0 ovpnc1"
     [[ ! -e "$TUN_DIR_FAILOVER_READY" ]]
 }
 
@@ -2583,4 +2585,74 @@ load_awg1() {
     run _tunnel_block_ensure 0 wgc1
     assert_success
     [ ! -e "$BATS_TEST_TMPDIR/ip_writes.log" ]
+}
+
+# ============================================================================
+# A tunnel the platform does not know: its clients are refused
+# ============================================================================
+
+@test "tunnel_apply: a tunnel no platform knows keeps a slot, its marks and the block rule only" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"foo1":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    # common.sh points LOG_FILE at /tmp/vpn-director.log, which every run
+    # appends to; the warning has to be looked for in this test's own lines.
+    LOG_FILE="$BATS_TEST_TMPDIR/vpn-director.log"
+    tunnel_apply
+    grep -qF "Tunnel 'foo1' is not a tunnel this platform knows; its clients are refused" "$LOG_FILE"
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n1 foo1'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000'
+    run ip rule show
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    refute_line --partial '16385:'
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.6"
+    [ ! -f "$TUN_DIR_HASH" ]
+}
+
+# Review Focus 5: KeeneticOS answers "main" alone while RCI is silent, and the
+# netfilter.d hook applies during exactly such an NDM rebuild. Skipping every
+# tunnel sent every client out through the WAN; refusing them all would cut the
+# LAN off. WireguardN's table is 2000 + idx whatever RCI says, so the tunnel
+# keeps its route and its lookup rule.
+@test "tunnel_apply: a tunnel whose table the platform names keeps routing while the platform does not list it" {
+    export VPD_PLATFORM=keenetic
+    load_tunnel_module_with '{"Wireguard0":{"clients":["192.168.1.6"]}}'
+    _rci_get() { return 1; }
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'Wireguard0' is not a tunnel this platform knows; its clients are refused"
+    grep -qx 'ip route replace default dev nwg0 table 2000' /tmp/bats_ip_calls.log
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup 2000'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# Review Focus 2: awg1 taken off tunnel_director.interfaces while its tunnel
+# keeps clients. The platform does not know it, and its table would carry them
+# on into awg1: the lookup rule and the route go, with the NAT and MSS rules,
+# and the block rule refuses the clients.
+@test "tunnel_apply: an interface taken off the list stops routing and its clients are refused" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip route show table 2000
+    assert_output "default dev awg1"
+
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'awg1' is not a tunnel this platform knows; its clients are refused"
+    run ip rule show
+    refute_line --partial '16384:'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run cat "$TUN_DIR_TABLES"
+    assert_output "0 awg1"
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
 }
