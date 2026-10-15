@@ -651,11 +651,12 @@ func (h *ClientsHandler) handleMoveTo(chatID int64, msgID int, data string, conf
 
 // moveQuestion is what a move of ip to the tunnel route asks before it goes
 // ahead, given what the platform answered, or "" when it asks nothing. A tunnel
-// listed as down has no route in its table: the client's traffic goes out
-// through the WAN until it is up. A configured tunnel the platform does not
-// list - "(unknown)": a typo, a connection deleted in the router, RCI silent -
-// is one Tunnel Director skips until it is listed. main is Tunnel Director's
-// own route, which no platform lists.
+// listed as down has no route in its table, and Tunnel Director refuses what
+// the client would send through it until it is up (the block rule after the
+// tunnel's lookup rule). A configured tunnel the platform does not list -
+// "(unknown)": a typo, a connection deleted in the router, RCI silent - refuses
+// its clients the same way until it is listed. Excluded destinations go direct
+// either way. main is Tunnel Director's own route, which no platform lists.
 func moveQuestion(info vpnconfig.PlatformInfo, route, ip string) string {
 	if route == "main" {
 		return ""
@@ -665,8 +666,8 @@ func moveQuestion(info vpnconfig.PlatformInfo, route, ip string) string {
 			if t.Connected {
 				return ""
 			}
-			return fmt.Sprintf("%s is down: until it is up, %s's traffic goes out through the WAN. Move anyway?", route, ip)
+			return fmt.Sprintf("%s is down: until it is up, Tunnel Director blocks the traffic %s would send through it (excluded destinations still go direct). Move anyway?", route, ip)
 		}
 	}
-	return fmt.Sprintf("%s is not on the router's tunnel list: until it is, Tunnel Director does not route %s through it. Move anyway?", route, ip)
+	return fmt.Sprintf("%s is not on the router's tunnel list: until it is, Tunnel Director blocks the traffic %s would send through it (excluded destinations still go direct). Move anyway?", route, ip)
 }

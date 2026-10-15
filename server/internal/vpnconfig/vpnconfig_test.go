@@ -654,6 +654,24 @@ func TestPlatformInfo_DecodesTheCLIDocumentAndFindsTunnels(t *testing.T) {
 	}
 }
 
+// vpn-director.sh platform lists an interface of tunnel_director.interfaces
+// after the firmware's tunnels, typed "interface". The daemons decode it as one
+// more tunnel: nothing in PlatformTunnel depends on the type.
+func TestPlatformInfo_DecodesAnInterfaceTunnel(t *testing.T) {
+	doc := `{"platform":"merlin","arch":"aarch64","password_file":"/etc/shadow","lan_ifaces":["br0"],"wan_if":"eth0","tunnels":[{"id":"wgc1","iface":"wgc1","type":"wireguard","connected":false,"description":"office-wg"},{"id":"awg1","iface":"awg1","type":"interface","connected":true,"description":""}]}`
+	var info PlatformInfo
+	if err := json.Unmarshal([]byte(doc), &info); err != nil {
+		t.Fatal(err)
+	}
+	want := PlatformTunnel{ID: "awg1", Iface: "awg1", Type: "interface", Connected: true, Description: ""}
+	if len(info.Tunnels) != 2 || info.Tunnels[1] != want {
+		t.Errorf("tunnels = %+v, want %+v after wgc1", info.Tunnels, want)
+	}
+	if !info.HasTunnel("awg1") {
+		t.Error("HasTunnel(awg1) = false for a listed interface tunnel")
+	}
+}
+
 func TestServerIPs_SortedAndDeduplicated(t *testing.T) {
 	cases := map[string]struct {
 		servers []Server
@@ -941,5 +959,51 @@ func TestMonitorConfig_KeepsTheSubscriptionRefresh(t *testing.T) {
 	out, err := json.Marshal(cfg)
 	if err != nil || !strings.Contains(string(out), `"subscription_refresh":"7m"`) {
 		t.Fatalf("written %s, err %v", out, err)
+	}
+}
+
+// A daemon writes the config from its struct: a key the struct lacks is gone
+// after the first save - a client moved in the Web UI, a failover commit.
+func TestSaveVPNDirectorConfig_KeepsTunnelDirectorInterfaces(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpn-director.json")
+	in := `{"data_dir":"/data","tunnel_director":{"interfaces":["awg1"],"tunnels":{"awg1":{"clients":["192.168.1.30"],"exclude":["ru","203.0.113.7"]}}},"xray":{"clients":[],"servers":[],"exclude_ips":[],"exclude_sets":[]}}`
+	if err := os.WriteFile(path, []byte(in), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadVPNDirectorConfig(path)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := SaveVPNDirectorConfig(path, cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	again, err := LoadVPNDirectorConfig(path)
+	if err != nil {
+		t.Fatalf("load again: %v", err)
+	}
+	if !reflect.DeepEqual(again.TunnelDirector.Interfaces, []string{"awg1"}) {
+		t.Errorf("interfaces = %v, want [awg1]", again.TunnelDirector.Interfaces)
+	}
+	if got := again.TunnelDirector.Tunnels["awg1"].Exclude; !reflect.DeepEqual(got, []string{"ru", "203.0.113.7"}) {
+		t.Errorf("exclude = %v, want [ru 203.0.113.7]", got)
+	}
+}
+
+func TestSaveVPNDirectorConfig_OmitsAnEmptyInterfaceList(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "vpn-director.json")
+	cfg := &VPNDirectorConfig{
+		DataDir:        "/data",
+		TunnelDirector: TunnelDirectorConfig{Tunnels: map[string]TunnelConfig{}},
+		Xray:           XrayConfig{Clients: []string{}, Servers: []string{}, ExcludeSets: []string{}},
+	}
+	if err := SaveVPNDirectorConfig(path, cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "interfaces") {
+		t.Errorf("an empty interface list was written:\n%s", data)
 	}
 }

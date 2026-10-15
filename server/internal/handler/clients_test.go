@@ -926,8 +926,8 @@ func TestClientsHandler_HandleAddRoute_RefusesATunnelForAnAddressTunnelDirectorC
 }
 
 // A configured tunnel the platform does not list - "(unknown)" on the keyboard:
-// a typo, a connection deleted in the router, RCI silent - is one Tunnel
-// Director skips. The move asks first, as for a tunnel that is down.
+// a typo, a connection deleted in the router, RCI silent - refuses its clients
+// until it is listed. The move asks first, as for a tunnel that is down.
 func TestClientsHandler_MoveToAnUnknownTunnelAsksFirst(t *testing.T) {
 	sender := &mockSenderClients{}
 	config := &mockConfigClients{vpnConfig: moveCfg()}
@@ -939,7 +939,7 @@ func TestClientsHandler_MoveToAnUnknownTunnelAsksFirst(t *testing.T) {
 	if config.savedConfig != nil || vpn.applyCalls != 0 {
 		t.Fatal("a move to a tunnel the router does not list happens only once confirmed")
 	}
-	want := "wgc1 is not on the router's tunnel list: until it is, Tunnel Director does not route 192.168.50.10 through it. Move anyway?"
+	want := "wgc1 is not on the router's tunnel list: until it is, Tunnel Director blocks the traffic 192.168.50.10 would send through it (excluded destinations still go direct). Move anyway?"
 	if !strings.Contains(sender.editText, telegramEscaped(want)) {
 		t.Errorf("edit text = %q", sender.editText)
 	}
@@ -1026,4 +1026,20 @@ func TestClientsHandler_MainIsNeverUnknown(t *testing.T) {
 // telegramEscaped is s as the bot sends it in MarkdownV2.
 func telegramEscaped(s string) string {
 	return telegram.EscapeMarkdownV2(s)
+}
+
+// The kill switch: a tunnel that carries nothing refuses what its clients would
+// send through it, so neither question may promise the WAN any more.
+func TestMoveQuestion_TheTunnelRefusesWhatItWouldCarry(t *testing.T) {
+	info := vpnconfig.PlatformInfo{Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "awg1", Iface: "awg1", Type: "interface", Connected: false},
+	}}
+	want := "awg1 is down: until it is up, Tunnel Director blocks the traffic 192.168.1.30 would send through it (excluded destinations still go direct). Move anyway?"
+	if got := moveQuestion(info, "awg1", "192.168.1.30"); got != want {
+		t.Errorf("down:\n got %q\nwant %q", got, want)
+	}
+	want = "wgc9 is not on the router's tunnel list: until it is, Tunnel Director blocks the traffic 192.168.1.30 would send through it (excluded destinations still go direct). Move anyway?"
+	if got := moveQuestion(info, "wgc9", "192.168.1.30"); got != want {
+		t.Errorf("unknown:\n got %q\nwant %q", got, want)
+	}
 }
