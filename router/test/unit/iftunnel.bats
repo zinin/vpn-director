@@ -58,6 +58,16 @@ load_iftunnel() {
     refute grep -q 'tunnel_director.interfaces' "$LOG_FILE"
 }
 
+@test "iftunnel_init: a rejected name listed twice warns once" {
+    load_iftunnel "br0 awg1 main br0 main"
+    iftunnel_init
+    run iftunnel_list
+    assert_output "awg1"
+    assert_equal "$(grep -c 'tunnel_director.interfaces: .*; ignored' "$LOG_FILE")" 2
+    assert_equal "$(grep -c "^br0"$'\t' <<< "$_iftunnel_rejected")" 1
+    assert_equal "$(grep -c "^main"$'\t' <<< "$_iftunnel_rejected")" 1
+}
+
 @test "iftunnel_init: checks a list once, and again when it changes" {
     load_iftunnel "bad/name"
     iftunnel_init
@@ -220,6 +230,37 @@ AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
     refute_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
 }
 
+# Review Focus 1, the other half: the replacement finds the old clamp by a
+# pattern too, and "awg1" must not take "awg10"'s.
+@test "iftunnel_route_ensure: a new MTU leaves another interface's inbound clamp alone, a longer name's included" {
+    load_iftunnel "awg1 awg10"
+    use_stateful_iptables
+    ip_links "$AWG1_UP" "awg10 <POINTOPOINT,NOARP,UP,LOWER_UP> 1420"
+    iftunnel_route_ensure awg1 1
+    iftunnel_route_ensure awg10 2
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1300" "awg10 <POINTOPOINT,NOARP,UP,LOWER_UP> 1420"
+    iftunnel_route_ensure awg1 1
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1260'
+    refute_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+    assert_line '-A FORWARD -i awg10 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380'
+}
+
+# An empty name would put "-o ''" rules in at position 1, and an older libxtables
+# reads an empty interface as any: a bare MASQUERADE at the head of nat
+# POSTROUTING.
+@test "iftunnel_route_ensure: an empty name puts no rule and no route in" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    : > /tmp/bats_iptables_calls.log
+    : > /tmp/bats_ip_calls.log
+    run iftunnel_route_ensure "" 1
+    assert_failure
+    [ ! -s /tmp/bats_iptables_calls.log ]
+    [ ! -s /tmp/bats_ip_calls.log ]
+}
+
 @test "iftunnel_table_release: the route and the three rules gone" {
     load_iftunnel "awg1"
     use_stateful_iptables
@@ -253,6 +294,19 @@ AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
     assert_line '-A FORWARD -i awg10 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380'
     assert_line '-A FORWARD -o awg10 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
     refute_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+# The release of an empty name would delete "-o ''" rules, which an older
+# libxtables reads as rules of no interface: someone else's bare MASQUERADE.
+@test "iftunnel_table_release: an empty name removes nothing" {
+    load_iftunnel ""
+    use_stateful_iptables
+    : > /tmp/bats_iptables_calls.log
+    : > /tmp/bats_ip_calls.log
+    run iftunnel_table_release "" 1
+    assert_failure
+    [ ! -s /tmp/bats_iptables_calls.log ]
+    [ ! -s /tmp/bats_ip_calls.log ]
 }
 
 # ============================================================================

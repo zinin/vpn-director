@@ -47,12 +47,13 @@ _iftunnel_warn() {
 # and nothing else claims it: not main, not a tunnel the platform lists, not a LAN interface, not
 # the WAN (checked only when the platform names one). A rejected name logs one WARN and is no
 # interface tunnel: a tunnel key that names main or a tunnel the platform lists stays that, and
-# any other is one the platform does not know. A name listed twice counts once. Call it in the
-# shell that goes on to use the list - tunnel.sh does, in _tunnel_init - so the WARNs come once
-# and every $(iftunnel_*) or $(vpd_*) after it finds the list checked.
+# any other is one the platform does not know. A name listed twice counts once, a rejected one
+# too: one WARN, one reason. Call it in the shell that goes on to use the list - tunnel.sh does,
+# in _tunnel_init - so the WARNs come once and every $(iftunnel_*) or $(vpd_*) after it finds the
+# list checked.
 # -------------------------------------------------------------------------------------------------
 iftunnel_init() {
-    local raw="${TUN_DIR_INTERFACES:-}" name reason platform_ids lan wan
+    local raw="${TUN_DIR_INTERFACES:-}" name reason platform_ids lan wan seen=" "
     local name_re='^[A-Za-z0-9_.-]{1,15}$'
     local -a names=()
     if [[ $_iftunnel_checked_once -eq 1 && $_iftunnel_checked == "$raw" ]]; then
@@ -70,6 +71,9 @@ iftunnel_init() {
     wan="$(platform_wan_if 2>/dev/null)" || wan=""
     read -ra names <<< "$raw"
     for name in "${names[@]}"; do
+        # A repeat is skipped before the reasons, or a rejected name would warn again.
+        [[ $seen != *" $name "* ]] || continue
+        seen+="$name "
         reason=""
         if [[ ! $name =~ $name_re || $name == . || $name == .. ]]; then
             reason="'$name' is no interface name (1-15 characters: letters, digits, _ . -)"
@@ -81,8 +85,6 @@ iftunnel_init() {
             reason="'$name' is a LAN interface"
         elif [[ -n $wan && $name == "$wan" ]]; then
             reason="'$name' is the WAN interface"
-        elif [[ " $_iftunnel_valid " == *" $name "* ]]; then
-            continue
         fi
         if [[ -n $reason ]]; then
             _iftunnel_rejected+="$name"$'\t'"$reason"$'\n'
@@ -248,6 +250,9 @@ _iftunnel_rules_release() {
 # -------------------------------------------------------------------------------------------------
 iftunnel_route_ensure() {
     local iface="${1:-}" table link mtu
+    # No name, no rule: an older libxtables reads "-o ''" as any interface, and the first rule
+    # below would be a bare MASQUERADE at the head of nat POSTROUTING.
+    [[ -n $iface ]] || return 1
     table="$(iftunnel_table "${2:-}")" || return 1
     _iftunnel_rules_ensure "$iface"
     link="$(_iftunnel_link "$iface")" || return 1
@@ -259,9 +264,12 @@ iftunnel_route_ensure() {
 }
 
 # iftunnel_table_release <iface> <idx> - the route and the three rules gone. A table that holds
-# nothing is no error: tunnel.sh releases slots that were never ensured.
+# nothing is no error: tunnel.sh releases slots that were never ensured. No name releases nothing:
+# an older libxtables reads "-o ''" as any interface, and the delete could take someone else's
+# bare MASQUERADE.
 iftunnel_table_release() {
     local table
+    [[ -n ${1:-} ]] || return 1
     table="$(iftunnel_table "${2:-}")" || return 1
     ip route flush table "$table" 2>/dev/null || true
     _iftunnel_rules_release "${1:-}"
