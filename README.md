@@ -101,6 +101,7 @@ After installation, configs are located at:
 /opt/vpn-director/vpn-director.sh stop                # Stop all components
 /opt/vpn-director/vpn-director.sh restart             # Restart Xray, rebuild all in place without a stop
 /opt/vpn-director/vpn-director.sh update              # Update ipsets + reapply
+/opt/vpn-director/vpn-director.sh ensure-routes       # Put back a route an interface tunnel lost (cron, every minute)
 
 # Component-specific
 /opt/vpn-director/vpn-director.sh status tunnel       # Tunnel Director status only
@@ -269,7 +270,7 @@ Up to ten subscriptions live side by side; you pick the running server from any 
 
 ### Tunnel Director
 
-Routes traffic from specified LAN clients through OpenVPN/WireGuard tunnels based on destination. Configurable exclusions allow direct access to specified countries for optimal performance. A tunnel key is an id the platform lists (`wgc1` / `ovpnc1` on Merlin, `OpenVPN0` / `Wireguard1` on KeeneticOS). On Merlin an OpenVPN client is listed only in "VPN Director (policy rules)" mode: in "No" and "Yes (all)" the firmware sends all of the router's traffic through the client's routing table, so a route Tunnel Director put there would take every device into the tunnel. An apply skips such a client with a warning that names its mode. If Tunnel Director still has the tunnel on record, an apply also takes out a default route an earlier version left in its table in "No" mode. An OpenVPN tunnel may set optional `gateway` (the next hop; otherwise the subnet's first host). WireGuard ignores it.
+Routes traffic from specified LAN clients through OpenVPN/WireGuard tunnels based on destination. Configurable exclusions allow direct access to specified countries for optimal performance. A tunnel key is an id the platform lists (`wgc1` / `ovpnc1` on Merlin, `OpenVPN0` / `Wireguard1` on KeeneticOS). On Merlin an OpenVPN client is listed only in "VPN Director (policy rules)" mode: in "No" and "Yes (all)" the firmware sends all of the router's traffic through the client's routing table, so a route Tunnel Director put there would take every device into the tunnel. An apply puts no Tunnel Director route there and logs a warning that names the client's mode; in "No" mode the traffic of the LAN clients on that tunnel is refused. If Tunnel Director still has the tunnel on record, an apply also takes out a default route an earlier version left in its table in "No" mode. An OpenVPN tunnel may set optional `gateway` (the next hop; otherwise the subnet's first host). WireGuard ignores it.
 
 ```json
 {
@@ -286,6 +287,21 @@ Routes traffic from specified LAN clients through OpenVPN/WireGuard tunnels base
 }
 ```
 
+Tunnel Director also routes through a Linux interface no firmware manages - an AmneziaWG or WireGuard interface an Entware script brings up. List it in `tunnel_director.interfaces` and use its name as a tunnel key: the Web UI, the bot and the failover watch offer it like `wgc1`, and Tunnel Director gives it its own routing table, a default route through the interface, `MASQUERADE` and MSS clamping. When the interface is re-created, the cron job `vpn_director_routes` (`vpn-director.sh ensure-routes`, every minute) puts its route back; the script that brings the interface up can run `vpn-director.sh --unless-stopped --wait apply tunnel` to do it at once. A tunnel's `exclude` takes IPv4 addresses and CIDRs beside country codes.
+
+```json
+{
+  "tunnel_director": {
+    "interfaces": ["awg1"],
+    "tunnels": {
+      "awg1": { "clients": ["192.168.1.30"], "exclude": ["<country_code>", "203.0.113.7"] }
+    }
+  }
+}
+```
+
+A tunnel with no route in its table - down, its interface re-created, not on the platform's list - refuses its clients' traffic instead of sending it out through the WAN; excluded destinations still go direct. Traffic to private networks beyond the LAN that only the router's main routing table knows - a guest network, the modem on the WAN side, the clients of the router's own VPN server - is refused too, and an interface tunnel's table holds only its default route, so while it is up such traffic goes into the tunnel; put those networks in the tunnel's `exclude`.
+
 ### Changing a client's route
 
 Pick another route for a client in the Web UI (the Route column) or in the bot (`/clients`, 🔀). It is one change and one apply, and the apply moves the client make-before-break: the client stays on its old route until the new one carries it, so none of its traffic leaves through the WAN in between. Every apply works that way — chains and sets are built beside the live ones and swapped in — and so does a server switch, which restarts Xray with its rules in place.
@@ -293,7 +309,7 @@ Pick another route for a client in the Web UI (the Route column) or in the bot (
 What remains:
 
 - The firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again.
-- A tunnel that is down sends its clients through the WAN (on Merlin, the VPN client's killswitch, when enabled, prevents that). The Web UI and the bot ask before they move a client to a tunnel that is down or that the router does not list.
+- A tunnel that is down refuses its clients' traffic until it is up (excluded destinations still go direct). The Web UI and the bot ask before they move a client to a tunnel that is down or that the router does not list.
 - A move changes the route of new connections. An open connection may break (reconnect it) or, on KeeneticOS, keep its old route until its conntrack entry expires. A UDP flow moved from Xray to a tunnel can stall until its conntrack entry expires.
 - Only a full `apply`, `restart` or `update` moves a client between Xray and a tunnel. The Web UI and the bot move clients with a full apply (a server switch, which changes no client's route, runs `restart xray`). After moving a client by hand in `vpn-director.json`, run a full `vpn-director.sh apply`: `apply xray` and `restart xray` keep a client moved from Xray to a tunnel proxied until then, but `apply tunnel` and `restart tunnel`, which move a client between tunnels in place, add nothing to Xray, so a client moved from a tunnel to Xray goes out through the WAN until the full apply.
 - `/opt/etc/init.d/S99vpn-director restart` stops the service and starts it again, and the clients go out through the WAN in between; `vpn-director.sh restart` rebuilds in place.
@@ -316,11 +332,14 @@ This project uses Entware init.d for automatic startup:
 | `/opt/etc/init.d/S99vpn-director` | After Entware initialized | Runs `vpn-director.sh apply` to initialize all components |
 | `/jffs/scripts/firewall-start` | After firewall rules applied (Merlin) | Reapplies configuration after firewall reload |
 | `/jffs/scripts/wan-event` | On WAN connected (Merlin) | Runs `vpn-director.sh apply` on WAN connection |
+| `/jffs/scripts/nat-start` | After the nat table is rebuilt (Merlin) | Runs `vpn-director.sh --wait apply`, so interface tunnels get their `MASQUERADE` back |
 | `/opt/etc/ndm/netfilter.d`, `wan.d`, `iflayerchanged.d` (`50-vpn-director.sh`) | NDM firewall rebuild / WAN start / VPN client IPv4 layer (KeeneticOS) | Detached `vpn-director.sh --wait apply` |
 
 **Note:** The init.d script ensures Entware bash is available before running vpn-director scripts.
 
 On Merlin, to enable user scripts: Administration -> System -> Enable JFFS custom scripts and configs -> Yes
+
+The installer, and every update after it, writes these `/jffs/scripts` hooks in full, over the files that are there, so a router whose other add-ons use the same hooks has to merge them by hand.
 
 ## Process Monitoring
 

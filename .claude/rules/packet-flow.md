@@ -48,6 +48,7 @@ Incoming packet from LAN (LAN interface)
 │  pref 200:   fwmark 0x100/0x100 ──► table 100 (Xray local)  │
 │  pref 16384: fwmark 0x10000/0xff0000 ──► table wgc1 / 2000  │
 │  pref 16385: fwmark 0x20000/0xff0000 ──► table ovpnc1 / 2001│
+│  pref 16639+: same marks ──► prohibit (no route in table)   │
 │  ...                                                         │
 │  pref 32767: default ──► table main (WAN)                   │
 │                                                              │
@@ -113,14 +114,15 @@ Left open:
 
 - The firmware flushing our chains (Merlin's `iptables -t mangle -F` on a firewall start, an NDM
   rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply.
-- A tunnel that is down sends its clients to `main`. One that comes from Xray while the tunnel's
-  route cannot be installed stays proxied instead (step 3).
+- A tunnel that is down refuses its clients' traffic (the block rule after its lookup rule);
+  excluded destinations still go direct. One that comes from Xray while the tunnel's route cannot
+  be installed stays proxied instead (step 3).
 - Xray that cannot intercept at all - no `xt_TPROXY`, so `tproxy_apply` sets up no rule and
   withholds the ready marker - carries no client: one moved from a tunnel to Xray leaves through
-  the WAN once `tunnel_apply` lets it go, as one moved to a tunnel that is down does, and nothing
-  asks first. It is the router's state, not a window of the apply: while `XRAY_TPROXY` holds
-  TPROXY targets the kernel keeps the module loaded, and an exclusion set that cannot be built
-  ends the run before `tproxy_apply` (`_ensure_ipsets`).
+  the WAN once `tunnel_apply` lets it go, and nothing asks first. It is the router's state, not a
+  window of the apply: while `XRAY_TPROXY` holds TPROXY targets the kernel keeps the module
+  loaded, and an exclusion set that cannot be built ends the run before `tproxy_apply`
+  (`_ensure_ipsets`).
 - A client the kernel refuses to add to `XRAY_CLIENTS` (a WARN names it, and the ready marker is
   withheld) is not proxied until an add succeeds - the prune of the same apply tries again. One
   moving from a tunnel to Xray leaves through the WAN in between, once `tunnel_apply` has let it
@@ -218,6 +220,7 @@ TUN_DIR chain:
 
   # Client 2 (ovpnc1)
   -s 192.168.1.5 -m set --match-set <country> dst → RETURN
+  -s 192.168.1.5 -d 203.0.113.7 → RETURN                     (an address in exclude)
   -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → PPE           (Keenetic only)
   -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → MARK 0x20000
 ```
@@ -288,6 +291,11 @@ Typically (one LAN interface):
 # (Merlin: the id from rt_tables; Keenetic: 2000+idx, route re-installed by
 # platform_tunnel_route_ensure):
 ip rule add pref {16384 + idx} fwmark {mark}/{mask} table {wgc1|ovpnc1|main|2000}
+```
+
+```bash
+# Right after the lookup range, for every slot but main's (the kill switch):
+ip rule add pref {16384 + 255 + idx} fwmark {mark}/{mask} prohibit
 ```
 
 ## Traffic Flow Examples
@@ -408,3 +416,5 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | `lib/tunnel.sh` | `_tunnel_ensure_routes()` | Re-install tunnel routes on an apply with no rebuild |
 | `lib/tunnel.sh` | `_tunnel_marks_present()` | Rebuild when a client's MARK rule is gone (Merlin's firewall start flushes every mangle chain) |
 | `lib/platform/keenetic.sh` | `platform_tunnel_offload_target()` | `PPE` — takes a marked flow out of the firmware fast path |
+| `lib/tunnel.sh` | `_tunnel_block_ensure()` | The slot's `prohibit` rule after its lookup rule |
+| `lib/iftunnel.sh` | `iftunnel_route_ensure()`, `vpd_*` | Interface tunnels; the layer the core calls for any tunnel |
