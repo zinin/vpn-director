@@ -145,3 +145,184 @@ load_iftunnel() {
     assert_success
     refute_output
 }
+
+# ============================================================================
+# Route, NAT and MSS
+# ============================================================================
+
+AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+
+@test "iftunnel_route_ensure: the default route of table 2000+idx, MASQUERADE and both MSS clamps" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    run iftunnel_route_ensure awg1 1
+    assert_success
+    run ip route show table 2001
+    assert_output "default dev awg1"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+@test "iftunnel_route_ensure: a second call adds no rule twice" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    iftunnel_route_ensure awg1 1
+    iftunnel_route_ensure awg1 1
+    run iptables -t mangle -S FORWARD
+    assert_equal "$(grep -c 'TCPMSS' <<< "$output")" 2
+    run iptables -t nat -S POSTROUTING
+    assert_equal "$(grep -c 'MASQUERADE' <<< "$output")" 1
+}
+
+# "ip link del" takes the route along, and the rules have to be in place for the
+# moment the interface is back: iptables matches its name, not the interface.
+@test "iftunnel_route_ensure: without the interface, the rules that need none and no route" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links
+    run iftunnel_route_ensure awg1 1
+    assert_failure
+    run ip route show table 2001
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
+    refute_output --partial 'TCPMSS --set-mss'
+}
+
+# Review Focus 4: S51awg1 sets the interface UP last, and the kernel refuses a
+# route through one that is down.
+@test "iftunnel_route_ensure: no route through an interface that is not UP" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "awg1 <POINTOPOINT,NOARP> 1280"
+    : > /tmp/bats_ip_calls.log
+    run iftunnel_route_ensure awg1 1
+    assert_failure
+    refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
+}
+
+@test "iftunnel_route_ensure: a new MTU replaces the inbound clamp" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    iftunnel_route_ensure awg1 1
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1420"
+    iftunnel_route_ensure awg1 1
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380'
+    refute_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+@test "iftunnel_table_release: the route and the three rules gone" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    iftunnel_route_ensure awg1 1
+    run iftunnel_table_release awg1 1
+    assert_success
+    run ip route show table 2001
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    assert_output '-P POSTROUTING ACCEPT'
+    run iptables -t mangle -S FORWARD
+    assert_output '-P FORWARD ACCEPT'
+}
+
+# Review Focus 1: the inbound clamp is found by a pattern, and "awg1" must not
+# take "awg10"'s.
+@test "iftunnel_table_release: leaves another interface's rules alone, a longer name included" {
+    load_iftunnel "awg1 awg10"
+    use_stateful_iptables
+    ip_links "$AWG1_UP" "awg10 <POINTOPOINT,NOARP,UP,LOWER_UP> 1420"
+    iftunnel_route_ensure awg1 1
+    iftunnel_route_ensure awg10 2
+    iftunnel_table_release awg1 1
+    run ip route show table 2002
+    assert_output "default dev awg10"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg10 -j MASQUERADE'
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -i awg10 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1380'
+    assert_line '-A FORWARD -o awg10 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
+    refute_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+# ============================================================================
+# The record of the applied interface tunnels
+# ============================================================================
+
+@test "iftunnel_state_write: the interface tunnels of a slot record, as <iface> <table>" {
+    load_iftunnel "awg1"
+    printf '0 wgc1\n1 awg1\n' > "$BATS_TEST_TMPDIR/slots"
+    iftunnel_state_write "$BATS_TEST_TMPDIR/slots"
+    run cat "$IFTUNNEL_STATE_FILE"
+    assert_output "awg1 2001"
+}
+
+@test "iftunnel_state_write: no interface tunnel, no file" {
+    load_iftunnel "awg1"
+    printf '1 awg1\n' > "$BATS_TEST_TMPDIR/slots"
+    iftunnel_state_write "$BATS_TEST_TMPDIR/slots"
+    printf '0 wgc1\n' > "$BATS_TEST_TMPDIR/slots"
+    iftunnel_state_write "$BATS_TEST_TMPDIR/slots"
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+}
+
+@test "iftunnel_recorded: the recorded table; nothing for an interface on no record" {
+    load_iftunnel ""
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    run iftunnel_recorded awg1
+    assert_success
+    assert_output "2001"
+    run iftunnel_recorded awg2
+    assert_failure
+    refute_output
+}
+
+@test "iftunnel_routes_missing: an interface UP with no default in its table" {
+    load_iftunnel ""
+    printf 'awg1 2001\nawg2 2002\nawg3 2003\nawg4 2004\n' > "$IFTUNNEL_STATE_FILE"
+    ip_links "$AWG1_UP" "awg2 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280" "awg3 <POINTOPOINT,NOARP> 1280"
+    ip route replace default dev awg2 table 2002
+    run iftunnel_routes_missing
+    assert_success
+    assert_output "awg1"
+}
+
+@test "iftunnel_routes_missing: nothing to say with every route in place, or no record" {
+    load_iftunnel ""
+    run iftunnel_routes_missing
+    assert_failure
+    refute_output
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    ip_links "$AWG1_UP"
+    ip route replace default dev awg1 table 2001
+    run iftunnel_routes_missing
+    assert_failure
+    refute_output
+}
+
+@test "iftunnel_status: the table, route and rules of each recorded interface tunnel" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    iftunnel_route_ensure awg1 1
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    run iftunnel_status
+    assert_success
+    assert_output "awg1: table 2001, route default dev awg1, NAT yes, MSS out yes, MSS in yes"
+}
+
+@test "iftunnel_status: says so when none is applied" {
+    load_iftunnel ""
+    run iftunnel_status
+    assert_output "No interface tunnels applied."
+}

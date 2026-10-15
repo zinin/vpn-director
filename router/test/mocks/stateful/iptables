@@ -58,7 +58,7 @@ target_known() {
     for arg in "$@"; do
         if [[ $prev == -j ]]; then
             case "$arg" in
-                RETURN|ACCEPT|DROP|REJECT|MARK|CONNMARK|TPROXY|PPE|LOG) ;;
+                RETURN|ACCEPT|DROP|REJECT|MARK|CONNMARK|TPROXY|PPE|LOG|MASQUERADE|TCPMSS) ;;
                 *) exists "$arg" || return 1 ;;
             esac
         fi

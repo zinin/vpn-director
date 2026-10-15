@@ -19,6 +19,13 @@
 # well (KEENETIC_TABLE_BASE), and a slot belongs to one tunnel, so no two tunnels share a table.
 IFTUNNEL_TABLE_BASE=2000
 
+# Where the last apply recorded its interface tunnels, "<iface> <table>" per line, and the marker
+# of the cron job that puts their routes back (vpn-director.sh, _routes_cron_sync). Beside
+# TUN_DIR_TABLES (lib/ipset.sh), named here because "ensure-routes" reads them every minute
+# without loading ipset.sh or the config.
+IFTUNNEL_STATE_FILE="${IFTUNNEL_STATE_FILE:-/tmp/tunnel_director/iftunnels}"
+IFTUNNEL_CRON_MARKER="${IFTUNNEL_CRON_MARKER:-/tmp/tunnel_director/routes_cron}"
+
 # Set by iftunnel_init: the raw list it checked, the names it kept (space-separated) and one
 # "<name><TAB><reason>" line for each name it rejected.
 _iftunnel_checked=""
@@ -169,4 +176,180 @@ iftunnel_read_config() {
     [[ -f ${1:-} ]] || return 0
     jq -r '.tunnel_director.interfaces // [] | if type == "array" then .[] | select(type == "string") else empty end' \
         "$1" 2>/dev/null | tr '\n' ' ' | sed 's/ $//' || true
+}
+
+###################################################################################################
+# Route, NAT and MSS of an interface tunnel
+###################################################################################################
+
+# _iftunnel_default_route <table> - the table's default route, the listing read whole; rc 1 when
+# there is none.
+_iftunnel_default_route() {
+    local routes line
+    routes="$(ip route show table "${1:-}" 2>/dev/null)" || return 1
+    while IFS= read -r line; do
+        if [[ $line == default* ]]; then
+            printf '%s\n' "$line"
+            return 0
+        fi
+    done <<< "$routes"
+    return 1
+}
+
+# _iftunnel_mss_pattern <iface> - the ERE that finds the inbound --set-mss rule whatever its MSS,
+# against "iptables -S" lines. The dots of the name escaped, or "wg0.5" would take "wg0x5"'s rule;
+# the space after the name keeps "awg1" off "awg10"'s.
+_iftunnel_mss_pattern() {
+    printf -- '-i %s -p tcp .*-j TCPMSS --set-mss ' "${1//./\\.}"
+}
+
+# _iftunnel_rules_ensure <iface> - MASQUERADE out of the interface and the outbound MSS clamp, at
+# the head of their chains, where no firmware rule takes the packet first. Neither needs the
+# interface: iptables matches its name, so both go in before it exists and outlive its
+# re-creation. A rule that does not go in logs its own ERROR (ensure_fw_rule); the route does not
+# depend on it.
+_iftunnel_rules_ensure() {
+    ensure_fw_rule -q nat POSTROUTING -I 1 -o "$1" -j MASQUERADE || true
+    ensure_fw_rule -q mangle FORWARD -I 1 -o "$1" -p tcp -m tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu || true
+}
+
+# _iftunnel_mss_in_ensure <iface> <mtu> - the inbound SYN-ACK clamp, MTU - 40: there
+# --clamp-mss-to-pmtu would read the LAN's MTU. One such rule per interface; another MSS replaces
+# it. Not sync_fw_rule: its position check would re-insert the rule whenever another went in
+# above it.
+_iftunnel_mss_in_ensure() {
+    local iface="$1" mss=$(( $2 - 40 )) pattern have
+    local -a want=(-i "$iface" -p tcp -m tcp --tcp-flags "SYN,RST" SYN -j TCPMSS --set-mss "$mss")
+    pattern="$(_iftunnel_mss_pattern "$iface")"
+    have="$(find_fw_rules "mangle FORWARD" "$pattern")"
+    [[ $have != "-A FORWARD ${want[*]}" ]] || return 0
+    [[ -z $have ]] || purge_fw_rules -q "mangle FORWARD" "$pattern"
+    ensure_fw_rule -q mangle FORWARD -I 1 "${want[@]}" || true
+}
+
+# _iftunnel_rules_release <iface> - the three rules gone. Removing a rule that is not there is no
+# error: a release can come for a slot that was never ensured.
+_iftunnel_rules_release() {
+    ensure_fw_rule -q nat POSTROUTING -D -o "$1" -j MASQUERADE || true
+    ensure_fw_rule -q mangle FORWARD -D -o "$1" -p tcp -m tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu || true
+    purge_fw_rules -q "mangle FORWARD" "$(_iftunnel_mss_pattern "$1")" || true
+}
+
+# -------------------------------------------------------------------------------------------------
+# iftunnel_route_ensure <iface> <idx> - the NAT and MSS rules, then the default route of its table
+# -------------------------------------------------------------------------------------------------
+# Idempotent: tunnel.sh calls it for every applied interface tunnel on every apply, so a firewall
+# rebuild of the firmware gets the rules back with the next apply, and a re-created interface gets
+# its route back once an apply comes (ensure-routes brings one within a minute). Returns 1 when
+# the interface is missing or not UP - "ip link del" takes the route along, and the kernel refuses
+# one through a down interface - or when the route does not go in.
+# -------------------------------------------------------------------------------------------------
+iftunnel_route_ensure() {
+    local iface="${1:-}" table link mtu
+    table="$(iftunnel_table "${2:-}")" || return 1
+    _iftunnel_rules_ensure "$iface"
+    link="$(_iftunnel_link "$iface")" || return 1
+    _iftunnel_up "$link" || return 1
+    if mtu="$(_iftunnel_mtu "$link")"; then
+        _iftunnel_mss_in_ensure "$iface" "$mtu"
+    fi
+    ip route replace default dev "$iface" table "$table" 2>/dev/null
+}
+
+# iftunnel_table_release <iface> <idx> - the route and the three rules gone. A table that holds
+# nothing is no error: tunnel.sh releases slots that were never ensured.
+iftunnel_table_release() {
+    local table
+    table="$(iftunnel_table "${2:-}")" || return 1
+    ip route flush table "$table" 2>/dev/null || true
+    _iftunnel_rules_release "${1:-}"
+    return 0
+}
+
+###################################################################################################
+# The record of the applied interface tunnels
+###################################################################################################
+
+# iftunnel_state_write <tables-file> - record the interface tunnels among the "<idx> <id>" lines of
+# TUN_DIR_TABLES: "<iface> <table>" per line in IFTUNNEL_STATE_FILE, through a file beside it and
+# a rename. No interface tunnel, no file. "ensure-routes" reads it without the config, and the
+# layer reads it to know an interface the list no longer names - so an apply writes it after its
+# releases.
+iftunnel_state_write() {
+    local idx id lines=""
+    if [[ -f ${1:-} ]]; then
+        while read -r idx id _; do
+            [[ -n $id ]] || continue
+            iftunnel_is "$id" || continue
+            lines+="$id $(iftunnel_table "$idx")"$'\n'
+        done < "$1"
+    fi
+    if [[ -z $lines ]]; then
+        rm -f "$IFTUNNEL_STATE_FILE"
+        return 0
+    fi
+    mkdir -p "$(dirname "$IFTUNNEL_STATE_FILE")" &&
+        printf '%s' "$lines" > "$IFTUNNEL_STATE_FILE.new" &&
+        mv -f "$IFTUNNEL_STATE_FILE.new" "$IFTUNNEL_STATE_FILE"
+}
+
+# iftunnel_recorded <iface> - the table the last apply recorded for an interface tunnel; rc 1 when
+# it recorded none.
+iftunnel_recorded() {
+    local iface table
+    [[ -n ${1:-} && -f $IFTUNNEL_STATE_FILE ]] || return 1
+    while read -r iface table _; do
+        if [[ $iface == "$1" && -n $table ]]; then
+            printf '%s\n' "$table"
+            return 0
+        fi
+    done < "$IFTUNNEL_STATE_FILE"
+    return 1
+}
+
+# iftunnel_routes_missing - the recorded interface tunnels that are UP with no default in their
+# table, one per line: interfaces re-created since the last apply. An interface that is not UP yet
+# is left for a later look - a route through it would be refused. rc 1 when there is none.
+iftunnel_routes_missing() {
+    local iface table link found=1
+    [[ -s $IFTUNNEL_STATE_FILE ]] || return 1
+    while read -r iface table _; do
+        [[ -n $iface && -n $table ]] || continue
+        link="$(_iftunnel_link "$iface")" || continue
+        _iftunnel_up "$link" || continue
+        ! _iftunnel_default_route "$table" >/dev/null || continue
+        printf '%s\n' "$iface"
+        found=0
+    done < "$IFTUNNEL_STATE_FILE"
+    return "$found"
+}
+
+# iftunnel_status - one line per recorded interface tunnel: its table, its route, its rules
+iftunnel_status() {
+    local iface table route nat mss_out mss_in
+    if [[ ! -s $IFTUNNEL_STATE_FILE ]]; then
+        printf '%s\n' "No interface tunnels applied."
+        return 0
+    fi
+    while read -r iface table _; do
+        [[ -n $iface && -n $table ]] || continue
+        route="$(_iftunnel_default_route "$table")" || route="none"
+        nat=no
+        mss_out=no
+        mss_in=no
+        if iptables -t nat -C POSTROUTING -o "$iface" -j MASQUERADE 2>/dev/null; then
+            nat=yes
+        fi
+        if iptables -t mangle -C FORWARD -o "$iface" -p tcp -m tcp --tcp-flags SYN,RST SYN \
+            -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null; then
+            mss_out=yes
+        fi
+        if [[ -n $(find_fw_rules "mangle FORWARD" "$(_iftunnel_mss_pattern "$iface")") ]]; then
+            mss_in=yes
+        fi
+        printf '%s: table %s, route %s, NAT %s, MSS out %s, MSS in %s\n' \
+            "$iface" "$table" "$route" "$nat" "$mss_out" "$mss_in"
+    done < "$IFTUNNEL_STATE_FILE"
 }
