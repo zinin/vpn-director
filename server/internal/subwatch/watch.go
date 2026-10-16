@@ -640,9 +640,12 @@ func (w *Watch) extendFailover(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPND
 // apply of the watch's own has not brought it back. Gone for
 // FallbackDownAfter, it is replaced by another exit; with none left the clients
 // go back to Xray, where a dead outbound takes them nowhere - what a death with
-// no fallback does too. A failed lookup is no answer. An empty list is also
-// no answer except on Merlin: Keenetic prints one while RCI does not reply,
-// but Merlin can have no eligible tunnels after its last client changes mode.
+// no fallback does too. A failed lookup is no answer. Nor, except on Merlin,
+// is a list without a firmware tunnel that does not list the failover's tunnel
+// itself: Keenetic lists no firmware tunnel while RCI does not reply, and the
+// interfaces of tunnel_director.interfaces are listed whatever the firmware
+// says, so a failover on a listed interface is still judged by the list. Merlin
+// can have no eligible tunnels after its last client changes mode.
 func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDirectorConfig {
 	if w.LoadPlatform == nil || w.UpdateVPN == nil || !committedFailover(cfg) {
 		return cfg
@@ -652,15 +655,15 @@ func (w *Watch) watchFallback(cfg *vpnconfig.VPNDirectorConfig) *vpnconfig.VPNDi
 		return cfg
 	}
 	w.lastFallbackCheck = now
+	id := failoverTunnel(cfg)
 	plat, err := w.LoadPlatform()
-	if err != nil || (len(plat.Tunnels) == 0 && plat.Platform != platform.Merlin) {
+	if err != nil || (plat.Platform != platform.Merlin && !plat.HasFirmwareTunnels() && !plat.HasTunnel(id)) {
 		return cfg
 	}
 	// LoadPlatform shells out and takes no lock; a /stop may have finished.
 	if w.mutationAllowed() != nil {
 		return cfg
 	}
-	id := failoverTunnel(cfg)
 	gone := "is no longer a Tunnel Director exit"
 	for _, exit := range vpnconfig.TDExits(cfg, plat) {
 		if exit != id {

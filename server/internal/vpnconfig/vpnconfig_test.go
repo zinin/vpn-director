@@ -672,6 +672,30 @@ func TestPlatformInfo_DecodesAnInterfaceTunnel(t *testing.T) {
 	}
 }
 
+// KeeneticOS lists no firmware tunnel while RCI does not answer, and the
+// interfaces of tunnel_director.interfaces are listed whatever the firmware
+// says: only a firmware entry tells an answer from that silence.
+func TestPlatformInfo_HasFirmwareTunnels(t *testing.T) {
+	awg1 := PlatformTunnel{ID: "awg1", Iface: "awg1", Type: "interface", Connected: true}
+	wg0 := PlatformTunnel{ID: "Wireguard0", Iface: "nwg0", Type: "wireguard", Connected: true}
+	cases := map[string]struct {
+		tunnels []PlatformTunnel
+		want    bool
+	}{
+		"no entries":           {nil, false},
+		"interfaces only":      {[]PlatformTunnel{awg1, {ID: "awg2", Iface: "awg2", Type: "interface"}}, false},
+		"a firmware tunnel":    {[]PlatformTunnel{wg0}, true},
+		"after the interfaces": {[]PlatformTunnel{awg1, wg0}, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := (PlatformInfo{Tunnels: tc.tunnels}).HasFirmwareTunnels(); got != tc.want {
+				t.Errorf("HasFirmwareTunnels() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestServerIPs_SortedAndDeduplicated(t *testing.T) {
 	cases := map[string]struct {
 		servers []Server

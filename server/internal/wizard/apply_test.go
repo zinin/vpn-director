@@ -1084,6 +1084,68 @@ func TestApplier_Apply_RefusesToSaveWhenThePlatformListsNoTunnels(t *testing.T) 
 	}
 }
 
+// interfacesOnlyApply is a wizard save on a KeeneticOS whose RCI does not
+// reply: the platform document lists awg1 of tunnel_director.interfaces, which
+// it lists whatever the firmware says, and no firmware tunnel.
+func interfacesOnlyApply(route string) (*trackingConfigStore, *trackingSender, error) {
+	sender := &trackingSender{}
+	configStore := &trackingConfigStore{
+		servers: []vpnconfig.Server{{Name: "Server1", IPs: []string{"1.2.3.4"}}},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{
+			DataDir: "/opt/vpn-director/data",
+			TunnelDirector: vpnconfig.TunnelDirectorConfig{
+				Tunnels: make(map[string]vpnconfig.TunnelConfig),
+			},
+		},
+	}
+	info := vpnconfig.PlatformInfo{Platform: "keenetic", Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "awg1", Iface: "awg1", Type: "interface", Connected: true},
+	}}
+	applier := NewApplier(&trackingManager{}, sender, configStore,
+		&mockVPNDirector{platform: info}, &mockXrayGenerator{})
+	err := applier.Apply(123, &State{
+		ChatID:      123,
+		Step:        StepConfirm,
+		ServerIndex: 0,
+		Exclusions:  map[string]bool{"ru": true},
+		Clients:     []ClientRoute{{IP: "192.168.1.30", Route: route}},
+	})
+	return configStore, sender, err
+}
+
+// An interface entry alone is no answer either: the document of an RCI outage
+// lists the interfaces as it lists them while RCI answers, so a firmware tunnel
+// outside the config cannot be validated by it - and must not be dropped from
+// the save behind a "Done!".
+func TestApplier_Apply_RefusesToSaveWhenThePlatformListsOnlyInterfaces(t *testing.T) {
+	configStore, sender, err := interfacesOnlyApply("Wireguard0") // picked while RCI answered
+
+	if err == nil {
+		t.Fatal("Apply() error = nil, want a refusal to save a route a document of interfaces alone cannot validate")
+	}
+	if configStore.saveConfigCalled {
+		t.Error("Apply() saved the configuration, want the client kept out of a silent drop")
+	}
+	if !slices.Contains(sender.messages, "platform info unavailable, try again") {
+		t.Errorf("user was told %q, want the platform-unavailable message", sender.messages)
+	}
+}
+
+// The same document does answer for awg1: a listed interface is a route.
+func TestApplier_Apply_SavesARouteToAListedInterfaceWhenThePlatformListsOnlyInterfaces(t *testing.T) {
+	configStore, _, err := interfacesOnlyApply("awg1")
+
+	if err != nil {
+		t.Fatalf("Apply() error = %v, want the client saved on awg1", err)
+	}
+	if !configStore.saveConfigCalled {
+		t.Fatal("Apply() saved nothing, want the client on awg1")
+	}
+	if got := configStore.savedConfig.TunnelDirector.Tunnels["awg1"].Clients; !slices.Equal(got, []string{"192.168.1.30"}) {
+		t.Errorf("awg1 clients = %v, want [192.168.1.30]", got)
+	}
+}
+
 func TestApplier_Apply_RefusesToSaveWhenThePlatformCannotValidateARoute(t *testing.T) {
 	manager := &trackingManager{}
 	sender := &trackingSender{}

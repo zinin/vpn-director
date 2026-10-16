@@ -92,16 +92,18 @@ func (a *Applier) Apply(chatID int64, state *State) error {
 		for _, t := range info.Tunnels {
 			validRoutes[t.ID] = true
 		}
-		// An empty list is not an answer: on Keenetic `vpn-director.sh
-		// platform` prints "tunnels": [] and exits 0 while RCI does not reply
-		// (spec 13), so a router with no tunnels and an RCI outage arrive
-		// here as the same document.
-		platformOK = len(info.Tunnels) > 0
+		// A list without a firmware tunnel is not an answer: on Keenetic
+		// `vpn-director.sh platform` lists no firmware tunnel and exits 0 while
+		// RCI does not reply (spec 13), so a router with no tunnels and an RCI
+		// outage arrive here as the same document. An interface entry alone is
+		// no answer either: the interfaces of tunnel_director.interfaces are
+		// listed whatever the firmware says. They stay valid routes above.
+		platformOK = info.HasFirmwareTunnels()
 	}
 
 	// A route that is neither xray nor already in the config can only be
 	// checked against the platform. With the platform silent, or listing no
-	// tunnel at all, the loop below
+	// firmware tunnel - nothing at all, or interfaces alone - the loop below
 	// would drop that client from the save without a word and the wizard would
 	// still report success - and a transient RCI failure between picking the
 	// tunnel and applying is exactly the NDM-rebuild window. Refuse the save

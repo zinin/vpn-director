@@ -333,6 +333,20 @@ func (p PlatformInfo) HasTunnel(id string) bool {
 	return false
 }
 
+// HasFirmwareTunnels reports whether the platform lists a tunnel of the
+// firmware's: any entry but an interface of tunnel_director.interfaces. Only
+// such an entry tells an answer from silence: KeeneticOS prints no firmware
+// tunnel while RCI does not answer (spec 14), and the interfaces are listed
+// whatever the firmware says.
+func (p PlatformInfo) HasFirmwareTunnels() bool {
+	for _, t := range p.Tunnels {
+		if t.Type != "interface" {
+			return true
+		}
+	}
+	return false
+}
+
 // CollectClients builds a unified list of all clients from xray and tunnel_director sections.
 // XrayInboundPorts reads advanced.xray.tproxy_port and advanced.xray.socks_port.
 // A missing, non-numeric or non-positive value comes back as 0, which the Xray
