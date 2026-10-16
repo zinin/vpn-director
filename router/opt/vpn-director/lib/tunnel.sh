@@ -259,7 +259,10 @@ _tunnel_not_carried_non_rfc1918() {
 # interface state. The platform may refuse a configured tunnel it no longer
 # lists; vpd_tunnel_unlisted_reason supplies the warning's reason then.
 # A tunnel whose route or ip rule is not in place refuses its marks (the block
-# rule): its clients are not carried (TUNNEL_UNCARRIED).
+# rule): its clients are not carried (TUNNEL_UNCARRIED). Nor are they while the
+# block rule itself is not in place: a route that goes would send their marks
+# to main. Returns 1 when the failover tunnel's route or block rule did not go
+# back in.
 # -------------------------------------------------------------------------------------------------
 _tunnel_ensure_routes() {
     local idx tunnel rc=0 carried
@@ -268,8 +271,14 @@ _tunnel_ensure_routes() {
         [[ -n $tunnel ]] || continue
         carried=1
         # The block rule first: a router an earlier version applied has none,
-        # and this path is the one its first apply takes.
-        _tunnel_block_ensure "$idx" "$tunnel" || true
+        # and this path is the one its first apply takes. A slot without it
+        # carries nothing, and its failover is not ready.
+        if ! _tunnel_block_ensure "$idx" "$tunnel"; then
+            carried=0
+            if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
+                rc=1
+            fi
+        fi
         if ! vpd_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
             _tunnel_route_warn "$tunnel"
             carried=0
@@ -1149,12 +1158,15 @@ tunnel_apply() {
 
     # Compute config hash for change detection. Failover snapshot clients are
     # extra MARK rules, not a key reorder, so they belong in the hash, and so do
-    # the interfaces of tunnel_director.interfaces - as written: the checked list
-    # changes with the platform's answers. With neither, hash only the tunnels
-    # JSON so an upgrade does not rebuild TUN_DIR.
+    # the interfaces of tunnel_director.interfaces: as written, and the names
+    # the check keeps of them. The platform's answers, the LAN and the WAN can
+    # change those under the same list, and a name no longer kept has to reach
+    # the rebuild, which releases what it left - the up-to-date path releases no
+    # slot. With neither, hash only the tunnels JSON so an upgrade does not
+    # rebuild TUN_DIR.
     local new_hash old_hash empty_hash hash_input="$TUN_DIR_TUNNELS_JSON"
     if [[ -n ${TUN_DIR_INTERFACES:-} ]]; then
-        hash_input+=$'\n'"interfaces: $TUN_DIR_INTERFACES"
+        hash_input+=$'\n'"interfaces: $TUN_DIR_INTERFACES"$'\n'"kept: $(iftunnel_list | tr '\n' ' ')"
     fi
     if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]]; then
         new_hash=$(printf '%s\n%s\n%s' "$hash_input" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
@@ -1287,8 +1299,13 @@ tunnel_apply() {
         rule_ok=1
         # The block rule first: from here on a mark whose table holds no route
         # is refused, never sent to main (the kill switch, tunnel-director.md).
-        # One that did not go in logged its ERROR; the up-to-date path retries it.
-        _tunnel_block_ensure "$tunnel_idx" "$tunnel" || warnings=1
+        # One that did not go in logged its ERROR, and its slot carries nothing
+        # until the up-to-date path puts it in: a route that goes would send the
+        # slot's marks to main. Its clients are reported, its failover not ready.
+        if ! _tunnel_block_ensure "$tunnel_idx" "$tunnel"; then
+            warnings=1
+            rule_ok=0
+        fi
         if ! _tunnel_table_allowed "$tunnel" && _tunnel_routeless "$tunnel" "$tunnel_idx"; then
             # Not listed, and no table to route it through - a typo, an
             # interface taken off tunnel_director.interfaces: the block rule

@@ -203,6 +203,23 @@ load_iftunnel() {
     refute_output
 }
 
+# The twin of config.sh's reading: a name holding whitespace or a control
+# character stays one name, with "?" for each such character, and an empty one
+# is '""' - names the check rejects, each with its WARN, instead of pieces it
+# would keep.
+@test "iftunnel_read_config: a name with whitespace stays one name, which the check rejects" {
+    load_iftunnel ""
+    local cfg="$BATS_TEST_TMPDIR/vpn-director.json"
+    jq '.tunnel_director.interfaces = ["awg1 ", "awg2\tx", "", "awg3"]' "$TEST_ROOT/fixtures/vpn-director.json" > "$cfg"
+    TUN_DIR_INTERFACES="$(iftunnel_read_config "$cfg")"
+    [ "$TUN_DIR_INTERFACES" = 'awg1? awg2?x "" awg3' ]
+    iftunnel_init
+    run iftunnel_list
+    assert_output "awg3"
+    grep -qF "tunnel_director.interfaces: 'awg1?' is no interface name" "$LOG_FILE"
+    grep -qF "tunnel_director.interfaces: '\"\"' is no interface name" "$LOG_FILE"
+}
+
 # ============================================================================
 # Route, NAT and MSS
 # ============================================================================

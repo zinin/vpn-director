@@ -102,9 +102,13 @@ unset _tid _gw
 
 # tunnel_director.interfaces, space-separated as written: lib/iftunnel.sh checks
 # the names (it asks the platform, which this file cannot) and tunnel.sh hashes
-# the list as written. The jq program is iftunnel_read_config's; anything but an
-# array of strings loads as no list, never as an error that ends the load.
-TUN_DIR_INTERFACES=$(jq -r '.tunnel_director.interfaces // [] | if type == "array" then .[] | select(type == "string") else empty end' "$VPD_CONFIG_FILE" | tr '\n' ' ' | sed 's/ $//')
+# the list as written. A name holding whitespace or a control character comes
+# through with "?" for each such character, and an empty one as '""': split by
+# the spaces, it would reach the check as names that were never listed - "awg1 "
+# as awg1 - so it stays one name, which the check rejects with its WARN. The jq
+# program is iftunnel_read_config's; a list that is no array loads as no list
+# and an entry that is no string is dropped, never an error that ends the load.
+TUN_DIR_INTERFACES=$(jq -r '.tunnel_director.interfaces // [] | if type == "array" then (.[] | select(type == "string") | if . == "" then "\"\"" else (explode | map(if . <= 32 or . == 127 then 63 else . end) | implode) end) else empty end' "$VPD_CONFIG_FILE" | tr '\n' ' ' | sed 's/ $//')
 
 IPS_BDR_DIR=$(_cfg '.data_dir')
 

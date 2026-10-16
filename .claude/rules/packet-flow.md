@@ -97,7 +97,7 @@ that is no object, a tunnel name that is empty or holds whitespace or a control 
 rules that would reach main's rule at 32766, no LAN interface, no PREROUTING position) ends the run
 before step 3. One that
 costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
-tunnel the platform does not list, a slot whose route or ip rule is not in place, a client outside
+tunnel the platform does not list, a slot whose route, lookup rule or block rule is not in place, a client outside
 RFC1918 - and step 2 reports the clients it cost. Step 3 keeps each of them that `XRAY_CLIENTS`
 still holds: a client that came from Xray stays proxied rather than leak, until an apply in which
 Tunnel Director carries it. A client that left Xray for direct - paused, deleted - is let go, and

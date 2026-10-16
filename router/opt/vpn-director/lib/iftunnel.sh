@@ -212,11 +212,12 @@ iftunnel_info() {
 }
 
 # iftunnel_read_config <file> - tunnel_director.interfaces of a config file, space-separated, for
-# the callers that load no config.sh (cmd_platform, configure.sh). The jq program is config.sh's:
-# anything but an array of strings reads as no list.
+# the callers that load no config.sh (cmd_platform, configure.sh). The jq program is config.sh's,
+# whose comment says why a name holding whitespace comes through with "?": a list that is no
+# array reads as no list, and an entry that is no string is dropped.
 iftunnel_read_config() {
     [[ -f ${1:-} ]] || return 0
-    jq -r '.tunnel_director.interfaces // [] | if type == "array" then .[] | select(type == "string") else empty end' \
+    jq -r '.tunnel_director.interfaces // [] | if type == "array" then (.[] | select(type == "string") | if . == "" then "\"\"" else (explode | map(if . <= 32 or . == 127 then 63 else . end) | implode) end) else empty end' \
         "$1" 2>/dev/null | tr '\n' ' ' | sed 's/ $//' || true
 }
 

@@ -2526,6 +2526,55 @@ load_awg1() {
     assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
 }
 
+# refuse_block_rules - for the rest of the test, the kernel refuses every block
+# rule: "ip rule add ... prohibit" fails, every other ip call goes to the mock.
+refuse_block_rules() {
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" prohibit "* ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+}
+
+# A slot whose block rule the kernel refused has no kill switch: a route that
+# goes would send its marks to main. It carries nothing until an apply puts the
+# rule in - a client that came from Xray stays proxied, a failover stays on Xray.
+@test "tunnel_apply: a slot whose block rule did not go in carries nothing, and its failover is not ready" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    refuse_block_rules
+    : > "$LOG_FILE"
+    # Not through `run`: TUNNEL_UNCARRIED has to outlive the call.
+    tunnel_apply
+    grep -qF "Tunnel 'wgc1': the block rule did not go in (pref=16639 fwmark=0x10000)" "$LOG_FILE"
+    run tunnel_uncarried
+    assert_output "192.168.1.5"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+@test "tunnel_apply: the up-to-date path counts a slot whose block rule does not go back in as carrying nothing" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+
+    ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit
+    refuse_block_rules
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    : > "$LOG_FILE"
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    grep -qF "Tunnel 'wgc1': the block rule did not go in (pref=16639 fwmark=0x10000)" "$LOG_FILE"
+    run tunnel_uncarried
+    assert_output "192.168.1.5"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
 @test "tunnel_apply: a slot the layout dropped loses its block rule after the swap" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
     run tunnel_apply
@@ -2781,6 +2830,24 @@ awg1_refused() {
     TUN_DIR_INTERFACES=""
     run tunnel_apply
     assert_success
+    awg1_refused
+}
+
+# Which names the check keeps can change while the list and the tunnels stay as
+# they are: the platform's answers, the LAN and the WAN decide it. A name no
+# longer kept has to reach the rebuild, which releases what it left; the
+# up-to-date path releases no slot, and it rewrites the record without the name.
+@test "tunnel_apply: an interface the check no longer keeps stops routing though the list did not change" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    [ -f "$TUN_DIR_HASH" ]
+
+    platform_wan_if() { echo awg1; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "tunnel_director.interfaces: 'awg1' is the WAN interface; ignored"
     awg1_refused
 }
 

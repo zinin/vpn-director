@@ -247,6 +247,18 @@ load 'test_helper'
     [ "$TUN_DIR_CHAIN" = "TUN_DIR" ]
 }
 
+# Split by the spaces of the list, a name holding whitespace would reach the
+# check as names that were never listed - "awg1 " as awg1, "awg1 x" as two.
+# Each whitespace or control character comes through as "?", and an empty name
+# as '""': one name each, which the check rejects with its WARN.
+@test "config.sh: an interface name with whitespace or a control character stays one name" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-interfaces-ws.json"
+    jq '.tunnel_director.interfaces = ["awg1 ", "awg2\tx", "", "awg3"]' "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ "$TUN_DIR_INTERFACES" = 'awg1? awg2?x "" awg3' ]
+}
+
 @test "config.sh: no interface list loads as empty" {
     load_config
     [ -z "$TUN_DIR_INTERFACES" ]

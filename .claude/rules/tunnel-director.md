@@ -126,10 +126,15 @@ interface an Entware init script brings up. `lib/iftunnel.sh` checks the list on
 and is not `main`, an id `platform_tunnels` lists, a LAN interface or the WAN; each rejected name
 logs one WARN, `tunnel_director.interfaces: <reason>; ignored`, and is no interface tunnel: a
 tunnel key that names `main` or an id `platform_tunnels` lists stays that, and any other is
-unknown. The core reaches every tunnel through the `vpd_*` layer of the same file: a kept name goes
-to `iftunnel_*`, and so do the table and the release of an interface the last apply recorded and
-the list no longer names; any other id goes to the platform contract, which describes the firmware
-alone.
+unknown. An entry holding whitespace or a control character reaches the check as one name, with
+`?` for each such character (an empty one as `""`), and is rejected: split by the spaces of the
+loaded list, `"awg1 "` would pass as `awg1`. The Tunnel Director hash covers the list as written
+and the names the check keeps of it, so a change of either rebuilds - the platform's answers, the
+LAN and the WAN can change the second under the same list - and the rebuild releases what a name
+no longer kept left. The core reaches every tunnel through the `vpd_*` layer of the same file: a
+kept name goes to `iftunnel_*`, and so do the table and the release of an interface the last apply
+recorded and the list no longer names; any other id goes to the platform contract, which describes
+the firmware alone.
 
 An interface tunnel gets:
 
@@ -180,10 +185,12 @@ with a `.`, `:` or `/` - and set only its countries.
 A rebuild puts each slot's block rule in before its route and lookup rule; the up-to-date path
 ensures it beside the lookup rule (`_tunnel_block_ensure`), which is how a router an earlier
 version applied gets it on its first apply after the upgrade; a dropped slot loses it after the
-swap; `tunnel_stop` clears both ranges. `tunnel_apply` refuses, with an ERROR and before touching
-a rule, a `pref_base` and mark field whose block range would reach main's rule at 32766. The
-firmware's own killswitch (`vpn_clientN_enforce`, `wgcN_enforce`) no longer matters for Tunnel
-Director's clients.
+swap; `tunnel_stop` clears both ranges. A slot whose block rule the kernel refuses carries nothing
+until an apply puts it in - a route that goes would send its marks to main: its clients are
+reported as not carried, and its failover is not ready. `tunnel_apply` refuses, with an ERROR and
+before touching a rule, a `pref_base` and mark field whose block range would reach main's rule at
+32766. The firmware's own killswitch (`vpn_clientN_enforce`, `wgcN_enforce`) no longer matters for
+Tunnel Director's clients.
 
 ## Chain Architecture
 
@@ -277,10 +284,10 @@ tunnel; neither is a leak. Reported, it would stay proxied instead: a client mov
 | Path | Reported |
 |------|----------|
 | Rebuild | The clients of a tunnel the platform does not list (it keeps a slot whose block rule refuses them, unless the platform still routes it), and of one the mark field has no room for |
-| Rebuild | The clients of a slot whose route or ip rule is not in place after the routing step, new or kept: its mark meets the block rule |
+| Rebuild | The clients of a slot whose route or lookup rule is not in place after the routing step, new or kept: its mark meets the block rule; and of one whose block rule is not: a route that goes would send its marks to main |
 | Rebuild | A client `_tunnel_emit_client` skipped as outside RFC1918, or whose MARK rule was refused - or whose offload opt-out was: the fast path then takes its flows past mangle after their first packets |
 | Rebuild | Every client, when `swap_fw_chain` did not take over every interface (rc 2 or 3): an interface still on the old chain marks none of the clients new to it |
-| Up to date | The clients of a slot whose route or rule did not go back in (`_tunnel_ensure_routes`), every client when a PREROUTING jump did not, and every client outside RFC1918: the rebuild that skipped it recorded the hash, and no path marks it |
+| Up to date | The clients of a slot whose route, lookup rule or block rule did not go back in (`_tunnel_ensure_routes`), every client when a PREROUTING jump did not, and every client outside RFC1918: the rebuild that skipped it recorded the hash, and no path marks it |
 | No tunnels (`{}`) | Nothing: no client is on a tunnel |
 
 The failover clients are clients of their tunnel and are reported with it. `vpn-director.sh` hands
@@ -313,7 +320,7 @@ hash says, so the tunnels on record keep their slots and the ones gone from the 
 A failover tunnel whose route or ip rule cannot be installed still writes the hash (when every
 configured tunnel was applied) and returns 0 with a WARN, so S99 start, hooks and Web UI Apply do
 not fail while the fallback interface is still coming up. The watch does not Commit Xray membership
-until `/tmp/tunnel_director/failover_ready` names that tunnel (route and ip rule installed);
+until `/tmp/tunnel_director/failover_ready` names that tunnel (route, lookup and block rules installed);
 `TUN_DIR_TABLES` alone is written even when those failed. The up-to-date path always re-installs
 recorded routes **and ip rules** (`_tunnel_rule_ensure`, one per row of `TUN_DIR_TABLES`), then
 re-checks the failover tunnel's row and its rule (`pref TUN_DIR_PREF_BASE+idx`) and rewrites or
