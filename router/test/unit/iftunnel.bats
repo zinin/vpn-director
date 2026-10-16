@@ -428,6 +428,78 @@ AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
     assert_output $'awg1\nmain'
 }
 
+# stub_platform_tunnels <rc> <id>... - a platform_tunnels that prints the ids
+# and returns <rc>, counting its calls in a file: vpd_tunnels runs in
+# subshells, where a counter in a variable would be lost.
+stub_platform_tunnels() {
+    stub_rc="$1"
+    shift
+    stub_ids=("$@")
+    platform_tunnels() {
+        echo call >> "$BATS_TEST_TMPDIR/platform_calls"
+        printf '%s\n' "${stub_ids[@]}"
+        return "$stub_rc"
+    }
+}
+
+# platform_calls - how many times platform_tunnels was asked
+platform_calls() {
+    local n=0
+    if [[ -f $BATS_TEST_TMPDIR/platform_calls ]]; then
+        n=$(wc -l < "$BATS_TEST_TMPDIR/platform_calls")
+    fi
+    echo $((n))
+}
+
+# On KeeneticOS each platform_tunnels is an RCI request - 5 s while RCI does
+# not answer - and two of them can read two states: the check of a non-empty
+# list keeps its answer, and vpd_tunnels lists from it.
+@test "vpd_tunnels: lists from the answer iftunnel_init kept, one platform_tunnels a run" {
+    load_iftunnel "awg1"
+    stub_platform_tunnels 0 wgc1 wgc2 main
+    iftunnel_init
+    run vpd_tunnels
+    assert_success
+    assert_output $'wgc1\nwgc2\nawg1\nmain'
+    assert_equal "$(platform_calls)" 1
+}
+
+@test "vpd_tunnels: a failed inventory iftunnel_init kept still fails, main last" {
+    load_iftunnel "awg1"
+    stub_platform_tunnels 1 main
+    iftunnel_init
+    run vpd_tunnels
+    assert_failure 1
+    assert_output $'awg1\nmain'
+    assert_equal "$(platform_calls)" 1
+}
+
+# An empty list asks the platform nothing in iftunnel_init.
+@test "vpd_tunnels: with an empty list asks the platform itself, once" {
+    load_iftunnel ""
+    stub_platform_tunnels 0 wgc1 wgc2 main
+    iftunnel_init
+    run vpd_tunnels
+    assert_success
+    assert_output $'wgc1\nwgc2\nmain'
+    assert_equal "$(platform_calls)" 1
+}
+
+@test "iftunnel_init: asks the platform again once the list changes, and vpd_tunnels lists that answer" {
+    load_iftunnel "awg1"
+    stub_platform_tunnels 0 wgc1 main
+    iftunnel_init
+    iftunnel_init
+    assert_equal "$(platform_calls)" 1
+    stub_platform_tunnels 0 wgc3 main
+    TUN_DIR_INTERFACES="awg1 awg2"
+    iftunnel_init
+    assert_equal "$(platform_calls)" 2
+    run vpd_tunnels
+    assert_output $'wgc3\nawg1\nawg2\nmain'
+    assert_equal "$(platform_calls)" 2
+}
+
 @test "vpd_tunnel_*: an interface goes to iftunnel_*, any other id to the platform" {
     load_iftunnel "awg1"
     iftunnel_init

@@ -29,11 +29,15 @@ IFTUNNEL_CRON_MARKER="${IFTUNNEL_CRON_MARKER:-/tmp/tunnel_director/routes_cron}"
 # Set by iftunnel_init: the raw list it checked, the names it kept (space-separated) and one
 # "<name><TAB><reason>" line for each name it rejected as no interface name, a LAN interface or
 # the WAN. A name rejected as main or as a tunnel the platform lists gets no line: the platform
-# answers for both.
+# answers for both. The check of a non-empty list keeps the platform's answer for vpd_tunnels:
+# _iftunnel_platform_asked 1, what platform_tunnels printed and its exit status.
 _iftunnel_checked=""
 _iftunnel_checked_once=0
 _iftunnel_valid=""
 _iftunnel_rejected=""
+_iftunnel_platform_asked=0
+_iftunnel_platform_list=""
+_iftunnel_platform_rc=0
 
 # _iftunnel_warn <message> - a WARN where log exists; configure.sh has no common.sh.
 _iftunnel_warn() {
@@ -71,10 +75,15 @@ iftunnel_init() {
     _iftunnel_checked_once=1
     _iftunnel_valid=""
     _iftunnel_rejected=""
+    _iftunnel_platform_asked=0
     [[ -n $raw ]] || return 0
 
-    # Asked once per list. A platform that cannot answer rejects nothing on its count.
-    platform_ids=" $(platform_tunnels 2>/dev/null | xargs || true) "
+    # Asked once per list, and kept with its status for vpd_tunnels. A platform that cannot
+    # answer rejects nothing on its count.
+    _iftunnel_platform_rc=0
+    _iftunnel_platform_list="$(platform_tunnels 2>/dev/null)" || _iftunnel_platform_rc=$?
+    _iftunnel_platform_asked=1
+    platform_ids=" $(printf '%s\n' "$_iftunnel_platform_list" | xargs || true) "
     lan=" $(platform_lan_ifaces 2>/dev/null | xargs || true) "
     wan="$(platform_wan_if 2>/dev/null)" || wan=""
     read -ra names <<< "$raw"
@@ -389,9 +398,18 @@ iftunnel_status() {
 
 # vpd_tunnels - the platform's tunnels without main, the interfaces, main last. rc 1 when the
 # platform's inventory failed, as platform_tunnels' own: cmd_platform refuses an incomplete list.
+# The platform's answer and its status are the ones iftunnel_init kept when it checked a
+# non-empty list: one RCI round-trip a run on KeeneticOS, and the check and the list read the
+# same answer. A process with an empty list asks the platform here, as before.
 vpd_tunnels() {
     local list rc=0 id
-    list="$(platform_tunnels)" || rc=$?
+    iftunnel_init
+    if [[ $_iftunnel_platform_asked -eq 1 ]]; then
+        list="$_iftunnel_platform_list"
+        rc="$_iftunnel_platform_rc"
+    else
+        list="$(platform_tunnels)" || rc=$?
+    fi
     while IFS= read -r id; do
         [[ -n $id && $id != main ]] || continue
         printf '%s\n' "$id"
