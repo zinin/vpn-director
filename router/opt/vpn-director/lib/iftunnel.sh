@@ -292,7 +292,9 @@ _iftunnel_rules_release() {
 # the interface is missing or not UP - "ip link del" takes the route along, and the kernel refuses
 # one through a down interface - when the route does not go in, or when the MASQUERADE is not in
 # place: the tunnel's peer takes the router's own tunnel address only, so without NAT the far end
-# drops what the clients send. The route still goes in then, and the next apply retries the rule.
+# drops what the clients send. Then the route stays out, and one already there goes: the block
+# rule refuses the clients' traffic at once, and ensure-routes, which looks for the route of an
+# interface that is UP, brings the apply that retries the rule within a minute.
 # -------------------------------------------------------------------------------------------------
 iftunnel_route_ensure() {
     local iface="${1:-}" table link mtu nat_ok=1
@@ -302,15 +304,18 @@ iftunnel_route_ensure() {
     table="$(iftunnel_table "${2:-}")" || return 1
     if ! _iftunnel_rules_ensure "$iface"; then
         nat_ok=0
-        _iftunnel_warn "Interface tunnel '$iface': its MASQUERADE did not go in; without NAT the far end drops what its clients send, so the tunnel carries nothing until an apply puts it in"
+        _iftunnel_warn "Interface tunnel '$iface': its MASQUERADE did not go in; without NAT the far end would drop what its clients send, so the tunnel gets no route and its clients are refused until an apply puts the rule in"
     fi
     link="$(_iftunnel_link "$iface")" || return 1
     _iftunnel_up "$link" || return 1
     if mtu="$(_iftunnel_mtu "$link")"; then
         _iftunnel_mss_in_ensure "$iface" "$mtu"
     fi
+    if [[ $nat_ok -eq 0 ]]; then
+        ip route del default dev "$iface" table "$table" 2>/dev/null || true
+        return 1
+    fi
     ip route replace default dev "$iface" table "$table" 2>/dev/null || return 1
-    [[ $nat_ok -eq 1 ]]
 }
 
 # iftunnel_table_release <iface> <idx> - the route and the three rules gone. A table that holds

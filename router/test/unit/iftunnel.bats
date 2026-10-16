@@ -265,9 +265,11 @@ refuse_masquerade() {
 }
 
 # Without NAT the far end drops what the clients send - its peer takes the
-# tunnel's own address only - so the tunnel carries nothing: the ensure fails,
-# though the route and the MSS clamps went in, and a later apply retries it.
-@test "iftunnel_route_ensure: fails while its MASQUERADE is not in place" {
+# tunnel's own address only - so the tunnel carries nothing, and it gets no
+# route: the block rule refuses its clients' traffic at once, and ensure-routes,
+# which looks for the route, brings the apply that retries the rule. The MSS
+# clamps go in.
+@test "iftunnel_route_ensure: no route while its MASQUERADE is not in place" {
     load_iftunnel "awg1"
     use_stateful_iptables
     ip_links "$AWG1_UP"
@@ -276,10 +278,30 @@ refuse_masquerade() {
     assert_failure
     grep -qF "Interface tunnel 'awg1': its MASQUERADE did not go in" "$LOG_FILE"
     run ip route show table 2001
-    assert_output "default dev awg1"
+    refute_output
     run iptables -t mangle -S FORWARD
     assert_line '-A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
     assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+# A rebuild of nat took the MASQUERADE, and it does not go back in: the route an
+# earlier apply put in goes, and the route checker names the interface, so the
+# cron job's ensure-routes retries within a minute.
+@test "iftunnel_route_ensure: a MASQUERADE that does not come back takes the route out, for ensure-routes" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    iftunnel_route_ensure awg1 1
+    iptables -t nat -D POSTROUTING -o awg1 -j MASQUERADE
+    refuse_masquerade
+    run iftunnel_route_ensure awg1 1
+    assert_failure
+    run ip route show table 2001
+    refute_output
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    run iftunnel_routes_missing
+    assert_success
+    assert_output "awg1"
 }
 
 # "ip link del" takes the route along, and the rules have to be in place for the
