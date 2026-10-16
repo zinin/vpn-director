@@ -149,8 +149,11 @@ An interface tunnel gets:
 
 `iftunnel_route_ensure` runs on every apply, so the firmware's rebuilds get the rules back with
 the next apply: Merlin's `iptables -t mangle -F` with `firewall-start`, a rebuild of `nat` with
-`nat-start`, KeeneticOS's with its netfilter hook. `iftunnel_table_release` flushes the table and
-removes the rules for a dropped slot and on `stop`.
+`nat-start`, KeeneticOS's with its netfilter hook. A `MASQUERADE` that does not go in makes the
+ensure fail although the route went in: the tunnel's peer takes the router's own tunnel address
+only, so without NAT the far end drops what the clients send, and the tunnel counts as down - its
+clients reported as not carried, its failover not ready - until an apply puts the rule in.
+`iftunnel_table_release` flushes the table and removes the rules for a dropped slot and on `stop`.
 
 Deleting an interface takes its route along. Each apply records the interface tunnels in
 `/tmp/tunnel_director/iftunnels` (`<iface> <table>`), and the cron job `vpn_director_routes`, which

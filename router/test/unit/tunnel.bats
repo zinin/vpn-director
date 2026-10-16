@@ -2851,6 +2851,25 @@ awg1_refused() {
     awg1_refused
 }
 
+# An interface tunnel without its MASQUERADE carries nothing - the far end drops
+# what its clients send - so a client that came from Xray stays proxied and a
+# failover onto it stays on Xray, until an apply puts the rule in.
+@test "tunnel_apply: an interface tunnel without its MASQUERADE carries nothing, and its failover is not ready" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    export XRAY_FAILOVER_TUNNEL=awg1 XRAY_FAILOVER_CLIENTS=192.168.1.30
+    iptables() {
+        if [[ " $* " == *" -t nat -I POSTROUTING "* ]]; then
+            return 1
+        fi
+        command iptables "$@"
+    }
+    # Not through `run`: TUNNEL_UNCARRIED has to outlive the call.
+    tunnel_apply
+    run tunnel_uncarried
+    assert_output "192.168.1.30"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
 # Only a well-formed interface name goes into the NAT and MSS deletes of a slot
 # the layer names no table for: the MSS pattern would read a key's * as a regex.
 @test "tunnel_apply: a routeless key that is no interface name gets no NAT or MSS delete" {

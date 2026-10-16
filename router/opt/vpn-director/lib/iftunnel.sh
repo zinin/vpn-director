@@ -249,12 +249,15 @@ _iftunnel_mss_pattern() {
 # _iftunnel_rules_ensure <iface> - MASQUERADE out of the interface and the outbound MSS clamp, at
 # the head of their chains, where no firmware rule takes the packet first. Neither needs the
 # interface: iptables matches its name, so both go in before it exists and outlive its
-# re-creation. A rule that does not go in logs its own ERROR (ensure_fw_rule); the route does not
-# depend on it.
+# re-creation. A rule that does not go in logs its own ERROR (ensure_fw_rule). Returns 1 when the
+# MASQUERADE is not in place: without NAT the tunnel carries nothing. A missing clamp costs only
+# the TCP segments too large for the tunnel.
 _iftunnel_rules_ensure() {
-    ensure_fw_rule -q nat POSTROUTING -I 1 -o "$1" -j MASQUERADE || true
+    local rc=0
+    ensure_fw_rule -q nat POSTROUTING -I 1 -o "$1" -j MASQUERADE || rc=1
     ensure_fw_rule -q mangle FORWARD -I 1 -o "$1" -p tcp -m tcp --tcp-flags SYN,RST SYN \
         -j TCPMSS --clamp-mss-to-pmtu || true
+    return "$rc"
 }
 
 # _iftunnel_mss_in_ensure <iface> <mtu> - the inbound SYN-ACK clamp, MTU - 40: there
@@ -287,21 +290,27 @@ _iftunnel_rules_release() {
 # rebuild of the firmware gets the rules back with the next apply, and a re-created interface gets
 # its route back once an apply comes (ensure-routes brings one within a minute). Returns 1 when
 # the interface is missing or not UP - "ip link del" takes the route along, and the kernel refuses
-# one through a down interface - or when the route does not go in.
+# one through a down interface - when the route does not go in, or when the MASQUERADE is not in
+# place: the tunnel's peer takes the router's own tunnel address only, so without NAT the far end
+# drops what the clients send. The route still goes in then, and the next apply retries the rule.
 # -------------------------------------------------------------------------------------------------
 iftunnel_route_ensure() {
-    local iface="${1:-}" table link mtu
+    local iface="${1:-}" table link mtu nat_ok=1
     # No name, no rule: an older libxtables reads "-o ''" as any interface, and the first rule
     # below would be a bare MASQUERADE at the head of nat POSTROUTING.
     [[ -n $iface ]] || return 1
     table="$(iftunnel_table "${2:-}")" || return 1
-    _iftunnel_rules_ensure "$iface"
+    if ! _iftunnel_rules_ensure "$iface"; then
+        nat_ok=0
+        _iftunnel_warn "Interface tunnel '$iface': its MASQUERADE did not go in; without NAT the far end drops what its clients send, so the tunnel carries nothing until an apply puts it in"
+    fi
     link="$(_iftunnel_link "$iface")" || return 1
     _iftunnel_up "$link" || return 1
     if mtu="$(_iftunnel_mtu "$link")"; then
         _iftunnel_mss_in_ensure "$iface" "$mtu"
     fi
-    ip route replace default dev "$iface" table "$table" 2>/dev/null
+    ip route replace default dev "$iface" table "$table" 2>/dev/null || return 1
+    [[ $nat_ok -eq 1 ]]
 }
 
 # iftunnel_table_release <iface> <idx> - the route and the three rules gone. A table that holds

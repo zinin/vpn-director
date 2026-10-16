@@ -253,6 +253,35 @@ AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
     assert_equal "$(grep -c 'MASQUERADE' <<< "$output")" 1
 }
 
+# refuse_masquerade - for the rest of the test, iptables refuses to put a rule
+# into nat POSTROUTING; everything else goes to the mock.
+refuse_masquerade() {
+    iptables() {
+        if [[ " $* " == *" -t nat -I POSTROUTING "* ]]; then
+            return 1
+        fi
+        command iptables "$@"
+    }
+}
+
+# Without NAT the far end drops what the clients send - its peer takes the
+# tunnel's own address only - so the tunnel carries nothing: the ensure fails,
+# though the route and the MSS clamps went in, and a later apply retries it.
+@test "iftunnel_route_ensure: fails while its MASQUERADE is not in place" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    refuse_masquerade
+    run iftunnel_route_ensure awg1 1
+    assert_failure
+    grep -qF "Interface tunnel 'awg1': its MASQUERADE did not go in" "$LOG_FILE"
+    run ip route show table 2001
+    assert_output "default dev awg1"
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
 # "ip link del" takes the route along, and the rules have to be in place for the
 # moment the interface is back: iptables matches its name, not the interface.
 @test "iftunnel_route_ensure: without the interface, the rules that need none and no route" {
