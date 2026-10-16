@@ -30,6 +30,7 @@ fi
 #   vpn-director update                      - Update ipsets and reapply all
 #   vpn-director platform                    - Print platform facts as JSON (for the daemons)
 #   vpn-director cron install|remove         - Schedule or drop the daily ipset update
+#   vpn-director ensure-routes               - Put back a route an interface tunnel lost (cron runs it)
 #
 # Options:
 #   -f, --force    Force operation (ignore hash checks)
@@ -121,6 +122,7 @@ Commands:
   update                      Download fresh ipsets and reapply all
   platform                    Print platform facts as JSON
   cron install|remove         Schedule or drop the daily "update" job
+  ensure-routes               Put back a route an interface tunnel lost (cron runs it every minute)
 
 Options:
   -f, --force       Force operation (ignore hash checks)
@@ -321,6 +323,7 @@ cmd_apply() {
             tproxy_apply
             tunnel_apply
             _prune_keeping "$(tunnel_uncarried)"
+            _routes_cron_sync
             ;;
         tunnel)
             required_ipsets=$(tunnel_get_required_ipsets)
@@ -329,6 +332,7 @@ cmd_apply() {
                 _ensure_ipsets $required_ipsets
             fi
             tunnel_apply
+            _routes_cron_sync
             ;;
         xray|tproxy)
             required_ipsets=$(tproxy_get_required_ipsets)
@@ -455,14 +459,74 @@ cmd_update() {
     tproxy_apply
     tunnel_apply
     _prune_keeping "$(tunnel_uncarried)"
+    _routes_cron_sync
 
     log "Update complete"
+}
+
+###################################################################################################
+# _routes_cron_sync - the cron job of ensure-routes follows the interface tunnels
+# -------------------------------------------------------------------------------------------------
+# Called after every tunnel_apply. With an interface tunnel applied (lib/iftunnel.sh's record) and
+# no marker, it schedules "ensure-routes" every minute and leaves the marker; with none and the
+# marker, it drops both. The marker lives in /tmp, as Merlin's cru jobs do, so the first apply
+# after a reboot schedules the job again, and an upgrade gets it with its first apply. KeeneticOS's
+# cron.d job outlives a reboot that skips S99's stop (its "cron remove"), and the marker does not:
+# an apply without interface tunnels after such a reboot leaves the job in place, and it exits
+# quietly every minute until "cron remove". A cron that refuses the job costs a WARN and no
+# marker - the next apply tries again - never the apply.
+###################################################################################################
+_routes_cron_sync() {
+    local cron_req
+    if [[ -s $IFTUNNEL_STATE_FILE ]]; then
+        [[ ! -e $IFTUNNEL_CRON_MARKER ]] || return 0
+        if platform_cron_add vpn_director_routes "* * * * *" "$SCRIPT_DIR/vpn-director.sh ensure-routes"; then
+            if mkdir -p "$(dirname "$IFTUNNEL_CRON_MARKER")" && : > "$IFTUNNEL_CRON_MARKER"; then
+                log "Scheduled the route check of the interface tunnels (every minute)"
+            else
+                log -l WARN "Scheduled the route check of the interface tunnels, but cannot write $IFTUNNEL_CRON_MARKER; the next apply schedules it again"
+            fi
+        else
+            log -l WARN "Could not schedule the route check of the interface tunnels; an interface re-created by its own scripts keeps its clients refused until the next apply"
+            if cron_req="$(platform_cron_requirements)"; then
+                log -l WARN "$cron_req"
+            fi
+        fi
+    elif [[ -e $IFTUNNEL_CRON_MARKER ]]; then
+        platform_cron_del vpn_director_routes || true
+        rm -f "$IFTUNNEL_CRON_MARKER"
+        log "Dropped the route check of the interface tunnels"
+    fi
+}
+
+###################################################################################################
+# cmd_ensure_routes - put back the route of an interface tunnel whose interface came back
+# -------------------------------------------------------------------------------------------------
+# Deleting an interface takes its routes along: S51awg1's watchdog restarts awg1 with
+# "ip link del", and the tunnel's table stays empty - its clients refused - until an apply puts
+# the default back. The cron job vpn_director_routes runs this every minute. A minute with nothing
+# missing costs common.sh, one state file and two ip calls per interface tunnel: no config, no
+# jq. Once stop has run it does nothing. It does not wait for the lock (cmd_apply takes it
+# without --wait): a Tunnel Director apply that holds it does the same work, and when another
+# command holds it - restart xray-process, apply xray, restart xray, stop - or an apply passed its
+# route step before the interface came up, the route waits for the next minute in which the lock
+# is free, its clients refused meanwhile.
+###################################################################################################
+cmd_ensure_routes() {
+    _load_common
+    [[ ! -e ${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped} ]] || return 0
+    local missing
+    missing="$(iftunnel_routes_missing)" || return 0
+    log "Interface tunnel back without its route: ${missing//$'\n'/ }; applying Tunnel Director"
+    UNLESS_STOPPED=1
+    COMPONENT=tunnel cmd_apply
 }
 
 # -------------------------------------------------------------------------------------------------
 # cmd_platform - print the platform facts the daemons need, as one JSON document
 # -------------------------------------------------------------------------------------------------
-# Tunnels are listed without "main"; a tunnel whose interface or info lookup
+# Tunnels are listed without "main" - the firmware's, then the interfaces of
+# tunnel_director.interfaces; a tunnel whose interface or info lookup
 # fails is omitted with a WARN so the rest of the document stays usable. An
 # incomplete tunnel inventory aborts: an empty Merlin list is authoritative
 # to the failover watch. The document is one line: the daemons read the
@@ -472,13 +536,19 @@ cmd_update() {
 cmd_platform() {
     _load_common
 
+    # The interfaces of tunnel_director.interfaces are tunnels as well. This
+    # command takes no lock and loads no config.sh - the daemons run it on every
+    # poll - so it reads the one key it needs.
+    TUN_DIR_INTERFACES="$(iftunnel_read_config "${VPD_CONFIG_FILE:-/opt/vpn-director/vpn-director.json}")"
+    iftunnel_init
+
     local arch wan pw_file lan_json tunnels_json tunnel_ids
     arch="$(uname -m)"
     wan="$(platform_wan_if)" || wan=""
     pw_file="$(platform_password_file)"
     lan_json="$(platform_lan_ifaces | jq -R . | jq -s -c .)"
 
-    if ! tunnel_ids="$(platform_tunnels)"; then
+    if ! tunnel_ids="$(vpd_tunnels)"; then
         log -l ERROR "platform: cannot read tunnel inventory"
         return 1
     fi
@@ -488,11 +558,11 @@ cmd_platform() {
     while IFS= read -r id; do
         [[ -n $id ]] || continue
         [[ $id == main ]] && continue
-        if ! iface="$(platform_tunnel_iface "$id")"; then
+        if ! iface="$(vpd_tunnel_iface "$id")"; then
             log -l WARN "platform: cannot map tunnel '$id' to an interface; omitted"
             continue
         fi
-        if ! info="$(platform_tunnel_info "$id")"; then
+        if ! info="$(vpd_tunnel_info "$id")"; then
             log -l WARN "platform: no info for tunnel '$id'; omitted"
             continue
         fi
@@ -551,6 +621,10 @@ cmd_cron() {
             platform_cron_del vpn_director_update || true
             # The legacy job as well, for the reason spelled out in install.
             platform_cron_del update_ipsets || true
+            # The route check of the interface tunnels goes with it: S99 stop
+            # runs this, and an apply schedules it again.
+            platform_cron_del vpn_director_routes || true
+            rm -f "$IFTUNNEL_CRON_MARKER"
             log "Removed daily ipset update"
             ;;
         *)
@@ -591,6 +665,9 @@ case "$COMMAND" in
         ;;
     cron)
         cmd_cron
+        ;;
+    ensure-routes)
+        cmd_ensure_routes
         ;;
     *)
         echo "Unknown command: $COMMAND" >&2

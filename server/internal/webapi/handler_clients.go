@@ -103,8 +103,10 @@ func handleAddClient(deps *Deps) http.HandlerFunc {
 // tunnel can appear or go at any time. A configured tunnel is accepted without
 // the platform, as the bot and the wizard accept it: ClientsTab offers exactly
 // those when the platform cannot be asked, and a 503 here made that fallback
-// unusable. An empty list is not an answer either: on Keenetic `vpn-director.sh
-// platform` prints "tunnels": [] and exits 0 while RCI does not reply (spec 13).
+// unusable. A list without a firmware tunnel is no answer about a route it does
+// not list either: on Keenetic `vpn-director.sh platform` lists no firmware
+// tunnel and exits 0 while RCI does not reply (spec 13), and the interfaces of
+// tunnel_director.interfaces are listed whatever the firmware says.
 // A Tunnel Director route - any but xray - takes only an address Tunnel
 // Director marks (vpnconfig.TDCarries): tunnel.sh skips the rest, so such a
 // client would be on no route at all. It writes the error response itself and
@@ -128,15 +130,19 @@ func checkClientRoute(w http.ResponseWriter, deps *Deps, ip, route string) bool 
 	}
 	extendWriteDeadline(w, statusDeadline)
 	info, err := deps.VPN.Platform()
-	if err != nil || len(info.Tunnels) == 0 {
+	if err != nil {
 		jsonError(w, http.StatusServiceUnavailable, "platform info unavailable")
 		return false
 	}
-	if !info.HasTunnel(route) {
-		jsonError(w, http.StatusBadRequest, "invalid route: must be xray or a tunnel this router has")
+	if info.HasTunnel(route) {
+		return true
+	}
+	if !info.HasFirmwareTunnels() {
+		jsonError(w, http.StatusServiceUnavailable, "platform info unavailable")
 		return false
 	}
-	return true
+	jsonError(w, http.StatusBadRequest, "invalid route: must be xray or a tunnel this router has")
+	return false
 }
 
 // moveClientRequest is the expected JSON body for POST /api/clients/route.

@@ -65,8 +65,8 @@ function rowRouteOptions(client: ClientInfo): RouteOption[] {
   return opts
 }
 
-// A tunnel the platform reports down has no route in its table, and a client
-// put on it goes out through the WAN until it comes up.
+// A tunnel the platform reports down has no route in its table, and Tunnel
+// Director refuses what a client put on it would send through it until it is up.
 function isDown(route: string): boolean {
   return platformTunnels.value.some((t) => t.id === route && !t.connected)
 }
@@ -94,13 +94,12 @@ function isMovable(client: ClientInfo): boolean {
 
 function confirmDown(route: string, verb: string): boolean {
   return confirm(
-    `${route} is down: until it is up, this client's traffic goes out through the WAN. ${verb} anyway?`,
+    `${route} is down: until it is up, Tunnel Director blocks the traffic this client would send through it (excluded destinations still go direct). ${verb} anyway?`,
   )
 }
 
 // A tunnel the platform does not list - a typo, a connection deleted on the
-// router - is one Tunnel Director skips until it is listed, and a client put
-// on it goes out through the WAN meanwhile. Asked only when the platform
+// router - refuses its clients until it is listed. Asked only when the platform
 // answered: a failed read has no list to go by.
 function isUnlisted(route: string): boolean {
   return platformError.value === '' && !platformTunnels.value.some((t) => t.id === route)
@@ -108,7 +107,7 @@ function isUnlisted(route: string): boolean {
 
 function confirmUnlisted(route: string, verb: string): boolean {
   return confirm(
-    `${route} is not on the router's tunnel list: until it is, Tunnel Director does not route this client through it. ${verb} anyway?`,
+    `${route} is not on the router's tunnel list: until it is, Tunnel Director blocks the traffic this client would send through it (excluded destinations still go direct). ${verb} anyway?`,
   )
 }
 

@@ -211,8 +211,9 @@ export interface UpdateStatusResponse {
  *  the Settings tab only ever re-serialises it. */
 export type ConfigResponse = Record<string, unknown>
 
-/** One firmware VPN client tunnel as `vpn-director.sh platform` lists it;
- *  `id` is what a client's route names. */
+/** One tunnel as `vpn-director.sh platform` lists it: a firmware VPN client, or
+ *  an interface of `tunnel_director.interfaces` (`type` "interface"); `id` is
+ *  what a client's route names. */
 export interface PlatformTunnel {
   id: string
   iface: string

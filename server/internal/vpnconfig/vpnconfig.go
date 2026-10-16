@@ -146,6 +146,11 @@ type TunnelConfig struct {
 }
 
 type TunnelDirectorConfig struct {
+	// Interfaces are the Linux interfaces Tunnel Director may route through
+	// beside the firmware's tunnels (tunnel_director.interfaces,
+	// lib/iftunnel.sh): a tunnel key equal to one of them is an interface
+	// tunnel. Kept here so a save by a daemon does not drop the list.
+	Interfaces []string `json:"interfaces,omitempty"`
 	// Note: Go's json.Marshal sorts map keys alphabetically, so tunnel order
 	// in saved JSON is deterministic. This matches jq 'keys[]' behavior.
 	// If insertion-order priority is needed, this should be changed to a slice.
@@ -307,12 +312,13 @@ type PlatformInfo struct {
 	Tunnels      []PlatformTunnel `json:"tunnels"`
 }
 
-// PlatformTunnel is one firmware VPN client tunnel, as the platform lists it.
-// ID is what tunnel_director.tunnels is keyed by.
+// PlatformTunnel is one tunnel Tunnel Director may route through, as
+// `vpn-director.sh platform` lists it: a firmware VPN client, or an interface
+// of tunnel_director.interfaces. ID is what tunnel_director.tunnels is keyed by.
 type PlatformTunnel struct {
 	ID          string `json:"id"`
 	Iface       string `json:"iface"`
-	Type        string `json:"type"` // openvpn or wireguard
+	Type        string `json:"type"` // openvpn, wireguard or interface
 	Connected   bool   `json:"connected"`
 	Description string `json:"description"`
 }
@@ -321,6 +327,20 @@ type PlatformTunnel struct {
 func (p PlatformInfo) HasTunnel(id string) bool {
 	for _, t := range p.Tunnels {
 		if t.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// HasFirmwareTunnels reports whether the platform lists a tunnel of the
+// firmware's: any entry but an interface of tunnel_director.interfaces. Only
+// such an entry tells an answer from silence: KeeneticOS prints no firmware
+// tunnel while RCI does not answer (spec 14), and the interfaces are listed
+// whatever the firmware says.
+func (p PlatformInfo) HasFirmwareTunnels() bool {
+	for _, t := range p.Tunnels {
+		if t.Type != "interface" {
 			return true
 		}
 	}

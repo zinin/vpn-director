@@ -9,9 +9,12 @@
 #
 # Dependencies:
 #   - common.sh (log, tmp_file, compute_hash, is_lan_ip, is_ipv4_net, rt_table_label)
-#     and, through it, the platform contract (platform_tunnels, platform_tunnel_table,
-#     platform_tunnel_route_ensure, platform_tunnel_table_release,
-#     platform_tunnel_unlisted_reason, platform_prerouting_base_pos, platform_lan_ifaces)
+#     and, through it, the tunnels of lib/iftunnel.sh's vpd_* layer (vpd_tunnels,
+#     vpd_tunnel_table, vpd_tunnel_route_ensure, vpd_tunnel_table_release,
+#     vpd_tunnel_slot_table, vpd_tunnel_slot_release, vpd_tunnel_unlisted_reason;
+#     iftunnel_init, iftunnel_state_write, iftunnel_status)
+#     and the platform contract (platform_prerouting_base_pos, platform_lan_ifaces,
+#     platform_tunnel_offload_target)
 #   - firewall.sh (delete_fw_chain, ensure_fw_rule, sync_fw_rule, swap_fw_chain,
 #                  purge_fw_rules, find_fw_rules, fw_chain_exists)
 #   - config.sh (TUN_DIR_TUNNELS_JSON, TUN_DIR_CHAIN, TUN_DIR_PREF_BASE,
@@ -42,7 +45,7 @@
 #   _tunnel_collect_applied()    - the slot of every tunnel: kept from TUN_DIR_TABLES, or the lowest free
 #   _tunnel_tables_write()       - replace TUN_DIR_TABLES in one step
 #   _tunnel_build_chain()        - fill a fresh chain with every client's rules (swap_fw_chain's build_fn)
-#   _tunnel_slot_release()       - drop the ip rule and the table of a slot the new layout dropped
+#   _tunnel_slot_release()       - drop the ip rules and the table of a slot the new layout dropped
 #   _tunnel_init()               - initialize module state
 #
 # Usage:
@@ -104,18 +107,22 @@ TUNNEL_UNCARRIED=()
 # -------------------------------------------------------------------------------------------------
 # _tunnel_init - initialize module state
 # -------------------------------------------------------------------------------------------------
-# Builds the valid_tables list from platform_tunnels and computes fwmark helpers.
+# Builds the valid_tables list from vpd_tunnels and computes fwmark helpers.
 # Safe to call multiple times (idempotent).
 # -------------------------------------------------------------------------------------------------
 _tunnel_init() {
     # Skip if already initialized
     [[ $_tunnel_initialized -eq 1 ]] && return 0
 
-    # Valid tunnel ids come from the platform (Merlin: wgcN tables from
-    # rt_tables, and ovpncN ones while their OpenVPN client is in VPN Director
-    # mode; Keenetic: OpenVPN*/Wireguard* interfaces), "main" last.
+    # Valid tunnel ids come through the vpd_* layer (lib/iftunnel.sh): the
+    # platform's (Merlin: wgcN tables from rt_tables, and ovpncN ones while
+    # their OpenVPN client is in VPN Director mode; Keenetic: OpenVPN*/Wireguard*
+    # interfaces), then the interfaces of tunnel_director.interfaces, "main"
+    # last. The list is checked here, in this shell, so its WARNs come once and
+    # every $(vpd_*) below finds it checked.
+    iftunnel_init
     local tables_list
-    tables_list="$(platform_tunnels || true)"
+    tables_list="$(vpd_tunnels || true)"
 
     # Single-line, space-separated (for matching)
     _tunnel_valid_tables="$(printf '%s\n' "$tables_list" | xargs)"
@@ -132,7 +139,7 @@ _tunnel_init() {
 # -------------------------------------------------------------------------------------------------
 # _tunnel_table_allowed - check the tunnel id is one the platform lists
 # -------------------------------------------------------------------------------------------------
-# Returns 0 if the id is in _tunnel_valid_tables (built from platform_tunnels), 1 otherwise.
+# Returns 0 if the id is in _tunnel_valid_tables (built from vpd_tunnels), 1 otherwise.
 # -------------------------------------------------------------------------------------------------
 _tunnel_table_allowed() {
     local table="${1:-}"
@@ -248,25 +255,34 @@ _tunnel_not_carried_non_rfc1918() {
 # _tunnel_ensure_routes - re-install the routes of every applied tunnel
 # -------------------------------------------------------------------------------------------------
 # Reads TUN_DIR_TABLES ("<idx> <id>" per line, written by tunnel_apply) and calls
-# platform_tunnel_route_ensure for each, so the route follows the tunnel's
+# vpd_tunnel_route_ensure for each, so the route follows the tunnel's
 # interface state. The platform may refuse a configured tunnel it no longer
-# lists; platform_tunnel_unlisted_reason supplies the warning's reason then.
-# A tunnel whose route or ip rule is not in place routes its marks to main: its
-# clients are not carried (TUNNEL_UNCARRIED).
+# lists; vpd_tunnel_unlisted_reason supplies the warning's reason then.
+# A tunnel whose route or ip rule is not in place refuses its marks (the block
+# rule): its clients are not carried (TUNNEL_UNCARRIED). Nor are they while the
+# block rule itself is not in place: a route that goes would send their marks
+# to main. Returns 1 when the failover tunnel's route or block rule did not go
+# back in.
 # -------------------------------------------------------------------------------------------------
 _tunnel_ensure_routes() {
-    local idx tunnel rc=0 carried reason
+    local idx tunnel rc=0 carried rules_ok
     [[ -f $TUN_DIR_TABLES ]] || return 0
     while read -r idx tunnel; do
         [[ -n $tunnel ]] || continue
         carried=1
-        if ! platform_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
-            reason="$(platform_tunnel_unlisted_reason "$tunnel")" || reason=""
-            if [[ -n $reason ]]; then
-                log -l WARN "Tunnel '$tunnel': route not installed: $reason; Tunnel Director does not route through it"
-            else
-                log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
+        rules_ok=1
+        # The block rule first: a router an earlier version applied has none,
+        # and this path is the one its first apply takes. A slot without it
+        # carries nothing, and its failover is not ready.
+        if ! _tunnel_block_ensure "$idx" "$tunnel"; then
+            carried=0
+            rules_ok=0
+            if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
+                rc=1
             fi
+        fi
+        if ! vpd_tunnel_route_ensure "$tunnel" "$idx" "$(_tunnel_gateway "$tunnel")"; then
+            _tunnel_route_warn "$tunnel"
             carried=0
             if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
                 rc=1
@@ -275,7 +291,16 @@ _tunnel_ensure_routes() {
         # The rule outlives an interface flap, but one that never went in at
         # rebuild time is retried nowhere else. The failover check below reads
         # the result; a rule that cannot be installed has logged its own error.
-        _tunnel_rule_ensure "$idx" "$tunnel" || carried=0
+        if ! _tunnel_rule_ensure "$idx" "$tunnel"; then
+            carried=0
+            rules_ok=0
+        fi
+        # What a former pref_base left of the slot goes once both of its own
+        # rules are in place, never before: until then the old ones are all
+        # that route its marks and refuse them when its route goes.
+        if [[ $rules_ok -eq 1 ]]; then
+            _tunnel_stale_rules_release "$idx"
+        fi
         if [[ $carried -eq 0 ]]; then
             _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
         fi
@@ -289,25 +314,27 @@ _tunnel_ensure_routes() {
 # A rebuild records TUN_DIR_HASH even when an "ip rule add" failed, so every
 # later apply lands in the up-to-date branch and this is the only place left to
 # retry. Without it a rule that never went in stays gone until the configuration
-# changes: those clients fall through to main, and for the failover tunnel
-# failover_ready is never written, so the watch keeps its Xray clients on a dead
-# outbound.
+# changes: those clients' marks meet the slot's block rule and are refused - they
+# reach main only where the block rule is missing too - and for the failover
+# tunnel failover_ready is never written, so the watch keeps its Xray clients on
+# a dead outbound.
 #
 # A rule that is in place is left alone. Deleting and re-adding it would open a
-# window in which marked packets fall through to main. Another rule on the
-# preference makes way for it: the range is this module's, as the rebuild and
-# tunnel_stop treat it.
+# window in which marked packets are refused by the block rule, or reach main
+# where that is missing too. Another owner's rule on the preference makes way for
+# it - the range is this module's, as the rebuild and tunnel_stop treat it - while
+# a rule of another slot of this module stays beside it (_tunnel_pref_make_way).
 # -------------------------------------------------------------------------------------------------
 _tunnel_rule_ensure() {
     local idx="$1" tunnel="$2"
     local pref=$((TUN_DIR_PREF_BASE + idx))
     local mark_hex table
     mark_hex=$(_tunnel_mark_hex "$idx")
-    table="$(platform_tunnel_table "$tunnel" "$idx")"
+    table="$(vpd_tunnel_table "$tunnel" "$idx")"
     if _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
         return 0
     fi
-    ip rule del pref "$pref" 2>/dev/null || true
+    _tunnel_pref_make_way "$pref" "$mark_hex"
     if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
         log -l ERROR "Tunnel '$tunnel': ip rule still not installed: pref=$pref fwmark=$mark_hex lookup=$table"
         return 1
@@ -336,15 +363,28 @@ _tunnel_mark_hex() {
 # rule as it prints it, and the SIGPIPE that ends "ip" made the pipeline report
 # 141, so a rule in place read as missing.
 _tunnel_rule_listed() {
-    local pref="$1" fwmark="fwmark $2/$_tunnel_mark_mask_hex" lookup rules line
+    _tunnel_ip_rule_listed "$1" "$2" "lookup $(rt_table_label "$3")"
+}
+
+# _tunnel_block_listed <pref> <mark> - is this module's block rule at that preference: "from all
+# fwmark <mark>/<mask> prohibit"? Read as _tunnel_rule_listed reads a lookup rule.
+_tunnel_block_listed() {
+    _tunnel_ip_rule_listed "$1" "$2" "prohibit"
+}
+
+# _tunnel_ip_rule_listed <pref> <mark> <action> - is "from all fwmark <mark>/<mask> <action>" at
+# that preference, every part a whole word (iproute2 4.4 ends each rule with a space), a mask of
+# all ones left out as iproute2 leaves it out? The listing is read whole first: piped into
+# "grep -q" it was wrong under pipefail (shell-conventions.md).
+_tunnel_ip_rule_listed() {
+    local pref="$1" fwmark="fwmark $2/$_tunnel_mark_mask_hex" action="$3" rules line
     [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || fwmark="fwmark $2"
-    lookup="lookup $(rt_table_label "$3")"
     rules=$(ip rule show 2>/dev/null) || true
     while IFS= read -r line; do
         [[ $line == "$pref:"* ]] || continue
         line=" ${line#*:} "
         line=${line//$'\t'/ }
-        if [[ $line == *" from all "* && $line == *" $fwmark "* && $line == *" $lookup "* ]]; then
+        if [[ $line == *" from all "* && $line == *" $fwmark "* && $line == *" $action "* ]]; then
             return 0
         fi
     done <<< "$rules"
@@ -358,7 +398,7 @@ _tunnel_failover_rule_present() {
     [[ -f $TUN_DIR_TABLES ]] || return 1
     idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$TUN_DIR_TABLES")
     [[ -n $idx ]] || return 1
-    table=$(platform_tunnel_table "$XRAY_FAILOVER_TUNNEL" "$idx") || return 1
+    table=$(vpd_tunnel_table "$XRAY_FAILOVER_TUNNEL" "$idx") || return 1
     _tunnel_rule_listed $((TUN_DIR_PREF_BASE + idx)) "$(_tunnel_mark_hex "$idx")" "$table"
 }
 
@@ -433,9 +473,10 @@ _tunnel_failover_needed() {
 # that neither layout holds: a slot this apply frees still carries marks until the
 # swap, and its ip rule goes only after it. warnings, skipped_unknown and
 # incomplete are tunnel_apply's locals (bash dynamic scope). One pass, so the
-# failover MARK slots cannot drift from the rules. The clients of a tunnel that
-# gets no slot - one the platform does not list, one the mark field has no room
-# for - are not carried (TUNNEL_UNCARRIED).
+# failover MARK slots cannot drift from the rules. A tunnel the platform does not
+# list keeps a slot when it has clients: their MARK rules and the slot's block
+# rule refuse what they would send through it. Its clients are not carried, nor
+# are those of a tunnel the mark field has no room for (TUNNEL_UNCARRIED).
 _tunnel_collect_applied() {
     local prev="${1:-/dev/null}"
     local tunnel tunnel_type clients_type clients idx used tunnels reason
@@ -444,22 +485,32 @@ _tunnel_collect_applied() {
     while IFS= read -r tunnel; do
         [[ -n $tunnel ]] || continue
         if ! _tunnel_table_allowed "$tunnel"; then
-            reason="$(platform_tunnel_unlisted_reason "$tunnel")" || reason=""
-            if [[ -n $reason ]]; then
-                log -l WARN "Tunnel '$tunnel' is skipped: $reason"
-            else
-                log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
-            fi
+            reason="$(vpd_tunnel_unlisted_reason "$tunnel")" || reason=""
             warnings=1
             # A tunnel with no clients gets no slot whether the platform lists it
             # or not, so there is nothing for a later apply to retry: it does not
             # keep the hash from being recorded.
             clients="$(_tunnel_clients_of "$tunnel")"
-            if [[ -n $clients ]]; then
-                skipped_unknown=1
-                _tunnel_not_carried_on "$tunnel" "$clients"
+            if [[ -z $clients ]]; then
+                if [[ -n $reason ]]; then
+                    log -l WARN "Tunnel '$tunnel' is skipped: $reason"
+                else
+                    log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; skipping"
+                fi
+                continue
             fi
-            continue
+            # One with clients keeps a slot: their MARK rules and the slot's block
+            # rule refuse what they would send through it. Skipped, they went
+            # unmarked - out through the WAN, every client of every tunnel at once
+            # while KeeneticOS's RCI was silent. The hash stays unrecorded, so the
+            # next apply looks again.
+            if [[ -n $reason ]]; then
+                log -l WARN "Tunnel '$tunnel' is not on the platform's list: $reason; its clients are refused"
+            else
+                log -l WARN "Tunnel '$tunnel' is not a tunnel this platform knows; its clients are refused"
+            fi
+            skipped_unknown=1
+            _tunnel_not_carried_on "$tunnel" "$clients"
         fi
         tunnel_type=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '.[$t] | type')
         if [[ $tunnel_type != "object" ]]; then
@@ -502,8 +553,9 @@ _tunnel_collect_applied() {
     done <<< "$tunnels"
 }
 
-# One client's RETURN / offload / MARK in <chain>. Offload sits immediately
-# before MARK with the same match so excluded destinations keep acceleration.
+# One client's RETURNs (country sets, addresses and CIDRs) / offload / MARK in
+# <chain>. Offload sits immediately before MARK with the same match so excluded
+# destinations keep acceleration.
 # warnings, changes, incomplete and offload_target are tunnel_apply's locals
 # (bash dynamic scope); incomplete says a rule did not go in, so the rebuild is
 # not recorded.
@@ -541,6 +593,23 @@ _tunnel_emit_client() {
     local excl excl_set
     while IFS= read -r excl; do
         [[ -n $excl ]] || continue
+        # An address or a CIDR returns its destination as it stands, an IPv6
+        # entry is skipped, and anything else names a set. iptables reads a
+        # leading zero as octal ("010" is 8); is_ipv4_net takes only what
+        # iptables reads as written, so "203.0.113.010" falls through to the set
+        # lookup and its WARN.
+        if is_ipv4_net "$excl"; then
+            if ! ensure_fw_rule -q mangle "$chain" -s "$client" -d "$excl" -j RETURN; then
+                warnings=1
+                incomplete=1
+            fi
+            continue
+        fi
+        if [[ $excl == *:* ]]; then
+            log -l WARN "Tunnel '$tunnel': exclusion '$excl' is IPv6; Tunnel Director routes IPv4 only, skipping it"
+            warnings=1
+            continue
+        fi
         excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
         if ! _ipset_exists "$excl_set"; then
             log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
@@ -716,20 +785,188 @@ _tunnel_build_chain() {
     return 0
 }
 
-# _tunnel_slot_release <idx> <tunnel> - drop the ip rule and the table of a slot
+# _tunnel_block_pref <idx> - the preference of the slot's block rule: right after the lookup
+# range, which ends at pref_base + field_max - 1. 16639-16893 with the defaults.
+_tunnel_block_pref() {
+    printf '%d' $((TUN_DIR_PREF_BASE + _tunnel_mark_field_max + $1))
+}
+
+# _tunnel_block_ensure <idx> <tunnel> - the kill switch of a slot: "fwmark <mark>/<mask>
+# prohibit" after its lookup rule. When the tunnel's table holds no route - the interface is
+# missing or down, the route never went in, the firmware flushed the table - the lookup falls
+# through to this rule, never to main, and the client gets ICMP "administratively prohibited"
+# instead of its traffic leaving through the WAN. main's slot has none: main is no tunnel. A rule
+# that is in place is left alone; another owner's rule on the preference makes way - the range is
+# this module's - while one of another slot stays beside it (_tunnel_pref_make_way). Returns 1
+# when the rule did not go in.
+_tunnel_block_ensure() {
+    local idx="$1" tunnel="$2" pref mark_hex
+    [[ $tunnel != main ]] || return 0
+    pref=$(_tunnel_block_pref "$idx")
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    _tunnel_block_listed "$pref" "$mark_hex" && return 0
+    _tunnel_pref_make_way "$pref" "$mark_hex"
+    if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" prohibit 2>/dev/null; then
+        log -l ERROR "Tunnel '$tunnel': the block rule did not go in (pref=$pref fwmark=$mark_hex); while its table has no route its clients fall through to main"
+        return 1
+    fi
+    return 0
+}
+
+# _tunnel_route_warn <tunnel> - a tunnel's route did not go in: say so, and why when the layer
+# knows. Its marks meet the slot's block rule, never main.
+_tunnel_route_warn() {
+    local reason
+    reason="$(vpd_tunnel_unlisted_reason "$1")" || reason=""
+    if [[ -n $reason ]]; then
+        log -l WARN "Tunnel '$1': route not installed: $reason; its clients are refused"
+    else
+        log -l WARN "Tunnel '$1': route not installed (interface down or not mapped?); its clients are refused until it is"
+    fi
+}
+
+# _tunnel_routeless <tunnel> <idx> - has a tunnel the platform does not list no table to route
+# through? An interface taken off tunnel_director.interfaces has none - though the layer still
+# names the table the last apply recorded, that table would carry its clients on into the
+# interface - and any other id has none when the layer names no table for it. KeeneticOS's
+# WireguardN and Merlin's ovpncN keep theirs: the platform decides about their routes.
+_tunnel_routeless() {
+    vpd_tunnel_retired "$1" && return 0
+    ! vpd_tunnel_table "$1" "$2" >/dev/null
+}
+
+# _tunnel_unroute <idx> <tunnel> - what a known past left on the slot of a routeless tunnel: its
+# lookup rule (ours only) and its table - for an interface the list no longer names, the route,
+# the NAT and MSS rules too (vpd_tunnel_slot_release). An interface whose record is gone - an
+# interrupted first apply, a failed write, a removed file - is one the layer names no table for:
+# its lookup rule can point only to the slot's own table, 2000 + idx (vpd_tunnel_slot_table), and
+# only that rule in place lets its NAT and MSS rules go by its name. A key never routed may name a
+# firmware interface, whose own rules read the same.
+_tunnel_unroute() {
+    local idx="$1" tunnel="$2" pref mark_hex table routed=0
+    pref=$((TUN_DIR_PREF_BASE + idx))
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    if table="$(vpd_tunnel_slot_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
+        ip rule del pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null || true
+        routed=1
+    fi
+    vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
+}
+
+# _tunnel_pref_make_way <pref> <mark> - clear <pref> for this module's rule of the slot with
+# <mark>. Another owner's rule there makes way - the range is this module's - and so do a rule of
+# the same slot that is not the one wanted and one of a slot no layout holds, an older layout's.
+# A rule of another slot that TUN_DIR_TABLES holds stays: after a change of pref_base that slot
+# may still route and refuse by its old rules, its new ones not in place yet, and they go with its
+# stale rules once those are (_tunnel_stale_rules_release); on a rebuild the file holds both
+# layouts, so a slot about to be dropped keeps its rules until its release. The new rule then
+# goes in beside it, rules on one preference being tried in turn, and the delete by the
+# preference alone - it takes the first rule there - is left out while one shares it.
+_tunnel_pref_make_way() {
+    local pref="$1" mark_hex="$2" rules line rest m m_idx i live=" " shared=0 mark_re
+    local lookup_re=' lookup ([^ ]+) '
+    local -a action
+    mark_re=" from all fwmark (0x[0-9a-f]+)/$_tunnel_mark_mask_hex "
+    [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || mark_re=' from all fwmark (0x[0-9a-f]+) '
+    if [[ -f $TUN_DIR_TABLES ]]; then
+        while read -r i _; do
+            [[ -z $i ]] || live+="$i "
+        done < "$TUN_DIR_TABLES"
+    fi
+    rules=$(ip rule show 2>/dev/null) || rules=""
+    while IFS= read -r line; do
+        [[ $line == "$pref:"* ]] || continue
+        rest=" ${line#*:} "
+        rest=${rest//$'\t'/ }
+        [[ $rest =~ $mark_re ]] || continue
+        m=${BASH_REMATCH[1]}
+        if [[ $m != "$mark_hex" ]]; then
+            m_idx=$(( (m >> _tunnel_mark_shift_val) - 1 ))
+            if [[ $live == *" $m_idx "* ]]; then
+                shared=1
+                continue
+            fi
+        fi
+        if [[ $rest == *" prohibit "* ]]; then
+            action=(prohibit)
+        elif [[ $rest =~ $lookup_re ]]; then
+            action=(lookup "${BASH_REMATCH[1]}")
+        else
+            continue
+        fi
+        if [[ $_tunnel_mark_mask_hex == 0xffffffff ]]; then
+            ip rule del pref "$pref" fwmark "$m" "${action[@]}" 2>/dev/null || true
+        else
+            ip rule del pref "$pref" fwmark "$m/$_tunnel_mark_mask_hex" "${action[@]}" 2>/dev/null || true
+        fi
+    done <<< "$rules"
+    if [[ $shared -eq 0 ]]; then
+        ip rule del pref "$pref" 2>/dev/null || true
+    fi
+    return 0
+}
+
+# _tunnel_stale_rules_release <idx> - this module's rules of slot <idx> on any preference but the
+# slot's own two: a lookup or block rule carrying the slot's mark under this module's mask, as an
+# apply with another pref_base leaves it - pref_base is no part of the hash. Ahead of the slot's
+# own rules such a rule would route its marks into a past tunnel's table, or refuse them, once the
+# slot goes to another tunnel. An apply calls it only once the slot's own lookup and block rules
+# are in place - until then the old ones are all that route the slot's marks and refuse them when
+# its route goes - and a released slot and stop, which leave no mark to protect, whatever. A
+# preference from 32766 on is never touched.
+_tunnel_stale_rules_release() {
+    local idx="$1" mark_hex pref bpref rules line p rest lookup_re=' lookup ([^ ]+) '
+    local -a sel action
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    pref=$((TUN_DIR_PREF_BASE + idx))
+    bpref=$(_tunnel_block_pref "$idx")
+    sel=(fwmark "$mark_hex/$_tunnel_mark_mask_hex")
+    [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || sel=(fwmark "$mark_hex")
+    rules=$(ip rule show 2>/dev/null) || return 0
+    while IFS= read -r line; do
+        p=${line%%:*}
+        [[ $p =~ ^[0-9]+$ && $p != "$pref" && $p != "$bpref" ]] || continue
+        (( p < 32766 )) || continue
+        rest=" ${line#*:} "
+        rest=${rest//$'\t'/ }
+        [[ $rest == *" from all ${sel[*]} "* ]] || continue
+        if [[ $rest == *" prohibit "* ]]; then
+            action=(prohibit)
+        elif [[ $rest =~ $lookup_re ]]; then
+            action=(lookup "${BASH_REMATCH[1]}")
+        else
+            continue
+        fi
+        ip rule del pref "$p" "${sel[@]}" "${action[@]}" 2>/dev/null || true
+    done <<< "$rules"
+}
+
+# _tunnel_slot_release <idx> <tunnel> - drop the ip rules and the table of a slot
 # the new layout no longer holds. Called after the swap, when no packet carries
 # the slot's mark any more. Only this module's rule goes (_tunnel_rule_listed):
 # another owner's rule on the preference stays, as the up-to-date path leaves it.
+# A slot the layer names no table for whose lookup rule points into the slot's
+# own interface table is an interface whose record is gone, and goes as that
+# table, its NAT and MSS rules with it (vpd_tunnel_slot_table,
+# vpd_tunnel_slot_release); without that rule nothing of its name is ours.
 _tunnel_slot_release() {
-    local idx="$1" tunnel="$2" pref mark_hex table
+    local idx="$1" tunnel="$2" pref bpref mark_hex table routed=0
     pref=$((TUN_DIR_PREF_BASE + idx))
+    bpref=$(_tunnel_block_pref "$idx")
     mark_hex=$(_tunnel_mark_hex "$idx")
-    if table="$(platform_tunnel_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
+    if table="$(vpd_tunnel_slot_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
+        routed=1
         if ! ip rule del pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
             log -l WARN "Tunnel '$tunnel': the ip rule at pref $pref did not go; it routes a mark nothing sets any more"
         fi
     fi
-    platform_tunnel_table_release "$tunnel" "$idx" || true
+    vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
+    if [[ $tunnel != main ]] && _tunnel_block_listed "$bpref" "$mark_hex"; then
+        if ! ip rule del pref "$bpref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" prohibit 2>/dev/null; then
+            log -l WARN "Tunnel '$tunnel': the block rule at pref $bpref did not go; it refuses a mark nothing sets any more"
+        fi
+    fi
+    _tunnel_stale_rules_release "$idx"
     log "Tunnel '$tunnel': released slot $idx"
 }
 
@@ -754,7 +991,8 @@ _tunnel_tables_write() {
 # -------------------------------------------------------------------------------------------------
 # tunnel_status - show tunnel director status
 # -------------------------------------------------------------------------------------------------
-# Displays TUN_DIR chain rules, ip rules, and configured tunnels.
+# Displays TUN_DIR chain rules, ip rules, and configured tunnels, then the interface tunnels the
+# last apply recorded: each one's table, route, and NAT and MSS rules (iftunnel_status).
 # -------------------------------------------------------------------------------------------------
 tunnel_status() {
     _tunnel_init
@@ -782,10 +1020,11 @@ tunnel_status() {
         printf '\n'
     fi
 
-    # Show IP rules
+    # Show IP rules: the lookup rules and the block rules, which refuse a mark whose table has no
+    # route (the kill switch).
     printf '%s\n' "--- IP Rules (fwmark-based) ---"
     local ip_rules
-    ip_rules=$(ip rule show 2>/dev/null | grep -E "fwmark.*lookup" || true)
+    ip_rules=$(ip rule show 2>/dev/null | grep -E "fwmark.*(lookup|prohibit)" || true)
 
     if [[ -z $ip_rules ]]; then
         printf '%s\n' "No fwmark-based ip rules found."
@@ -804,6 +1043,10 @@ tunnel_status() {
             "Tunnel: \(.key)\n  Clients: \(.value.clients // [] | join(", "))\n  Exclude: \(.value.exclude // [] | join(", "))"
         ' 2>/dev/null || printf '%s\n' "Error: Failed to parse tunnels JSON"
     fi
+    printf '\n'
+
+    printf '%s\n' "--- Interface tunnels ---"
+    iftunnel_status
     printf '\n'
 
     return 0
@@ -858,8 +1101,12 @@ tunnel_clients() {
 # tunnel_stop - remove chain, ip rules and tunnel tables
 # -------------------------------------------------------------------------------------------------
 # Removes TUN_DIR chain, all associated ip rules and the tunnel tables this
-# module owns. Where the firmware owns them, the platform may only clear a
-# default route Tunnel Director left in a table it no longer uses.
+# module owns. An interface tunnel loses its route and its NAT and MSS rules
+# too (vpd_tunnel_slot_release) - one whose record is gone as well, while its
+# lookup rule shows it was routed - and the record ensure-routes reads
+# (IFTUNNEL_STATE_FILE) goes. Where the firmware owns the tables, the platform
+# may only clear a default route Tunnel Director left in a table it no longer
+# uses.
 # -------------------------------------------------------------------------------------------------
 tunnel_stop() {
     _tunnel_init
@@ -878,28 +1125,56 @@ tunnel_stop() {
         delete_fw_chain -q mangle "${TUN_DIR_CHAIN}_NEW" || true
     fi
 
-    # Remove ip rules in our pref range
     local pref_base="${TUN_DIR_PREF_BASE:-16384}"
     local max_rules="${_tunnel_mark_field_max:-255}"
-    local i
+    local i idx tunnel table routed routed_slots=" "
 
-    for ((i = 0; i < max_rules; i++)); do
+    # The slots whose lookup rule is in place, read before the rules go: for a
+    # slot the layer names no table for, that rule into the slot's own interface
+    # table is the sign of an interface whose record is gone, and the only one
+    # that lets the release below take NAT and MSS rules by its name.
+    if [[ -f $TUN_DIR_TABLES ]]; then
+        while read -r idx tunnel; do
+            [[ -n $tunnel ]] || continue
+            if table="$(vpd_tunnel_slot_table "$tunnel" "$idx")" &&
+                _tunnel_rule_listed "$((pref_base + idx))" "$(_tunnel_mark_hex "$idx")" "$table"; then
+                routed_slots+="$idx "
+            fi
+        done < "$TUN_DIR_TABLES"
+    fi
+
+    # Remove the ip rules in our pref range: the lookup rules, then the block
+    # rules right after them (_tunnel_block_pref). The loop stops short of main's
+    # rule at 32766: tunnel_apply refuses a layout whose block rules would reach
+    # it, but this runs with whatever pref_base the config holds - from "stop",
+    # and from tunnel_apply's no-tunnels branch, ahead of that check - and
+    # "ip rule del pref N" deletes a rule at N, whoever owns it. At 32766 and
+    # 32767 those are main's and the default's: the router's routing would go
+    # with them.
+    for ((i = 0; i < 2 * max_rules; i++)); do
+        (( pref_base + i < 32766 )) || break
         ip rule del pref $((pref_base + i)) 2>/dev/null || true
     done
 
     # Release the tunnel tables this module owns; the platform may also clear
     # a default route that Tunnel Director left in a table it no longer uses.
-    local idx tunnel
+    # A slot the layer names no table for goes as the slot's own interface
+    # table where its lookup rule was there: an interface whose record is gone.
+    # The rules a former pref_base left of a slot go with it: the loop above
+    # covers the current range only.
     if [[ -f $TUN_DIR_TABLES ]]; then
         while read -r idx tunnel; do
             [[ -n $tunnel ]] || continue
-            platform_tunnel_table_release "$tunnel" "$idx" || true
+            routed=0
+            [[ $routed_slots != *" $idx "* ]] || routed=1
+            vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
+            _tunnel_stale_rules_release "$idx"
         done < "$TUN_DIR_TABLES"
         rm -f "$TUN_DIR_TABLES"
     fi
 
     # Clear hash file
-    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY"
+    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY" "$IFTUNNEL_STATE_FILE"
 
     log "Tunnel Director stopped"
     return 0
@@ -919,17 +1194,21 @@ tunnel_stop() {
 # TUN_DIR_FORCE_REBUILD=1 rebuilds even when the state reads up to date ("restart").
 #
 # A failure that ends the apply - rc 1 before any rule is touched (a tunnels value that is no
-# object, no LAN interface, no PREROUTING position), or errexit - ends vpn-director.sh before its
-# prune. A refused rule, a swap that did not take over every interface, a tunnel the platform does
-# not list cost their clients and return 0, and TUNNEL_UNCARRIED names those clients: the ones the
-# live TUN_DIR may not mark or route when this returns. On a rebuild, the clients of a tunnel that
-# got no slot, of a slot whose route or ip rule is not in place, every client _tunnel_emit_client
-# did not carry, and every client when the swap did not take over every interface; on the
-# up-to-date path, the clients of a slot whose route or rule did not go back in, every client when
-# a jump did not, and the clients outside RFC1918, which no path marks. The failover clients count
-# as clients of their tunnel. A client of main is never reported: main is no tunnel, and a client
-# of it that TUN_DIR does not mark still goes direct (_tunnel_not_carried_on). A full apply keeps
-# those of them Xray still has in XRAY_CLIENTS (tproxy_prune).
+# object, a tunnel name that is empty or holds whitespace or a control character, a pref_base and
+# mark field whose block rules would reach main's rule at 32766, no LAN interface, no PREROUTING
+# position), or errexit - ends vpn-director.sh before its prune. A refused
+# rule, a swap that did not take over every interface, a tunnel the platform does not list cost
+# their clients and return 0, and TUNNEL_UNCARRIED names those clients: the ones the live TUN_DIR
+# may not mark or route when this returns. On a rebuild, the clients of a tunnel the platform does
+# not list - it keeps a slot, and its clients are reported even when its route went in - and of one
+# the mark field has no room for, of a slot whose route or ip rule is not in place, every client
+# _tunnel_emit_client did not carry, and every client when the swap did not take over every
+# interface; on the up-to-date path, the clients of a slot whose route or rule did not go back in,
+# every client when a jump did not, and the clients outside RFC1918, which no path marks. The
+# failover clients count as clients of their tunnel. A client of main is never reported: main is
+# no tunnel, and a client of it that TUN_DIR does not mark still goes direct
+# (_tunnel_not_carried_on). A full apply keeps those of them Xray still has in XRAY_CLIENTS
+# (tproxy_prune).
 # -------------------------------------------------------------------------------------------------
 tunnel_apply() {
     # Before anything else: a run never hands on what an earlier one reported.
@@ -948,7 +1227,7 @@ tunnel_apply() {
         # Only when there is something to tear down: a state file, or a chain
         # that outlived its state files in /tmp. Every Xray-only install (the
         # template's default) takes this branch on every hook and cron run,
-        # and an unconditional tunnel_stop is 255 `ip rule del` spawns, a
+        # and an unconditional tunnel_stop is 510 `ip rule del` spawns, a
         # PREROUTING purge and two syslog lines each time.
         if [[ -f $TUN_DIR_HASH || -f $TUN_DIR_TABLES ]] || fw_chain_exists mangle "$TUN_DIR_CHAIN"; then
             tunnel_stop
@@ -962,14 +1241,42 @@ tunnel_apply() {
         return 1
     fi
 
+    # The slot record and TUN_DIR_TABLES are whitespace-separated fields: a tunnel name that is
+    # empty or holds whitespace or a control character comes back from them as another name or as
+    # none, and its clients would get no MARK - they would leave through the WAN instead of being
+    # refused. Each such key is listed JSON-encoded, so the whitespace shows; no jq regex builtins.
+    local bad_names
+    bad_names=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" |
+        jq -r '[keys_unsorted[] | select(length == 0 or (explode | any(. <= 32 or . == 127)))] | map(@json) | join(", ")')
+    if [[ -n $bad_names ]]; then
+        log -l ERROR "Tunnel Director: a tunnel name must not be empty or hold whitespace or a control character: $bad_names; rules not applied"
+        return 1
+    fi
+
+    # The block rules take the preferences right after the lookup range. They
+    # have to stay ahead of main's rule at 32766, or a mark with no route in its
+    # table would reach main after all.
+    if (( TUN_DIR_PREF_BASE + 2 * _tunnel_mark_field_max > 32766 )); then
+        log -l ERROR "Tunnel Director: the block rules would reach main's rule (32766) with pref_base $TUN_DIR_PREF_BASE and $_tunnel_mark_field_max slots; rules not applied"
+        return 1
+    fi
+
     # Compute config hash for change detection. Failover snapshot clients are
-    # extra MARK rules, not a key reorder, so they belong in the hash. With no
-    # failover, hash only the tunnels JSON so an upgrade does not rebuild TUN_DIR.
-    local new_hash old_hash empty_hash
+    # extra MARK rules, not a key reorder, so they belong in the hash, and so do
+    # the interfaces of tunnel_director.interfaces: as written, and the names
+    # the check keeps of them. The platform's answers, the LAN and the WAN can
+    # change those under the same list, and a name no longer kept has to reach
+    # the rebuild, which releases what it left - the up-to-date path releases no
+    # slot. With neither, hash only the tunnels JSON so an upgrade does not
+    # rebuild TUN_DIR.
+    local new_hash old_hash empty_hash hash_input="$TUN_DIR_TUNNELS_JSON"
+    if [[ -n ${TUN_DIR_INTERFACES:-} ]]; then
+        hash_input+=$'\n'"interfaces: $TUN_DIR_INTERFACES"$'\n'"kept: $(iftunnel_list | tr '\n' ' ')"
+    fi
     if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]]; then
-        new_hash=$(printf '%s\n%s\n%s' "$TUN_DIR_TUNNELS_JSON" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
+        new_hash=$(printf '%s\n%s\n%s' "$hash_input" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
     else
-        new_hash=$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)
+        new_hash=$(printf '%s' "$hash_input" | compute_hash)
     fi
     empty_hash=$(printf '' | compute_hash)
     old_hash=$(cat "$TUN_DIR_HASH" 2>/dev/null || printf '%s' "$empty_hash")
@@ -1015,6 +1322,8 @@ tunnel_apply() {
         else
             rm -f "$TUN_DIR_FAILOVER_READY"
         fi
+        iftunnel_state_write "$TUN_DIR_TABLES" ||
+            log -l WARN "Tunnel Director: cannot write $IFTUNNEL_STATE_FILE; ensure-routes does not see the interface tunnels"
         log "Rules are applied and up-to-date"
         return 0
     fi
@@ -1093,12 +1402,27 @@ tunnel_apply() {
         [[ -n $tunnel ]] || continue
         route_ok=1
         rule_ok=1
-        if grep -qxF "$tunnel_idx $tunnel" "$prev_tmp"; then
+        # The block rule first: from here on a mark whose table holds no route
+        # is refused, never sent to main (the kill switch, tunnel-director.md).
+        # One that did not go in logged its ERROR, and its slot carries nothing
+        # until the up-to-date path puts it in: a route that goes would send the
+        # slot's marks to main. Its clients are reported, its failover not ready.
+        if ! _tunnel_block_ensure "$tunnel_idx" "$tunnel"; then
+            warnings=1
+            rule_ok=0
+        fi
+        if ! _tunnel_table_allowed "$tunnel" && _tunnel_routeless "$tunnel" "$tunnel_idx"; then
+            # Not listed, and no table to route it through - a typo, an
+            # interface taken off tunnel_director.interfaces: the block rule
+            # alone refuses its clients. What a known past left on the slot goes.
+            _tunnel_unroute "$tunnel_idx" "$tunnel"
+            route_ok=0
+        elif grep -qxF "$tunnel_idx $tunnel" "$prev_tmp"; then
             # A kept slot is carrying its clients now: its route and its rule
             # are ensured, never released - an empty table is a window in which
-            # they fall through to main.
-            if ! platform_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
-                log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
+            # they are refused.
+            if ! vpd_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
+                _tunnel_route_warn "$tunnel"
                 warnings=1
                 route_ok=0
             fi
@@ -1111,31 +1435,40 @@ tunnel_apply() {
             # ensuring a route but before recording its slot left the route
             # with no record, and a route_ensure that fails now (interface
             # down) would leave the previous owner's route behind the ip rule
-            # installed below. No-op on Merlin.
-            platform_tunnel_table_release "$tunnel" "$tunnel_idx" || true
-            if ! platform_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
-                log -l WARN "Tunnel '$tunnel': route not installed (interface down or not mapped?); traffic falls through to main"
+            # installed below. For Merlin's firmware tunnels the release is a
+            # no-op; for an interface tunnel it also takes the interface's NAT
+            # and MSS rules, which the route ensure right after puts back.
+            vpd_tunnel_table_release "$tunnel" "$tunnel_idx" || true
+            if ! vpd_tunnel_route_ensure "$tunnel" "$tunnel_idx" "$(_tunnel_gateway "$tunnel")"; then
+                _tunnel_route_warn "$tunnel"
                 warnings=1
                 route_ok=0
             fi
             # The ip rule goes in even when the route does not: a lookup in an
-            # empty table falls through to main.
-            table="$(platform_tunnel_table "$tunnel" "$tunnel_idx")"
+            # empty table falls through to the block rule.
+            table="$(vpd_tunnel_table "$tunnel" "$tunnel_idx")"
             pref=$((TUN_DIR_PREF_BASE + tunnel_idx))
             mark_hex=$(_tunnel_mark_hex "$tunnel_idx")
-            ip rule del pref "$pref" 2>/dev/null || true
+            _tunnel_pref_make_way "$pref" "$mark_hex"
             if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
                 log -l ERROR "Failed to add ip rule: pref=$pref fwmark=$mark_hex lookup=$table"
                 warnings=1
                 rule_ok=0
             fi
         fi
+        # What a former pref_base left of the slot goes once the slot's own
+        # rules are in place, never before: until then the old ones are all that
+        # route its marks and refuse them when its route goes.
+        if [[ $rule_ok -eq 1 ]]; then
+            _tunnel_stale_rules_release "$tunnel_idx"
+        fi
         if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
             fo_applied=1
             [[ $route_ok -eq 1 ]] || fo_route_ok=0
             [[ $rule_ok -eq 1 ]] || fo_rule_ok=0
         fi
-        # Marked or not, a client of this slot reaches main, not the tunnel.
+        # Marked or not, a client of this slot is not carried: its marks are
+        # refused (the block rule), and without one it goes to main.
         if [[ $route_ok -eq 0 || $rule_ok -eq 0 ]]; then
             _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
         fi
@@ -1173,6 +1506,13 @@ tunnel_apply() {
             log -l ERROR "Tunnel Director: cannot write $TUN_DIR_TABLES; the next apply rebuilds"
             return 1
         }
+        # The record of the interface tunnels is rewritten only once the dropped
+        # slots are released: until then the last apply's record is what tells a
+        # release that an id the list no longer names was an interface tunnel. A
+        # rebuild whose swap did not finish keeps it for the next apply, which is
+        # a rebuild too, since this one records no hash.
+        iftunnel_state_write "$TUN_DIR_TABLES" ||
+            log -l WARN "Tunnel Director: cannot write $IFTUNNEL_STATE_FILE; ensure-routes does not see the interface tunnels"
     fi
 
     # 4. The hash is what makes the next apply take the up-to-date branch, so it

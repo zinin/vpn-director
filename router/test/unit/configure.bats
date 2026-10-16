@@ -1,5 +1,9 @@
 #!/usr/bin/env bats
 
+# The tests of the tunnel menu's warnings pass a flag to `run`, which bats only
+# guarantees from 1.5.0; without this the suite prints a BW02 warning for it.
+bats_require_minimum_version 1.5.0
+
 load '../test_helper'
 
 # configure.sh is sourced with --source-only, so main() never runs. VPD_DIR must
@@ -111,6 +115,43 @@ write_subscriptions() {
     assert_output "10.73.149.1"
     run jq -c '.tunnel_director.tunnels.wgc1.clients' "$VPD_DIR/vpn-director.json"
     assert_output '["192.168.50.20"]'
+}
+
+# A tunnel's exclude holds addresses and CIDRs beside the countries - a guest
+# network, the modem, a server the tunnel must not carry inside itself - and the
+# wizard asks for countries only. The countries are the wizard's; every on-disk
+# entry with a '.', ':' or '/' follows them, once.
+@test "step_generate_configs: keeps the addresses and CIDRs of an existing tunnel's exclude" {
+    load_wizard
+    write_daemon_config
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.50.20"],"exclude":["ru"]},"wgc2":{"clients":["192.168.50.21"],"exclude":["ru"]}}'
+    jq '.tunnel_director.tunnels.wgc1 = {"clients":["192.168.50.99"],"exclude":["de","203.0.113.7","192.168.101.0/24","2001:db8::/32",7,"203.0.113.7"]}' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+    mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.tunnel_director.tunnels.wgc1.exclude' "$VPD_DIR/vpn-director.json"
+    assert_output '["ru","203.0.113.7","192.168.101.0/24","2001:db8::/32"]'
+    run jq -c '.tunnel_director.tunnels.wgc2.exclude' "$VPD_DIR/vpn-director.json"
+    assert_output '["ru"]'
+}
+
+# An exclude that is no array has nothing to keep, and must not end the save:
+# jq's .[] on a string exits 5.
+@test "step_generate_configs: survives an exclude that is no array" {
+    load_wizard
+    write_daemon_config
+    jq '.tunnel_director.tunnels.wgc1 = {"clients":["192.168.50.99"],"exclude":"203.0.113.7"}' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/vpn-director.json.new"
+    mv "$VPD_DIR/vpn-director.json.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -c '.tunnel_director.tunnels.wgc1.exclude' "$VPD_DIR/vpn-director.json"
+    assert_output '["ru"]'
 }
 
 # A string in place of the tunnel object is a shape tunnel_apply tolerates with a
@@ -632,6 +673,39 @@ two_subscriptions='[
     assert_line --index 1 "  2) ovpnc1  Office OVPN (down)"
     run wizard_tunnel_by_number 2
     assert_output "ovpnc1"
+}
+
+@test "wizard_tunnel_choices: offers the interfaces of tunnel_director.interfaces after the platform's tunnels" {
+    load_wizard
+    jq '.tunnel_director.interfaces = ["awg1"]' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    run wizard_tunnel_choices
+    assert_success
+    assert_line --index 4 "  5) awg1 (down)"
+    run wizard_tunnel_by_number 5
+    assert_output "awg1"
+}
+
+# The wizard has no log, so a name the list's check rejects went missing from
+# the menu without a word. It says why on stderr, which
+# choices="$(wizard_tunnel_choices)" leaves out of the menu it captures.
+@test "wizard_tunnel_choices: says on stderr why an interface of the list is not offered" {
+    load_wizard
+    jq '.tunnel_director.interfaces = ["br0"]' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    run --separate-stderr wizard_tunnel_choices
+    assert_success
+    [[ $stderr == *"tunnel_director.interfaces: 'br0' is a LAN interface; ignored"* ]]
+    assert_line --index 0 "  1) wgc1  Office WG (down)"
+    assert_line --index 3 "  4) ovpnc2 (down)"
+    [ "${#lines[@]}" -eq 4 ]
+}
+
+@test "wizard_tunnel_choices: no warning for a kept interface" {
+    load_wizard
+    jq '.tunnel_director.interfaces = ["awg1"]' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    run --separate-stderr wizard_tunnel_choices
+    assert_success
+    [[ $stderr != *"tunnel_director.interfaces"* ]]
+    assert_line --index 4 "  5) awg1 (down)"
 }
 
 # Only the prefix used to be checked, so 192.168.1.1000 went into the config

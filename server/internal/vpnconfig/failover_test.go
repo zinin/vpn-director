@@ -46,6 +46,21 @@ func TestTDExits_MatchesPathManagerFilter(t *testing.T) {
 	}
 }
 
+// An interface tunnel is an exit like a firmware tunnel: listed connected, with
+// its iface, and carrying clients. The platform lists it after the firmware's
+// tunnels; the exits come back sorted, its id among theirs.
+func TestTDExits_TakesAnInterfaceTunnelLikeAnyOther(t *testing.T) {
+	cfg := sample()
+	cfg.TunnelDirector.Tunnels["awg1"] = TunnelConfig{Clients: []string{"192.168.1.30"}}
+	p := plat()
+	p.Tunnels = append(p.Tunnels, PlatformTunnel{ID: "awg1", Iface: "awg1", Type: "interface", Connected: true})
+	got := TDExits(cfg, p)
+	want := []string{"awg1", "ovpnc2"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("TDExits = %v, want %v", got, want)
+	}
+}
+
 func TestFailoverTDExit_PrefersTheRecordedFailoverTunnel(t *testing.T) {
 	both := PlatformInfo{Tunnels: []PlatformTunnel{
 		{ID: "ovpnc2", Iface: "tun12", Connected: true},

@@ -1229,6 +1229,51 @@ func TestHandleMoveClient_PlatformUnavailableIs503(t *testing.T) {
 	}
 }
 
+// interfacesOnlyPlatform is the platform document of a KeeneticOS whose RCI
+// does not reply: awg1 of tunnel_director.interfaces, listed whatever the
+// firmware says, and no firmware tunnel.
+func interfacesOnlyPlatform() vpnconfig.PlatformInfo {
+	return vpnconfig.PlatformInfo{Platform: "keenetic", Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "awg1", Iface: "awg1", Type: "interface", Connected: true},
+	}}
+}
+
+// An interface entry alone is no answer either: the document of an RCI outage
+// lists the interfaces as an answer does, so a firmware tunnel it does not list
+// is not an invalid route but one it cannot validate.
+func TestHandleMoveClient_InterfacesAloneAre503ForAFirmwareTunnel(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	deps.VPN = &mockVPN{platform: interfacesOnlyPlatform()}
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"Wireguard0"}`))
+	if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "platform info unavailable") {
+		t.Fatalf("status = %d: %s", rec.Code, rec.Body.String())
+	}
+	if mc.savedCfg != nil {
+		t.Error("nothing may be saved when the route could not be validated")
+	}
+}
+
+// The same document does answer for awg1: a listed interface is a route.
+func TestHandleMoveClient_InterfacesAloneAcceptAListedInterface(t *testing.T) {
+	mc := &mockConfig{cfg: movableClients()}
+	deps := newTestDeps(t)
+	deps.Config = mc
+	deps.VPN = &mockVPN{platform: interfacesOnlyPlatform()}
+
+	rec := httptest.NewRecorder()
+	handleMoveClient(deps).ServeHTTP(rec, moveRequest(`{"ip":"192.168.50.10","route":"awg1"}`))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	if got := mc.savedCfg.TunnelDirector.Tunnels["awg1"].Clients; strings.Join(got, ",") != "192.168.50.10" {
+		t.Errorf("awg1 = %v", got)
+	}
+}
+
 func TestHandleMoveClient_SavedButApplyFailed(t *testing.T) {
 	mc := &mockConfig{cfg: movableClients()}
 	deps := newTestDeps(t)

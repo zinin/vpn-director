@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -915,6 +916,63 @@ func TestApplier_Apply_PreservesExistingTunnelGateway(t *testing.T) {
 	}
 }
 
+// A tunnel's exclude holds addresses and CIDRs beside the countries - a guest
+// network, the modem, a server the tunnel must not carry inside itself - and
+// the wizard asks for countries only. A save that rebuilt each tunnel from the
+// countries dropped the rest, and the kill switch then refused what the user
+// had sent direct. Each existing tunnel keeps one entry here: on a slice the
+// tunnels shared, each one's append would overwrite the one before.
+func TestApplier_Apply_KeepsTheAddressExclusionsOfAnExistingTunnel(t *testing.T) {
+	configStore := &trackingConfigStore{
+		servers: []vpnconfig.Server{
+			{Name: "Server1", IPs: []string{"1.2.3.4"}},
+		},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{
+			DataDir: "/opt/vpn-director/data",
+			TunnelDirector: vpnconfig.TunnelDirectorConfig{
+				Tunnels: map[string]vpnconfig.TunnelConfig{
+					"wgc1":   {Clients: []string{"192.168.1.1"}, Exclude: []string{"de", "203.0.113.7", "203.0.113.7"}},
+					"wgc2":   {Clients: []string{"192.168.1.2"}, Exclude: []string{"ru", "192.168.101.0/24"}},
+					"ovpnc1": {Clients: []string{"192.168.1.3"}, Exclude: []string{"2001:db8::/32"}},
+				},
+			},
+		},
+	}
+	applier := NewApplier(&trackingManager{}, &trackingSender{}, configStore,
+		&mockVPNDirector{platform: platformWith("wgc1", "wgc2", "ovpnc1", "ovpnc2")}, &mockXrayGenerator{})
+
+	if err := applier.Apply(123, &State{
+		ChatID:      123,
+		Step:        StepConfirm,
+		ServerIndex: 0,
+		Exclusions:  map[string]bool{"ru": true, "ua": true, "by": true},
+		Clients: []ClientRoute{
+			{IP: "192.168.1.10", Route: "wgc1"},
+			{IP: "192.168.1.20", Route: "wgc2"},
+			{IP: "192.168.1.30", Route: "ovpnc1"},
+			{IP: "192.168.1.40", Route: "ovpnc2"},
+		},
+	}); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	// The countries are the wizard's; an address follows them, once.
+	want := map[string][]string{
+		"wgc1":   {"by", "ru", "ua", "203.0.113.7"},
+		"wgc2":   {"by", "ru", "ua", "192.168.101.0/24"},
+		"ovpnc1": {"by", "ru", "ua", "2001:db8::/32"},
+		"ovpnc2": {"by", "ru", "ua"},
+	}
+	tunnels := configStore.savedConfig.TunnelDirector.Tunnels
+	for id, exclude := range want {
+		if got := tunnels[id].Exclude; !slices.Equal(got, exclude) {
+			t.Errorf("%s Exclude = %v, want %v", id, got, exclude)
+		}
+	}
+	if got := configStore.savedConfig.Xray.ExcludeSets; !slices.Equal(got, []string{"by", "ru", "ua"}) {
+		t.Errorf("Xray.ExcludeSets = %v, want [by ru ua]", got)
+	}
+}
+
 // The wizard is the third path that writes config.json, and it owes the same
 // record as the Web UI and /xray: without it a wizard run leaves the Status
 // tab naming whichever server some other path chose last.
@@ -1023,6 +1081,68 @@ func TestApplier_Apply_RefusesToSaveWhenThePlatformListsNoTunnels(t *testing.T) 
 	}
 	if !strings.Contains(strings.Join(sender.messages, "\n"), "platform info unavailable") {
 		t.Errorf("user was told %q, want the platform-unavailable message", sender.messages)
+	}
+}
+
+// interfacesOnlyApply is a wizard save on a KeeneticOS whose RCI does not
+// reply: the platform document lists awg1 of tunnel_director.interfaces, which
+// it lists whatever the firmware says, and no firmware tunnel.
+func interfacesOnlyApply(route string) (*trackingConfigStore, *trackingSender, error) {
+	sender := &trackingSender{}
+	configStore := &trackingConfigStore{
+		servers: []vpnconfig.Server{{Name: "Server1", IPs: []string{"1.2.3.4"}}},
+		vpnConfig: &vpnconfig.VPNDirectorConfig{
+			DataDir: "/opt/vpn-director/data",
+			TunnelDirector: vpnconfig.TunnelDirectorConfig{
+				Tunnels: make(map[string]vpnconfig.TunnelConfig),
+			},
+		},
+	}
+	info := vpnconfig.PlatformInfo{Platform: "keenetic", Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "awg1", Iface: "awg1", Type: "interface", Connected: true},
+	}}
+	applier := NewApplier(&trackingManager{}, sender, configStore,
+		&mockVPNDirector{platform: info}, &mockXrayGenerator{})
+	err := applier.Apply(123, &State{
+		ChatID:      123,
+		Step:        StepConfirm,
+		ServerIndex: 0,
+		Exclusions:  map[string]bool{"ru": true},
+		Clients:     []ClientRoute{{IP: "192.168.1.30", Route: route}},
+	})
+	return configStore, sender, err
+}
+
+// An interface entry alone is no answer either: the document of an RCI outage
+// lists the interfaces as it lists them while RCI answers, so a firmware tunnel
+// outside the config cannot be validated by it - and must not be dropped from
+// the save behind a "Done!".
+func TestApplier_Apply_RefusesToSaveWhenThePlatformListsOnlyInterfaces(t *testing.T) {
+	configStore, sender, err := interfacesOnlyApply("Wireguard0") // picked while RCI answered
+
+	if err == nil {
+		t.Fatal("Apply() error = nil, want a refusal to save a route a document of interfaces alone cannot validate")
+	}
+	if configStore.saveConfigCalled {
+		t.Error("Apply() saved the configuration, want the client kept out of a silent drop")
+	}
+	if !slices.Contains(sender.messages, "platform info unavailable, try again") {
+		t.Errorf("user was told %q, want the platform-unavailable message", sender.messages)
+	}
+}
+
+// The same document does answer for awg1: a listed interface is a route.
+func TestApplier_Apply_SavesARouteToAListedInterfaceWhenThePlatformListsOnlyInterfaces(t *testing.T) {
+	configStore, _, err := interfacesOnlyApply("awg1")
+
+	if err != nil {
+		t.Fatalf("Apply() error = %v, want the client saved on awg1", err)
+	}
+	if !configStore.saveConfigCalled {
+		t.Fatal("Apply() saved nothing, want the client on awg1")
+	}
+	if got := configStore.savedConfig.TunnelDirector.Tunnels["awg1"].Clients; !slices.Equal(got, []string{"192.168.1.30"}) {
+		t.Errorf("awg1 clients = %v, want [192.168.1.30]", got)
 	}
 }
 

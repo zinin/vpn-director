@@ -3887,6 +3887,60 @@ func TestTick_AnEmptyPlatformAnswerIsNotADeadFallback(t *testing.T) {
 	}
 }
 
+// interfacesOnlyPlatform is the platform document of a KeeneticOS whose RCI
+// does not reply: awg1 of tunnel_director.interfaces, listed whatever the
+// firmware says, and no firmware tunnel.
+func interfacesOnlyPlatform() vpnconfig.PlatformInfo {
+	return vpnconfig.PlatformInfo{Platform: "keenetic", Tunnels: []vpnconfig.PlatformTunnel{
+		{ID: "awg1", Iface: "awg1", Type: "interface", Connected: true},
+	}}
+}
+
+// The document of an RCI outage still lists the interfaces: awg1 alone is no
+// answer about Wireguard0, and the clients stay on it rather than move to awg1.
+func TestTick_InterfacesAloneAreNoAnswerAboutAFirmwareFallback(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	cfg.TunnelDirector.Tunnels["Wireguard0"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.3"}}
+	cfg.TunnelDirector.Tunnels["awg1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.4"}}
+	vpnconfig.MoveXrayClientsToTunnel(cfg, "Wireguard0")
+	f := &fake{cfg: cfg, plat: interfacesOnlyPlatform(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	w.FallbackReady = func(string) bool { return false }
+
+	tickFor(w, f, 10*time.Minute)
+
+	if f.cfg.Xray.Failover == nil || f.cfg.Xray.Failover.Tunnel != "Wireguard0" || contains(f.cfg.Xray.Clients, "192.168.1.8") {
+		t.Fatalf("failover %+v, xray.clients %v", f.cfg.Xray.Failover, f.cfg.Xray.Clients)
+	}
+	if !contains(f.cfg.TunnelDirector.Tunnels["Wireguard0"].Clients, "192.168.1.8") || contains(f.cfg.TunnelDirector.Tunnels["awg1"].Clients, "192.168.1.8") || f.applies != 0 {
+		t.Fatalf("Wireguard0 %v, awg1 %v, applies %d; interfaces alone must keep the committed failover",
+			f.cfg.TunnelDirector.Tunnels["Wireguard0"].Clients, f.cfg.TunnelDirector.Tunnels["awg1"].Clients, f.applies)
+	}
+}
+
+// The same document does answer about awg1: a failover on it is still judged
+// by the list, and an awg1 that does not carry its clients is gone like any
+// tunnel - with no other exit, back to Xray.
+func TestTick_InterfacesAloneStillJudgeAFailoverOnAListedInterface(t *testing.T) {
+	cfg := baseCfg()
+	cfg.Xray.ActiveServer = &vpnconfig.ActiveServer{Name: "Oslo"}
+	cfg.TunnelDirector.Tunnels["awg1"] = vpnconfig.TunnelConfig{Clients: []string{"192.168.1.4"}}
+	vpnconfig.MoveXrayClientsToTunnel(cfg, "awg1")
+	f := &fake{cfg: cfg, plat: interfacesOnlyPlatform(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
+	w := runningWatch(f.watch())
+	w.FallbackReady = func(string) bool { return false }
+
+	tickFor(w, f, FallbackDownAfter)
+
+	if f.cfg.Xray.Failover != nil {
+		t.Fatalf("failover %+v on an awg1 that does not carry its clients", f.cfg.Xray.Failover)
+	}
+	if !contains(f.cfg.Xray.Clients, "192.168.1.8") || contains(f.cfg.TunnelDirector.Tunnels["awg1"].Clients, "192.168.1.8") {
+		t.Fatalf("xray.clients %v, awg1 %v; the client must go back to Xray", f.cfg.Xray.Clients, f.cfg.TunnelDirector.Tunnels["awg1"].Clients)
+	}
+}
+
 func TestTick_AFailedMerlinPlatformLookupIsNotADeadFallback(t *testing.T) {
 	f := &fake{cfg: committedCfg(), probeErr: errProbe, now: time.Unix(1_700_000_000, 0)}
 	w := runningWatch(f.watch())

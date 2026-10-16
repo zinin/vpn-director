@@ -19,6 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 /opt/vpn-director/vpn-director.sh update              # Update ipsets + reapply
 /opt/vpn-director/vpn-director.sh platform            # Platform facts as JSON (tunnels, WAN, password file)
 /opt/vpn-director/vpn-director.sh cron install        # Schedule the daily update (S99 does this)
+/opt/vpn-director/vpn-director.sh ensure-routes       # Put back a route an interface tunnel lost (its cron job runs it every minute)
 /opt/vpn-director/vpn-director.sh --wait apply        # Queue for a running instance (120 s) instead of skipping
 /opt/vpn-director/vpn-director.sh --unless-stopped apply  # Skip once "stop" has run (watchd's subscription watch)
 
@@ -58,6 +59,7 @@ cd server && go run ./cmd/watchd --dev
 | `router/opt/vpn-director/lib/platform.sh` | Platform detection (`VPD_PLATFORM`) and loader of the platform contract |
 | `router/opt/vpn-director/lib/platform/merlin.sh` | Asuswrt-Merlin implementation: nvram, rt_tables, cru |
 | `router/opt/vpn-director/lib/platform/keenetic.sh` | KeeneticOS implementation: RCI, ip-full, insmod, cron.d |
+| `router/opt/vpn-director/lib/iftunnel.sh` | Interface tunnels (`tunnel_director.interfaces`): table 2000+idx, route, NAT/MSS; the `vpd_*` layer the core calls for any tunnel |
 | `router/opt/etc/ndm/*/50-vpn-director.sh` | KeeneticOS hooks: firewall rebuilds, WAN, tunnel interfaces |
 | `server/internal/platform/` | Platform name and password file for the daemons |
 | `router/files.manifest` | Shipped files with platform tags; read by `install.sh` and the updater |
@@ -74,6 +76,7 @@ cd server && go run ./cmd/watchd --dev
 | `router/opt/etc/init.d/S99vpn-director` | Entware init.d script for startup |
 | `router/jffs/scripts/firewall-start` | Asuswrt-Merlin hook for firewall reload |
 | `router/jffs/scripts/wan-event` | Asuswrt-Merlin hook for WAN events |
+| `router/jffs/scripts/nat-start` | Asuswrt-Merlin hook after a rebuild of nat |
 | `router/test/` | Bats tests (unit/, integration/) |
 | `router/opt/vpn-director/vpn-director.json.template` | Unified config template |
 | `router/opt/etc/xray/config.json.template` | Xray server config template |
@@ -120,8 +123,16 @@ shutdown, durable notification and recovery contracts.
 - A tunnel key is any id `platform_tunnels` lists (Merlin: `wgcN` from
   `/etc/iproute2/rt_tables`, and `ovpncN` while that OpenVPN client is in "VPN Director
   (policy rules)" mode, plus `main`; Keenetic: `OpenVPNN` and `WireguardN` from RCI, plus
-  `main`); a key the platform does not list is skipped with a warning, which on Merlin
-  names the OpenVPN client's mode
+  `main`); a key the platform does not list gets a warning, which on Merlin names the
+  OpenVPN client's mode
+- A tunnel key may also be an interface listed in `tunnel_director.interfaces` (an AmneziaWG
+  `awg1` an Entware script brings up): Tunnel Director gives it table 2000+idx, its route, NAT
+  and MSS (`lib/iftunnel.sh`); `ensure-routes` puts a route its re-creation took back
+- A tunnel whose table holds no route refuses its clients' traffic (a `prohibit` rule per slot
+  after the lookup range); one the platform does not list keeps a slot whose block rule refuses
+  its clients while its table has no route (KeeneticOS keeps routing `WireguardN` while RCI is
+  silent)
+- `exclude` takes IPv4 addresses and CIDRs beside country codes
 - Optional `gateway` is the OpenVPN next hop; ignored on WireGuard. On Merlin it
   is also what fills ovpncN when the server does not push redirect-gateway.
 
@@ -158,8 +169,11 @@ shutdown, durable notification and recovery contracts.
 - Conditionals: Use `[[ ]]` instead of `[ ]`
 - Logging: `log -l ERROR|WARN|INFO|DEBUG|TRACE "message"`
 - Platform facts (WAN, tunnels, cron, kernel modules) belong behind the `platform_*` functions;
-  core modules never test the platform name. Tests set `VPD_PLATFORM=merlin` through
-  `test_helper.bash`; Keenetic tests export `VPD_PLATFORM=keenetic`
+  core modules never test the platform name. The core reaches tunnels only through the `vpd_*`
+  layer of `lib/iftunnel.sh`, which hands the firmware's tunnels to `platform_*`: a call of
+  `platform_tunnels` or of a per-tunnel `platform_tunnel_*` from the core would bypass interface
+  tunnels. Tests set `VPD_PLATFORM=merlin` through `test_helper.bash`; Keenetic tests export
+  `VPD_PLATFORM=keenetic`
 
 ## Modular Docs
 

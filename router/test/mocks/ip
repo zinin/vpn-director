@@ -6,6 +6,37 @@ echo "ip $*" >> /tmp/bats_ip_calls.log
 RULES_FILE="${BATS_IP_RULES_FILE:-/tmp/bats_test_ip_rules}"
 RT_TABLES="${RT_TABLES_FILE:-/etc/iproute2/rt_tables}"
 
+# Routes the kernel would hold per table, "<table><TAB><route>" per line: what
+# add and replace put in, del and flush took out. Cleared by the test_helper
+# teardown, which removes /tmp/bats_test_*.
+ROUTES_FILE="${BATS_IP_ROUTES_FILE:-/tmp/bats_test_ip_routes}"
+
+# _route_args <args...> - split "ip route add|replace|del ..." into the table
+# (_rt_table) and the route without it (_rt_spec); _rt_dst is the destination,
+# the route's first word.
+_route_args() {
+    _rt_table=""
+    _rt_spec=""
+    while [[ $# -gt 0 ]]; do
+        if [[ $1 == table ]]; then
+            _rt_table="${2:-}"
+            shift 2
+            continue
+        fi
+        _rt_spec+="${_rt_spec:+ }$1"
+        shift
+    done
+    _rt_dst="${_rt_spec%% *}"
+}
+
+# _routes_drop <table> [dst] - remove the routes of a table, or its route to dst
+_routes_drop() {
+    [[ -f $ROUTES_FILE ]] || return 0
+    awk -F'\t' -v t="$1" -v d="${2:-}" \
+        '!($1 == t && (d == "" || $2 == d || index($2, d " ") == 1))' \
+        "$ROUTES_FILE" > "$ROUTES_FILE.tmp" && mv "$ROUTES_FILE.tmp" "$ROUTES_FILE"
+}
+
 # Family and output options precede the object. The family decides which
 # default route is shown; -o and -br only change a layout this mock does not
 # render.
@@ -21,17 +52,20 @@ done
 _pref=""
 _fwmark=""
 _table=""
+_action=""
 
 # _parse_rule_args reads the selectors of "ip rule add|del|show" into globals.
 _parse_rule_args() {
     _pref=""
     _fwmark=""
     _table=""
+    _action=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             pref|priority) _pref="$2"; shift 2 ;;
             fwmark)        _fwmark="$2"; shift 2 ;;
             table|lookup)  _table="$2"; shift 2 ;;
+            prohibit|blackhole|unreachable) _action="$1"; shift ;;
             *)             shift ;;
         esac
     done
@@ -46,9 +80,14 @@ _table_name() {
     printf '%s' "${name:-$1}"
 }
 
-# _rule_line renders the parsed selectors as "ip rule show" would print them.
+# _rule_line renders the parsed selectors as "ip rule show" would print them: an
+# action such as prohibit in place of the lookup.
 _rule_line() {
-    printf '%s:\tfrom all%s lookup %s' "$_pref" "${_fwmark:+ fwmark $_fwmark}" "$(_table_name "$_table")"
+    if [[ -n $_action ]]; then
+        printf '%s:\tfrom all%s %s' "$_pref" "${_fwmark:+ fwmark $_fwmark}" "$_action"
+    else
+        printf '%s:\tfrom all%s lookup %s' "$_pref" "${_fwmark:+ fwmark $_fwmark}" "$(_table_name "$_table")"
+    fi
 }
 
 # _addr_line renders "ip -4 -o addr show <iface>" for the interfaces the
@@ -101,7 +140,7 @@ case "$1" in
                 # The kernel matches every selector it was given, deletes one
                 # rule and fails when none is left - which is what a delete
                 # loop relies on to stop.
-                if [[ -n $_fwmark || -n $_table ]]; then
+                if [[ -n $_fwmark || -n $_table || -n $_action ]]; then
                     target=$(_rule_line)
                     grep -qxF "$target" "$RULES_FILE" 2>/dev/null || {
                         echo "RTNETLINK answers: No such file or directory" >&2
@@ -123,7 +162,8 @@ case "$1" in
         case "$2" in
             show)
                 # The default route of a family, as a Keenetic reads its WAN
-                # and its IPv6 state; anything else is an empty table.
+                # and its IPv6 state; a table, as its routes stand; anything
+                # else is empty.
                 if [[ ${3:-} == default ]]; then
                     case "$FAMILY" in
                         -4) v="${BATS_IP_DEFAULT_ROUTE4-default via 192.168.100.1 dev eth2.4  metric 1000}" ;;
@@ -131,15 +171,52 @@ case "$1" in
                         *)  v="" ;;
                     esac
                     [[ -n $v ]] && printf '%s\n' "$v"
+                elif [[ ${3:-} == table && -n ${4:-} ]]; then
+                    awk -F'\t' -v t="$4" '$1 == t { print $2 }' "$ROUTES_FILE" 2>/dev/null || true
                 else
                     echo ""
                 fi
                 ;;
-            add|del|replace|flush) exit 0 ;;
+            add|replace)
+                _route_args "${@:3}"
+                if [[ -n $_rt_table ]]; then
+                    _routes_drop "$_rt_table" "$_rt_dst"
+                    printf '%s\t%s\n' "$_rt_table" "$_rt_spec" >> "$ROUTES_FILE"
+                fi
+                exit 0
+                ;;
+            del)
+                _route_args "${@:3}"
+                [[ -z $_rt_table ]] || _routes_drop "$_rt_table" "$_rt_dst"
+                exit 0
+                ;;
+            flush)
+                [[ ${3:-} != table || -z ${4:-} ]] || _routes_drop "$4"
+                exit 0
+                ;;
         esac
         ;;
     addr)
         [[ ${2:-} == show ]] && _addr_line "${3:-}"
+        ;;
+    link)
+        # "ip -o link show [dev] <iface>" - after dev, as lib/iftunnel.sh asks, or
+        # without it, as Merlin's platform_tunnel_info does - for the interfaces of
+        # BATS_IP_LINKS_FILE, one "<iface> <flags> <mtu>" per line (ip_links in
+        # test_helper.bash). A name the file does not list does not exist. Without
+        # the file every name prints nothing, as it did before the file existed.
+        if [[ ${2:-} == show && -n ${BATS_IP_LINKS_FILE:-} ]]; then
+            l_iface="${3:-}"
+            [[ $l_iface != dev ]] || l_iface="${4:-}"
+            entry=$(awk -v i="$l_iface" '$1 == i { print; exit }' "$BATS_IP_LINKS_FILE" 2>/dev/null)
+            if [[ -z $entry ]]; then
+                echo "Device \"$l_iface\" does not exist." >&2
+                exit 1
+            fi
+            read -r l_name l_flags l_mtu <<< "$entry"
+            printf '9: %s: %s mtu %s qdisc fq_codel state UNKNOWN mode DEFAULT group default qlen 500\\    link/none \n' \
+                "$l_name" "$l_flags" "$l_mtu"
+        fi
         ;;
     *) exit 0 ;;
 esac

@@ -223,3 +223,43 @@ load 'test_helper'
     [ "$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r '.wgc1 | has("gateway")')" = "false" ]
     [ "$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r '.wgc1.clients[0]')" = "192.168.50.0/24" ]
 }
+
+# ============================================================================
+# config.sh: tunnel_director.interfaces
+# ============================================================================
+
+@test "config.sh: loads tunnel_director.interfaces into TUN_DIR_INTERFACES" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-interfaces.json"
+    jq '.tunnel_director.interfaces = ["awg1", "wg0"]' "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ "$TUN_DIR_INTERFACES" = "awg1 wg0" ]
+}
+
+# A string where the array belongs must not end the load under set -e: the rest
+# of the configuration still applies, and the list is empty.
+@test "config.sh: an interface list of the wrong type loads as empty, and the rest loads" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-interfaces-string.json"
+    jq '.tunnel_director.interfaces = "awg1"' "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ -z "$TUN_DIR_INTERFACES" ]
+    [ "$TUN_DIR_CHAIN" = "TUN_DIR" ]
+}
+
+# Split by the spaces of the list, a name holding whitespace would reach the
+# check as names that were never listed - "awg1 " as awg1, "awg1 x" as two.
+# Each whitespace or control character comes through as "?", and an empty name
+# as '""': one name each, which the check rejects with its WARN.
+@test "config.sh: an interface name with whitespace or a control character stays one name" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-interfaces-ws.json"
+    jq '.tunnel_director.interfaces = ["awg1 ", "awg2\tx", "", "awg3"]' "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ "$TUN_DIR_INTERFACES" = 'awg1? awg2?x "" awg3' ]
+}
+
+@test "config.sh: no interface list loads as empty" {
+    load_config
+    [ -z "$TUN_DIR_INTERFACES" ]
+}

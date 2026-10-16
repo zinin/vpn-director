@@ -848,7 +848,8 @@ load_tunnel_module_with() {
     assert_success
     grep -q 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1' /tmp/bats_ip_calls.log
     run cat "$TUN_DIR_TABLES"
-    assert_output "0 wgc1"
+    assert_output $'0 wgc1\n1 wgc9'
+    grep -q 'ip rule add pref 16640 fwmark 0x20000/0xff0000 prohibit' /tmp/bats_ip_calls.log
     [ ! -f "$TUN_DIR_HASH" ]
 }
 
@@ -865,7 +866,7 @@ load_tunnel_module_with() {
     assert_success
     [ ! -f "$TUN_DIR_HASH" ]
     run cat "$TUN_DIR_TABLES"
-    assert_output "0 wgc1"
+    assert_output $'0 wgc1\n1 wgc9'
 
     platform_tunnel_table_release() { echo "release $1 $2" >> "$BATS_TEST_TMPDIR/release.log"; }
     TUN_DIR_TUNNELS_JSON='{"wgc2":{"clients":["192.168.1.5"]}}'
@@ -1533,10 +1534,13 @@ ip_rule_show_cut_short() {
     run tunnel_apply
     assert_success
     run cat "$BATS_TEST_TMPDIR/order.log"
-    assert_line --index 0 'ip rule del pref 16385'
-    assert_line --index 1 'ip rule add pref 16385 fwmark 0x20000/0xff0000 lookup ovpnc2'
-    assert_line --index 2 'iptables -t mangle -E TUN_DIR_NEW TUN_DIR'
-    assert_line --index 3 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line --index 0 'ip rule del pref 16640'
+    assert_line --index 1 'ip rule add pref 16640 fwmark 0x20000/0xff0000 prohibit'
+    assert_line --index 2 'ip rule del pref 16385'
+    assert_line --index 3 'ip rule add pref 16385 fwmark 0x20000/0xff0000 lookup ovpnc2'
+    assert_line --index 4 'iptables -t mangle -E TUN_DIR_NEW TUN_DIR'
+    assert_line --index 5 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line --index 6 'ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit'
 }
 
 # Review Focus 2: an NDM rebuild deletes our chain and jumps; the ip rules,
@@ -2176,7 +2180,7 @@ tun11_addressed() {
     tunnel_apply
 
     grep -q "Rules are applied and up-to-date" "$LOG_FILE"
-    grep -qF "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\"); Tunnel Director does not route through it" "$LOG_FILE"
+    grep -qF "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\"); its clients are refused" "$LOG_FILE"
     refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
     grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
     run tunnel_uncarried
@@ -2196,7 +2200,7 @@ tun11_addressed() {
     run tunnel_apply
     assert_success
     assert_output --partial "Rules are applied and up-to-date"
-    assert_output --partial "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"Yes (all)\"); Tunnel Director does not route through it"
+    assert_output --partial "Tunnel 'ovpnc1': route not installed: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"Yes (all)\"); its clients are refused"
     refute grep -qE 'ip route (replace|del)' /tmp/bats_ip_calls.log
 }
 
@@ -2213,17 +2217,18 @@ tun11_addressed() {
     [[ ! -f "$TUN_DIR_TABLES" ]]
 }
 
-@test "tunnel_apply: skips an OpenVPN client out of VPN Director mode and says why" {
+@test "tunnel_apply: an OpenVPN client out of VPN Director mode keeps a slot that refuses its clients, and says why" {
     load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
     ovpn_mode 1 0
     : > /tmp/bats_ip_calls.log
     run tunnel_apply
     assert_success
-    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\")"
+    assert_output --partial "Tunnel 'ovpnc1' is not on the platform's list: OpenVPN client 1 is not in VPN Director mode (\"Redirect Internet traffic through tunnel\" is \"No\"); its clients are refused"
     refute_output --partial "not a tunnel this platform knows"
     assert_output --partial "not recorded as up-to-date"
     refute grep -q 'ip route replace' /tmp/bats_ip_calls.log
-    refute grep -q 'lookup ovpnc1' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule add pref 16639 fwmark 0x10000/0xff0000 prohibit' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup ovpnc1' /tmp/bats_ip_calls.log
     [[ ! -f "$TUN_DIR_HASH" ]]
 }
 
@@ -2255,10 +2260,10 @@ tun11_addressed() {
 }
 
 # `restart` and `restart tunnel` rebuild with the config unchanged
-# (TUN_DIR_FORCE_REBUILD=1). The client's slot is on record from before the
-# switch; the rebuild gives it none, so the slot is released after the swap -
-# its ip rule, and in "No" mode the default in its table.
-@test "tunnel_apply: a rebuild releases the slot of a client switched out of VPN Director mode" {
+# (TUN_DIR_FORCE_REBUILD=1). The client switched out of VPN Director mode
+# keeps its slot - its clients are refused, not skipped - and in "No" mode the
+# default in its table goes.
+@test "tunnel_apply: a rebuild keeps the slot of a client switched out of VPN Director mode, and its default goes" {
     load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.5"]}}'
     run tunnel_apply
     assert_success
@@ -2270,26 +2275,26 @@ tun11_addressed() {
     : > /tmp/bats_ip_calls.log
     run tunnel_apply
     assert_success
-    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
-    grep -qx 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup ovpnc1' /tmp/bats_ip_calls.log
+    assert_output --partial "Tunnel 'ovpnc1' is not on the platform's list: OpenVPN client 1 is not in VPN Director mode"
+    refute grep -qx 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup ovpnc1' /tmp/bats_ip_calls.log
     grep -qx 'ip route del default dev tun11 table ovpnc1' /tmp/bats_ip_calls.log
     run cat "$TUN_DIR_TABLES"
-    refute_output --partial "ovpnc1"
+    assert_output "0 ovpnc1"
 }
 
 # The watch drops Xray membership on failover_ready. A failover tunnel the
-# platform leaves out gets no slot, so no marker goes out and the Xray clients
+# platform leaves out has no route, so no marker goes out and the Xray clients
 # stay proxied. tun11 has an address: listed, the tunnel would be carried.
-@test "tunnel_apply: no slot and no failover_ready for a failover tunnel out of VPN Director mode" {
+@test "tunnel_apply: no failover_ready for a failover tunnel out of VPN Director mode" {
     load_tunnel_module_with '{"ovpnc1":{"clients":["192.168.1.8"]}}'
     export XRAY_FAILOVER_TUNNEL=ovpnc1 XRAY_FAILOVER_CLIENTS=192.168.1.8
     tun11_addressed
     ovpn_mode 1 0
     run tunnel_apply
     assert_success
-    assert_output --partial "Tunnel 'ovpnc1' is skipped: OpenVPN client 1 is not in VPN Director mode"
+    assert_output --partial "Tunnel 'ovpnc1' is not on the platform's list: OpenVPN client 1 is not in VPN Director mode"
     run cat "$TUN_DIR_TABLES"
-    refute_output --partial "ovpnc1"
+    assert_output "0 ovpnc1"
     [[ ! -e "$TUN_DIR_FAILOVER_READY" ]]
 }
 
@@ -2312,4 +2317,903 @@ tun11_addressed() {
     assert_output --partial "Rules are applied and up-to-date"
     assert_output --partial "Failover tunnel 'ovpnc1' is not carrying traffic; Xray membership stays"
     [[ ! -e "$TUN_DIR_FAILOVER_READY" ]]
+}
+
+# ============================================================================
+# Interface tunnels (tunnel_director.interfaces)
+# ============================================================================
+
+# load_awg1 <tunnels JSON> - Tunnel Director with tunnel_director.interfaces =
+# awg1, UP with MTU 1280, on the stateful iptables mock.
+load_awg1() {
+    load_tunnel_module_with "$1"
+    export TUN_DIR_INTERFACES=awg1
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    ip_links "awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    use_stateful_iptables
+}
+
+@test "tunnel_apply: routes an interface tunnel through table 2000+idx, with its NAT and MSS" {
+    load_awg1 '{"wgc1":{"clients":["192.168.1.5"]},"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x20000/0xff0000 lookup 2001'
+    run ip route show table 2001
+    assert_output "default dev awg1"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000'
+    run cat "$IFTUNNEL_STATE_FILE"
+    assert_output "awg1 2001"
+    [ -f "$TUN_DIR_HASH" ]
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+@test "tunnel_apply: the hash covers tunnel_director.interfaces, and an empty list leaves it as it was" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    assert_equal "$(cat "$TUN_DIR_HASH")" "$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)"
+
+    export TUN_DIR_INTERFACES=awg1
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Configuration changed; rebuilding in place"
+}
+
+@test "tunnel_apply: the up-to-date path puts back the route an interface's re-creation took" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    ip route flush table 2000
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip route show table 2000
+    assert_output "default dev awg1"
+}
+
+# Review Focus 3: Merlin's firewall start empties every mangle chain - the MSS
+# clamps with the marks - and firewall-start applies again.
+@test "tunnel_apply: after Merlin emptied mangle, the rebuild puts the MSS clamps back" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    iptables -t mangle -F
+    run tunnel_apply
+    assert_success
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu'
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+# Review Focus 3: a rebuild of nat by the firmware (a WAN coming up, a port
+# forward changed) takes MASQUERADE; nat-start applies, and the up-to-date path
+# puts it back.
+@test "tunnel_apply: after the firmware rebuilt nat, the up-to-date path puts MASQUERADE back" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    iptables -t nat -F
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+}
+
+@test "tunnel_apply: an interface tunnel that is down gets no route, keeps its NAT and reports its clients" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    ip_links "awg1 <POINTOPOINT,NOARP> 1280"
+    tunnel_apply
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.30"
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+}
+
+# A rebuild whose swap did not finish releases no slot; the next apply - a
+# rebuild too, as this one records no hash - releases them. Only the last
+# apply's record tells that release an id the list no longer names was an
+# interface tunnel, so the record waits for it: rewritten here, it lost awg1,
+# and awg1's lookup rule, route and MASQUERADE outlived the release.
+@test "tunnel_apply: a rebuild whose swap did not finish keeps the record of an interface that left the list" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+
+    eval "real_$(declare -f swap_fw_chain)"
+    swap_fw_chain() { return 3; }
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    run cat "$IFTUNNEL_STATE_FILE"
+    assert_output "awg1 2000"
+
+    swap_fw_chain() { real_swap_fw_chain "$@"; }
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial 'lookup 2000'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+@test "tunnel_stop: releases an interface tunnel - route, NAT, MSS - and its record" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run tunnel_stop
+    assert_success
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+}
+
+@test "tunnel_status: lists the interface tunnels" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run tunnel_status
+    assert_success
+    assert_output --partial "Interface tunnels"
+    assert_output --partial "awg1: table 2000, route default dev awg1, NAT yes, MSS out yes, MSS in yes"
+}
+
+# ============================================================================
+# The kill switch: a mark whose table has no route is refused, never sent to main
+# ============================================================================
+
+@test "tunnel_apply: every slot but main's gets a block rule right after the lookup range" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"main":{"clients":["192.168.1.6"]},"ovpnc2":{"clients":["192.168.1.7"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    assert_line $'16641:\tfrom all fwmark 0x30000/0xff0000 prohibit'
+    refute_line --partial '16640:'
+}
+
+@test "tunnel_status: lists the block rules beside the lookup rules" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    run tunnel_status
+    assert_success
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+@test "tunnel_apply: a new slot's block rule goes in before its lookup rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    ip() {
+        if [[ ${1:-} == rule && ( ${2:-} == add || ${2:-} == del ) ]]; then
+            echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/order.log"
+    assert_line --index 0 'ip rule del pref 16639'
+    assert_line --index 1 'ip rule add pref 16639 fwmark 0x10000/0xff0000 prohibit'
+    assert_line --index 2 'ip rule del pref 16384'
+    assert_line --index 3 'ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+}
+
+# The upgrade: a router an earlier version applied has its hash, its chain and
+# its lookup rules, and no block rule. Its first apply takes the up-to-date path.
+@test "tunnel_apply: the up-to-date path puts a missing block rule back, without a rebuild" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# refuse_block_rules - for the rest of the test, the kernel refuses every block
+# rule: "ip rule add ... prohibit" fails, every other ip call goes to the mock.
+refuse_block_rules() {
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" prohibit "* ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+}
+
+# A slot whose block rule the kernel refused has no kill switch: a route that
+# goes would send its marks to main. It carries nothing until an apply puts the
+# rule in - a client that came from Xray stays proxied, a failover stays on Xray.
+@test "tunnel_apply: a slot whose block rule did not go in carries nothing, and its failover is not ready" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    refuse_block_rules
+    : > "$LOG_FILE"
+    # Not through `run`: TUNNEL_UNCARRIED has to outlive the call.
+    tunnel_apply
+    grep -qF "Tunnel 'wgc1': the block rule did not go in (pref=16639 fwmark=0x10000)" "$LOG_FILE"
+    run tunnel_uncarried
+    assert_output "192.168.1.5"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+@test "tunnel_apply: the up-to-date path counts a slot whose block rule does not go back in as carrying nothing" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+
+    ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit
+    refuse_block_rules
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    : > "$LOG_FILE"
+    tunnel_apply
+    grep -q "Rules are applied and up-to-date" "$LOG_FILE"
+    grep -qF "Tunnel 'wgc1': the block rule did not go in (pref=16639 fwmark=0x10000)" "$LOG_FILE"
+    run tunnel_uncarried
+    assert_output "192.168.1.5"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+@test "tunnel_apply: a slot the layout dropped loses its block rule after the swap" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    TUN_DIR_TUNNELS_JSON='{"ovpnc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16639:'
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+}
+
+@test "tunnel_stop: clears the block range with the lookup range" {
+    load_tunnel_module
+    : > /tmp/bats_ip_calls.log
+    run tunnel_stop
+    assert_success
+    grep -qx 'ip rule del pref 16384' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule del pref 16639' /tmp/bats_ip_calls.log
+    grep -qx 'ip rule del pref 16893' /tmp/bats_ip_calls.log
+    refute grep -qx 'ip rule del pref 16894' /tmp/bats_ip_calls.log
+}
+
+# pref_base is no part of the hash: raised past the old block range with the
+# tunnels as they were, the up-to-date path puts each slot's rules at the new
+# preferences. What the old layout left goes - ahead of the slot's new lookup
+# rule, a stale block rule would refuse its marks once the slot goes to another
+# tunnel, and a stale lookup rule would route them into the old tunnel's table.
+@test "tunnel_apply: the rules a former pref_base left go, on the up-to-date path" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip rule show
+    refute_line --partial '16384:'
+    refute_line --partial '16639:'
+    assert_line $'20000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'20255:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+@test "tunnel_apply: the rules a former pref_base left go, on a rebuild" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16384:'
+    refute_line --partial '16639:'
+    assert_line $'20000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'20255:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# Make before break: what the former layout left goes only once the slot's own
+# lookup and block rules are in place. Until then the old rules are all that
+# route the slot's marks and refuse them when its route goes.
+@test "tunnel_apply: the rules a former pref_base left stay while the slot's new block rule is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    refuse_block_rules
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    assert_line $'20000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+}
+
+@test "tunnel_apply: the rules a former pref_base left stay while the slot's new lookup rule is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" lookup "* ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+@test "tunnel_apply: a rebuild keeps the rules a former pref_base left while the slot's new block rule is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    refuse_block_rules
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# A pref_base moved by one puts slot 0's new rules on slot 1's old preferences.
+# Making way for them must not take slot 1's rules, which still route and refuse
+# its marks: slot 0's go in beside them, and slot 1's old ones go only once its
+# own new rules are in place - here never, its new rules refused.
+@test "tunnel_apply: a new preference shared with another slot's old rule leaves that rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=16385
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && ( ${4:-} == 16386 || ${4:-} == 16641 ) ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    assert_line $'16385:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16640:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# With nothing refused the same move ends with every slot on its new
+# preferences and nothing of the old layout left.
+@test "tunnel_apply: a pref_base moved by one ends with each slot on its new preferences alone" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=16385
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16640:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    assert_line $'16386:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+    assert_line $'16641:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    assert_equal "$(grep -c 'fwmark' <<< "$output")" 4
+}
+
+# The rebuild's new slot makes way the same way: ovpnc1 takes the slot wgc1
+# left, and its new lookup preference is wgc2's old one.
+@test "tunnel_apply: a rebuild's new slot leaves another slot's old rule on its preference" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    TUN_DIR_TUNNELS_JSON='{"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=16385
+    TUN_DIR_TUNNELS_JSON='{"ovpnc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && ( ${4:-} == 16386 || ${4:-} == 16641 ) ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    assert_line $'16385:\tfrom all fwmark 0x10000/0xff0000 lookup ovpnc1'
+}
+
+# A slot released after a change of pref_base loses the rules of the old layout
+# too: nothing would take them away before the slot goes to another tunnel.
+@test "tunnel_apply: a slot released after a change of pref_base loses the rules of the old layout" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    TUN_DIR_TUNNELS_JSON='{"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial 'fwmark 0x10000/0xff0000'
+    assert_line $'20001:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+}
+
+@test "tunnel_stop: clears the rules a former pref_base left" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    run tunnel_stop
+    assert_success
+    run ip rule show
+    refute_line --partial 'fwmark 0x10000/0xff0000'
+}
+
+# tunnel_apply refuses a layout whose block rules would reach main's rule, but
+# stop runs with whatever pref_base the config holds: "ip rule del pref 32766"
+# would take the router's main routing with it, and 32767 its default.
+@test "tunnel_stop: never deletes main's rules, whatever pref_base" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export TUN_DIR_PREF_BASE=32300
+    : > /tmp/bats_ip_calls.log
+    run tunnel_stop
+    assert_success
+    grep -qx 'ip rule del pref 32765' /tmp/bats_ip_calls.log
+    refute grep -qx 'ip rule del pref 32766' /tmp/bats_ip_calls.log
+    refute grep -qx 'ip rule del pref 32767' /tmp/bats_ip_calls.log
+}
+
+@test "tunnel_apply: refuses a layout whose block rules would reach main, before touching a rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export TUN_DIR_PREF_BASE=32300
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "the block rules would reach main's rule (32766)"
+    refute grep -q 'ip rule' /tmp/bats_ip_calls.log
+}
+
+# refuses_tunnel_name <tunnels JSON> <the name, JSON-encoded> - tunnel_apply
+# refuses the configuration before it touches a rule: rc 1, the ERROR naming
+# the key, no ip rule, no chain, no flush.
+refuses_tunnel_name() {
+    load_tunnel_module_with "$1"
+    use_stateful_iptables
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "Tunnel Director: a tunnel name must not be empty or hold whitespace or a control character: $2; rules not applied"
+    refute grep -q 'ip rule' /tmp/bats_ip_calls.log
+    run iptables -t mangle -S
+    refute_output --partial 'TUN_DIR'
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+# The slot lines and TUN_DIR_TABLES are whitespace-separated: "wgc1 " came back
+# as wgc1, whose clients the chain builder found none of, and the clients of
+# "wgc1 " got no MARK - out through the WAN, under a WARN that said refused.
+@test "tunnel_apply: refuses a tunnel name with a trailing space, before touching a rule" {
+    refuses_tunnel_name '{"wgc1 ":{"clients":["192.168.1.30"]}}' '"wgc1 "'
+}
+
+@test "tunnel_apply: refuses a tunnel name holding a newline, before touching a rule" {
+    refuses_tunnel_name '{"wg\nc1":{"clients":["192.168.1.30"]}}' '"wg\nc1"'
+}
+
+# An empty name was skipped without a word, and its clients went unmarked.
+@test "tunnel_apply: refuses an empty tunnel name, before touching a rule" {
+    refuses_tunnel_name '{"":{"clients":["192.168.1.30"]}}' '""'
+}
+
+@test "tunnel_apply: a route that does not go in says its clients are refused" {
+    load_tunnel_module
+    platform_tunnel_route_ensure() { return 1; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'wgc1': route not installed (interface down or not mapped?); its clients are refused until it is"
+}
+
+# tunnel_director.interfaces rejects wgc1 listed there by mistake, but wgc1 stays
+# the firmware's tunnel: a route of it that did not go in is no refusal of the list.
+@test "_tunnel_route_warn: a firmware tunnel the interface list names by mistake gets the plain warning" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export TUN_DIR_INTERFACES=wgc1
+    _tunnel_init
+    run _tunnel_route_warn wgc1
+    assert_success
+    assert_output --partial "Tunnel 'wgc1': route not installed (interface down or not mapped?); its clients are refused until it is"
+}
+
+# iproute2 4.4 ends each rule with a space, as it does a lookup rule.
+@test "_tunnel_block_ensure: recognises its rule as iproute2 4.4 prints it" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    _tunnel_init
+    ip() {
+        if [[ $1 == rule && $2 == show ]]; then
+            printf '0:\tfrom all lookup local \n16639:\tfrom all fwmark 0x10000/0xff0000 prohibit \n'
+            return 0
+        fi
+        echo "ip $*" >> "$BATS_TEST_TMPDIR/ip_writes.log"
+    }
+    run _tunnel_block_ensure 0 wgc1
+    assert_success
+    [ ! -e "$BATS_TEST_TMPDIR/ip_writes.log" ]
+}
+
+# ============================================================================
+# A tunnel the platform does not know: its clients are refused
+# ============================================================================
+
+@test "tunnel_apply: a tunnel no platform knows keeps a slot, its marks and the block rule only" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"foo1":{"clients":["192.168.1.6"]}}'
+    use_stateful_iptables
+    # common.sh points LOG_FILE at /tmp/vpn-director.log, which every run
+    # appends to; the warning has to be looked for in this test's own lines.
+    LOG_FILE="$BATS_TEST_TMPDIR/vpn-director.log"
+    tunnel_apply
+    grep -qF "Tunnel 'foo1' is not a tunnel this platform knows; its clients are refused" "$LOG_FILE"
+    run cat "$TUN_DIR_TABLES"
+    assert_output $'0 wgc1\n1 foo1'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.6 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x20000/0xff0000'
+    run ip rule show
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    refute_line --partial '16385:'
+    assert_equal "${TUNNEL_UNCARRIED[*]}" "192.168.1.6"
+    [ ! -f "$TUN_DIR_HASH" ]
+}
+
+# Review Focus 5: KeeneticOS answers "main" alone while RCI is silent, and the
+# netfilter.d hook applies during exactly such an NDM rebuild. Skipping every
+# tunnel sent every client out through the WAN; refusing them all would cut the
+# LAN off. WireguardN's table is 2000 + idx whatever RCI says, so the tunnel
+# keeps its route and its lookup rule.
+@test "tunnel_apply: a tunnel whose table the platform names keeps routing while the platform does not list it" {
+    export VPD_PLATFORM=keenetic
+    load_tunnel_module_with '{"Wireguard0":{"clients":["192.168.1.6"]}}'
+    _rci_get() { return 1; }
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'Wireguard0' is not a tunnel this platform knows; its clients are refused"
+    grep -qx 'ip route replace default dev nwg0 table 2000' /tmp/bats_ip_calls.log
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup 2000'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# Review Focus 2: awg1 taken off tunnel_director.interfaces while its tunnel
+# keeps clients. The platform does not know it, and its table would carry them
+# on into awg1: the lookup rule and the route go, with the NAT and MSS rules,
+# and the block rule refuses the clients. The refusal rests on the client's
+# MARK, which stays: without it the client would leave through the WAN.
+@test "tunnel_apply: an interface taken off the list stops routing and its clients are refused" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip route show table 2000
+    assert_output "default dev awg1"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+    [ -f "$TUN_DIR_HASH" ]
+
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'awg1' is not a tunnel this platform knows; its clients are refused"
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    run ip rule show
+    refute_line --partial '16384:'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
+    run cat "$TUN_DIR_TABLES"
+    assert_output "0 awg1"
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+    [ ! -f "$TUN_DIR_HASH" ]
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+# awg1_routed - awg1 in slot 0 as an apply leaves it: the route of table 2000,
+# MASQUERADE and the inbound MSS clamp.
+awg1_routed() {
+    run ip route show table 2000
+    assert_output "default dev awg1"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+# awg1_refused - slot 0 once awg1 left the list with its client: no lookup rule,
+# table 2000 empty, no MASQUERADE and no MSS rule of awg1, the block rule, and
+# the client's MARK the refusal rests on.
+awg1_refused() {
+    run ip rule show
+    refute_line --partial '16384:'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+}
+
+# The same with the record gone - removed, or a write that failed. The layer
+# then names no table for awg1, and a lookup rule of its slot can point only to
+# the slot's own interface table, 2000 + idx: that is what goes, with awg1's
+# NAT and MSS rules.
+@test "tunnel_apply: an interface taken off the list stops routing though its record is gone" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    rm -f "$IFTUNNEL_STATE_FILE"
+
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    awg1_refused
+}
+
+# A first apply whose swap did not finish routed awg1 and recorded nothing: the
+# record is written only once the swap is done.
+@test "tunnel_apply: an interface taken off the list after a first apply whose swap did not finish stops routing" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    eval "real_$(declare -f swap_fw_chain)"
+    swap_fw_chain() { return 3; }
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+
+    swap_fw_chain() { real_swap_fw_chain "$@"; }
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    awg1_refused
+}
+
+# Which names the check keeps can change while the list and the tunnels stay as
+# they are: the platform's answers, the LAN and the WAN decide it. A name no
+# longer kept has to reach the rebuild, which releases what it left; the
+# up-to-date path releases no slot, and it rewrites the record without the name.
+@test "tunnel_apply: an interface the check no longer keeps stops routing though the list did not change" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    [ -f "$TUN_DIR_HASH" ]
+
+    platform_wan_if() { echo awg1; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "tunnel_director.interfaces: 'awg1' is the WAN interface; ignored"
+    awg1_refused
+}
+
+# An interface tunnel without its MASQUERADE carries nothing - the far end drops
+# what its clients send - so a client that came from Xray stays proxied and a
+# failover onto it stays on Xray, until an apply puts the rule in.
+@test "tunnel_apply: an interface tunnel without its MASQUERADE carries nothing, and its failover is not ready" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    export XRAY_FAILOVER_TUNNEL=awg1 XRAY_FAILOVER_CLIENTS=192.168.1.30
+    iptables() {
+        if [[ " $* " == *" -t nat -I POSTROUTING "* ]]; then
+            return 1
+        fi
+        command iptables "$@"
+    }
+    # Not through `run`: TUNNEL_UNCARRIED has to outlive the call.
+    tunnel_apply
+    run tunnel_uncarried
+    assert_output "192.168.1.30"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# Only a well-formed interface name goes into the NAT and MSS deletes of a slot
+# the layer names no table for: the MSS pattern would read a key's * as a regex.
+@test "tunnel_apply: a routeless key that is no interface name gets no NAT or MSS delete" {
+    load_tunnel_module_with '{"a*b":{"clients":["192.168.1.30"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'a*b' is not a tunnel this platform knows; its clients are refused"
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    refute grep -qF 'a*b' /tmp/bats_iptables_calls.log
+}
+
+# firmware_masquerade <iface> - the NAT rule the firmware keeps for its own
+# tunnel interface (Asuswrt-Merlin's tun12 for OpenVPN client 2), in the very
+# form an interface tunnel's MASQUERADE has.
+firmware_masquerade() {
+    iptables -t nat -A POSTROUTING -o "$1" -j MASQUERADE
+}
+
+# A key the platform does not know may name a firmware interface - tun12 instead
+# of ovpnc2. It was never routed as an interface tunnel: no lookup rule of its
+# slot points into the slot's own interface table, so nothing says the NAT and
+# MSS rules of that name are this module's, and the firmware's stay - on the
+# rebuild every apply of such a key is.
+@test "tunnel_apply: a routeless key that names a firmware interface leaves its NAT alone" {
+    load_tunnel_module_with '{"tun12":{"clients":["192.168.1.30"]}}'
+    use_stateful_iptables
+    firmware_masquerade tun12
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'tun12' is not a tunnel this platform knows; its clients are refused"
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o tun12 -j MASQUERADE'
+}
+
+# The same where such a key's slot goes, its client moved to another tunnel. The
+# firmware's rule goes in after the first apply, so only the release of the
+# dropped slot can take it.
+@test "tunnel_apply: the dropped slot of a routeless key that names a firmware interface leaves its NAT alone" {
+    load_tunnel_module_with '{"tun12":{"clients":["192.168.1.30"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    firmware_masquerade tun12
+
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16639:'
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o tun12 -j MASQUERADE'
+}
+
+# And on stop.
+@test "tunnel_stop: leaves the NAT of a firmware interface a routeless key names alone" {
+    load_tunnel_module_with '{"tun12":{"clients":["192.168.1.30"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    firmware_masquerade tun12
+
+    run tunnel_stop
+    assert_success
+    run ip rule show
+    refute_line --partial '16639:'
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o tun12 -j MASQUERADE'
+}
+
+# An interface taken off the list whose record is gone still loses its NAT and
+# MSS rules where its slot goes, and on stop: its lookup rule into the slot's own
+# interface table shows the slot was routed as an interface tunnel.
+@test "tunnel_apply: the dropped slot of an interface whose record is gone loses its NAT and MSS" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    rm -f "$IFTUNNEL_STATE_FILE"
+
+    TUN_DIR_INTERFACES=""
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16384:'
+    refute_line --partial '16639:'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
+}
+
+@test "tunnel_stop: an interface whose record is gone loses its NAT and MSS" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    rm -f "$IFTUNNEL_STATE_FILE"
+
+    TUN_DIR_INTERFACES=""
+    run tunnel_stop
+    assert_success
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
+}
+
+# ============================================================================
+# Addresses and CIDRs in a tunnel's exclude
+# ============================================================================
+
+@test "tunnel_apply: an address or CIDR in exclude returns ahead of the mark, beside the countries" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["ru","203.0.113.7","198.51.100.0/24"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    run grep -- '-A TUN_DIR_NEW' /tmp/bats_iptables_calls.log
+    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m set --match-set ru dst -j RETURN'
+    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 203.0.113.7 -j RETURN'
+    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 198.51.100.0/24 -j RETURN'
+    assert_line --index 3 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_equal "${#lines[@]}" 4
+}
+
+# Skipped, the entry costs the client nothing else: it is still marked.
+@test "tunnel_apply: an IPv6 exclusion is skipped with a WARN" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["2001:db8::/32"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'wgc1': exclusion '2001:db8::/32' is IPv6; Tunnel Director routes IPv4 only, skipping it"
+    assert_output --partial "Added: client=192.168.1.30 tunnel=wgc1 mark=0x10000"
+    refute grep -q '2001:db8' /tmp/bats_iptables_calls.log
+}
+
+# iptables would read 203.0.113.010 as .8: what is no address as written is no
+# address, and no set by that name exists either.
+@test "tunnel_apply: an address with a leading zero is no address" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["203.0.113.010"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Exclude ipset '203.0.113.010' not found"
+    refute grep -q -- '-d 203.0.113' /tmp/bats_iptables_calls.log
+}
+
+@test "tunnel_get_required_ipsets: an address in exclude asks for no ipset" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["ru","203.0.113.7"]}}'
+    run tunnel_get_required_ipsets
+    assert_success
+    assert_output "ru"
 }

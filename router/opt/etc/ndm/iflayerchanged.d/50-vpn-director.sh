@@ -3,9 +3,9 @@
 # interface: $id (OpenVPN0, Wireguard1, Bridge0, ...), $system_name (its
 # Linux name), $layer (conf|link|ctrl|ipv4|ipv6), $level (running|pending|
 # disabled). Only the IPv4 layer of a VPN client interface matters: up, its
-# tunnel table route can be installed; down, apply logs the WARN and marked
-# traffic falls through to main until the next change. Detached for the
-# reason netfilter.d gives.
+# tunnel table route can be installed; down, apply logs the WARN and the
+# slot's block rule refuses marked traffic until the next change. Detached
+# for the reason netfilter.d gives.
 #
 # Not ifstatechanged.d: on 5.1.5 both directories fire, but one OpenVPN0
 # down/up cycle gives this one exactly one "layer=ipv4 level=disabled" and
