@@ -2581,6 +2581,17 @@ load_awg1() {
     assert_output --partial "Tunnel 'wgc1': route not installed (interface down or not mapped?); its clients are refused until it is"
 }
 
+# tunnel_director.interfaces rejects wgc1 listed there by mistake, but wgc1 stays
+# the firmware's tunnel: a route of it that did not go in is no refusal of the list.
+@test "_tunnel_route_warn: a firmware tunnel the interface list names by mistake gets the plain warning" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export TUN_DIR_INTERFACES=wgc1
+    _tunnel_init
+    run _tunnel_route_warn wgc1
+    assert_success
+    assert_output --partial "Tunnel 'wgc1': route not installed (interface down or not mapped?); its clients are refused until it is"
+}
+
 # iproute2 4.4 ends each rule with a space, as it does a lookup rule.
 @test "_tunnel_block_ensure: recognises its rule as iproute2 4.4 prints it" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'

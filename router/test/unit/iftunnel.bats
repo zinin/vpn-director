@@ -65,7 +65,7 @@ load_iftunnel() {
     assert_output "awg1"
     assert_equal "$(grep -c 'tunnel_director.interfaces: .*; ignored' "$LOG_FILE")" 2
     assert_equal "$(grep -c "^br0"$'\t' <<< "$_iftunnel_rejected")" 1
-    assert_equal "$(grep -c "^main"$'\t' <<< "$_iftunnel_rejected")" 1
+    assert_equal "$(grep -c "^main"$'\t' <<< "$_iftunnel_rejected")" 0
 }
 
 @test "iftunnel_init: checks a list once, and again when it changes" {
@@ -139,6 +139,19 @@ load_iftunnel() {
     assert_output $'interface\n0'
     run iftunnel_info wg0
     assert_failure
+}
+
+# ip reads a word such as "up", "type" or "group" after "link show" as a keyword
+# - "ip -o link show up" lists every interface that is UP - and the name check
+# takes such a word. After "dev" it is a name.
+@test "iftunnel_info: asks ip for the interface after dev, so a name such as 'up' is no keyword" {
+    load_iftunnel "up"
+    ip_links "up <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
+    : > /tmp/bats_ip_calls.log
+    run iftunnel_info up
+    assert_success
+    assert_output $'interface\n1'
+    grep -qx 'ip -o link show dev up' /tmp/bats_ip_calls.log
 }
 
 @test "iftunnel_read_config: the interfaces of a config file; nothing for a wrong type or no file" {
@@ -465,4 +478,24 @@ AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
     run vpd_tunnel_unlisted_reason wgc9
     assert_failure
     refute_output
+}
+
+# main and a tunnel the platform lists stay what they are when the list names
+# them by mistake: they warn, and the platform's answer stands - nothing for a
+# tunnel it lists. The list's reason would make the warning about a firmware
+# tunnel whose route merely failed blame the list.
+@test "vpd_tunnel_unlisted_reason: the platform's answer for main and a tunnel it lists, though the list names them" {
+    load_iftunnel "wgc1 main br0"
+    iftunnel_init
+    run vpd_tunnel_unlisted_reason wgc1
+    assert_failure
+    refute_output
+    run vpd_tunnel_unlisted_reason main
+    assert_failure
+    refute_output
+    grep -qF "tunnel_director.interfaces: 'wgc1' is a tunnel the firmware manages; ignored" "$LOG_FILE"
+    grep -qF "tunnel_director.interfaces: 'main' is Tunnel Director's own route, not an interface; ignored" "$LOG_FILE"
+    run vpd_tunnel_unlisted_reason br0
+    assert_success
+    assert_output "'br0' is a LAN interface"
 }

@@ -27,7 +27,9 @@ IFTUNNEL_STATE_FILE="${IFTUNNEL_STATE_FILE:-/tmp/tunnel_director/iftunnels}"
 IFTUNNEL_CRON_MARKER="${IFTUNNEL_CRON_MARKER:-/tmp/tunnel_director/routes_cron}"
 
 # Set by iftunnel_init: the raw list it checked, the names it kept (space-separated) and one
-# "<name><TAB><reason>" line for each name it rejected.
+# "<name><TAB><reason>" line for each name it rejected as no interface name, a LAN interface or
+# the WAN. A name rejected as main or as a tunnel the platform lists gets no line: the platform
+# answers for both.
 _iftunnel_checked=""
 _iftunnel_checked_once=0
 _iftunnel_valid=""
@@ -53,7 +55,7 @@ _iftunnel_warn() {
 # list checked.
 # -------------------------------------------------------------------------------------------------
 iftunnel_init() {
-    local raw="${TUN_DIR_INTERFACES:-}" name reason platform_ids lan wan seen=" "
+    local raw="${TUN_DIR_INTERFACES:-}" name reason record platform_ids lan wan seen=" "
     local name_re='^[A-Za-z0-9_.-]{1,15}$'
     local -a names=()
     if [[ $_iftunnel_checked_once -eq 1 && $_iftunnel_checked == "$raw" ]]; then
@@ -75,19 +77,26 @@ iftunnel_init() {
         [[ $seen != *" $name "* ]] || continue
         seen+="$name "
         reason=""
+        # main and a tunnel the platform lists stay the platform's: they warn, and their reason
+        # is not kept, so the platform's own answer stands for them (vpd_tunnel_unlisted_reason).
+        record=1
         if [[ ! $name =~ $name_re || $name == . || $name == .. ]]; then
             reason="'$name' is no interface name (1-15 characters: letters, digits, _ . -)"
         elif [[ $name == main ]]; then
             reason="'main' is Tunnel Director's own route, not an interface"
+            record=0
         elif [[ $platform_ids == *" $name "* ]]; then
             reason="'$name' is a tunnel the firmware manages"
+            record=0
         elif [[ $lan == *" $name "* ]]; then
             reason="'$name' is a LAN interface"
         elif [[ -n $wan && $name == "$wan" ]]; then
             reason="'$name' is the WAN interface"
         fi
         if [[ -n $reason ]]; then
-            _iftunnel_rejected+="$name"$'\t'"$reason"$'\n'
+            if [[ $record -eq 1 ]]; then
+                _iftunnel_rejected+="$name"$'\t'"$reason"$'\n'
+            fi
             _iftunnel_warn "tunnel_director.interfaces: $reason; ignored"
             continue
         fi
@@ -112,8 +121,9 @@ iftunnel_is() {
     [[ " $_iftunnel_valid " == *" $1 "* ]]
 }
 
-# iftunnel_rejected_reason <id> - why the list's <id> was rejected; rc 1 for a kept name or one
-# the list does not hold. For the warning tunnel.sh logs about a tunnel the platform does not know.
+# iftunnel_rejected_reason <id> - why the list's <id> was rejected; rc 1 for a kept name, for one
+# the list does not hold, and for one rejected as main or as a tunnel the platform lists. For the
+# warning tunnel.sh logs about a tunnel the platform does not know.
 iftunnel_rejected_reason() {
     local name reason
     iftunnel_init
@@ -141,7 +151,8 @@ iftunnel_iface() {
 # pitfall in shell-conventions.md); rc 1 when there is none.
 _iftunnel_link() {
     local out
-    out="$(ip -o link show "${1:-}" 2>/dev/null)" || return 1
+    # "dev" first: ip would read a name such as up, type or group as one of its keywords.
+    out="$(ip -o link show dev "${1:-}" 2>/dev/null)" || return 1
     [[ -n $out ]] || return 1
     printf '%s\n' "$out"
 }
@@ -432,7 +443,8 @@ vpd_tunnel_table_release() {
     fi
 }
 
-# vpd_tunnel_unlisted_reason <id> - why the list rejected a name, else the platform's reason
+# vpd_tunnel_unlisted_reason <id> - why the list rejected a name, else the platform's reason; for
+# main and a tunnel the platform lists, named by the list or not, the platform's: nothing, rc 1.
 vpd_tunnel_unlisted_reason() {
     iftunnel_rejected_reason "${1:-}" || platform_tunnel_unlisted_reason "$@"
 }

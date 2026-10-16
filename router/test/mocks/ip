@@ -200,14 +200,17 @@ case "$1" in
         [[ ${2:-} == show ]] && _addr_line "${3:-}"
         ;;
     link)
-        # "ip -o link show <iface>" for the interfaces of BATS_IP_LINKS_FILE, one
-        # "<iface> <flags> <mtu>" per line (ip_links in test_helper.bash). A name
-        # the file does not list does not exist. Without the file every name
-        # prints nothing, as it did before the file existed.
+        # "ip -o link show [dev] <iface>" - after dev, as lib/iftunnel.sh asks, or
+        # without it, as Merlin's platform_tunnel_info does - for the interfaces of
+        # BATS_IP_LINKS_FILE, one "<iface> <flags> <mtu>" per line (ip_links in
+        # test_helper.bash). A name the file does not list does not exist. Without
+        # the file every name prints nothing, as it did before the file existed.
         if [[ ${2:-} == show && -n ${BATS_IP_LINKS_FILE:-} ]]; then
-            entry=$(awk -v i="${3:-}" '$1 == i { print; exit }' "$BATS_IP_LINKS_FILE" 2>/dev/null)
+            l_iface="${3:-}"
+            [[ $l_iface != dev ]] || l_iface="${4:-}"
+            entry=$(awk -v i="$l_iface" '$1 == i { print; exit }' "$BATS_IP_LINKS_FILE" 2>/dev/null)
             if [[ -z $entry ]]; then
-                echo "Device \"${3:-}\" does not exist." >&2
+                echo "Device \"$l_iface\" does not exist." >&2
                 exit 1
             fi
             read -r l_name l_flags l_mtu <<< "$entry"

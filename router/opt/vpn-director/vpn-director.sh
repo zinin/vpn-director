@@ -481,9 +481,11 @@ _routes_cron_sync() {
     if [[ -s $IFTUNNEL_STATE_FILE ]]; then
         [[ ! -e $IFTUNNEL_CRON_MARKER ]] || return 0
         if platform_cron_add vpn_director_routes "* * * * *" "$SCRIPT_DIR/vpn-director.sh ensure-routes"; then
-            mkdir -p "$(dirname "$IFTUNNEL_CRON_MARKER")"
-            : > "$IFTUNNEL_CRON_MARKER"
-            log "Scheduled the route check of the interface tunnels (every minute)"
+            if mkdir -p "$(dirname "$IFTUNNEL_CRON_MARKER")" && : > "$IFTUNNEL_CRON_MARKER"; then
+                log "Scheduled the route check of the interface tunnels (every minute)"
+            else
+                log -l WARN "Scheduled the route check of the interface tunnels, but cannot write $IFTUNNEL_CRON_MARKER; the next apply schedules it again"
+            fi
         else
             log -l WARN "Could not schedule the route check of the interface tunnels; an interface re-created by its own scripts keeps its clients refused until the next apply"
             if cron_req="$(platform_cron_requirements)"; then

@@ -866,6 +866,17 @@ run_ensure_routes() {
     [ ! -e "$IFTUNNEL_CRON_MARKER" ]
 }
 
+# The marker's directory is a regular file: neither mkdir -p nor the write goes through.
+@test "vpn-director: a marker of the route check that cannot be written costs a WARN, not the apply" {
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    : > "$BATS_TEST_TMPDIR/not_a_dir"
+    export IFTUNNEL_CRON_MARKER="$BATS_TEST_TMPDIR/not_a_dir/routes_cron"
+    printf 'awg1 2001\n' > "$IFTUNNEL_STATE_FILE"
+    run_stubbed_cli apply
+    assert_success
+    assert_output --partial "Scheduled the route check of the interface tunnels, but cannot write $IFTUNNEL_CRON_MARKER; the next apply schedules it again"
+}
+
 @test "vpn-director: cron remove drops the route check with the daily update" {
     export IFTUNNEL_CRON_MARKER="$BATS_TEST_TMPDIR/routes_cron"
     : > "$IFTUNNEL_CRON_MARKER"
