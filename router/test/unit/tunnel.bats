@@ -2573,6 +2573,38 @@ load_awg1() {
     refute grep -q 'ip rule' /tmp/bats_ip_calls.log
 }
 
+# refuses_tunnel_name <tunnels JSON> <the name, JSON-encoded> - tunnel_apply
+# refuses the configuration before it touches a rule: rc 1, the ERROR naming
+# the key, no ip rule, no chain, no flush.
+refuses_tunnel_name() {
+    load_tunnel_module_with "$1"
+    use_stateful_iptables
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "Tunnel Director: a tunnel name must not be empty or hold whitespace or a control character: $2; rules not applied"
+    refute grep -q 'ip rule' /tmp/bats_ip_calls.log
+    run iptables -t mangle -S
+    refute_output --partial 'TUN_DIR'
+    [ ! -s "$BATS_IPT_DIR/live_flushes" ]
+}
+
+# The slot lines and TUN_DIR_TABLES are whitespace-separated: "wgc1 " came back
+# as wgc1, whose clients the chain builder found none of, and the clients of
+# "wgc1 " got no MARK - out through the WAN, under a WARN that said refused.
+@test "tunnel_apply: refuses a tunnel name with a trailing space, before touching a rule" {
+    refuses_tunnel_name '{"wgc1 ":{"clients":["192.168.1.30"]}}' '"wgc1 "'
+}
+
+@test "tunnel_apply: refuses a tunnel name holding a newline, before touching a rule" {
+    refuses_tunnel_name '{"wg\nc1":{"clients":["192.168.1.30"]}}' '"wg\nc1"'
+}
+
+# An empty name was skipped without a word, and its clients went unmarked.
+@test "tunnel_apply: refuses an empty tunnel name, before touching a rule" {
+    refuses_tunnel_name '{"":{"clients":["192.168.1.30"]}}' '""'
+}
+
 @test "tunnel_apply: a route that does not go in says its clients are refused" {
     load_tunnel_module
     platform_tunnel_route_ensure() { return 1; }

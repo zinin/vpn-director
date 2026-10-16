@@ -93,8 +93,9 @@ A full apply (`apply`, `update`, `restart`) moves every client make-before-break
 Xray wins over TUN_DIR (above). A client moving from Xray to a tunnel stays proxied until step 3
 lets it go, when TUN_DIR already marks it; a client moving the other way is proxied from step 1,
 before TUN_DIR lets it go in step 2. A Tunnel Director failure that stops the apply (a tunnels value
-that is no object, block rules that would reach main's rule at 32766, no LAN interface, no
-PREROUTING position) ends the run before step 3. One that
+that is no object, a tunnel name that is empty or holds whitespace or a control character, block
+rules that would reach main's rule at 32766, no LAN interface, no PREROUTING position) ends the run
+before step 3. One that
 costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
 tunnel the platform does not list, a slot whose route or ip rule is not in place, a client outside
 RFC1918 - and step 2 reports the clients it cost. Step 3 keeps each of them that `XRAY_CLIENTS`

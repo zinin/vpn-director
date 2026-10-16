@@ -44,7 +44,7 @@ Routes LAN client traffic through VPN tunnels. All traffic goes through the tunn
 | Field | Description |
 |-------|-------------|
 | `interfaces` | Linux interfaces Tunnel Director may route through beside the firmware's tunnels; a tunnel key equal to one of them is an interface tunnel (see "Interface tunnels") |
-| Tunnel key | A tunnel id `platform_tunnels` lists (Merlin: `wgcN` from `/etc/iproute2/rt_tables`, and `ovpncN` while its OpenVPN client is in "VPN Director (policy rules)" mode, plus `main`; Keenetic: `OpenVPNN`, `WireguardN` from RCI, plus `main`), or a kept name of `interfaces`; see "Which tunnels the platform lists" and "Interface tunnels" |
+| Tunnel key | A tunnel id `platform_tunnels` lists (Merlin: `wgcN` from `/etc/iproute2/rt_tables`, and `ovpncN` while its OpenVPN client is in "VPN Director (policy rules)" mode, plus `main`; Keenetic: `OpenVPNN`, `WireguardN` from RCI, plus `main`), or a kept name of `interfaces`; see "Which tunnels the platform lists" and "Interface tunnels". A name that is empty or holds whitespace or a control character makes `tunnel_apply` refuse the whole configuration with an ERROR before touching a rule |
 | `clients` | Array of LAN IPs/CIDRs (RFC1918 only) |
 | `exclude` | Array of country codes, IPv4 addresses and CIDRs; a client's traffic to them goes direct |
 | `gateway` | Optional. OpenVPN next hop; ignored on WireGuard. On Merlin it fills ovpncN when the server does not push redirect-gateway |

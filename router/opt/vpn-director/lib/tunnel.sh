@@ -1059,8 +1059,9 @@ tunnel_stop() {
 # TUN_DIR_FORCE_REBUILD=1 rebuilds even when the state reads up to date ("restart").
 #
 # A failure that ends the apply - rc 1 before any rule is touched (a tunnels value that is no
-# object, a pref_base and mark field whose block rules would reach main's rule at 32766, no LAN
-# interface, no PREROUTING position), or errexit - ends vpn-director.sh before its prune. A refused
+# object, a tunnel name that is empty or holds whitespace or a control character, a pref_base and
+# mark field whose block rules would reach main's rule at 32766, no LAN interface, no PREROUTING
+# position), or errexit - ends vpn-director.sh before its prune. A refused
 # rule, a swap that did not take over every interface, a tunnel the platform does not list cost
 # their clients and return 0, and TUNNEL_UNCARRIED names those clients: the ones the live TUN_DIR
 # may not mark or route when this returns. On a rebuild, the clients of a tunnel the platform does
@@ -1102,6 +1103,18 @@ tunnel_apply() {
     # Validate JSON before modifying firewall state
     if ! printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -e 'type == "object"' >/dev/null 2>&1; then
         log -l ERROR "Invalid tunnels JSON configuration"
+        return 1
+    fi
+
+    # The slot record and TUN_DIR_TABLES are whitespace-separated fields: a tunnel name that is
+    # empty or holds whitespace or a control character comes back from them as another name or as
+    # none, and its clients would get no MARK - they would leave through the WAN instead of being
+    # refused. Each such key is listed JSON-encoded, so the whitespace shows; no jq regex builtins.
+    local bad_names
+    bad_names=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" |
+        jq -r '[keys_unsorted[] | select(length == 0 or (explode | any(. <= 32 or . == 127)))] | map(@json) | join(", ")')
+    if [[ -n $bad_names ]]; then
+        log -l ERROR "Tunnel Director: a tunnel name must not be empty or hold whitespace or a control character: $bad_names; rules not applied"
         return 1
     fi
 
