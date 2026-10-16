@@ -265,16 +265,18 @@ _tunnel_not_carried_non_rfc1918() {
 # back in.
 # -------------------------------------------------------------------------------------------------
 _tunnel_ensure_routes() {
-    local idx tunnel rc=0 carried
+    local idx tunnel rc=0 carried rules_ok
     [[ -f $TUN_DIR_TABLES ]] || return 0
     while read -r idx tunnel; do
         [[ -n $tunnel ]] || continue
         carried=1
+        rules_ok=1
         # The block rule first: a router an earlier version applied has none,
         # and this path is the one its first apply takes. A slot without it
         # carries nothing, and its failover is not ready.
         if ! _tunnel_block_ensure "$idx" "$tunnel"; then
             carried=0
+            rules_ok=0
             if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
                 rc=1
             fi
@@ -289,8 +291,16 @@ _tunnel_ensure_routes() {
         # The rule outlives an interface flap, but one that never went in at
         # rebuild time is retried nowhere else. The failover check below reads
         # the result; a rule that cannot be installed has logged its own error.
-        _tunnel_rule_ensure "$idx" "$tunnel" || carried=0
-        _tunnel_stale_rules_release "$idx"
+        if ! _tunnel_rule_ensure "$idx" "$tunnel"; then
+            carried=0
+            rules_ok=0
+        fi
+        # What a former pref_base left of the slot goes once both of its own
+        # rules are in place, never before: until then the old ones are all
+        # that route its marks and refuse them when its route goes.
+        if [[ $rules_ok -eq 1 ]]; then
+            _tunnel_stale_rules_release "$idx"
+        fi
         if [[ $carried -eq 0 ]]; then
             _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
         fi
@@ -845,8 +855,10 @@ _tunnel_unroute() {
 # slot's own two: a lookup or block rule carrying the slot's mark under this module's mask, as an
 # apply with another pref_base leaves it - pref_base is no part of the hash. Ahead of the slot's
 # own rules such a rule would route its marks into a past tunnel's table, or refuse them, once the
-# slot goes to another tunnel. Called once the slot's own rules are in place; a preference from
-# 32766 on is never touched.
+# slot goes to another tunnel. An apply calls it only once the slot's own lookup and block rules
+# are in place - until then the old ones are all that route the slot's marks and refuse them when
+# its route goes - and a released slot and stop, which leave no mark to protect, whatever. A
+# preference from 32766 on is never touched.
 _tunnel_stale_rules_release() {
     local idx="$1" mark_hex pref bpref rules line p rest lookup_re=' lookup ([^ ]+) '
     local -a sel action
@@ -1389,8 +1401,12 @@ tunnel_apply() {
                 rule_ok=0
             fi
         fi
-        # The slot's own rules are in place: what a former pref_base left of it goes.
-        _tunnel_stale_rules_release "$tunnel_idx"
+        # What a former pref_base left of the slot goes once the slot's own
+        # rules are in place, never before: until then the old ones are all that
+        # route its marks and refuse them when its route goes.
+        if [[ $rule_ok -eq 1 ]]; then
+            _tunnel_stale_rules_release "$tunnel_idx"
+        fi
         if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
             fo_applied=1
             [[ $route_ok -eq 1 ]] || fo_route_ok=0

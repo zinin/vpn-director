@@ -2635,6 +2635,59 @@ refuse_block_rules() {
     assert_line $'20255:\tfrom all fwmark 0x10000/0xff0000 prohibit'
 }
 
+# Make before break: what the former layout left goes only once the slot's own
+# lookup and block rules are in place. Until then the old rules are all that
+# route the slot's marks and refuse them when its route goes.
+@test "tunnel_apply: the rules a former pref_base left stay while the slot's new block rule is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    refuse_block_rules
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    assert_line $'20000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+}
+
+@test "tunnel_apply: the rules a former pref_base left stay while the slot's new lookup rule is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" lookup "* ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+@test "tunnel_apply: a rebuild keeps the rules a former pref_base left while the slot's new block rule is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    refuse_block_rules
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
 # A slot released after a change of pref_base loses the rules of the old layout
 # too: nothing would take them away before the slot goes to another tunnel.
 @test "tunnel_apply: a slot released after a change of pref_base loses the rules of the old layout" {
