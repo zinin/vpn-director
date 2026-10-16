@@ -805,8 +805,9 @@ run_ensure_routes() {
     [ ! -e "$BATS_TEST_TMPDIR/calls" ]
 }
 
-# An apply that holds the lock does the same work, so ensure-routes does not
-# queue behind it. The test holds the CLI's lock on FD 201.
+# ensure-routes does not queue behind whoever holds the lock: a Tunnel Director
+# apply does the same work, and with any other holder the route waits for the
+# next minute. The test holds the CLI's lock on FD 201.
 @test "vpn-director: ensure-routes leaves the work to an apply that holds the lock" {
     export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
     export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"

@@ -506,8 +506,11 @@ _routes_cron_sync() {
 # "ip link del", and the tunnel's table stays empty - its clients refused - until an apply puts
 # the default back. The cron job vpn_director_routes runs this every minute. A minute with nothing
 # missing costs common.sh, one state file and two ip calls per interface tunnel: no config, no
-# jq. Once stop has run it does nothing; an apply that holds the lock does the same work, so it
-# does not wait for one (cmd_apply takes the lock without --wait).
+# jq. Once stop has run it does nothing. It does not wait for the lock (cmd_apply takes it
+# without --wait): a Tunnel Director apply that holds it does the same work, and when another
+# command holds it - restart xray-process, apply xray, restart xray, stop - or an apply passed its
+# route step before the interface came up, the route waits for the next minute in which the lock
+# is free, its clients refused meanwhile.
 ###################################################################################################
 cmd_ensure_routes() {
     _load_common
