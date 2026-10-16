@@ -2688,6 +2688,76 @@ refuse_block_rules() {
     assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
 }
 
+# A pref_base moved by one puts slot 0's new rules on slot 1's old preferences.
+# Making way for them must not take slot 1's rules, which still route and refuse
+# its marks: slot 0's go in beside them, and slot 1's old ones go only once its
+# own new rules are in place - here never, its new rules refused.
+@test "tunnel_apply: a new preference shared with another slot's old rule leaves that rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=16385
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && ( ${4:-} == 16386 || ${4:-} == 16641 ) ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    assert_line $'16385:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16640:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# With nothing refused the same move ends with every slot on its new
+# preferences and nothing of the old layout left.
+@test "tunnel_apply: a pref_base moved by one ends with each slot on its new preferences alone" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=16385
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'16640:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    assert_line $'16386:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+    assert_line $'16641:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    assert_equal "$(grep -c 'fwmark' <<< "$output")" 4
+}
+
+# The rebuild's new slot makes way the same way: ovpnc1 takes the slot wgc1
+# left, and its new lookup preference is wgc2's old one.
+@test "tunnel_apply: a rebuild's new slot leaves another slot's old rule on its preference" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    TUN_DIR_TUNNELS_JSON='{"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=16385
+    TUN_DIR_TUNNELS_JSON='{"ovpnc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && ( ${4:-} == 16386 || ${4:-} == 16641 ) ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16385:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+    assert_line $'16640:\tfrom all fwmark 0x20000/0xff0000 prohibit'
+    assert_line $'16385:\tfrom all fwmark 0x10000/0xff0000 lookup ovpnc1'
+}
+
 # A slot released after a change of pref_base loses the rules of the old layout
 # too: nothing would take them away before the slot goes to another tunnel.
 @test "tunnel_apply: a slot released after a change of pref_base loses the rules of the old layout" {

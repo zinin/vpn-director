@@ -321,8 +321,9 @@ _tunnel_ensure_routes() {
 #
 # A rule that is in place is left alone. Deleting and re-adding it would open a
 # window in which marked packets are refused by the block rule, or reach main
-# where that is missing too. Another rule on the preference makes way for it:
-# the range is this module's, as the rebuild and tunnel_stop treat it.
+# where that is missing too. Another owner's rule on the preference makes way for
+# it - the range is this module's, as the rebuild and tunnel_stop treat it - while
+# a rule of another slot of this module stays beside it (_tunnel_pref_make_way).
 # -------------------------------------------------------------------------------------------------
 _tunnel_rule_ensure() {
     local idx="$1" tunnel="$2"
@@ -333,7 +334,7 @@ _tunnel_rule_ensure() {
     if _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
         return 0
     fi
-    ip rule del pref "$pref" 2>/dev/null || true
+    _tunnel_pref_make_way "$pref" "$mark_hex"
     if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
         log -l ERROR "Tunnel '$tunnel': ip rule still not installed: pref=$pref fwmark=$mark_hex lookup=$table"
         return 1
@@ -795,15 +796,16 @@ _tunnel_block_pref() {
 # missing or down, the route never went in, the firmware flushed the table - the lookup falls
 # through to this rule, never to main, and the client gets ICMP "administratively prohibited"
 # instead of its traffic leaving through the WAN. main's slot has none: main is no tunnel. A rule
-# that is in place is left alone; another rule on the preference makes way - the range is this
-# module's. Returns 1 when the rule did not go in.
+# that is in place is left alone; another owner's rule on the preference makes way - the range is
+# this module's - while one of another slot stays beside it (_tunnel_pref_make_way). Returns 1
+# when the rule did not go in.
 _tunnel_block_ensure() {
     local idx="$1" tunnel="$2" pref mark_hex
     [[ $tunnel != main ]] || return 0
     pref=$(_tunnel_block_pref "$idx")
     mark_hex=$(_tunnel_mark_hex "$idx")
     _tunnel_block_listed "$pref" "$mark_hex" && return 0
-    ip rule del pref "$pref" 2>/dev/null || true
+    _tunnel_pref_make_way "$pref" "$mark_hex"
     if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" prohibit 2>/dev/null; then
         log -l ERROR "Tunnel '$tunnel': the block rule did not go in (pref=$pref fwmark=$mark_hex); while its table has no route its clients fall through to main"
         return 1
@@ -849,6 +851,59 @@ _tunnel_unroute() {
         routed=1
     fi
     vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
+}
+
+# _tunnel_pref_make_way <pref> <mark> - clear <pref> for this module's rule of the slot with
+# <mark>. Another owner's rule there makes way - the range is this module's - and so do a rule of
+# the same slot that is not the one wanted and one of a slot no layout holds, an older layout's.
+# A rule of another slot that TUN_DIR_TABLES holds stays: after a change of pref_base that slot
+# may still route and refuse by its old rules, its new ones not in place yet, and they go with its
+# stale rules once those are (_tunnel_stale_rules_release); on a rebuild the file holds both
+# layouts, so a slot about to be dropped keeps its rules until its release. The new rule then
+# goes in beside it, rules on one preference being tried in turn, and the delete by the
+# preference alone - it takes the first rule there - is left out while one shares it.
+_tunnel_pref_make_way() {
+    local pref="$1" mark_hex="$2" rules line rest m m_idx i live=" " shared=0 mark_re
+    local lookup_re=' lookup ([^ ]+) '
+    local -a action
+    mark_re=" from all fwmark (0x[0-9a-f]+)/$_tunnel_mark_mask_hex "
+    [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || mark_re=' from all fwmark (0x[0-9a-f]+) '
+    if [[ -f $TUN_DIR_TABLES ]]; then
+        while read -r i _; do
+            [[ -z $i ]] || live+="$i "
+        done < "$TUN_DIR_TABLES"
+    fi
+    rules=$(ip rule show 2>/dev/null) || rules=""
+    while IFS= read -r line; do
+        [[ $line == "$pref:"* ]] || continue
+        rest=" ${line#*:} "
+        rest=${rest//$'\t'/ }
+        [[ $rest =~ $mark_re ]] || continue
+        m=${BASH_REMATCH[1]}
+        if [[ $m != "$mark_hex" ]]; then
+            m_idx=$(( (m >> _tunnel_mark_shift_val) - 1 ))
+            if [[ $live == *" $m_idx "* ]]; then
+                shared=1
+                continue
+            fi
+        fi
+        if [[ $rest == *" prohibit "* ]]; then
+            action=(prohibit)
+        elif [[ $rest =~ $lookup_re ]]; then
+            action=(lookup "${BASH_REMATCH[1]}")
+        else
+            continue
+        fi
+        if [[ $_tunnel_mark_mask_hex == 0xffffffff ]]; then
+            ip rule del pref "$pref" fwmark "$m" "${action[@]}" 2>/dev/null || true
+        else
+            ip rule del pref "$pref" fwmark "$m/$_tunnel_mark_mask_hex" "${action[@]}" 2>/dev/null || true
+        fi
+    done <<< "$rules"
+    if [[ $shared -eq 0 ]]; then
+        ip rule del pref "$pref" 2>/dev/null || true
+    fi
+    return 0
 }
 
 # _tunnel_stale_rules_release <idx> - this module's rules of slot <idx> on any preference but the
@@ -1394,7 +1449,7 @@ tunnel_apply() {
             table="$(vpd_tunnel_table "$tunnel" "$tunnel_idx")"
             pref=$((TUN_DIR_PREF_BASE + tunnel_idx))
             mark_hex=$(_tunnel_mark_hex "$tunnel_idx")
-            ip rule del pref "$pref" 2>/dev/null || true
+            _tunnel_pref_make_way "$pref" "$mark_hex"
             if ! ip rule add pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
                 log -l ERROR "Failed to add ip rule: pref=$pref fwmark=$mark_hex lookup=$table"
                 warnings=1
