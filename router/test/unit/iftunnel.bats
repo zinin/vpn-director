@@ -595,7 +595,10 @@ platform_calls() {
     assert_output "2003"
 }
 
-@test "vpd_tunnel_slot_release: the layer's release, else an interface's for a well-formed name, else nothing" {
+# The interface's release goes by the name alone, so it needs the caller's sign
+# that the slot was routed as an interface tunnel: without one, the name may be a
+# firmware interface whose own rules read the same.
+@test "vpd_tunnel_slot_release: the layer's release, else an interface's for a routed slot of a well-formed name, else nothing" {
     load_iftunnel ""
     iftunnel_init
     vpd_tunnel_table_release() { echo "layer $*"; return 1; }
@@ -603,10 +606,16 @@ platform_calls() {
     run vpd_tunnel_slot_release wgc1 0
     assert_success
     assert_output "layer wgc1 0"
-    run vpd_tunnel_slot_release awg1 1
+    run vpd_tunnel_slot_release awg1 1 1
     assert_success
     assert_output "iftunnel awg1 1"
-    run vpd_tunnel_slot_release 'a*b' 2
+    run vpd_tunnel_slot_release awg1 1 0
+    assert_success
+    refute_output
+    run vpd_tunnel_slot_release awg1 1
+    assert_success
+    refute_output
+    run vpd_tunnel_slot_release 'a*b' 2 1
     assert_success
     refute_output
 }

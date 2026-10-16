@@ -107,7 +107,10 @@ an interface taken off `tunnel_director.interfaces`, the slot keeps the block ru
 lookup rule and table a known past left go (`_tunnel_routeless`, `_tunnel_unroute`). An interface
 whose record is gone - an interrupted first apply, a failed write, a removed file - is cleaned the
 same way: the layer names no table for it, and its lookup rule can point only to the slot's own
-table, 2000 + idx (`vpd_tunnel_slot_table`, `vpd_tunnel_slot_release`).
+table, 2000 + idx (`vpd_tunnel_slot_table`, `vpd_tunnel_slot_release`). Only that lookup rule in
+place lets the slot's release take NAT and MSS rules by the tunnel's name: a key the platform does
+not know and that was never routed may name a firmware interface (`tun12` instead of `ovpnc2`),
+whose own `MASQUERADE` reads the same, and the release of its slot leaves them alone.
 `route not installed: <reason>; its clients are refused` is the warning for a recorded tunnel on
 the up-to-date branch. A configuration that gives such a tunnel clients records no hash, as one
 with a typo in the id does: every apply rebuilds in place and repeats the warning, and the first

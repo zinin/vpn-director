@@ -2797,6 +2797,109 @@ awg1_refused() {
     refute grep -qF 'a*b' /tmp/bats_iptables_calls.log
 }
 
+# firmware_masquerade <iface> - the NAT rule the firmware keeps for its own
+# tunnel interface (Asuswrt-Merlin's tun12 for OpenVPN client 2), in the very
+# form an interface tunnel's MASQUERADE has.
+firmware_masquerade() {
+    iptables -t nat -A POSTROUTING -o "$1" -j MASQUERADE
+}
+
+# A key the platform does not know may name a firmware interface - tun12 instead
+# of ovpnc2. It was never routed as an interface tunnel: no lookup rule of its
+# slot points into the slot's own interface table, so nothing says the NAT and
+# MSS rules of that name are this module's, and the firmware's stay - on the
+# rebuild every apply of such a key is.
+@test "tunnel_apply: a routeless key that names a firmware interface leaves its NAT alone" {
+    load_tunnel_module_with '{"tun12":{"clients":["192.168.1.30"]}}'
+    use_stateful_iptables
+    firmware_masquerade tun12
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'tun12' is not a tunnel this platform knows; its clients are refused"
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o tun12 -j MASQUERADE'
+}
+
+# The same where such a key's slot goes, its client moved to another tunnel. The
+# firmware's rule goes in after the first apply, so only the release of the
+# dropped slot can take it.
+@test "tunnel_apply: the dropped slot of a routeless key that names a firmware interface leaves its NAT alone" {
+    load_tunnel_module_with '{"tun12":{"clients":["192.168.1.30"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    firmware_masquerade tun12
+
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16639:'
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o tun12 -j MASQUERADE'
+}
+
+# And on stop.
+@test "tunnel_stop: leaves the NAT of a firmware interface a routeless key names alone" {
+    load_tunnel_module_with '{"tun12":{"clients":["192.168.1.30"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    firmware_masquerade tun12
+
+    run tunnel_stop
+    assert_success
+    run ip rule show
+    refute_line --partial '16639:'
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o tun12 -j MASQUERADE'
+}
+
+# An interface taken off the list whose record is gone still loses its NAT and
+# MSS rules where its slot goes, and on stop: its lookup rule into the slot's own
+# interface table shows the slot was routed as an interface tunnel.
+@test "tunnel_apply: the dropped slot of an interface whose record is gone loses its NAT and MSS" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    rm -f "$IFTUNNEL_STATE_FILE"
+
+    TUN_DIR_INTERFACES=""
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16384:'
+    refute_line --partial '16639:'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
+}
+
+@test "tunnel_stop: an interface whose record is gone loses its NAT and MSS" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    rm -f "$IFTUNNEL_STATE_FILE"
+
+    TUN_DIR_INTERFACES=""
+    run tunnel_stop
+    assert_success
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
+}
+
 # ============================================================================
 # Addresses and CIDRs in a tunnel's exclude
 # ============================================================================

@@ -489,15 +489,20 @@ vpd_tunnel_slot_table() {
     vpd_tunnel_table "$@" || iftunnel_table "${2:-}"
 }
 
-# vpd_tunnel_slot_release <id> <idx> - the release of the slot's table: the layer's when it names
-# one; otherwise, for a well-formed interface name, an interface's (iftunnel_table_release: the
-# table 2000 + idx flushed, that name's MASQUERADE and MSS rules gone), for the same interface
-# whose record is gone; otherwise nothing. Only a well-formed name goes into the NAT and MSS
-# deletes: a key's regex characters would otherwise reach the MSS pattern. Always rc 0.
+# vpd_tunnel_slot_release <id> <idx> [<routed>] - the release of the slot's table: the layer's
+# when it names one; otherwise, when <routed> is 1 and <id> a well-formed interface name, an
+# interface's (iftunnel_table_release: the table 2000 + idx flushed, that name's MASQUERADE and
+# MSS rules gone), for the same interface whose record is gone; otherwise nothing. <routed> 1 is
+# the caller's word that its lookup rule of the slot pointed into the slot's own interface table
+# (vpd_tunnel_slot_table): the only sign that the slot was routed as an interface tunnel, and so
+# that the rules of that name are this module's. A key the platform does not know and that was
+# never routed may name a firmware interface - Asuswrt-Merlin's tun12 for OpenVPN client 2 - whose
+# own MASQUERADE reads the same. Only a well-formed name goes into the NAT and MSS deletes: a key's
+# regex characters would otherwise reach the MSS pattern. Always rc 0.
 vpd_tunnel_slot_release() {
     if vpd_tunnel_table "${1:-}" "${2:-}" >/dev/null; then
         vpd_tunnel_table_release "$1" "${2:-}" || true
-    elif iftunnel_name_ok "${1:-}"; then
+    elif [[ ${3:-0} == 1 ]] && iftunnel_name_ok "${1:-}"; then
         iftunnel_table_release "$1" "${2:-}" || true
     fi
     return 0

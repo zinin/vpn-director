@@ -817,35 +817,40 @@ _tunnel_routeless() {
 # lookup rule (ours only) and its table - for an interface the list no longer names, the route,
 # the NAT and MSS rules too (vpd_tunnel_slot_release). An interface whose record is gone - an
 # interrupted first apply, a failed write, a removed file - is one the layer names no table for:
-# its lookup rule can point only to the slot's own table, 2000 + idx (vpd_tunnel_slot_table).
+# its lookup rule can point only to the slot's own table, 2000 + idx (vpd_tunnel_slot_table), and
+# only that rule in place lets its NAT and MSS rules go by its name. A key never routed may name a
+# firmware interface, whose own rules read the same.
 _tunnel_unroute() {
-    local idx="$1" tunnel="$2" pref mark_hex table
+    local idx="$1" tunnel="$2" pref mark_hex table routed=0
     pref=$((TUN_DIR_PREF_BASE + idx))
     mark_hex=$(_tunnel_mark_hex "$idx")
     if table="$(vpd_tunnel_slot_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
         ip rule del pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null || true
+        routed=1
     fi
-    vpd_tunnel_slot_release "$tunnel" "$idx"
+    vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
 }
 
 # _tunnel_slot_release <idx> <tunnel> - drop the ip rules and the table of a slot
 # the new layout no longer holds. Called after the swap, when no packet carries
 # the slot's mark any more. Only this module's rule goes (_tunnel_rule_listed):
 # another owner's rule on the preference stays, as the up-to-date path leaves it.
-# A slot the layer names no table for is an interface whose record is gone, and
-# goes as the slot's own interface table (vpd_tunnel_slot_table,
-# vpd_tunnel_slot_release).
+# A slot the layer names no table for whose lookup rule points into the slot's
+# own interface table is an interface whose record is gone, and goes as that
+# table, its NAT and MSS rules with it (vpd_tunnel_slot_table,
+# vpd_tunnel_slot_release); without that rule nothing of its name is ours.
 _tunnel_slot_release() {
-    local idx="$1" tunnel="$2" pref bpref mark_hex table
+    local idx="$1" tunnel="$2" pref bpref mark_hex table routed=0
     pref=$((TUN_DIR_PREF_BASE + idx))
     bpref=$(_tunnel_block_pref "$idx")
     mark_hex=$(_tunnel_mark_hex "$idx")
     if table="$(vpd_tunnel_slot_table "$tunnel" "$idx")" && _tunnel_rule_listed "$pref" "$mark_hex" "$table"; then
+        routed=1
         if ! ip rule del pref "$pref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" lookup "$table" 2>/dev/null; then
             log -l WARN "Tunnel '$tunnel': the ip rule at pref $pref did not go; it routes a mark nothing sets any more"
         fi
     fi
-    vpd_tunnel_slot_release "$tunnel" "$idx"
+    vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
     if [[ $tunnel != main ]] && _tunnel_block_listed "$bpref" "$mark_hex"; then
         if ! ip rule del pref "$bpref" fwmark "$mark_hex/$_tunnel_mark_mask_hex" prohibit 2>/dev/null; then
             log -l WARN "Tunnel '$tunnel': the block rule at pref $bpref did not go; it refuses a mark nothing sets any more"
@@ -986,10 +991,11 @@ tunnel_clients() {
 # -------------------------------------------------------------------------------------------------
 # Removes TUN_DIR chain, all associated ip rules and the tunnel tables this
 # module owns. An interface tunnel loses its route and its NAT and MSS rules
-# too (vpd_tunnel_slot_release), one whose record is gone included, and the
-# record ensure-routes reads (IFTUNNEL_STATE_FILE) goes. Where the firmware
-# owns the tables, the platform may only clear a default route Tunnel Director
-# left in a table it no longer uses.
+# too (vpd_tunnel_slot_release) - one whose record is gone as well, while its
+# lookup rule shows it was routed - and the record ensure-routes reads
+# (IFTUNNEL_STATE_FILE) goes. Where the firmware owns the tables, the platform
+# may only clear a default route Tunnel Director left in a table it no longer
+# uses.
 # -------------------------------------------------------------------------------------------------
 tunnel_stop() {
     _tunnel_init
@@ -1008,6 +1014,24 @@ tunnel_stop() {
         delete_fw_chain -q mangle "${TUN_DIR_CHAIN}_NEW" || true
     fi
 
+    local pref_base="${TUN_DIR_PREF_BASE:-16384}"
+    local max_rules="${_tunnel_mark_field_max:-255}"
+    local i idx tunnel table routed routed_slots=" "
+
+    # The slots whose lookup rule is in place, read before the rules go: for a
+    # slot the layer names no table for, that rule into the slot's own interface
+    # table is the sign of an interface whose record is gone, and the only one
+    # that lets the release below take NAT and MSS rules by its name.
+    if [[ -f $TUN_DIR_TABLES ]]; then
+        while read -r idx tunnel; do
+            [[ -n $tunnel ]] || continue
+            if table="$(vpd_tunnel_slot_table "$tunnel" "$idx")" &&
+                _tunnel_rule_listed "$((pref_base + idx))" "$(_tunnel_mark_hex "$idx")" "$table"; then
+                routed_slots+="$idx "
+            fi
+        done < "$TUN_DIR_TABLES"
+    fi
+
     # Remove the ip rules in our pref range: the lookup rules, then the block
     # rules right after them (_tunnel_block_pref). The loop stops short of main's
     # rule at 32766: tunnel_apply refuses a layout whose block rules would reach
@@ -1016,10 +1040,6 @@ tunnel_stop() {
     # "ip rule del pref N" deletes a rule at N, whoever owns it. At 32766 and
     # 32767 those are main's and the default's: the router's routing would go
     # with them.
-    local pref_base="${TUN_DIR_PREF_BASE:-16384}"
-    local max_rules="${_tunnel_mark_field_max:-255}"
-    local i
-
     for ((i = 0; i < 2 * max_rules; i++)); do
         (( pref_base + i < 32766 )) || break
         ip rule del pref $((pref_base + i)) 2>/dev/null || true
@@ -1028,12 +1048,13 @@ tunnel_stop() {
     # Release the tunnel tables this module owns; the platform may also clear
     # a default route that Tunnel Director left in a table it no longer uses.
     # A slot the layer names no table for goes as the slot's own interface
-    # table: an interface whose record is gone.
-    local idx tunnel
+    # table where its lookup rule was there: an interface whose record is gone.
     if [[ -f $TUN_DIR_TABLES ]]; then
         while read -r idx tunnel; do
             [[ -n $tunnel ]] || continue
-            vpd_tunnel_slot_release "$tunnel" "$idx"
+            routed=0
+            [[ $routed_slots != *" $idx "* ]] || routed=1
+            vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
         done < "$TUN_DIR_TABLES"
         rm -f "$TUN_DIR_TABLES"
     fi
