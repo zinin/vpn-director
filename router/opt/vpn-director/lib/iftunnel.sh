@@ -150,6 +150,20 @@ iftunnel_rejected_reason() {
     return 1
 }
 
+# iftunnel_rejections - the reason of every name iftunnel_init recorded, one per line, in list
+# order; nothing, rc 0, when there is none. For the wizard, which has no log and shows them
+# itself. A name rejected as main or as a tunnel the platform lists is not recorded and so not
+# printed: the menu offers those as the platform's tunnels anyway.
+iftunnel_rejections() {
+    local name reason
+    iftunnel_init
+    while IFS=$'\t' read -r name reason; do
+        [[ -n $name ]] || continue
+        printf '%s\n' "$reason"
+    done <<< "$_iftunnel_rejected"
+    return 0
+}
+
 # iftunnel_table <idx> - the routing table of the interface tunnel in slot <idx>
 iftunnel_table() {
     [[ ${1:-} =~ ^[0-9]+$ ]] || return 1

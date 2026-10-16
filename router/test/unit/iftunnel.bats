@@ -104,6 +104,27 @@ load_iftunnel() {
     assert_failure
 }
 
+# The wizard has no log and shows these itself. main and wgc1 are the
+# platform's, recorded as nothing, and the menu offers them anyway.
+@test "iftunnel_rejections: the recorded reasons in list order, one for a name listed twice" {
+    load_iftunnel "eth0 awg1 main bad/name wgc1 br0 eth0 br0"
+    iftunnel_init
+    run iftunnel_rejections
+    assert_success
+    assert_line --index 0 "'eth0' is the WAN interface"
+    assert_line --index 1 "'bad/name' is no interface name (1-15 characters: letters, digits, _ . -)"
+    assert_line --index 2 "'br0' is a LAN interface"
+    [ "${#lines[@]}" -eq 3 ]
+}
+
+@test "iftunnel_rejections: nothing for main, a platform-listed id or a kept name" {
+    load_iftunnel "awg1 main wgc1"
+    iftunnel_init
+    run iftunnel_rejections
+    assert_success
+    refute_output
+}
+
 @test "iftunnel_name_ok: 1-15 characters of letters, digits, _ . -, not . or .." {
     load_iftunnel ""
     local name

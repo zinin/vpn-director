@@ -1,5 +1,9 @@
 #!/usr/bin/env bats
 
+# The tests of the tunnel menu's warnings pass a flag to `run`, which bats only
+# guarantees from 1.5.0; without this the suite prints a BW02 warning for it.
+bats_require_minimum_version 1.5.0
+
 load '../test_helper'
 
 # configure.sh is sourced with --source-only, so main() never runs. VPD_DIR must
@@ -679,6 +683,29 @@ two_subscriptions='[
     assert_line --index 4 "  5) awg1 (down)"
     run wizard_tunnel_by_number 5
     assert_output "awg1"
+}
+
+# The wizard has no log, so a name the list's check rejects went missing from
+# the menu without a word. It says why on stderr, which
+# choices="$(wizard_tunnel_choices)" leaves out of the menu it captures.
+@test "wizard_tunnel_choices: says on stderr why an interface of the list is not offered" {
+    load_wizard
+    jq '.tunnel_director.interfaces = ["br0"]' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    run --separate-stderr wizard_tunnel_choices
+    assert_success
+    [[ $stderr == *"tunnel_director.interfaces: 'br0' is a LAN interface; ignored"* ]]
+    assert_line --index 0 "  1) wgc1  Office WG (down)"
+    assert_line --index 3 "  4) ovpnc2 (down)"
+    [ "${#lines[@]}" -eq 4 ]
+}
+
+@test "wizard_tunnel_choices: no warning for a kept interface" {
+    load_wizard
+    jq '.tunnel_director.interfaces = ["awg1"]' "$VPD_DIR/vpn-director.json.template" > "$VPD_DIR/vpn-director.json"
+    run --separate-stderr wizard_tunnel_choices
+    assert_success
+    [[ $stderr != *"tunnel_director.interfaces"* ]]
+    assert_line --index 4 "  5) awg1 (down)"
 }
 
 # Only the prefix used to be checked, so 192.168.1.1000 went into the config

@@ -100,10 +100,16 @@ wizard_interfaces() {
 # wizard_tunnel_choices - the tunnels this router has, one numbered line each
 # ("  N) <id>  <description> (down)"); main is not offered.
 wizard_tunnel_choices() {
-    local id info desc connected n=0
+    local id info desc connected n=0 reason
     local TUN_DIR_INTERFACES
     TUN_DIR_INTERFACES="$(wizard_interfaces)"
     iftunnel_init
+    # No log in the wizard: the list's rejections go to stderr, above the menu,
+    # in the text the module logs on an apply.
+    while IFS= read -r reason; do
+        [[ -n $reason ]] || continue
+        print_warning "tunnel_director.interfaces: $reason; ignored" >&2
+    done < <(iftunnel_rejections)
     while IFS= read -r id; do
         [[ -n $id && $id != main ]] || continue
         n=$((n + 1))
