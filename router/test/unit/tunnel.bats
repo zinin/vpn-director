@@ -2598,6 +2598,69 @@ refuse_block_rules() {
     refute grep -qx 'ip rule del pref 16894' /tmp/bats_ip_calls.log
 }
 
+# pref_base is no part of the hash: raised past the old block range with the
+# tunnels as they were, the up-to-date path puts each slot's rules at the new
+# preferences. What the old layout left goes - ahead of the slot's new lookup
+# rule, a stale block rule would refuse its marks once the slot goes to another
+# tunnel, and a stale lookup rule would route them into the old tunnel's table.
+@test "tunnel_apply: the rules a former pref_base left go, on the up-to-date path" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip rule show
+    refute_line --partial '16384:'
+    refute_line --partial '16639:'
+    assert_line $'20000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'20255:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+@test "tunnel_apply: the rules a former pref_base left go, on a rebuild" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial '16384:'
+    refute_line --partial '16639:'
+    assert_line $'20000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'20255:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+}
+
+# A slot released after a change of pref_base loses the rules of the old layout
+# too: nothing would take them away before the slot goes to another tunnel.
+@test "tunnel_apply: a slot released after a change of pref_base loses the rules of the old layout" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    TUN_DIR_TUNNELS_JSON='{"wgc2":{"clients":["192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    refute_line --partial 'fwmark 0x10000/0xff0000'
+    assert_line $'20001:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
+}
+
+@test "tunnel_stop: clears the rules a former pref_base left" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    export TUN_DIR_PREF_BASE=20000
+    run tunnel_stop
+    assert_success
+    run ip rule show
+    refute_line --partial 'fwmark 0x10000/0xff0000'
+}
+
 # tunnel_apply refuses a layout whose block rules would reach main's rule, but
 # stop runs with whatever pref_base the config holds: "ip rule del pref 32766"
 # would take the router's main routing with it, and 32767 its default.

@@ -228,7 +228,7 @@ inside `TUN_DIR` with the identical match immediately before `MARK`.
 | JSON Path | Default | Purpose |
 |-----------|---------|---------|
 | `advanced.tunnel_director.chain` | `TUN_DIR` | Chain name |
-| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base. The module owns `pref_base` to `pref_base + 2 × field_max − 1` (`field_max` is 255 with the default mask): the lookup range, then the block range - 16384-16893 with the defaults. Another rule on a preference there makes way for the module's, so a base near the firmware's own rules (Merlin's `ovpncN` rule sits at 10000+N) can delete one of them |
+| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base. The module owns `pref_base` to `pref_base + 2 × field_max − 1` (`field_max` is 255 with the default mask): the lookup range, then the block range - 16384-16893 with the defaults. Another rule on a preference there makes way for the module's, so a base near the firmware's own rules (Merlin's `ovpncN` rule sits at 10000+N) can delete one of them. A new base moves every slot's rules with the next apply, which removes what the former base left - a rule carrying a slot's mark under the module's mask on any preference that is no longer the slot's (`_tunnel_stale_rules_release`), on both paths, for a released slot and on `stop` |
 | `advanced.tunnel_director.mark_mask` | `0x00ff0000` | Fwmark mask |
 | `advanced.tunnel_director.mark_shift` | `16` | Bit position |
 

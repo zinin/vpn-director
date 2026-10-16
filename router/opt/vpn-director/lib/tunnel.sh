@@ -290,6 +290,7 @@ _tunnel_ensure_routes() {
         # rebuild time is retried nowhere else. The failover check below reads
         # the result; a rule that cannot be installed has logged its own error.
         _tunnel_rule_ensure "$idx" "$tunnel" || carried=0
+        _tunnel_stale_rules_release "$idx"
         if [[ $carried -eq 0 ]]; then
             _tunnel_not_carried_on "$tunnel" "$(_tunnel_clients_of "$tunnel")"
         fi
@@ -840,6 +841,39 @@ _tunnel_unroute() {
     vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
 }
 
+# _tunnel_stale_rules_release <idx> - this module's rules of slot <idx> on any preference but the
+# slot's own two: a lookup or block rule carrying the slot's mark under this module's mask, as an
+# apply with another pref_base leaves it - pref_base is no part of the hash. Ahead of the slot's
+# own rules such a rule would route its marks into a past tunnel's table, or refuse them, once the
+# slot goes to another tunnel. Called once the slot's own rules are in place; a preference from
+# 32766 on is never touched.
+_tunnel_stale_rules_release() {
+    local idx="$1" mark_hex pref bpref rules line p rest lookup_re=' lookup ([^ ]+) '
+    local -a sel action
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    pref=$((TUN_DIR_PREF_BASE + idx))
+    bpref=$(_tunnel_block_pref "$idx")
+    sel=(fwmark "$mark_hex/$_tunnel_mark_mask_hex")
+    [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || sel=(fwmark "$mark_hex")
+    rules=$(ip rule show 2>/dev/null) || return 0
+    while IFS= read -r line; do
+        p=${line%%:*}
+        [[ $p =~ ^[0-9]+$ && $p != "$pref" && $p != "$bpref" ]] || continue
+        (( p < 32766 )) || continue
+        rest=" ${line#*:} "
+        rest=${rest//$'\t'/ }
+        [[ $rest == *" from all ${sel[*]} "* ]] || continue
+        if [[ $rest == *" prohibit "* ]]; then
+            action=(prohibit)
+        elif [[ $rest =~ $lookup_re ]]; then
+            action=(lookup "${BASH_REMATCH[1]}")
+        else
+            continue
+        fi
+        ip rule del pref "$p" "${sel[@]}" "${action[@]}" 2>/dev/null || true
+    done <<< "$rules"
+}
+
 # _tunnel_slot_release <idx> <tunnel> - drop the ip rules and the table of a slot
 # the new layout no longer holds. Called after the swap, when no packet carries
 # the slot's mark any more. Only this module's rule goes (_tunnel_rule_listed):
@@ -865,6 +899,7 @@ _tunnel_slot_release() {
             log -l WARN "Tunnel '$tunnel': the block rule at pref $bpref did not go; it refuses a mark nothing sets any more"
         fi
     fi
+    _tunnel_stale_rules_release "$idx"
     log "Tunnel '$tunnel': released slot $idx"
 }
 
@@ -1058,12 +1093,15 @@ tunnel_stop() {
     # a default route that Tunnel Director left in a table it no longer uses.
     # A slot the layer names no table for goes as the slot's own interface
     # table where its lookup rule was there: an interface whose record is gone.
+    # The rules a former pref_base left of a slot go with it: the loop above
+    # covers the current range only.
     if [[ -f $TUN_DIR_TABLES ]]; then
         while read -r idx tunnel; do
             [[ -n $tunnel ]] || continue
             routed=0
             [[ $routed_slots != *" $idx "* ]] || routed=1
             vpd_tunnel_slot_release "$tunnel" "$idx" "$routed"
+            _tunnel_stale_rules_release "$idx"
         done < "$TUN_DIR_TABLES"
         rm -f "$TUN_DIR_TABLES"
     fi
@@ -1351,6 +1389,8 @@ tunnel_apply() {
                 rule_ok=0
             fi
         fi
+        # The slot's own rules are in place: what a former pref_base left of it goes.
+        _tunnel_stale_rules_release "$tunnel_idx"
         if [[ $tunnel == "${XRAY_FAILOVER_TUNNEL:-}" ]]; then
             fo_applied=1
             [[ $route_ok -eq 1 ]] || fo_route_ok=0
