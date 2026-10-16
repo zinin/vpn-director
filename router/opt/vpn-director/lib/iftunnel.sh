@@ -42,6 +42,13 @@ _iftunnel_warn() {
     fi
 }
 
+# iftunnel_name_ok <name> - would the kernel take <name> as an interface name: 1-15 characters of
+# A-Za-z0-9_.-, not "." or "..". The rule iftunnel_init checks the list by.
+iftunnel_name_ok() {
+    local name="${1:-}" name_re='^[A-Za-z0-9_.-]{1,15}$'
+    [[ $name =~ $name_re && $name != . && $name != .. ]]
+}
+
 # -------------------------------------------------------------------------------------------------
 # iftunnel_init - check TUN_DIR_INTERFACES once per value
 # -------------------------------------------------------------------------------------------------
@@ -56,7 +63,6 @@ _iftunnel_warn() {
 # -------------------------------------------------------------------------------------------------
 iftunnel_init() {
     local raw="${TUN_DIR_INTERFACES:-}" name reason record platform_ids lan wan seen=" "
-    local name_re='^[A-Za-z0-9_.-]{1,15}$'
     local -a names=()
     if [[ $_iftunnel_checked_once -eq 1 && $_iftunnel_checked == "$raw" ]]; then
         return 0
@@ -80,7 +86,7 @@ iftunnel_init() {
         # main and a tunnel the platform lists stay the platform's: they warn, and their reason
         # is not kept, so the platform's own answer stands for them (vpd_tunnel_unlisted_reason).
         record=1
-        if [[ ! $name =~ $name_re || $name == . || $name == .. ]]; then
+        if ! iftunnel_name_ok "$name"; then
             reason="'$name' is no interface name (1-15 characters: letters, digits, _ . -)"
         elif [[ $name == main ]]; then
             reason="'main' is Tunnel Director's own route, not an interface"
@@ -441,6 +447,28 @@ vpd_tunnel_table_release() {
     else
         platform_tunnel_table_release "$@"
     fi
+}
+
+# vpd_tunnel_slot_table <id> <idx> - the table a lookup rule of the slot can point to: the
+# layer's, or, when it names none, the slot's own interface table (iftunnel_table). A slot whose
+# id the layer cannot name had a lookup rule only as an interface tunnel whose record is gone - an
+# interrupted first apply, a failed write, a removed file - and that rule points to this table.
+vpd_tunnel_slot_table() {
+    vpd_tunnel_table "$@" || iftunnel_table "${2:-}"
+}
+
+# vpd_tunnel_slot_release <id> <idx> - the release of the slot's table: the layer's when it names
+# one; otherwise, for a well-formed interface name, an interface's (iftunnel_table_release: the
+# table 2000 + idx flushed, that name's MASQUERADE and MSS rules gone), for the same interface
+# whose record is gone; otherwise nothing. Only a well-formed name goes into the NAT and MSS
+# deletes: a key's regex characters would otherwise reach the MSS pattern. Always rc 0.
+vpd_tunnel_slot_release() {
+    if vpd_tunnel_table "${1:-}" "${2:-}" >/dev/null; then
+        vpd_tunnel_table_release "$1" "${2:-}" || true
+    elif iftunnel_name_ok "${1:-}"; then
+        iftunnel_table_release "$1" "${2:-}" || true
+    fi
+    return 0
 }
 
 # vpd_tunnel_unlisted_reason <id> - why the list rejected a name, else the platform's reason; for

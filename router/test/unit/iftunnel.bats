@@ -104,6 +104,19 @@ load_iftunnel() {
     assert_failure
 }
 
+@test "iftunnel_name_ok: 1-15 characters of letters, digits, _ . -, not . or .." {
+    load_iftunnel ""
+    local name
+    for name in awg1 wg0.5 a-b_c A23456789012345; do
+        run iftunnel_name_ok "$name"
+        assert_success
+    done
+    for name in "" . .. a234567890123456 bad/name 'a*b' 'a b'; do
+        run iftunnel_name_ok "$name"
+        assert_failure
+    done
+}
+
 # ============================================================================
 # Table, interface, info
 # ============================================================================
@@ -468,6 +481,41 @@ AWG1_UP="awg1 <POINTOPOINT,NOARP,UP,LOWER_UP> 1280"
     assert_failure
     run vpd_tunnel_retired wgc1
     assert_failure
+}
+
+# A lookup rule of a slot the layer names no table for - an interface whose
+# record is gone - can point only to the slot's own interface table.
+@test "vpd_tunnel_slot_table: the layer's table, else the slot's own interface table" {
+    load_iftunnel "awg1"
+    iftunnel_init
+    printf 'awg9 2005\n' > "$IFTUNNEL_STATE_FILE"
+    run vpd_tunnel_slot_table awg1 3
+    assert_output "2003"
+    run vpd_tunnel_slot_table wgc1 3
+    assert_output "wgc1"
+    run vpd_tunnel_slot_table awg9 3
+    assert_output "2005"
+    run vpd_tunnel_slot_table awg7 3
+    assert_success
+    assert_output "2003"
+    run vpd_tunnel_slot_table 'a*b' 3
+    assert_output "2003"
+}
+
+@test "vpd_tunnel_slot_release: the layer's release, else an interface's for a well-formed name, else nothing" {
+    load_iftunnel ""
+    iftunnel_init
+    vpd_tunnel_table_release() { echo "layer $*"; return 1; }
+    iftunnel_table_release() { echo "iftunnel $*"; return 1; }
+    run vpd_tunnel_slot_release wgc1 0
+    assert_success
+    assert_output "layer wgc1 0"
+    run vpd_tunnel_slot_release awg1 1
+    assert_success
+    assert_output "iftunnel awg1 1"
+    run vpd_tunnel_slot_release 'a*b' 2
+    assert_success
+    refute_output
 }
 
 @test "vpd_tunnel_unlisted_reason: why the list rejected a name, else the platform's answer" {

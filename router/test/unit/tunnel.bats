@@ -2689,6 +2689,82 @@ load_awg1() {
     [ ! -s "$BATS_IPT_DIR/live_flushes" ]
 }
 
+# awg1_routed - awg1 in slot 0 as an apply leaves it: the route of table 2000,
+# MASQUERADE and the inbound MSS clamp.
+awg1_routed() {
+    run ip route show table 2000
+    assert_output "default dev awg1"
+    run iptables -t nat -S POSTROUTING
+    assert_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    assert_line '-A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240'
+}
+
+# awg1_refused - slot 0 once awg1 left the list with its client: no lookup rule,
+# table 2000 empty, no MASQUERADE and no MSS rule of awg1, the block rule, and
+# the client's MARK the refusal rests on.
+awg1_refused() {
+    run ip rule show
+    refute_line --partial '16384:'
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    run ip route show table 2000
+    refute_output
+    run iptables -t nat -S POSTROUTING
+    refute_line '-A POSTROUTING -o awg1 -j MASQUERADE'
+    run iptables -t mangle -S FORWARD
+    refute_output --partial 'awg1'
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+}
+
+# The same with the record gone - removed, or a write that failed. The layer
+# then names no table for awg1, and a lookup rule of its slot can point only to
+# the slot's own interface table, 2000 + idx: that is what goes, with awg1's
+# NAT and MSS rules.
+@test "tunnel_apply: an interface taken off the list stops routing though its record is gone" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    rm -f "$IFTUNNEL_STATE_FILE"
+
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    awg1_refused
+}
+
+# A first apply whose swap did not finish routed awg1 and recorded nothing: the
+# record is written only once the swap is done.
+@test "tunnel_apply: an interface taken off the list after a first apply whose swap did not finish stops routing" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    eval "real_$(declare -f swap_fw_chain)"
+    swap_fw_chain() { return 3; }
+    run tunnel_apply
+    assert_success
+    awg1_routed
+    [ ! -e "$IFTUNNEL_STATE_FILE" ]
+
+    swap_fw_chain() { real_swap_fw_chain "$@"; }
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    awg1_refused
+}
+
+# Only a well-formed interface name goes into the NAT and MSS deletes of a slot
+# the layer names no table for: the MSS pattern would read a key's * as a regex.
+@test "tunnel_apply: a routeless key that is no interface name gets no NAT or MSS delete" {
+    load_tunnel_module_with '{"a*b":{"clients":["192.168.1.30"]}}'
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel 'a*b' is not a tunnel this platform knows; its clients are refused"
+    run ip rule show
+    assert_line $'16639:\tfrom all fwmark 0x10000/0xff0000 prohibit'
+    refute grep -qF 'a*b' /tmp/bats_iptables_calls.log
+}
+
 # ============================================================================
 # Addresses and CIDRs in a tunnel's exclude
 # ============================================================================

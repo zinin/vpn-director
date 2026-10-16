@@ -104,7 +104,10 @@ platform decides about the route: KeeneticOS still installs the route of a `Wire
 clients keep flowing; Merlin refuses `ovpncN` in every mode but VPN Director, and in "No" mode also
 takes out a default Tunnel Director left there. When it names none - for a typo, as a rule - or the tunnel is
 an interface taken off `tunnel_director.interfaces`, the slot keeps the block rule alone, and the
-lookup rule and table a known past left go (`_tunnel_routeless`, `_tunnel_unroute`).
+lookup rule and table a known past left go (`_tunnel_routeless`, `_tunnel_unroute`). An interface
+whose record is gone - an interrupted first apply, a failed write, a removed file - is cleaned the
+same way: the layer names no table for it, and its lookup rule can point only to the slot's own
+table, 2000 + idx (`vpd_tunnel_slot_table`, `vpd_tunnel_slot_release`).
 `route not installed: <reason>; its clients are refused` is the warning for a recorded tunnel on
 the up-to-date branch. A configuration that gives such a tunnel clients records no hash, as one
 with a typo in the id does: every apply rebuilds in place and repeats the warning, and the first
@@ -296,7 +299,7 @@ prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clien
 
 `tunnel_apply` writes the first three, `vpn-director.sh` the marker (`_routes_cron_sync`, after
 every `tunnel_apply`); `tunnel_stop` walks `TUN_DIR_TABLES` to release each tunnel's table through
-`vpd_tunnel_table_release`, then removes the first three files.
+`vpd_tunnel_slot_release`, then removes the first three files.
 
 The hash and `TUN_DIR_TABLES` can be out of step in one direction: a tunnel with clients that the
 platform does not list keeps a slot in `TUN_DIR_TABLES` - its clients' MARK rules and the slot's
@@ -417,9 +420,10 @@ From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_H
 
 Through the `vpd_*` layer of `lib/iftunnel.sh` (sourced by `common.sh`): `vpd_tunnels`,
 `vpd_tunnel_unlisted_reason`, `vpd_tunnel_table`, `vpd_tunnel_route_ensure`,
-`vpd_tunnel_table_release`, `vpd_tunnel_retired`, and `iftunnel_init`, `iftunnel_state_write`,
-`iftunnel_status`. From the platform contract directly: `platform_tunnel_offload_target`,
-`platform_prerouting_base_pos`, `platform_lan_ifaces`.
+`vpd_tunnel_table_release`, `vpd_tunnel_slot_table`, `vpd_tunnel_slot_release`,
+`vpd_tunnel_retired`, and `iftunnel_init`, `iftunnel_state_write`, `iftunnel_status`. From the
+platform contract directly: `platform_tunnel_offload_target`, `platform_prerouting_base_pos`,
+`platform_lan_ifaces`.
 
 ## Requirements
 
