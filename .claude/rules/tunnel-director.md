@@ -197,6 +197,48 @@ before touching a rule, a `pref_base` and mark field whose block range would rea
 32766. The firmware's own killswitch (`vpn_clientN_enforce`, `wgcN_enforce`) no longer matters for
 Tunnel Director's clients.
 
+The kill switch rests on the mark, and the firmware's firewall rebuilds take the chain that sets it
+away: KeeneticOS's NDM deletes `TUN_DIR` (every WAN lease renewal did on the KN-4521), Merlin's
+firewall start empties it (`iptables -t mangle -F`). Until the hook's apply puts it back, a client's
+packets carry no mark: the lookup and block rules never see them, and they would reach main and the
+WAN. ip rules survive both, so every client the chain marks for a tunnel also has guards
+(`lib/guard.sh`): ip rules by source and LAN interface (`platform_lan_ifaces`; `iif` takes one name,
+so each interface has its own) at Tunnel Director's guard preferences, 16895-16896, behind the
+direct rule at 16894. The client of awg1 in "Configuration Format", in slot 3:
+
+```
+16895: from 192.168.1.30 to 203.0.113.7 iif br0 lookup main   # each address or CIDR exclusion
+16895: from 192.168.1.30 iif br0 lookup 2003                  # the tunnel's table
+16895: from 192.168.1.30 iif br0 prohibit                     # refused when it holds no route
+```
+
+A packet the chain marked - for its tunnel, or direct - meets the fwmark rules or the direct rule
+first, so in normal operation only an unmarked packet reaches a guard. While the chain is gone, a
+client goes on through its tunnel or is refused, and its address and CIDR exclusions go direct. A
+country exclusion is no ip rule (no rule matches a set): that traffic goes through the tunnel until
+the chain is back. `iif` keeps the router's own traffic out - a client CIDR may hold the router's
+LAN address - and the local table, at preference 0, answers traffic to the router before any guard.
+
+`_tunnel_guard_lines` lists the guards in the chain's order, so the first match is the same one:
+the failover clients still on the failover tunnel first, then the clients of each slot. A slot with
+no table to route through (`_tunnel_routeless`) gets the refusing guard alone. No guard goes to a
+client of `main` - it goes direct anyway, and a guard sending it to main would take it past the
+guard of an Xray client entry that covers it - nor to a client the chain skips (no IPv4 address or
+CIDR, outside RFC1918) or a paused one, and an exclusion that is IPv6 or that iptables would
+misread gets none.
+
+A rebuild syncs the guards (`guard_sync`) right after the swap, once the new chain carries every
+interface: the old guards route the old layout's clients until then, and a dropped slot is released
+only after the sync. Not before the swap: the chain an earlier version left returns bare from every
+exclusion, and that traffic would meet the new guards and go into the tunnel. The up-to-date path
+syncs them after the routes: a guard that is gone goes back in, one in place is left alone.
+`tunnel_stop` removes them, and the direct rule with them once neither module needs it
+(`guard_direct_release`: not while `XRAY_TPROXY` is in mangle or Xray has guards), stopping short
+of main's rule at 32766 as the range loop does. A guard the kernel refuses is an ERROR: a rebuild
+with one missing records no hash, so the next apply retries it, and on either path the failover is
+not ready. Its client is not reported as not carried: while the chain is in place, it is.
+`status tunnel` lists the direct rule and the guards.
+
 ## Chain Architecture
 
 Single chain in mangle table:
@@ -278,7 +320,9 @@ A rebuild no longer starts with `tunnel_stop`:
    lookup rule replaced; a kept slot's route and rule are only ensured (`_tunnel_rule_ensure`
    leaves a correct rule alone), and its table is never released. A slot with no table to route
    through keeps the block rule alone ("Which tunnels the platform lists").
-2. `TUN_DIR_NEW` is built (`_tunnel_build_chain`) and swapped in by `swap_fw_chain`.
+2. `TUN_DIR_NEW` is built (`_tunnel_build_chain`) and swapped in by `swap_fw_chain`. Once it
+   carries every interface, the guards of the new layout replace the old ones (`guard_sync`; "The
+   kill switch").
 3. Every slot the new layout dropped loses its lookup and block rules (only when they are ours)
    and its table (`_tunnel_slot_release`) — after the swap, when no packet carries its mark.
 4. The hash and `failover_ready` are recorded. `TUN_DIR_TABLES` holds the union of both layouts
@@ -379,11 +423,13 @@ looks for the MARK rules only, not for an exclusion or offload rule.
 The PREROUTING jumps: a rebuild whose new jumps did not all go in records no hash, and the next
 apply finishes the swap. A jump that goes missing after a recorded rebuild is put back by the
 up-to-date branch (`_tunnel_jumps_ensure`), which leaves one that is there where it is.
-`failover_ready` needs the jumps, and every failover client still on the failover tunnel marked and,
-on KeeneticOS, out of the fast path (its offload opt-out in place) — one outside RFC1918 is TPROXY's
-to take but never TUN_DIR's, and dropped from Xray it would leave through the WAN; a marked one
-without its opt-out is marked for its first packets only, as the fast path takes the rest past
-mangle (`_tunnel_emit_client` returns 4).
+`failover_ready` needs the jumps, the direct rule, the guards - a sync that leaves one out withholds
+it, so the failover clients have theirs: one taken off Xray without its guard would leave through
+the WAN in the next firewall rebuild ("The kill switch") - and every failover client still on the
+failover tunnel marked and, on KeeneticOS, out of the fast path (its offload opt-out in place) —
+one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it would leave
+through the WAN; a marked one without its opt-out is marked for its first packets only, as the
+fast path takes the rest past mangle (`_tunnel_emit_client` returns 4).
 
 A chain can also lose rules a recorded rebuild put in. Merlin's firewall start runs
 `iptables -t mangle -F`, which empties `TUN_DIR` without deleting it (the pitfall in
@@ -417,11 +463,11 @@ slot's table is never released: it is carrying traffic.
 
 | Function | Purpose |
 |----------|---------|
-| `tunnel_status()` | Show chain, ip rules, configured tunnels |
+| `tunnel_status()` | Show chain, ip rules, the direct rule and the guards, configured tunnels |
 | `tunnel_apply()` | Apply rules from config (idempotent; a rebuild happens in place); reports the clients it does not carry in `TUNNEL_UNCARRIED` |
 | `tunnel_uncarried()` | Print `TUNNEL_UNCARRIED`, one client per line |
 | `tunnel_clients()` | Print every client the config puts on a tunnel; `main`'s and the paused ones left out |
-| `tunnel_stop()` | Remove chain, ip rules and the tunnel tables this module owns |
+| `tunnel_stop()` | Remove chain, ip rules, the guards and the tunnel tables this module owns; the direct rule once neither module needs it |
 | `tunnel_get_required_ipsets()` | Return list of exclude ipsets needed |
 
 **Internal functions** (for testing):
@@ -434,6 +480,9 @@ slot's table is never released: it is carrying traffic.
 | `_tunnel_marks_present()` | Does `TUN_DIR` still hold every client's MARK rule; one that is gone makes the apply a rebuild |
 | `_tunnel_collect_applied(prev)` | The slot of every tunnel of the new layout: kept from `prev`, or the lowest idx neither layout holds |
 | `_tunnel_build_chain(chain)` | `swap_fw_chain`'s build_fn: every client's rules, the failover clients first |
+| `_tunnel_guard_lines(slots)` | The guards of a layout, one ip rule per line, in the chain's order; rc 1 when the platform names no LAN interface |
+| `_tunnel_slot_guards(idx, tunnel, clients, lan_ifaces)` | The guards of some clients of one slot: per client and LAN interface, each address or CIDR exclusion direct, the tunnel's table, the refusal |
+| `_tunnel_guards_sync(slots)` | Make the guards those of a layout (`guard_sync`); rc 1 when one did not go in |
 | `_tunnel_slot_release(idx, tunnel)` | Drop the lookup and block rules (ours only) and the table of a slot the layout dropped |
 | `_tunnel_block_ensure(idx, tunnel)` | The slot's block rule, put back when it is gone |
 | `_tunnel_route_warn(tunnel)` | The warning for a route that did not go in, with the layer's reason |
@@ -458,7 +507,8 @@ From `lib/firewall.sh`: `swap_fw_chain`, `delete_fw_chain`, `ensure_fw_rule`, `s
 
 From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`, `TUN_DIR_TABLES`
 
-From `lib/guard.sh`: `guard_layout_check`, `guard_direct_mark_hex`, `guard_direct_ensure`
+From `lib/guard.sh`: `guard_layout_check`, `guard_direct_mark_hex`, `guard_direct_ensure`,
+`guard_direct_pref`, `guard_direct_release`, `guard_sync`, `guard_clear`, `guard_list`
 
 Through the `vpd_*` layer of `lib/iftunnel.sh` (sourced by `common.sh`): `vpd_tunnels`,
 `vpd_tunnel_unlisted_reason`, `vpd_tunnel_table`, `vpd_tunnel_route_ensure`,
