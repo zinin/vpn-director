@@ -3511,9 +3511,40 @@ refuse_direct_rule() {
     export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.7
     _tunnel_init
     printf '0 wgc1\n' > "$BATS_TEST_TMPDIR/slots"
+    # The slot's lookup rule, which its lookup guards follow.
+    ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1
     run _tunnel_guard_lines "$BATS_TEST_TMPDIR/slots"
     assert_success
     assert_output $'from 192.168.1.7 iif br0 lookup wgc1\nfrom 192.168.1.7 iif br0 prohibit\nfrom 192.168.1.0/24 iif br0 lookup wgc1\nfrom 192.168.1.0/24 iif br0 prohibit'
+}
+
+# One listing serves the lookup rule of every slot: each "ip rule show" is a
+# process, and the up-to-date path lists the guards on every apply.
+@test "_tunnel_guard_lines: lists the ip rules once for every slot" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]},"ovpnc1":{"clients":["192.168.1.7"]}}'
+    _tunnel_init
+    printf '0 wgc1\n1 wgc2\n2 ovpnc1\n' > "$BATS_TEST_TMPDIR/slots"
+    : > /tmp/bats_ip_calls.log
+    run _tunnel_guard_lines "$BATS_TEST_TMPDIR/slots"
+    assert_success
+    assert_equal "$(grep -c '^ip rule show$' /tmp/bats_ip_calls.log)" 1
+}
+
+# Without the listing no lookup rule could be found, and a list of refusals alone
+# would replace the guards of every working tunnel.
+@test "_tunnel_guard_lines: a listing that fails is an error, not a list without lookups" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    _tunnel_init
+    printf '0 wgc1\n' > "$BATS_TEST_TMPDIR/slots"
+    ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1
+    ip() {
+        [[ ${1:-} == rule && ${2:-} == show ]] && return 1
+        command ip "$@"
+    }
+    run _tunnel_guard_lines "$BATS_TEST_TMPDIR/slots"
+    assert_failure
+    assert_output --partial "Tunnel Director: cannot list the ip rules; the guards stay as they are"
+    refute_output --partial "from 192.168.1.5"
 }
 
 # An empty list would take every guard away. A rebuild does not start without
@@ -3544,8 +3575,8 @@ refuse_direct_rule() {
 }
 
 # The layer still names the table the last apply recorded for an interface taken
-# off the list, and the release empties it: the slot keeps its block rule alone,
-# and the clients their refusing guard alone.
+# off the list, but the slot's lookup rule into it goes (_tunnel_unroute): the
+# slot keeps its block rule alone, and the clients their refusing guard alone.
 @test "tunnel_apply: an interface taken off the list keeps the refusing guard alone" {
     load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
     run tunnel_apply
@@ -3558,6 +3589,57 @@ refuse_direct_rule() {
     assert_success
     run guard_list tunnel
     assert_output $'16896:\tfrom 192.168.1.30 iif br0 prohibit'
+}
+
+# refuse_lookup_wgc9 - for the rest of the test, ip refuses every rule that looks
+# wgc9 up, as iproute2 does on an Asuswrt-Merlin whose rt_tables names no wgc9
+# ("invalid table ID"); every other ip call goes to the mock. Merlin's naming
+# convention accepts wgc9 all the same, so its slot gets a lookup rule to try.
+refuse_lookup_wgc9() {
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" lookup wgc9 "* ]]; then
+            return 255
+        fi
+        command ip "$@"
+    }
+}
+
+# Such a key has its lookup rule refused on every apply, and its guard follows
+# that rule: the refusing guard alone, as its marks meet the block rule. A guard
+# line refused on every apply would keep each sync from completing, and the list
+# that guarded before would stay - with the guards of a client that has left
+# another tunnel since, which then go on routing it.
+@test "tunnel_apply: a slot whose lookup rule is refused gets the refusing guard alone, and the guards still sync" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]},"wgc9":{"clients":["192.168.1.20"]}}'
+    refuse_lookup_wgc9
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Failed to add ip rule: pref=16385 fwmark=0x20000 lookup=wgc9"
+    refute_output --partial "Guard of tunnel not installed"
+    assert_output --partial "a configured tunnel is not in the platform list"
+    [ ! -f "$TUN_DIR_HASH" ]
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit\n16895:\tfrom 192.168.1.6 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.6 iif br0 prohibit\n16895:\tfrom 192.168.1.20 iif br0 prohibit'
+
+    # 192.168.1.6 leaves Tunnel Director: TUN_DIR marks it no more, and its guards go.
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"wgc9":{"clients":["192.168.1.20"]}}'
+    run tunnel_apply
+    assert_success
+    refute_output --partial "Guard of tunnel not installed"
+    run guard_list tunnel
+    assert_output $'16896:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16896:\tfrom 192.168.1.5 iif br0 prohibit\n16896:\tfrom 192.168.1.20 iif br0 prohibit'
+}
+
+# The same key no longer keeps the failover of another tunnel from being ready.
+@test "tunnel_apply: a slot whose lookup rule is refused leaves another tunnel's failover ready" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc9":{"clients":["192.168.1.20"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    refuse_lookup_wgc9
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    grep -qx wgc1 "$TUN_DIR_FAILOVER_READY"
 }
 
 # The chain skips such a client, and so do the guards.

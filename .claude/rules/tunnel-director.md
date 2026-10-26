@@ -208,7 +208,7 @@ direct rule at 16894. The client of awg1 in "Configuration Format", in slot 3:
 
 ```
 16895: from 192.168.1.30 to 203.0.113.7 iif br0 lookup main   # each address or CIDR exclusion
-16895: from 192.168.1.30 iif br0 lookup 2003                  # the tunnel's table
+16895: from 192.168.1.30 iif br0 lookup 2003                  # while the slot's lookup rule is in
 16895: from 192.168.1.30 iif br0 prohibit                     # refused when it holds no route
 ```
 
@@ -220,12 +220,18 @@ the chain is back. `iif` keeps the router's own traffic out - a client CIDR may 
 LAN address - and the local table, at preference 0, answers traffic to the router before any guard.
 
 `_tunnel_guard_lines` lists the guards in the chain's order, so the first match is the same one:
-the failover clients still on the failover tunnel first, then the clients of each slot. A slot with
-no table to route through (`_tunnel_routeless`) gets the refusing guard alone. No guard goes to a
-client of `main` - it goes direct anyway, and a guard sending it to main would take it past the
-guard of an Xray client entry that covers it - nor to a client the chain skips (no IPv4 address or
-CIDR, outside RFC1918) or a paused one, and an exclusion that is IPv6 or that iptables would
-misread gets none.
+the failover clients still on the failover tunnel first, then the clients of each slot. The lookup
+guard follows the slot's lookup rule: it is written only while that rule is listed (one
+`ip rule show` read for every slot), so an unmarked packet goes where the slot sends its marks. A
+slot whose lookup rule is not in place - refused, as Merlin's iproute2 refuses a `wgcN` its
+rt_tables does not name, or taken off a slot with no table to route through - gets the refusing
+guard alone, as its marks meet the block rule. A guard line refused on every apply would keep
+`guard_sync` from ever completing, and the list that guarded before would stay: the guards of a
+client that has left Tunnel Director since would go on routing it. No guard goes to a client of
+`main` - it goes direct anyway, and a guard sending it to main would take it past the guard of an
+Xray client entry that covers it - nor to a client the chain skips (no IPv4 address or CIDR,
+outside RFC1918) or a paused one, and an exclusion that is IPv6 or that iptables would misread gets
+none.
 
 A rebuild syncs the guards (`guard_sync`) right after the swap, once the new chain carries every
 interface: the old guards route the old layout's clients until then, and a dropped slot is released
@@ -480,8 +486,8 @@ slot's table is never released: it is carrying traffic.
 | `_tunnel_marks_present()` | Does `TUN_DIR` still hold every client's MARK rule; one that is gone makes the apply a rebuild |
 | `_tunnel_collect_applied(prev)` | The slot of every tunnel of the new layout: kept from `prev`, or the lowest idx neither layout holds |
 | `_tunnel_build_chain(chain)` | `swap_fw_chain`'s build_fn: every client's rules, the failover clients first |
-| `_tunnel_guard_lines(slots)` | The guards of a layout, one ip rule per line, in the chain's order; rc 1 when the platform names no LAN interface |
-| `_tunnel_slot_guards(idx, tunnel, clients, lan_ifaces)` | The guards of some clients of one slot: per client and LAN interface, each address or CIDR exclusion direct, the tunnel's table, the refusal |
+| `_tunnel_guard_lines(slots)` | The guards of a layout, one ip rule per line, in the chain's order; rc 1 when the platform names no LAN interface or the ip rules cannot be listed |
+| `_tunnel_slot_guards(idx, tunnel, clients, lan_ifaces, rules)` | The guards of some clients of one slot: per client and LAN interface, each address or CIDR exclusion direct, the tunnel's table while the slot's lookup rule is listed in `rules`, the refusal |
 | `_tunnel_guards_sync(slots)` | Make the guards those of a layout (`guard_sync`); rc 1 when one did not go in |
 | `_tunnel_slot_release(idx, tunnel)` | Drop the lookup and block rules (ours only) and the table of a slot the layout dropped |
 | `_tunnel_block_ensure(idx, tunnel)` | The slot's block rule, put back when it is gone |

@@ -376,9 +376,10 @@ _tunnel_mark_hex() {
 # unfiltered listing is searched here - read whole first. Piped into "grep -q"
 # it was wrong under pipefail: grep leaves at its match, iproute2 writes each
 # rule as it prints it, and the SIGPIPE that ends "ip" made the pipeline report
-# 141, so a rule in place read as missing.
+# 141, so a rule in place read as missing. A fourth argument is the listing to
+# search instead: one the caller read whole, for many rules at once.
 _tunnel_rule_listed() {
-    _tunnel_ip_rule_listed "$1" "$2" "lookup $(rt_table_label "$3")"
+    _tunnel_ip_rule_listed "$1" "$2" "lookup $(rt_table_label "$3")" "${@:4}"
 }
 
 # _tunnel_block_listed <pref> <mark> - is this module's block rule at that preference: "from all
@@ -387,14 +388,19 @@ _tunnel_block_listed() {
     _tunnel_ip_rule_listed "$1" "$2" "prohibit"
 }
 
-# _tunnel_ip_rule_listed <pref> <mark> <action> - is "from all fwmark <mark>/<mask> <action>" at
-# that preference, every part a whole word (iproute2 4.4 ends each rule with a space), a mask of
-# all ones left out as iproute2 leaves it out? The listing is read whole first: piped into
-# "grep -q" it was wrong under pipefail (shell-conventions.md).
+# _tunnel_ip_rule_listed <pref> <mark> <action> [<rules>] - is "from all fwmark <mark>/<mask>
+# <action>" at that preference, every part a whole word (iproute2 4.4 ends each rule with a space),
+# a mask of all ones left out as iproute2 leaves it out? The listing is read whole first, or is
+# <rules>, one the caller read whole: piped into "grep -q" it was wrong under pipefail
+# (shell-conventions.md).
 _tunnel_ip_rule_listed() {
     local pref="$1" fwmark="fwmark $2/$_tunnel_mark_mask_hex" action="$3" rules line
     [[ $_tunnel_mark_mask_hex != 0xffffffff ]] || fwmark="fwmark $2"
-    rules=$(ip rule show 2>/dev/null) || true
+    if [[ $# -ge 4 ]]; then
+        rules=$4
+    else
+        rules=$(ip rule show 2>/dev/null) || true
+    fi
     while IFS= read -r line; do
         [[ $line == "$pref:"* ]] || continue
         line=" ${line#*:} "
@@ -831,13 +837,22 @@ _tunnel_build_chain() {
 #
 # The order is the chain's (_tunnel_build_chain), so the first match is the same one: the failover
 # clients still on the failover tunnel first, under it, then the clients of each row in the order
-# of <slots>, those failover clients left out on their tunnel's row. Returns 1, printing nothing,
-# when the platform names no LAN interface: the empty list would take every guard away.
+# of <slots>, those failover clients left out on their tunnel's row. The ip rules are listed once,
+# read whole, for the lookup rule of every slot. Returns 1 with an ERROR, printing nothing, when
+# the platform names no LAN interface - the empty list would take every guard away - or the
+# listing fails.
 _tunnel_guard_lines() {
-    local slots="$1" lan_ifaces idx tunnel clients client kept fo_idx="" fo_on_tunnel fo_client fo_c
-    local fo_clients=""
+    local slots="$1" lan_ifaces rules idx tunnel clients client kept fo_idx="" fo_on_tunnel
+    local fo_client fo_c fo_clients=""
     lan_ifaces="$(platform_lan_ifaces)" || lan_ifaces=""
-    [[ -n $lan_ifaces ]] || return 1
+    if [[ -z $lan_ifaces ]]; then
+        log -l ERROR "Tunnel Director: cannot determine the LAN interfaces; the guards stay as they are"
+        return 1
+    fi
+    if ! rules=$(ip rule show 2>/dev/null); then
+        log -l ERROR "Tunnel Director: cannot list the ip rules; the guards stay as they are"
+        return 1
+    fi
 
     if [[ -n ${XRAY_FAILOVER_TUNNEL:-} && -n ${XRAY_FAILOVER_CLIENTS:-} ]]; then
         fo_idx=$(awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { print $1; exit }' "$slots")
@@ -848,7 +863,7 @@ _tunnel_guard_lines() {
             grep -qxF -- "$fo_client" <<< "$fo_on_tunnel" || continue
             fo_clients+="$fo_client"$'\n'
         done
-        _tunnel_slot_guards "$fo_idx" "$XRAY_FAILOVER_TUNNEL" "$fo_clients" "$lan_ifaces"
+        _tunnel_slot_guards "$fo_idx" "$XRAY_FAILOVER_TUNNEL" "$fo_clients" "$lan_ifaces" "$rules"
     fi
 
     while read -r idx tunnel; do
@@ -864,32 +879,44 @@ _tunnel_guard_lines() {
             done <<< "$clients"
             clients=$kept
         fi
-        _tunnel_slot_guards "$idx" "$tunnel" "$clients" "$lan_ifaces"
+        _tunnel_slot_guards "$idx" "$tunnel" "$clients" "$lan_ifaces" "$rules"
     done < "$slots"
     return 0
 }
 
-# _tunnel_slot_guards <idx> <tunnel> <clients> <lan_ifaces> - the guards of <clients> (one per
-# line) under the tunnel in slot <idx>, per client and LAN interface L:
+# _tunnel_slot_guards <idx> <tunnel> <clients> <lan_ifaces> <rules> - the guards of <clients> (one
+# per line) under the tunnel in slot <idx>, per client and LAN interface L:
 #
 #   from <C> to <X> iif L lookup main    each exclusion X that is an address or a CIDR: direct
-#   from <C> iif L lookup <table>        the tunnel's table (vpd_tunnel_table)
+#   from <C> iif L lookup <table>        the tunnel's table, while the slot's lookup rule is listed
 #   from <C> iif L prohibit              refused when that table holds no route
 #
+# The lookup follows the slot's own lookup rule, found in the listing <rules>
+# (_tunnel_rule_listed), so an unmarked packet goes where the slot sends its marks. While that rule
+# is not listed - refused, as Asuswrt-Merlin's iproute2 refuses a wgcN its rt_tables does not name;
+# taken off a slot with no table to route through (_tunnel_unroute); never there for a key the
+# layer names no table for - the marks meet the block rule, and the guard is the refusal alone. A
+# line the kernel refuses on every apply would keep each sync from completing, and the list that
+# guarded before would stay, with the guards of a client that has left Tunnel Director since
+# (guard_sync).
+#
 # "iif" keeps the router's own traffic out - a client's CIDR may hold the router's LAN address -
-# and the local table, at preference 0, answers traffic to the router before any guard. A slot
-# with no table to route through (_tunnel_routeless) gets no lookup: its block rule alone refuses
-# its marks. A country exclusion gets no line - no ip rule matches a set - and while the chain is
-# gone that traffic goes through the tunnel. Nothing for main: its clients go direct anyway, and a
-# guard sending them to main would take them past the guard of an Xray client entry that covers
-# them. Nothing for a client the chain skips either - no IPv4 address or CIDR (is_ipv4_net),
-# outside RFC1918 (is_lan_ip) - nor for an exclusion that is no address to iptables (is_ipv4_net:
-# IPv6, a leading zero). A paused client is in no client list (config.sh).
+# and the local table, at preference 0, answers traffic to the router before any guard. A country
+# exclusion gets no line - no ip rule matches a set - and while the chain is gone that traffic goes
+# through the tunnel. Nothing for main: its clients go direct anyway, and a guard sending them to
+# main would take them past the guard of an Xray client entry that covers them. Nothing for a
+# client the chain skips either - no IPv4 address or CIDR (is_ipv4_net), outside RFC1918
+# (is_lan_ip) - nor for an exclusion that is no address to iptables (is_ipv4_net: IPv6, a leading
+# zero). A paused client is in no client list (config.sh).
 _tunnel_slot_guards() {
-    local idx="$1" tunnel="$2" clients="$3" lan_ifaces="$4" table="" excludes client lan_if excl
+    local idx="$1" tunnel="$2" clients="$3" lan_ifaces="$4" rules="$5" table excludes client
+    local lan_if excl pref mark_hex
     [[ $tunnel != main ]] || return 0
-    if ! _tunnel_routeless "$tunnel" "$idx"; then
-        table=$(vpd_tunnel_table "$tunnel" "$idx") || table=""
+    pref=$((TUN_DIR_PREF_BASE + idx))
+    mark_hex=$(_tunnel_mark_hex "$idx")
+    table=$(vpd_tunnel_table "$tunnel" "$idx") || table=""
+    if [[ -n $table ]] && ! _tunnel_rule_listed "$pref" "$mark_hex" "$table" "$rules"; then
+        table=""
     fi
     excludes=$(printf '%s\n' "$TUN_DIR_TUNNELS_JSON" | jq -r --arg t "$tunnel" '
         .[$t] | if type == "object" then .exclude else null end
@@ -916,13 +943,11 @@ _tunnel_slot_guards() {
 # _tunnel_guards_sync <slots> - make Tunnel Director's guards those of the layout <slots>
 # (_tunnel_guard_lines), the new list in before the old one goes (guard_sync). Returns 1 when a
 # guard did not go in - guard_sync logs an ERROR for each and keeps the list that guarded so far -
-# or when the platform names no LAN interface, the guards left as they are.
+# or when _tunnel_guard_lines cannot say what they are (it logs the ERROR), the guards left as
+# they are.
 _tunnel_guards_sync() {
     local lines
-    if ! lines=$(_tunnel_guard_lines "$1"); then
-        log -l ERROR "Tunnel Director: cannot determine the LAN interfaces; the guards stay as they are"
-        return 1
-    fi
+    lines=$(_tunnel_guard_lines "$1") || return 1
     guard_sync tunnel "$lines"
 }
 
