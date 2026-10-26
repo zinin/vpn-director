@@ -94,7 +94,8 @@ Xray wins over TUN_DIR (above). A client moving from Xray to a tunnel stays prox
 lets it go, when TUN_DIR already marks it; a client moving the other way is proxied from step 1,
 before TUN_DIR lets it go in step 2. A Tunnel Director failure that stops the apply (a tunnels value
 that is no object, a tunnel name that is empty or holds whitespace or a control character, block
-rules that would reach main's rule at 32766, no LAN interface, no PREROUTING position) ends the run
+rules that would reach main's rule at 32766, a direct mark or guard preferences
+`guard_layout_check` refuses, no LAN interface, no PREROUTING position) ends the run
 before step 3. One that
 costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
 tunnel the platform does not list, a slot whose route, lookup rule or block rule is not in place, a client outside
@@ -216,16 +217,23 @@ Single chain with rules for all clients:
 ```
 TUN_DIR chain:
   # Client 1 (wgc1)
+  -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 → PPE                    (Keenetic only)
+  -s 192.168.50.0/24 -m set --match-set <country> dst → MARK 0x200/0x200  (direct)
   -s 192.168.50.0/24 -m set --match-set <country> dst → RETURN
-  -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 → PPE       (Keenetic only)
   -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 → MARK 0x10000
 
   # Client 2 (ovpnc1)
+  -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → PPE                        (Keenetic only)
+  -s 192.168.1.5 -m set --match-set <country> dst → MARK 0x200/0x200      (direct)
   -s 192.168.1.5 -m set --match-set <country> dst → RETURN
-  -s 192.168.1.5 -d 203.0.113.7 → RETURN                     (an address in exclude)
-  -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → PPE           (Keenetic only)
+  -s 192.168.1.5 -d 203.0.113.7 → MARK 0x200/0x200                        (an address in exclude)
+  -s 192.168.1.5 -d 203.0.113.7 → RETURN
   -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → MARK 0x20000
 ```
+
+Each exclusion sets the direct mark and returns, both with its own match; the direct rule
+(`fwmark 0x200/0x200 lookup main`, `lib/guard.sh`) sends what carries the mark to main
+(`tunnel-director.md`, "Chain Architecture").
 
 PREROUTING jump, one per LAN interface (`platform_lan_ifaces`; Merlin: `br0`):
 
@@ -249,18 +257,17 @@ Keenetic, which sets `ct->fast_ext` (a condition of both the `fastnat` and the `
 test) and `FOE_ALG_SKIP`, closing the hardware path too. Merlin has no such path and prints
 nothing, so the rule does not exist there at all.
 
-Placement carries the meaning: the exclusion `RETURN`s run first, so an excluded destination
-keeps its acceleration, and the opt-out sits immediately before `MARK` with the identical match,
-where the `--mark 0x0/0xff0000` test still holds.
+Placement carries the meaning: the opt-out opens each client's block with the `MARK` rule's
+match, ahead of the exclusions, so no flow of a Tunnel Director client is accelerated - one to an
+excluded destination included.
 
 Xray needs none of this — TPROXY terminates the connection in a local socket, so no forwarded
 flow is left to accelerate. That is why Xray worked on KeeneticOS while Tunnel Director did not.
 
 A flow already bound to the fast path stays bound until its conntrack entry expires; new flows
-are correct immediately. And because `tunnel_apply` hashes the *configuration*, a router that
-already has Tunnel Director applied with an unchanged config gets the rule on its next rebuild —
-seconds away on Keenetic, where any NDM firewall rebuild wipes our chains and the `netfilter.d`
-hook re-applies. `restart tunnel` forces it.
+are correct immediately. A router upgraded with its configuration unchanged gets the rules of a
+new placement on the first apply after the upgrade: the hash input carries the format of the
+rules (`_tunnel_format`). `restart tunnel` forces a rebuild at any time.
 
 ### Position Calculation
 
@@ -350,7 +357,7 @@ Packet from 192.168.1.5 to 8.8.8.8 (foreign):
 
 Packet from 192.168.1.5 to 203.0.113.1 (excluded country):
 1. XRAY_TPROXY: src in XRAY_CLIENTS? No → RETURN
-2. TUN_DIR: src=192.168.1.5 + dst in excluded country? Yes → **RETURN** (no mark)
+2. TUN_DIR: src=192.168.1.5 + dst in excluded country? Yes → **RETURN** with the direct mark 0x200
 3. **Goes to main table → WAN (direct)**
 
 ### Example 3: Client in both Xray and TD

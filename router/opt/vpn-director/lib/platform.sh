@@ -71,8 +71,9 @@
 #     on both platforms; Merlin ignores the TPROXY mark (it has no extra rule).
 #   * platform_tunnel_offload_target names a target, not a rule: tunnel.sh owns
 #     where it goes. It builds the rule with the same match as the MARK rule of
-#     the client it belongs to and places it immediately before that rule, so a
-#     destination the exclusions return on keeps the platform's acceleration.
+#     the client it belongs to and puts it at the head of that client's block,
+#     ahead of the exclusions, so no flow of a Tunnel Director client is
+#     accelerated - those to its excluded destinations included.
 #     A platform that needs no opt-out must print nothing - a target name the
 #     kernel does not have fails the append and takes the apply down with it.
 #   * Keenetic's tunnel tables are KEENETIC_TABLE_BASE + idx (keenetic.sh).

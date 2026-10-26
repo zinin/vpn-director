@@ -20,6 +20,8 @@
 #   - config.sh (TUN_DIR_TUNNELS_JSON, TUN_DIR_CHAIN, TUN_DIR_PREF_BASE,
 #                TUN_DIR_MARK_MASK, TUN_DIR_MARK_SHIFT; XRAY_CHAIN, to keep the
 #                PREROUTING jump behind the Xray jumps)
+#   - guard.sh (guard_layout_check, guard_direct_mark_hex, guard_direct_ensure: the
+#               direct mark the exclusions set, and the direct rule that routes it)
 #   - ipset.sh (_ipset_exists, parse_exclude_sets_from_json, TUN_DIR_HASH, TUN_DIR_TABLES)
 #
 # Public API:
@@ -99,6 +101,13 @@ _tunnel_initialized=0
 # add to it run inside tunnel_apply, some inside swap_fw_chain; the array is global, so no local of
 # theirs can shadow it.
 TUNNEL_UNCARRIED=()
+
+# The format of the rules a rebuild puts in TUN_DIR, a line of the hash input (tunnel_apply). Raise
+# it whenever the same configuration is to give other rules: the first apply after the upgrade is
+# then a rebuild, where an unchanged hash would take the up-to-date path, which looks for the MARK
+# rules alone and leaves the old ones in place. 2: the offload opt-out opens each client's block,
+# and each exclusion sets the direct mark before it returns.
+_tunnel_format=2
 
 ###################################################################################################
 # Internal helper functions (defined before --source-only for testability)
@@ -553,12 +562,24 @@ _tunnel_collect_applied() {
     done <<< "$tunnels"
 }
 
-# One client's RETURNs (country sets, addresses and CIDRs) / offload / MARK in
-# <chain>. Offload sits immediately before MARK with the same match so excluded
-# destinations keep acceleration.
-# warnings, changes, incomplete and offload_target are tunnel_apply's locals
-# (bash dynamic scope); incomplete says a rule did not go in, so the rebuild is
-# not recorded.
+# One client's rules in <chain>: the offload opt-out, then the direct mark and a
+# RETURN for each exclusion (country sets, addresses and CIDRs), then the MARK.
+#
+# The opt-out opens the block, with the MARK rule's match, so no flow of the
+# client is accelerated, those to its exclusions included: the fast path routes
+# a flow it took over by the ip rules alone, never by a mark, and the client's
+# guard would take an accelerated flow to an excluded destination into the
+# tunnel, where it dies. Every other device keeps its acceleration.
+#
+# An exclusion sets the direct mark and returns, both with its own match: the
+# direct rule sends the mark to main ahead of the guards, which a packet that
+# returned bare would meet. A single RETURN on the direct mark would also return
+# what XRAY_TPROXY marks direct: what Xray lets through of a client that is on a
+# tunnel too would no longer reach the tunnel.
+#
+# warnings, changes, incomplete, offload_target and direct_mark are tunnel_apply's
+# locals (bash dynamic scope); incomplete says a rule did not go in, so the
+# rebuild is not recorded.
 #
 # Returns 0 when the client is marked, 1 when it is skipped as no IPv4 address
 # or CIDR at all - nothing TPROXY can take either - 2 when it is skipped as
@@ -590,39 +611,6 @@ _tunnel_emit_client() {
         return 2
     fi
 
-    local excl excl_set
-    while IFS= read -r excl; do
-        [[ -n $excl ]] || continue
-        # An address or a CIDR returns its destination as it stands, an IPv6
-        # entry is skipped, and anything else names a set. iptables reads a
-        # leading zero as octal ("010" is 8); is_ipv4_net takes only what
-        # iptables reads as written, so "203.0.113.010" falls through to the set
-        # lookup and its WARN.
-        if is_ipv4_net "$excl"; then
-            if ! ensure_fw_rule -q mangle "$chain" -s "$client" -d "$excl" -j RETURN; then
-                warnings=1
-                incomplete=1
-            fi
-            continue
-        fi
-        if [[ $excl == *:* ]]; then
-            log -l WARN "Tunnel '$tunnel': exclusion '$excl' is IPv6; Tunnel Director routes IPv4 only, skipping it"
-            warnings=1
-            continue
-        fi
-        excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
-        if ! _ipset_exists "$excl_set"; then
-            log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
-            warnings=1
-            continue
-        fi
-        if ! ensure_fw_rule -q mangle "$chain" \
-            -s "$client" -m set --match-set "$excl_set" dst -j RETURN; then
-            warnings=1
-            incomplete=1
-        fi
-    done <<< "$excludes"
-
     local offload_ok=1
     if [[ -n $offload_target ]]; then
         if ! ensure_fw_rule -q mangle "$chain" \
@@ -634,6 +622,46 @@ _tunnel_emit_client() {
             offload_ok=0
         fi
     fi
+
+    local excl excl_set
+    local -a excl_match=()
+    while IFS= read -r excl; do
+        [[ -n $excl ]] || continue
+        # An address or a CIDR matches its destination as it stands, an IPv6
+        # entry is skipped, and anything else names a set. iptables reads a
+        # leading zero as octal ("010" is 8); is_ipv4_net takes only what
+        # iptables reads as written, so "203.0.113.010" falls through to the set
+        # lookup and its WARN.
+        if is_ipv4_net "$excl"; then
+            excl_match=(-d "$excl")
+        elif [[ $excl == *:* ]]; then
+            log -l WARN "Tunnel '$tunnel': exclusion '$excl' is IPv6; Tunnel Director routes IPv4 only, skipping it"
+            warnings=1
+            continue
+        else
+            excl_set=$(printf '%s' "$excl" | tr 'A-Z' 'a-z')
+            if ! _ipset_exists "$excl_set"; then
+                log -l WARN "Exclude ipset '$excl_set' not found; skipping exclusion"
+                warnings=1
+                continue
+            fi
+            excl_match=(-m set --match-set "$excl_set" dst)
+        fi
+        # Each of the pair is tried on its own. A RETURN whose mark was refused
+        # still keeps the destination from the tunnel's mark; a mark whose RETURN
+        # was refused is followed by the tunnel's mark, whose lookup rule comes
+        # before the direct rule. Either way the apply is not recorded, and the
+        # next one rebuilds.
+        if ! ensure_fw_rule -q mangle "$chain" -s "$client" "${excl_match[@]}" \
+            -j MARK --set-xmark "$direct_mark/$direct_mark"; then
+            warnings=1
+            incomplete=1
+        fi
+        if ! ensure_fw_rule -q mangle "$chain" -s "$client" "${excl_match[@]}" -j RETURN; then
+            warnings=1
+            incomplete=1
+        fi
+    done <<< "$excludes"
 
     if ! ensure_fw_rule -q mangle "$chain" \
         -s "$client" -m mark --mark "0x0/$_tunnel_mark_mask_hex" \
@@ -1195,8 +1223,9 @@ tunnel_stop() {
 #
 # A failure that ends the apply - rc 1 before any rule is touched (a tunnels value that is no
 # object, a tunnel name that is empty or holds whitespace or a control character, a pref_base and
-# mark field whose block rules would reach main's rule at 32766, no LAN interface, no PREROUTING
-# position), or errexit - ends vpn-director.sh before its prune. A refused
+# mark field whose block rules would reach main's rule at 32766, a direct mark or guard
+# preferences guard_layout_check refuses, no LAN interface, no PREROUTING position), or errexit -
+# ends vpn-director.sh before its prune. A refused
 # rule, a swap that did not take over every interface, a tunnel the platform does not list cost
 # their clients and return 0, and TUNNEL_UNCARRIED names those clients: the ones the live TUN_DIR
 # may not mark or route when this returns. On a rebuild, the clients of a tunnel the platform does
@@ -1261,23 +1290,37 @@ tunnel_apply() {
         return 1
     fi
 
+    # The direct mark the exclusions set is a bit of its own: in the mark field
+    # or in Xray's mask it would read as a tunnel's mark or as Xray's. The direct
+    # rule and the guards follow the block range, and stay ahead of main's rule
+    # as well. guard_layout_check logs the ERROR.
+    guard_layout_check || return 1
+    local direct_mark
+    direct_mark=$(guard_direct_mark_hex)
+
     # Compute config hash for change detection. Failover snapshot clients are
     # extra MARK rules, not a key reorder, so they belong in the hash, and so do
     # the interfaces of tunnel_director.interfaces: as written, and the names
     # the check keeps of them. The platform's answers, the LAN and the WAN can
     # change those under the same list, and a name no longer kept has to reach
     # the rebuild, which releases what it left - the up-to-date path releases no
-    # slot. With neither, hash only the tunnels JSON so an upgrade does not
-    # rebuild TUN_DIR.
+    # slot. Neither adds a line when it is not set.
+    #
+    # The direct mark and the format of the rules end it. Every exclusion's rule
+    # sets the mark, and guard_direct_ensure takes the direct rule of a former
+    # one away: a new direct_mark rebuilds the chain in that same apply. A new
+    # _tunnel_format makes the first apply after an upgrade a rebuild, where the
+    # up-to-date path, which looks for the MARK rules alone, would leave the
+    # rules of the old format in place.
     local new_hash old_hash empty_hash hash_input="$TUN_DIR_TUNNELS_JSON"
     if [[ -n ${TUN_DIR_INTERFACES:-} ]]; then
         hash_input+=$'\n'"interfaces: $TUN_DIR_INTERFACES"$'\n'"kept: $(iftunnel_list | tr '\n' ' ')"
     fi
     if [[ -n ${XRAY_FAILOVER_TUNNEL:-} ]]; then
-        new_hash=$(printf '%s\n%s\n%s' "$hash_input" "$XRAY_FAILOVER_TUNNEL" "${XRAY_FAILOVER_CLIENTS:-}" | compute_hash)
-    else
-        new_hash=$(printf '%s' "$hash_input" | compute_hash)
+        hash_input+=$'\n'"$XRAY_FAILOVER_TUNNEL"$'\n'"${XRAY_FAILOVER_CLIENTS:-}"
     fi
+    hash_input+=$'\n'"direct_mark: $direct_mark"$'\n'"format: $_tunnel_format"
+    new_hash=$(printf '%s' "$hash_input" | compute_hash)
     empty_hash=$(printf '' | compute_hash)
     old_hash=$(cat "$TUN_DIR_HASH" 2>/dev/null || printf '%s' "$empty_hash")
 
@@ -1296,10 +1339,15 @@ tunnel_apply() {
     fi
 
     if [[ $rebuild -eq 0 ]]; then
-        # Always re-install recorded routes first. Gating that on the failover
+        local route_rc=0 jumps_rc=0 direct_rc=0
+        # The direct rule first: the chain marks every excluded destination
+        # direct, and the rule sends that to main ahead of the guards. One that
+        # is gone is put back, one in place is left alone; one that does not go
+        # in (guard_direct_ensure logs the ERROR) keeps the failover not ready.
+        guard_direct_ensure || direct_rc=1
+        # Always re-install the recorded routes. Gating that on the failover
         # row being in TUN_DIR_TABLES skipped Keenetic route repair for every
         # other tunnel after an interface flap.
-        local route_rc=0 jumps_rc=0
         _tunnel_ensure_routes || route_rc=$?
         if ! _tunnel_jumps_ensure; then
             log -l ERROR "Tunnel Director: a PREROUTING jump to $TUN_DIR_CHAIN is missing and did not go back in"
@@ -1312,6 +1360,7 @@ tunnel_apply() {
             if ! awk -v id="$XRAY_FAILOVER_TUNNEL" '$2 == id { found = 1 } END { exit !found }' "$TUN_DIR_TABLES" \
                 || [[ $route_rc -ne 0 ]] \
                 || [[ $jumps_rc -ne 0 ]] \
+                || [[ $direct_rc -ne 0 ]] \
                 || ! _tunnel_failover_carried \
                 || ! _tunnel_failover_rule_present; then
                 rm -f "$TUN_DIR_FAILOVER_READY"
@@ -1388,6 +1437,18 @@ tunnel_apply() {
         : > "$prev_tmp"
     fi
     _tunnel_collect_applied "$prev_tmp" > "$slots_tmp"
+
+    # The direct rule ahead of everything the rebuild puts in: from the swap on,
+    # the chain marks every excluded destination direct, and the rule sends that
+    # to main ahead of the guards. One that does not go in (guard_direct_ensure
+    # logs the ERROR) leaves the rebuild unrecorded, so the next apply tries
+    # again, and the failover not ready.
+    local direct_ok=1
+    if ! guard_direct_ensure; then
+        warnings=1
+        incomplete=1
+        direct_ok=0
+    fi
 
     # 1. Routing, before any packet carries a new mark. TUN_DIR_TABLES holds
     # both layouts until the release below: an apply that dies in between
@@ -1525,13 +1586,15 @@ tunnel_apply() {
     # hash absent repeats the warning and retries on the next apply. A refused
     # chain rule is the same: the up-to-date branch looks for the MARK rules
     # alone, so a refused exclusion or offload rule would stay missing, and only
-    # a rebuild retries it.
+    # a rebuild retries it. A direct rule that did not go in keeps it out too.
     if [[ $skipped_unknown -eq 0 && $incomplete -eq 0 && $jumps_ok -eq 1 ]]; then
         printf '%s\n' "$new_hash" > "$TUN_DIR_HASH"
     elif [[ $skipped_unknown -ne 0 ]]; then
         log -l WARN "Tunnel Director: a configured tunnel is not in the platform list (see the warning above); this apply is not recorded as up-to-date and the next apply retries"
     elif [[ $jumps_ok -eq 0 ]]; then
         log -l WARN "Tunnel Director: the rebuild did not finish; this apply is not recorded as up-to-date and the next apply finishes it"
+    elif [[ $direct_ok -eq 0 ]]; then
+        log -l WARN "Tunnel Director: the direct rule did not go in; this apply is not recorded as up-to-date and the next apply rebuilds"
     else
         log -l WARN "Tunnel Director: a client rule did not go in; this apply is not recorded as up-to-date and the next apply rebuilds"
     fi
@@ -1541,10 +1604,11 @@ tunnel_apply() {
     # fallback interface is still coming up. The watch reads
     # TUN_DIR_FAILOVER_READY instead of the apply exit status, and drops Xray
     # membership on it: every failover client has to be marked - and, where the
-    # platform names an offload target, out of the fast path - and the jump
-    # that sends LAN traffic to those marks has to be there.
+    # platform names an offload target, out of the fast path - the jump that
+    # sends LAN traffic to those marks has to be there, and so does the direct
+    # rule.
     if _tunnel_failover_needed && [[ $fo_applied -eq 1 && $fo_route_ok -eq 1 && $fo_rule_ok -eq 1 \
-        && $fo_carried -eq 1 && $jumps_ok -eq 1 ]]; then
+        && $fo_carried -eq 1 && $jumps_ok -eq 1 && $direct_ok -eq 1 ]]; then
         printf '%s\n' "$XRAY_FAILOVER_TUNNEL" > "$TUN_DIR_FAILOVER_READY"
     else
         rm -f "$TUN_DIR_FAILOVER_READY"

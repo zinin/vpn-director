@@ -204,24 +204,47 @@ Single chain in mangle table:
 ```
 PREROUTING
     └─> TUN_DIR
+          ├─ src 192.168.50.0/24 -> PPE                         (Keenetic only)
+          ├─ src 192.168.50.0/24 + dst <country> -> MARK 0x200  (direct)
           ├─ src 192.168.50.0/24 + dst <country> -> RETURN
-          ├─ src 192.168.50.0/24 -> PPE                  (Keenetic only)
           ├─ src 192.168.50.0/24 -> MARK 0x10000 (wgc1)
+          ├─ src 192.168.1.5 -> PPE                             (Keenetic only)
+          ├─ src 192.168.1.5 + dst <country> -> MARK 0x200      (direct)
           ├─ src 192.168.1.5 + dst <country> -> RETURN
-          ├─ src 192.168.1.5 -> PPE                      (Keenetic only)
           ├─ src 192.168.1.5 -> MARK 0x20000 (ovpnc1)
-          ├─ ...                                         (OpenVPN0: MARK 0x30000)
+          ├─ ...                                                (OpenVPN0: MARK 0x30000)
+          ├─ src 192.168.1.30 -> PPE                            (Keenetic only)
+          ├─ src 192.168.1.30 + dst <country> -> MARK 0x200     (direct)
           ├─ src 192.168.1.30 + dst <country> -> RETURN
-          ├─ src 192.168.1.30 + dst 203.0.113.7 -> RETURN (an address in exclude)
-          ├─ src 192.168.1.30 -> PPE                     (Keenetic only)
+          ├─ src 192.168.1.30 + dst 203.0.113.7 -> MARK 0x200   (direct; an address in exclude)
+          ├─ src 192.168.1.30 + dst 203.0.113.7 -> RETURN
           └─ src 192.168.1.30 -> MARK 0x40000 (awg1)
 ```
 
 The routing table for each tunnel comes from `vpd_tunnel_table`: `IFTUNNEL_TABLE_BASE + idx` for
 an interface tunnel, the platform's `platform_tunnel_table` for any other id (Merlin: the id from
-`rt_tables`; Keenetic: `KEENETIC_TABLE_BASE + idx`). `platform_tunnel_offload_target`
-prints `PPE` on Keenetic (nothing, rc 1 on Merlin); `tunnel.sh` places that target
-inside `TUN_DIR` with the identical match immediately before `MARK`.
+`rt_tables`; Keenetic: `KEENETIC_TABLE_BASE + idx`).
+
+Each client's block opens with the offload opt-out: `platform_tunnel_offload_target` prints `PPE`
+on Keenetic (nothing, rc 1 on Merlin), and `tunnel.sh` gives it the `MARK` rule's match, ahead of
+the exclusions. No flow of a Tunnel Director client is accelerated, a client of `main` and the
+flows to excluded destinations included: the fast path routes a flow it took over by the ip
+rules alone, never by a mark, and the client's guard would take an accelerated flow to an
+excluded destination into the tunnel, where it dies. Every other device keeps its acceleration.
+
+Each exclusion sets the direct mark (`direct_mark`, `0x200`; see "Advanced Configuration") and
+returns, both with its own match. The direct rule sends the mark to main ahead of the guards,
+which a packet that returned bare would meet. A single `RETURN` on the direct mark would also
+return what `XRAY_TPROXY` marks direct: what Xray lets through of a client that is on a tunnel
+too would no longer reach the tunnel. `guard_direct_ensure` puts the direct rule in before
+anything a rebuild puts in, and at the head of the up-to-date path; a rebuild without it records
+no hash, and either path leaves the failover not ready.
+
+The hash input ends with the direct mark and `format: 2` (`_tunnel_format`). A new `direct_mark`
+rebuilds the chain in the same apply in which `guard_direct_ensure` takes the former direct rule
+away. A raised format makes the first apply after an upgrade that changes the rules a rebuild in
+place: the up-to-date path looks for the `MARK` rules alone and would leave the old ones - the
+bare `RETURN`s before format 2 - where they are.
 
 ## Advanced Configuration
 
@@ -381,7 +404,8 @@ cannot be installed, would otherwise send its clients through the previous owner
 slot's table is never released: it is carrying traffic.
 
 **Rebuild triggers**:
-- Config hash changed
+- Config hash changed (it covers the direct mark and the format of the rules too; see "Chain
+  Architecture")
 - Chain does not exist
 - `TUN_DIR_TABLES` is missing
 - A client's MARK rule is missing from the chain (`_tunnel_marks_present`)
@@ -433,6 +457,8 @@ From `lib/common.sh`: `log`, `tmp_file`, `compute_hash`, `is_lan_ip`
 From `lib/firewall.sh`: `swap_fw_chain`, `delete_fw_chain`, `ensure_fw_rule`, `sync_fw_rule`, `purge_fw_rules`, `find_fw_rules`, `fw_chain_exists`
 
 From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`, `TUN_DIR_TABLES`
+
+From `lib/guard.sh`: `guard_layout_check`, `guard_direct_mark_hex`, `guard_direct_ensure`
 
 Through the `vpd_*` layer of `lib/iftunnel.sh` (sourced by `common.sh`): `vpd_tunnels`,
 `vpd_tunnel_unlisted_reason`, `vpd_tunnel_table`, `vpd_tunnel_route_ensure`,
