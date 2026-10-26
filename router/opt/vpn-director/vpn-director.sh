@@ -161,6 +161,7 @@ _load_modules() {
     _load_common
     . "$SCRIPT_DIR/lib/firewall.sh"
     . "$SCRIPT_DIR/lib/config.sh"
+    . "$SCRIPT_DIR/lib/guard.sh"
     . "$SCRIPT_DIR/lib/ipset.sh" --source-only
     . "$SCRIPT_DIR/lib/tunnel.sh" --source-only
     . "$SCRIPT_DIR/lib/tproxy.sh" --source-only

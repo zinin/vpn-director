@@ -7,7 +7,7 @@ bats_require_minimum_version 1.5.0
 load '../test_helper'
 
 # Note: load_tunnel_module is provided by test_helper.bash
-# It loads: common.sh, config.sh, ipset.sh, firewall.sh, tunnel.sh
+# It loads: common.sh, config.sh, guard.sh, ipset.sh, firewall.sh, tunnel.sh
 
 # ============================================================================
 # _tunnel_table_allowed - validate routing tables
@@ -62,6 +62,7 @@ load '../test_helper'
 @test "tunnel_get_required_ipsets: handles empty tunnels gracefully" {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export TUN_DIR_TUNNELS_JSON='{}'
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"
     source "$LIB_DIR/ipset.sh" --source-only
@@ -234,6 +235,7 @@ marks_in_place() {
 @test "tunnel.sh: can be sourced with --source-only" {
     load_common
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     run source "$LIB_DIR/tunnel.sh" --source-only
     # Note: 'run source' doesn't work well, use direct sourcing
@@ -251,6 +253,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-invalid-string.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -268,6 +271,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-clients-string.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -287,6 +291,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-exclude-string.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -313,6 +318,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -341,6 +347,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -356,6 +363,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-overlapping.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -379,6 +387,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-nonexistent-ipset.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -447,6 +456,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     run tunnel_apply
@@ -466,6 +476,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 1; }
@@ -492,6 +503,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() {
@@ -527,6 +539,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     # Route must succeed so the up-to-date path is not already failing on
@@ -568,6 +581,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -608,6 +622,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -638,6 +653,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -677,6 +693,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -710,6 +727,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -732,6 +750,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     run tunnel_apply
@@ -753,6 +772,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -802,6 +822,7 @@ marks_in_place() {
 load_tunnel_module_with() {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export TUN_DIR_CHAIN=TUN_DIR
     export TUN_DIR_PREF_BASE=16384
     export TUN_DIR_MARK_MASK=0x00ff0000
@@ -893,6 +914,7 @@ load_tunnel_module_with() {
 @test "tunnel_apply: empty tunnels tears down previously applied Tunnel Director" {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export TUN_DIR_CHAIN=TUN_DIR
     export TUN_DIR_PREF_BASE=16384
     export TUN_DIR_MARK_MASK=0x00ff0000
@@ -1047,6 +1069,7 @@ load_tunnel_module_with() {
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
@@ -1060,6 +1083,7 @@ load_tunnel_module_with() {
 
 @test "_tunnel_gateway: drops a value that is not an IPv4 address with a WARN" {
     load_common
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
     # Bypass config.sh: the load-time filter would strip this key before the
     # apply-time belt sees it. config.bats covers that path.
@@ -1074,6 +1098,7 @@ load_tunnel_module_with() {
 # is the only thing between "10.8.0.999" and ip route.
 @test "_tunnel_gateway: drops an address whose octet is above 255 with a WARN" {
     load_common
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
     TUN_DIR_TUNNELS_JSON='{"wgc1":{"gateway":"10.8.0.999"}}'
     run --separate-stderr _tunnel_gateway wgc1
@@ -1088,6 +1113,7 @@ load_tunnel_module_with() {
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tunnel.sh" --source-only

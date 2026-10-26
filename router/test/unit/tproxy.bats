@@ -3,7 +3,7 @@
 load '../test_helper'
 
 # Note: load_tproxy_module is provided by test_helper.bash
-# It loads: common.sh, config.sh, ipset.sh, firewall.sh, tproxy.sh
+# It loads: common.sh, config.sh, guard.sh, ipset.sh, firewall.sh, tproxy.sh
 
 # ============================================================================
 # _tproxy_check_module - check xt_TPROXY kernel module
@@ -73,6 +73,7 @@ load '../test_helper'
     # This test uses a subshell to override XRAY_EXCLUDE_SETS
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     # Manually set XRAY_EXCLUDE_SETS before loading config
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"
     # Source tproxy with override
@@ -87,6 +88,7 @@ load '../test_helper'
 @test "tproxy_get_required_ipsets: drops an unknown country code with a WARN" {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"
     source "$LIB_DIR/ipset.sh" --source-only
     export XRAY_EXCLUDE_SETS="ru xx US"
@@ -100,6 +102,7 @@ load '../test_helper'
 @test "_tproxy_check_required_ipsets: ignores an unknown country code" {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"
     source "$LIB_DIR/ipset.sh" --source-only
     export XRAY_EXCLUDE_SETS="ru xx"
@@ -118,6 +121,7 @@ load '../test_helper'
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only
@@ -271,6 +275,7 @@ load '../test_helper'
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only
@@ -320,6 +325,7 @@ load '../test_helper'
     load_common
     source "$LIB_DIR/firewall.sh"
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
 
     # Create temp mock that always fails
@@ -350,6 +356,7 @@ EOF
     load_common
     source "$LIB_DIR/firewall.sh"
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
 
     # Create temp mock that returns nothing for ipset list
@@ -394,6 +401,7 @@ EOF
 @test "tproxy.sh: can be sourced with --source-only" {
     load_common
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tproxy.sh" --source-only
@@ -656,6 +664,7 @@ duplicate_last_rule() {
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only
@@ -1074,6 +1083,7 @@ load_tproxy_module_with_clients() {
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only

@@ -137,6 +137,7 @@ load_ipset_module() {
 load_tunnel_module() {
     load_common
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
@@ -146,6 +147,7 @@ load_tunnel_module() {
 load_tproxy_module() {
     load_common
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only

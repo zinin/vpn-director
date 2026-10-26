@@ -81,6 +81,21 @@ load 'test_helper'
     [[ $TUN_DIR_PREF_BASE == "16384" ]]
 }
 
+# Installs from before the setting have no such key.
+@test "config.sh: TUN_DIR_DIRECT_MARK defaults to 0x200" {
+    load_config
+    [ "$(jq '.advanced.tunnel_director | has("direct_mark")' "$VPD_CONFIG_FILE")" = "false" ]
+    [ "$TUN_DIR_DIRECT_MARK" = "0x200" ]
+}
+
+@test "config.sh: loads advanced.tunnel_director.direct_mark" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-direct-mark.json"
+    jq '.advanced.tunnel_director.direct_mark = "0x400"' "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ "$TUN_DIR_DIRECT_MARK" = "0x400" ]
+}
+
 # ============================================================================
 # config.sh: error handling
 # ============================================================================

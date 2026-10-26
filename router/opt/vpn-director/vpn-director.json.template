@@ -40,7 +40,8 @@
       "chain": "TUN_DIR",
       "pref_base": 16384,
       "mark_mask": "0x00ff0000",
-      "mark_shift": 16
+      "mark_shift": 16,
+      "direct_mark": "0x200"
     },
     "boot": {
       "min_time": 120,
