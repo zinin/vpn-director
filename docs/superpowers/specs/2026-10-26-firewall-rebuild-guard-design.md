@@ -249,9 +249,10 @@ break"): a protected client never loses its guard while it is protected.
   under a 24-second timeout, and every millisecond is part of the window. The full `--wait apply`
   follows, detached as today, and reconciles everything the snapshot may have had stale.
 - iptables-restore with `--noflush` flushes and refills a user chain it declares that already exists in
-  the same commit, which is what Merlin's emptied chains need. PREROUTING jumps go in as inserts at
-  their positions: on Merlin `TUN_DIR`'s position depends on the firmware's iface-mark rules
-  (`platform_prerouting_base_pos`) and is computed at restore time.
+  the same commit, which is what Merlin's emptied chains need. PREROUTING jumps go in as inserts at the
+  top, Xray's first (my call): on Merlin that puts `TUN_DIR`'s jump ahead of the firmware's iface-mark
+  rules, which match other interfaces, and the rebuild that follows the restore puts it back at
+  `platform_prerouting_base_pos`.
 - A restore drops Tunnel Director's hash (`tun_dir_rules.sha256`), so the apply that follows is a
   rebuild: the up-to-date path looks for MARK rules only, and anything stale the snapshot brought back
   would otherwise stay (my call). `tproxy_apply` rebuilds its chain on every apply anyway.
