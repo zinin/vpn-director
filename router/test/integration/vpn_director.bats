@@ -1113,6 +1113,38 @@ applied_then_moved_by_hand() {
     done
 }
 
+# What an apply leaves and a stop takes, through the CLI with the real modules on the stateful
+# mocks: the fixture's client of wgc1 and its Xray client. The apply puts in both chains, the
+# direct rule, both owners' guards, their records and the snapshot. An older release knows none of
+# them, so going back to one starts with this stop: afterwards nothing is at 16894-16898, neither
+# chain exists, and no snapshot or record is left.
+@test "vpn-director: stop takes away what an apply put in: chains, direct rule, guards, records, snapshot" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    iptables -t mangle -S XRAY_TPROXY >/dev/null
+    iptables -t mangle -S TUN_DIR >/dev/null
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_line --regexp '^16895:	from 192\.168\.50\.0/24 iif br0 '
+    assert_line --regexp '^16897:	from 192\.168\.1\.100 iif br0 prohibit$'
+    [ -f "$GUARD_STATE_DIR/direct" ]
+    [ -f "$GUARD_STATE_DIR/tunnel" ]
+    [ -f "$GUARD_STATE_DIR/xray" ]
+    [ -f "$FWSNAP_DIR/mangle.rules" ]
+
+    run_cli stop
+    assert_success
+    run ip rule show
+    refute_line --regexp '^1689[4-8]:'
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_failure
+    run iptables -t mangle -S TUN_DIR
+    assert_failure
+    [ -z "$(find "$FWSNAP_DIR" "$GUARD_STATE_DIR" -type f 2>/dev/null)" ]
+}
+
 # Only path declarations are rehomed; init control flow remains production code.
 watchd_init_sandbox() {
     export WATCHD_TEST_BIN="$BATS_TEST_TMPDIR/watchd-bin"
