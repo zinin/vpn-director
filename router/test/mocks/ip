@@ -93,9 +93,13 @@ _table_name() {
 # iproute2's order: from (all when none was given), to, fwmark, iif, then the
 # lookup - or an action such as prohibit in its place. An address ending in /32
 # loses it: the kernel keeps a host, and iproute2 prints a host without a length.
+# One ending in /0 is no selector to the kernel: "from x/0" reads back as
+# "from all", and "to x/0" not at all.
 _rule_line() {
-    local from="${_from:-all}" sel
-    sel="from ${from%/32}${_to:+ to ${_to%/32}}${_fwmark:+ fwmark $_fwmark}${_iif:+ iif $_iif}"
+    local from="${_from:-all}" to="$_to" sel
+    [[ $from != */0 ]] || from=all
+    [[ $to != */0 ]] || to=""
+    sel="from ${from%/32}${to:+ to ${to%/32}}${_fwmark:+ fwmark $_fwmark}${_iif:+ iif $_iif}"
     if [[ -n $_action ]]; then
         printf '%s:\t%s %s' "$_pref" "$sel" "$_action"
     else

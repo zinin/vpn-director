@@ -15,14 +15,32 @@
 #   Both chains set the direct mark on what they let go direct, and the direct rule - "fwmark
 #   <mark>/<mark> lookup main", right after Tunnel Director's block range - sends that to main
 #   ahead of every guard. Both modules need it, so it lives here, and it stays while either has a
-#   chain or a guard (guard_direct_release). Its preference is this layer's: whatever else sits
-#   there - the rule of an earlier direct_mark among them - goes once the rule is in.
+#   chain or a guard (guard_direct_release). At its preference it stands alone: once it is in, the
+#   rule of an earlier direct_mark goes, and so does any guard there - a former layout's.
 #
 #   Preferences, with field_max = mark_mask >> mark_shift (255 by default): the direct rule at
 #   pref_base + 2 * field_max (16894), Tunnel Director's guards at the next two (16895, 16896),
 #   Xray's at the two after them (16897, 16898). An owner's guards sit at one of its two
 #   preferences, and while a changed list goes in at one, the list at the other goes on guarding
 #   (guard_sync).
+#
+#   What this layer owns at a preference is a shape (_guard_is): at a direct rule's preference,
+#   "from all fwmark <m>/<m> lookup main"; at an owner's, a guard - a rule with iif and without
+#   fwmark. It lists, compares and deletes nothing else: a rule of another shape there is its
+#   owner's, such as a slot rule of Tunnel Director's that a change of pref_base leaves for a
+#   moment on what is a guard preference now. Nothing at 32766 or above is touched: main's rule
+#   and default's are there, and stop runs with whatever pref_base the configuration holds.
+#
+#   The preferences move with pref_base, mark_mask and mark_shift, and the rules at the former ones
+#   would stay for good: after a raise past the lookup range, the direct rule would send a packet
+#   that carries a tunnel's mark beside the direct bit to main, and the guards would route every
+#   packet of their clients whatever its mark. So each kind - direct, tunnel, xray - has a record
+#   in GUARD_STATE_DIR of the preferences its rules last went in at. Once the rules are in at the
+#   current ones, those at the recorded ones go, and guard_clear and guard_direct_release take
+#   both, the record with them. A pref_base moved by less than five puts a former preference of
+#   one kind on a current one of another: the guards there are the other kind's to take, as its
+#   own (_guard_release_former), and a former direct rule there goes with guard_direct_ensure, no
+#   rule of another kind having its shape.
 #
 # Dependencies:
 #   - common.sh (log, rt_table_label)
@@ -32,24 +50,33 @@
 #                when this file is sourced. Each TUN_DIR_* setting has its default here, so a test
 #                that skips config.sh can call everything; an XRAY_* one that is unset or empty is
 #                no Xray to look at.
+#   - GUARD_STATE_DIR: the directory of the records, /tmp/vpn-director/guards unless set. /tmp
+#     goes at a reboot, as the ip rules do.
 #
 # Public API:
 #   guard_direct_pref          - the preference of the direct rule
 #   guard_owner_prefs <owner>  - the two preferences of an owner's guards (tunnel, xray)
 #   guard_direct_mark_hex      - the direct mark as ip prints it
 #   guard_layout_check         - refuse a direct mark or guard preferences that cannot work
-#   guard_direct_ensure        - the direct rule, put in when it is not listed
+#   guard_direct_ensure        - the direct rule, alone at its preference; a former one goes
 #   guard_direct_release       - remove the direct rule once neither module needs it
 #   guard_sync <owner> <lines> - make an owner's guards exactly <lines>, make before break
-#   guard_clear <owner>        - remove an owner's guards
+#   guard_clear <owner>        - remove an owner's guards, at its former preferences too
 #   guard_list <owner>         - print an owner's guards as "ip rule show" lists them
 #
 # Internal functions (for testing):
 #   _guard_direct_mark()       - the direct mark as a number; rc 1 for a value that is none
 #   _guard_norm()              - an ip rule's selectors as they compare
-#   _guard_listed()            - the rules a listing holds at one preference, as they compare
+#   _guard_is()                - is a rule of a shape this layer owns: the direct rule's, a guard?
+#   _guard_client()            - the client a guard is for: its from and its iif
+#   _guard_listed()            - the rules of a shape a listing holds at one preference
 #   _guard_in_order()          - are the rules of one list rules of another, in its order?
-#   _guard_pref_clear()        - delete the rules a listing holds at one preference
+#   _guard_pref_clear()        - delete the rules of a shape a listing holds at one preference
+#   _guard_current_prefs()     - the preferences of every kind, as the settings put them now
+#   _guard_record()            - the preferences a kind's rules last went in at
+#   _guard_record_set()        - record them
+#   _guard_record_drop()       - remove a kind's record
+#   _guard_release_former()    - delete what a kind left at the preferences its record names
 ###################################################################################################
 
 # -------------------------------------------------------------------------------------------------
@@ -80,18 +107,33 @@ _guard_direct_mark() {
 
 # _guard_norm <var> <selectors> - set <var> to an ip rule's selectors as they compare: split at
 # tabs and runs of spaces, ends trimmed (iproute2 4.4 ends each rule with a space), "/32" dropped
-# after from and to (the kernel keeps a host, and iproute2 prints it without a length), a lookup
-# table as rt_table_label prints it (table 111 reads back as "lookup wgc1" on Asuswrt-Merlin).
-# Only a number goes to rt_table_label: it prints a name as given, and each lookup is a process.
-# The locals carry a _gn_ prefix, so none of them can stand in for the caller's <var>.
+# after from and to (the kernel keeps a host, and iproute2 prints it without a length), a prefix
+# of length 0 written as the kernel lists it ("from x/0" as "from all", "to x/0" not at all), a
+# lookup table as rt_table_label prints it (table 111 reads back as "lookup wgc1" on
+# Asuswrt-Merlin). Only a number goes to rt_table_label: it prints a name as given, and each
+# lookup is a process. The locals carry a _gn_ prefix, so none of them can stand in for the
+# caller's <var>.
 _guard_norm() {
     local -a _gn_words=()
     local _gn_w _gn_prev="" _gn_out=""
     read -ra _gn_words <<< "$2"
     for _gn_w in ${_gn_words[@]+"${_gn_words[@]}"}; do
         case "$_gn_prev" in
-            from|to) _gn_w=${_gn_w%/32} ;;
-            lookup)  [[ ! $_gn_w =~ ^[0-9]+$ ]] || _gn_w=$(rt_table_label "$_gn_w") ;;
+            from|to)
+                _gn_w=${_gn_w%/32}
+                if [[ $_gn_w == */0 && $_gn_prev == from ]]; then
+                    _gn_w=all
+                elif [[ $_gn_w == */0 ]]; then
+                    # "to" is written already: it goes, and the address with it.
+                    _gn_out=${_gn_out%to}
+                    _gn_out=${_gn_out% }
+                    _gn_prev=""
+                    continue
+                fi
+                ;;
+            lookup)
+                [[ ! $_gn_w =~ ^[0-9]+$ ]] || _gn_w=$(rt_table_label "$_gn_w")
+                ;;
         esac
         _gn_out+="${_gn_out:+ }$_gn_w"
         _gn_prev=$_gn_w
@@ -99,16 +141,59 @@ _guard_norm() {
     printf -v "$1" '%s' "$_gn_out"
 }
 
-# _guard_listed <var> <pref> <rules> - set <var> to the rules the listing <rules> holds at <pref>,
-# each as _guard_norm writes it, one per line in the order listed: the order the kernel tries them
-# in. Empty when there are none.
+# _guard_is <shape> <selectors> - is the rule of <shape>, one of the two this layer owns? direct:
+# "from all fwmark <m>/<m> lookup main", value and mask equal, the shape of the direct rule. guard:
+# a rule with iif and without fwmark. main's, default's and local's rules carry no iif, so
+# "from all lookup main" is no guard, while the "from all iif br0 ..." of a /0 client is one.
+# <selectors> as listed or as _guard_norm writes them: neither shape rests on what it changes.
+_guard_is() {
+    local rule direct_re='^from all fwmark (0x[0-9a-f]+)/(0x[0-9a-f]+) lookup main$'
+    local -a words=()
+    read -ra words <<< "$2"
+    [[ ${#words[@]} -gt 0 ]] || return 1
+    rule="${words[*]}"
+    case "$1" in
+        direct)
+            [[ $rule =~ $direct_re && ${BASH_REMATCH[1]} == "${BASH_REMATCH[2]}" ]]
+            ;;
+        guard)
+            [[ " $rule " == *" iif "* && " $rule " != *" fwmark "* ]]
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# _guard_client <var> <rule> - set <var> to the client a guard (as _guard_norm writes it) is for:
+# its from and its iif, as "<from> <iif>". The locals carry a _gc_ prefix, as _guard_norm's do.
+_guard_client() {
+    local -a _gc_words=()
+    local _gc_w _gc_prev="" _gc_from="" _gc_iif=""
+    read -ra _gc_words <<< "$2"
+    for _gc_w in ${_gc_words[@]+"${_gc_words[@]}"}; do
+        case "$_gc_prev" in
+            from) _gc_from=$_gc_w ;;
+            iif)  _gc_iif=$_gc_w ;;
+        esac
+        _gc_prev=$_gc_w
+    done
+    printf -v "$1" '%s %s' "$_gc_from" "$_gc_iif"
+}
+
+# _guard_listed <var> <pref> <rules> <shape> - set <var> to the rules of <shape> (_guard_is) the
+# listing <rules> holds at <pref>, each as _guard_norm writes it, one per line in the order listed:
+# the order the kernel tries them in. Empty when there are none, and at a <pref> from 32766 on.
 _guard_listed() {
     local _gl_line _gl_norm _gl_out=""
-    while IFS= read -r _gl_line; do
-        [[ $_gl_line == "$2:"* ]] || continue
-        _guard_norm _gl_norm "${_gl_line#*:}"
-        _gl_out+="$_gl_norm"$'\n'
-    done <<< "$3"
+    if (( $2 < 32766 )); then
+        while IFS= read -r _gl_line; do
+            [[ $_gl_line == "$2:"* ]] || continue
+            _guard_is "$4" "${_gl_line#*:}" || continue
+            _guard_norm _gl_norm "${_gl_line#*:}"
+            _gl_out+="$_gl_norm"$'\n'
+        done <<< "$3"
+    fi
     printf -v "$1" '%s' "$_gl_out"
 }
 
@@ -129,25 +214,96 @@ _guard_in_order() {
     (( i == ${#part[@]} ))
 }
 
-# _guard_pref_clear <pref> <rules> [<keep>] - delete every rule the listing <rules> holds at <pref>
-# but one that reads <keep> (as _guard_norm writes it), one by one, each by its full selector as
-# listed: a delete takes the rule it names or none, where "ip rule del pref <pref>" alone takes
-# whichever rule is first there by then. One that does not go is logged and costs nothing else.
+# _guard_pref_clear <pref> <rules> <shape> [<keep>] - delete every rule of <shape> the listing
+# <rules> holds at <pref> but those <keep> holds (rules one per line, as _guard_norm writes them),
+# one by one, each by its full selector as listed: a delete takes the rule it names or none, where
+# "ip rule del pref <pref>" alone takes whichever rule is first there by then. One that does not
+# go is logged and costs nothing else. A rule of another shape stays, and nothing goes at a <pref>
+# from 32766 on.
 _guard_pref_clear() {
-    local line norm
+    local line norm keep=$'\n'"${4:-}"$'\n'
     local -a sel=()
+    (( $1 < 32766 )) || return 0
     while IFS= read -r line; do
         [[ $line == "$1:"* ]] || continue
-        if [[ -n ${3:-} ]]; then
+        _guard_is "$3" "${line#*:}" || continue
+        if [[ -n ${4:-} ]]; then
             _guard_norm norm "${line#*:}"
-            [[ $norm != "$3" ]] || continue
+            [[ $keep != *$'\n'"$norm"$'\n'* ]] || continue
         fi
         read -ra sel <<< "${line#*:}"
-        [[ ${#sel[@]} -gt 0 ]] || continue
         if ! ip rule del pref "$1" "${sel[@]}" 2>/dev/null; then
             log -l WARN "The ip rule at pref $1 did not go: ${sel[*]}"
         fi
     done <<< "$2"
+    return 0
+}
+
+# _guard_current_prefs - the preferences of every kind as the settings put them now, on one line:
+# the direct rule's, Tunnel Director's two, Xray's two.
+_guard_current_prefs() {
+    local direct
+    direct=$(guard_direct_pref)
+    printf '%d %d %d %d %d\n' "$direct" $((direct + 1)) $((direct + 2)) \
+        $((direct + 3)) $((direct + 4))
+}
+
+# _guard_record <kind> - print the preferences the record of <kind> (direct, tunnel, xray) names,
+# on one line: where its rules last went in. Nothing when there is no record; a word that is no
+# preference is left out.
+_guard_record() {
+    local file="${GUARD_STATE_DIR:-/tmp/vpn-director/guards}/$1" line="" w out=""
+    local -a words=()
+    [[ -f $file ]] || return 0
+    { IFS= read -r line < "$file"; } 2>/dev/null || true
+    read -ra words <<< "$line"
+    for w in ${words[@]+"${words[@]}"}; do
+        [[ ! $w =~ ^[1-9][0-9]{0,9}$ ]] || out+="${out:+ }$w"
+    done
+    [[ -z $out ]] || printf '%s\n' "$out"
+}
+
+# _guard_record_set <kind> <prefs> - record that the rules of <kind> went in at <prefs>: through a
+# file beside the record and a rename, and only when that changes it. The directory is made 0755
+# whatever the umask, and so is its parent: /tmp/vpn-director is also watchd's runtime directory.
+# A write that fails is a WARN and nothing else: the next change of pref_base then finds no former
+# preferences to release.
+_guard_record_set() {
+    local dir="${GUARD_STATE_DIR:-/tmp/vpn-director/guards}" file
+    file="$dir/$1"
+    [[ $(_guard_record "$1") != "$2" ]] || return 0
+    # shellcheck disable=SC2174  # each directory named is the deepest of its own path: both get -m
+    if ! { { [[ -d $dir ]] || mkdir -p -m 755 "${dir%/*}" "$dir"; } &&
+        printf '%s\n' "$2" > "$file.new" && mv -f "$file.new" "$file"; } 2>/dev/null; then
+        rm -f "$file.new" 2>/dev/null || true
+        log -l WARN "Guards: cannot record preferences $2 in $file; after a change of pref_base their rules stay"
+    fi
+    return 0
+}
+
+# _guard_record_drop <kind> - remove the record of <kind>, its rules gone.
+_guard_record_drop() {
+    local file="${GUARD_STATE_DIR:-/tmp/vpn-director/guards}/$1"
+    [[ ! -e $file ]] || rm -f "$file" 2>/dev/null || true
+}
+
+# _guard_release_former <kind> <shape> <rules> - delete the rules of <shape> (_guard_pref_clear)
+# the listing <rules> holds at each preference the record of <kind> names, but at a current
+# preference of any kind (_guard_current_prefs). The kind's own current ones are its to reconcile
+# as such. A pref_base moved by less than five puts a former preference of one kind on a current
+# one of another, and released there, its rules would go with that kind's live ones - "stop xray"
+# taking Tunnel Director's guards. The kind that holds it now takes it instead: an owner's sync
+# lists every guard at its preferences as its own and replaces them make before break, and
+# guard_direct_ensure deletes every guard at the direct rule's.
+_guard_release_former() {
+    local current p
+    local -a recorded=()
+    read -ra recorded <<< "$(_guard_record "$1")"
+    current=" $(_guard_current_prefs) "
+    for p in ${recorded[@]+"${recorded[@]}"}; do
+        [[ $current == *" $p "* ]] || _guard_pref_clear "$p" "$3" "$2"
+    done
+    return 0
 }
 
 ###################################################################################################
@@ -234,29 +390,49 @@ guard_layout_check() {
 # "<pref>: from all fwmark <mark>/<mark> lookup main", put in when it is not listed and left alone
 # when it is: deleting and re-adding it is a window in which what the chains mark direct meets the
 # guards - an Xray client's excluded traffic refused, a tunnel client's taken into its tunnel. Once
-# it is in, every other rule at its preference goes, each by its full selector: the preference is
-# this layer's, and a module reconciles a preference it owns (shell-conventions.md, "`ip rule show`
-# prints the table by name"). The rule of an earlier direct_mark would otherwise route a mark
-# nothing sets any more for good, and outlive stop. Whether a rule is listed is read from the whole
-# listing. Returns 1 with an ERROR when the rule did not go in, the other rules left as they are.
+# it is in, every other rule of its shape at its preference goes: the rule of an earlier
+# direct_mark would otherwise route a mark nothing sets any more for good, and outlive stop. So
+# does every guard there: none belongs there, so any is a former layout's - a pref_base raised by
+# one or two puts the direct rule on Tunnel Director's former guards - and, tried ahead of the
+# rule, it would take what the chains mark direct. Then the rules of its shape go at the
+# preference the record names, when that is another one: after a raise of pref_base the former
+# rule sits ahead of the new lookup range, and sends a packet that carries a tunnel's mark beside
+# the direct bit to main. They go even where that preference is another kind's now: no rule of
+# that kind has their shape, and nothing else would take them. Each goes by its full selector, a
+# rule of another shape stays, and the record then names the current preference. Whether a rule is
+# listed is read from the whole listing; one that fails releases nothing. Returns 1 when the rule
+# did not go in - an ERROR, or a WARN for a preference from main's rule (32766) on - with nothing
+# deleted and the record as it was.
 # -------------------------------------------------------------------------------------------------
 guard_direct_ensure() {
-    local pref mark rules listed want
+    local pref mark rules listed want p listed_ok=1
+    local -a recorded=()
     pref=$(guard_direct_pref)
     if ! mark=$(guard_direct_mark_hex); then
         log -l ERROR "Guards: the direct rule did not go in (pref $pref): advanced.tunnel_director.direct_mark '${TUN_DIR_DIRECT_MARK:-}' is no mark"
         return 1
     fi
+    if (( pref >= 32766 )); then
+        log -l WARN "Guards: the direct rule not put in: pref $pref reaches main's rule (32766)"
+        return 1
+    fi
     want="from all fwmark $mark/$mark lookup main"
-    rules=$(ip rule show 2>/dev/null) || rules=""
-    _guard_listed listed "$pref" "$rules"
+    rules=$(ip rule show 2>/dev/null) || { rules=""; listed_ok=0; }
+    _guard_listed listed "$pref" "$rules" direct
     if [[ $'\n'$listed != *$'\n'"$want"$'\n'* ]]; then
         if ! ip rule add pref "$pref" fwmark "$mark/$mark" lookup main 2>/dev/null; then
             log -l ERROR "Guards: the direct rule did not go in (pref $pref, $want); what the chains mark direct meets the guards instead"
             return 1
         fi
     fi
-    _guard_pref_clear "$pref" "$rules" "$want"
+    [[ $listed_ok -eq 1 ]] || return 0
+    _guard_pref_clear "$pref" "$rules" direct "$want"
+    _guard_pref_clear "$pref" "$rules" guard
+    read -ra recorded <<< "$(_guard_record direct)"
+    for p in ${recorded[@]+"${recorded[@]}"}; do
+        [[ $p == "$pref" ]] || _guard_pref_clear "$p" "$rules" direct
+    done
+    _guard_record_set direct "$pref"
     return 0
 }
 
@@ -264,24 +440,30 @@ guard_direct_ensure() {
 # guard_direct_release - remove the direct rule once neither module needs it
 # -------------------------------------------------------------------------------------------------
 # Only when neither TUN_DIR_CHAIN nor XRAY_CHAIN is in mangle - either could still mark a packet
-# direct - and neither owner's preferences hold a rule, which would take such a packet instead.
-# Then every rule at the direct rule's preference goes, the rule of an earlier direct_mark too.
-# Each module's stop calls it once its own chain and guards are gone, so the one that stops last
+# direct - and no guard is listed at either owner's preferences, current or recorded, which would
+# take such a packet instead. Then every rule of its shape goes, at its preference and at the one
+# its record names unless another kind holds that now (_guard_release_former) - the rule of an
+# earlier direct_mark too, and that of a former pref_base - and the record with them. Each
+# module's stop calls it once its own chain and guards are gone, so the one that stops last
 # removes it. A listing that fails says nothing about the guards, and the rule stays. Returns 0.
 # -------------------------------------------------------------------------------------------------
 guard_direct_release() {
-    local rules p
+    local rules owners p listed
     local -a prefs=()
     fw_chain_exists mangle "${TUN_DIR_CHAIN:-TUN_DIR}" && return 0
     if [[ -n ${XRAY_CHAIN:-} ]] && fw_chain_exists mangle "$XRAY_CHAIN"; then
         return 0
     fi
     rules=$(ip rule show 2>/dev/null) || return 0
-    read -ra prefs <<< "$(guard_owner_prefs tunnel) $(guard_owner_prefs xray)"
+    owners="$(guard_owner_prefs tunnel) $(guard_owner_prefs xray)"
+    read -ra prefs <<< "$owners $(_guard_record tunnel) $(_guard_record xray)"
     for p in "${prefs[@]}"; do
-        [[ $'\n'$rules != *$'\n'"$p:"* ]] || return 0
+        _guard_listed listed "$p" "$rules" guard
+        [[ -z $listed ]] || return 0
     done
-    _guard_pref_clear "$(guard_direct_pref)" "$rules"
+    _guard_pref_clear "$(guard_direct_pref)" "$rules" direct
+    _guard_release_former direct direct "$rules"
+    _guard_record_drop direct
     return 0
 }
 
@@ -290,9 +472,10 @@ guard_direct_release() {
 # -------------------------------------------------------------------------------------------------
 # <lines>: ip rule selectors, one per line, in the order they are to match - such as
 # "from 192.168.1.5 iif br0 lookup wgc1". Afterwards one of the owner's two preferences holds them
-# in that order and the other holds nothing. The kernel tries the rules of one preference in the
+# in that order and the other holds no guard. The kernel tries the rules of one preference in the
 # order they went in, and puts a new one after them, so the list is written at one preference while
-# the other goes on guarding. Which one is decided by what each holds:
+# the other goes on guarding. Which one is decided by the guards each holds - every guard there,
+# those another kind's former layout left included (_guard_release_former):
 #
 #   1. One that holds exactly <lines> keeps them, and the other is cleared: an unchanged list adds
 #      and deletes nothing.
@@ -306,18 +489,25 @@ guard_direct_release() {
 #      only the cleared list guarded - one new since that other list - is without a guard from
 #      its delete to its add.
 #
-# Only once every line is in does the other preference go. A refused line leaves it, with an ERROR
-# and rc 1, and so does every later sync of that list while the refusal lasts - each finds its own
-# partial list by 2 or 3 - so a client whose new guard is refused keeps its old one.
+# Only once every line is in does the other preference go, and with it the guards at the
+# preferences the record names (_guard_release_former): after a change of pref_base they would
+# route every packet of their clients whatever its mark. The record then names the current two.
+# A refused line leaves both, and the record, with an ERROR and rc 1, and so does every later sync
+# of that list while the refusal lasts - each finds its own partial list by 2 or 3 - so a client
+# whose new guard is refused keeps its old one. A client <lines> no longer names - no line with
+# its from and iif - loses its guards at the other preference all the same: nothing protects it
+# any more, and they would go on routing it while the refusal lasts. A preference from main's rule
+# (32766) on takes no line: a WARN and rc 1.
 #
 # The listing is read once, whole (shell-conventions.md: never "ip rule show pref N", never piped
 # into "grep -q"); one that fails changes nothing and returns 1. Lines compare as _guard_norm
-# writes them, so a host written x/32, or a table given by its number, reads as the kernel lists
-# it. A line given twice goes in once, where it came first: the kernel refuses an identical rule
-# (EEXIST), and an older kernel keeps it as a second copy.
+# writes them, so a host written x/32, a prefix of length 0, or a table given by its number, reads
+# as the kernel lists it. A line given twice goes in once, where it came first: the kernel refuses
+# an identical rule (EEXIST), and an older kernel keeps it as a second copy.
 # -------------------------------------------------------------------------------------------------
 guard_sync() {
-    local owner="${1:-}" lines="${2:-}" prefs p0 p1 rules want="" norm line l0 l1 n0 n1 t o
+    local owner="${1:-}" lines="${2:-}" prefs p0 p1 rules want="" clients="" norm key line
+    local l0 l1 lo n0 n1 t o keep=""
     local i=0 rc=0 pre0=0 pre1=0 sub0=0 sub1=0 first=0
     local -a add=() sel=()
     prefs=$(guard_owner_prefs "$owner") || return 1
@@ -330,74 +520,91 @@ guard_sync() {
         _guard_norm norm "$line"
         [[ -n $norm && $'\n'$want != *$'\n'"$norm"$'\n'* ]] || continue
         want+="$norm"$'\n'
+        _guard_client key "$norm"
+        clients+="$key"$'\n'
         add+=("$line")
     done <<< "$lines"
-    _guard_listed l0 "$p0" "$rules"
-    _guard_listed l1 "$p1" "$rules"
+    _guard_listed l0 "$p0" "$rules" guard
+    _guard_listed l1 "$p1" "$rules" guard
 
-    # 1. In place already.
     if [[ $l0 == "$want" ]]; then
-        _guard_pref_clear "$p1" "$rules"
-        return 0
-    fi
-    if [[ $l1 == "$want" ]]; then
-        _guard_pref_clear "$p0" "$rules"
-        return 0
-    fi
-
-    # How many rules each preference holds: a newline ends each.
-    n0=${l0//[!$'\n']/} n1=${l1//[!$'\n']/}
-    n0=${#n0} n1=${#n1}
-    if [[ $want == "$l0"* ]]; then
-        pre0=1
-    fi
-    if [[ $want == "$l1"* ]]; then
-        pre1=1
-    fi
-    if (( pre0 && (!pre1 || n0 >= n1) )); then
-        # 2. The rest appended where the start is: the first preference...
-        t=$p0 o=$p1 i=$n0
-    elif (( pre1 )); then
+        # 1. In place already: the first preference...
+        t=$p0 o=$p1 lo=$l1 i=${#add[@]}
+    elif [[ $l1 == "$want" ]]; then
         # ...or the second.
-        t=$p1 o=$p0 i=$n1
+        t=$p1 o=$p0 lo=$l0 i=${#add[@]}
     else
-        # 3. Written anew where a part of it is, or where fewer rules are.
-        if _guard_in_order "$l0" "$want"; then
-            sub0=1
+        # How many rules each preference holds: a newline ends each.
+        n0=${l0//[!$'\n']/} n1=${l1//[!$'\n']/}
+        n0=${#n0} n1=${#n1}
+        if [[ $want == "$l0"* ]]; then
+            pre0=1
         fi
-        if _guard_in_order "$l1" "$want"; then
-            sub1=1
+        if [[ $want == "$l1"* ]]; then
+            pre1=1
         fi
-        if (( sub0 != sub1 )); then
-            first=$sub0
-        elif (( n0 < n1 )); then
-            first=1
-        fi
-        if (( first )); then
-            t=$p0 o=$p1
+        if (( pre0 && (!pre1 || n0 >= n1) )); then
+            # 2. The rest appended where the start is: the first preference...
+            t=$p0 o=$p1 lo=$l1 i=$n0
+        elif (( pre1 )); then
+            # ...or the second.
+            t=$p1 o=$p0 lo=$l0 i=$n1
         else
-            t=$p1 o=$p0
+            # 3. Written anew where a part of it is, or where fewer rules are.
+            if _guard_in_order "$l0" "$want"; then
+                sub0=1
+            fi
+            if _guard_in_order "$l1" "$want"; then
+                sub1=1
+            fi
+            if (( sub0 != sub1 )); then
+                first=$sub0
+            elif (( n0 < n1 )); then
+                first=1
+            fi
+            if (( first )); then
+                t=$p0 o=$p1 lo=$l1
+            else
+                t=$p1 o=$p0 lo=$l0
+            fi
+            _guard_pref_clear "$t" "$rules" guard
         fi
-        _guard_pref_clear "$t" "$rules"
     fi
 
-    for (( ; i < ${#add[@]}; i++ )); do
-        read -ra sel <<< "${add[i]}"
-        if ! ip rule add pref "$t" "${sel[@]}" 2>/dev/null; then
-            log -l ERROR "Guard of $owner not installed at pref $t: ${sel[*]}"
-            rc=1
-        fi
-    done
-    [[ $rc -eq 0 ]] || return 1
-    _guard_pref_clear "$o" "$rules"
+    if (( i < ${#add[@]} && t >= 32766 )); then
+        log -l WARN "Guards of $owner not installed: pref $t reaches main's rule (32766)"
+        rc=1
+    else
+        for (( ; i < ${#add[@]}; i++ )); do
+            read -ra sel <<< "${add[i]}"
+            if ! ip rule add pref "$t" "${sel[@]}" 2>/dev/null; then
+                log -l ERROR "Guard of $owner not installed at pref $t: ${sel[*]}"
+                rc=1
+            fi
+        done
+    fi
+    if [[ $rc -ne 0 ]]; then
+        while IFS= read -r norm; do
+            [[ -n $norm ]] || continue
+            _guard_client key "$norm"
+            [[ $'\n'$clients != *$'\n'"$key"$'\n'* ]] || keep+="$norm"$'\n'
+        done <<< "$lo"
+        _guard_pref_clear "$o" "$rules" guard "$keep"
+        return 1
+    fi
+    _guard_pref_clear "$o" "$rules" guard
+    _guard_release_former "$owner" guard "$rules"
+    _guard_record_set "$owner" "$p0 $p1"
     return 0
 }
 
 # -------------------------------------------------------------------------------------------------
 # guard_clear <owner> - remove an owner's guards
 # -------------------------------------------------------------------------------------------------
-# Every rule at the owner's two preferences, each by its full selector (_guard_pref_clear). A rule
-# at any other preference stays, the direct rule too (guard_direct_release). Returns 0.
+# Every guard at the owner's two preferences and at those its record names (_guard_release_former),
+# each by its full selector (_guard_pref_clear), then the record. A rule of another shape stays, and
+# so does every rule at any other preference, the direct rule too (guard_direct_release). A listing
+# that fails removes nothing, the record neither. Returns 0.
 # -------------------------------------------------------------------------------------------------
 guard_clear() {
     local prefs p0 p1 rules
@@ -407,15 +614,18 @@ guard_clear() {
         log -l WARN "Guards of $1: cannot list the ip rules; none removed"
         return 0
     fi
-    _guard_pref_clear "$p0" "$rules"
-    _guard_pref_clear "$p1" "$rules"
+    _guard_pref_clear "$p0" "$rules" guard
+    _guard_pref_clear "$p1" "$rules" guard
+    _guard_release_former "$1" guard "$rules"
+    _guard_record_drop "$1"
     return 0
 }
 
 # -------------------------------------------------------------------------------------------------
 # guard_list <owner> - print an owner's guards as "ip rule show" lists them
 # -------------------------------------------------------------------------------------------------
-# The rules at the owner's two preferences, in the order listed, for a status.
+# The guards at the owner's two preferences, in the order listed, for a status: a rule of another
+# shape there is none, and nothing from 32766 on is listed.
 # -------------------------------------------------------------------------------------------------
 guard_list() {
     local prefs p0 p1 rules line
@@ -424,6 +634,8 @@ guard_list() {
     rules=$(ip rule show 2>/dev/null) || return 0
     while IFS= read -r line; do
         [[ $line == "$p0:"* || $line == "$p1:"* ]] || continue
+        (( ${line%%:*} < 32766 )) || continue
+        _guard_is guard "${line#*:}" || continue
         printf '%s\n' "$line"
     done <<< "$rules"
     return 0

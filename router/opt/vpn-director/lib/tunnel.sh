@@ -942,9 +942,9 @@ _tunnel_slot_guards() {
 
 # _tunnel_guards_sync <slots> - make Tunnel Director's guards those of the layout <slots>
 # (_tunnel_guard_lines), the new list in before the old one goes (guard_sync). Returns 1 when a
-# guard did not go in - guard_sync logs an ERROR for each and keeps the list that guarded so far -
-# or when _tunnel_guard_lines cannot say what they are (it logs the ERROR), the guards left as
-# they are.
+# guard did not go in - guard_sync logs an ERROR for each and keeps the old guards of the clients
+# the list still names - or when _tunnel_guard_lines cannot say what they are (it logs the ERROR),
+# the guards left as they are.
 _tunnel_guards_sync() {
     local lines
     lines=$(_tunnel_guard_lines "$1") || return 1
@@ -1339,12 +1339,11 @@ tunnel_stop() {
 
     # The guards, and with them the direct rule once neither module needs it:
     # guard_direct_release leaves it while XRAY_TPROXY is in mangle or Xray's
-    # guards are in place. Both follow the block range, and stop short of main's
-    # rule for the same reason as the loop above.
-    if (( $(guard_direct_pref) + 2 < 32766 )); then
-        guard_clear tunnel
-        guard_direct_release
-    fi
+    # guards are in place. Those a former pref_base left go too, at the
+    # preferences guard.sh recorded. guard.sh touches nothing from main's rule
+    # at 32766 on, for the same reason as the loop above.
+    guard_clear tunnel
+    guard_direct_release
 
     # Release the tunnel tables this module owns; the platform may also clear
     # a default route that Tunnel Director left in a table it no longer uses.

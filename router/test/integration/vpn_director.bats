@@ -19,8 +19,10 @@ setup() {
     # /etc/iproute2/rt_tables, which the machine running the suite need not have.
     export RT_TABLES_FILE="$TEST_ROOT/fixtures/rt_tables"
     # And the ready marker: tproxy_apply would otherwise write the machine's own
-    # /tmp/xray_tproxy/ready.
+    # /tmp/xray_tproxy/ready. So would guard.sh its record of the preferences
+    # its rules went in at, under /tmp/vpn-director/guards.
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
+    export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
     : > "$LOG_FILE"
 }
 

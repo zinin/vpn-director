@@ -226,24 +226,25 @@ guard follows the slot's lookup rule: it is written only while that rule is list
 slot whose lookup rule is not in place - refused, as Merlin's iproute2 refuses a `wgcN` its
 rt_tables does not name, or taken off a slot with no table to route through - gets the refusing
 guard alone, as its marks meet the block rule. A guard line refused on every apply would keep
-`guard_sync` from ever completing, and the list that guarded before would stay: the guards of a
-client that has left Tunnel Director since would go on routing it. No guard goes to a client of
-`main` - it goes direct anyway, and a guard sending it to main would take it past the guard of an
-Xray client entry that covers it - nor to a client the chain skips (no IPv4 address or CIDR,
-outside RFC1918) or a paused one, and an exclusion that is IPv6 or that iptables would misread gets
-none.
+`guard_sync` from ever completing: the list that guarded before would stay at its other preference,
+less the guards of the clients the new list no longer names, and the failover would never be ready.
+No guard goes to a client of `main` - it goes direct anyway, and a guard sending it to main would
+take it past the guard of an Xray client entry that covers it - nor to a client the chain skips (no
+IPv4 address or CIDR, outside RFC1918) or a paused one, and an exclusion that is IPv6 or that
+iptables would misread gets none.
 
 A rebuild syncs the guards (`guard_sync`) right after the swap, once the new chain carries every
 interface: the old guards route the old layout's clients until then, and a dropped slot is released
 only after the sync. Not before the swap: the chain an earlier version left returns bare from every
 exclusion, and that traffic would meet the new guards and go into the tunnel. The up-to-date path
 syncs them after the routes: a guard that is gone goes back in, one in place is left alone.
-`tunnel_stop` removes them, and the direct rule with them once neither module needs it
-(`guard_direct_release`: not while `XRAY_TPROXY` is in mangle or Xray has guards), stopping short
-of main's rule at 32766 as the range loop does. A guard the kernel refuses is an ERROR: a rebuild
-with one missing records no hash, so the next apply retries it, and on either path the failover is
-not ready. Its client is not reported as not carried: while the chain is in place, it is.
-`status tunnel` lists the direct rule and the guards.
+`tunnel_stop` removes them, those a former `pref_base` left too (see "State Tracking"), and the
+direct rule with them once neither module needs it (`guard_direct_release`: not while `XRAY_TPROXY`
+is in mangle or Xray has guards). `lib/guard.sh` touches nothing from main's rule at 32766 on, as
+the range loop stops short of it. A guard the kernel refuses is an ERROR: a rebuild with one missing
+records no hash, so the next apply retries it, and on either path the failover is not ready. Its
+client is not reported as not carried: while the chain is in place, it is. `status tunnel` lists
+the direct rule and the guards.
 
 ## Chain Architecture
 
@@ -299,10 +300,10 @@ bare `RETURN`s before format 2 - where they are.
 | JSON Path | Default | Purpose |
 |-----------|---------|---------|
 | `advanced.tunnel_director.chain` | `TUN_DIR` | Chain name |
-| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base. The module owns `pref_base` to `pref_base + 2 × field_max − 1` (`field_max` is 255 with the default mask): the lookup range, then the block range - 16384-16893 with the defaults. Another owner's rule on a preference there makes way for the module's, so a base near the firmware's own rules (Merlin's `ovpncN` rule sits at 10000+N) can delete one of them. A new base moves every slot's rules with the next apply: a slot's new rule goes in beside the old rule of another slot the layout holds on the same preference (`_tunnel_pref_make_way`; one of a slot no layout holds makes way), and what the former base left of a slot - a rule carrying its mark under the module's mask on any preference that is no longer its own (`_tunnel_stale_rules_release`) - goes once the slot's own lookup and block rules are in place, on both paths; a released slot and `stop` take it whatever |
+| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base. The module owns `pref_base` to `pref_base + 2 × field_max − 1` (`field_max` is 255 with the default mask): the lookup range, then the block range - 16384-16893 with the defaults. Another owner's rule on a preference there makes way for the module's, so a base near the firmware's own rules (Merlin's `ovpncN` rule sits at 10000+N) can delete one of them. A new base moves every slot's rules with the next apply: a slot's new rule goes in beside the old rule of another slot the layout holds on the same preference (`_tunnel_pref_make_way`; one of a slot no layout holds makes way), and what the former base left of a slot - a rule carrying its mark under the module's mask on any preference that is no longer its own (`_tunnel_stale_rules_release`) - goes once the slot's own lookup and block rules are in place, on both paths; a released slot and `stop` take it whatever. The direct rule and the guards after the block range move with the base too (`direct_mark` below) |
 | `advanced.tunnel_director.mark_mask` | `0x00ff0000` | Fwmark mask |
 | `advanced.tunnel_director.mark_shift` | `16` | Bit position |
-| `advanced.tunnel_director.direct_mark` | `0x200` | The direct mark (`lib/guard.sh`): the bit both chains set on what they let go direct. The direct rule, `fwmark <mark>/<mark> lookup main`, takes `pref_base + 2 × field_max` (16894 with the defaults), right after the block range and ahead of the guards at the four preferences after it: Tunnel Director's 16895-16896, Xray's 16897-16898. Any other rule on that preference, one an earlier value left included, goes once the rule is in (`guard_direct_ensure`). A configuration without the key takes the default. `guard_layout_check` refuses, with an ERROR, a value that is not one bit of the fwmark or lies in `mark_mask` or in Xray's `fwmark_mask`, and a `pref_base` whose guards would reach main's rule at 32766 |
+| `advanced.tunnel_director.direct_mark` | `0x200` | The direct mark (`lib/guard.sh`): the bit both chains set on what they let go direct. The direct rule, `fwmark <mark>/<mark> lookup main`, takes `pref_base + 2 × field_max` (16894 with the defaults), right after the block range and ahead of the guards at the four preferences after it: Tunnel Director's 16895-16896, Xray's 16897-16898. Once the rule is in, any other rule of its shape on that preference goes, one an earlier value left, and so does any guard there, a former layout's (`guard_direct_ensure`); a rule of another shape stays - `lib/guard.sh` lists, compares and deletes only its own shapes, and nothing at 32766 or above. A new `pref_base`, `mark_mask` or `mark_shift` moves the direct rule and the guards: those at the preferences `lib/guard.sh` recorded go once the new ones are in, and `stop` takes both (see "State Tracking"). A configuration without the key takes the default. `guard_layout_check` refuses, with an ERROR, a value that is not one bit of the fwmark or lies in `mark_mask` or in Xray's `fwmark_mask`, and a `pref_base` whose guards would reach main's rule at 32766 |
 
 ## Fwmark Layout
 
@@ -385,10 +386,28 @@ prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clien
 | `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`) |
 | `/tmp/tunnel_director/iftunnels` | The applied interface tunnels, `<iface> <table>` per line (`IFTUNNEL_STATE_FILE`) |
 | `/tmp/tunnel_director/routes_cron` | Marker: the cron job of `ensure-routes` is scheduled (`IFTUNNEL_CRON_MARKER`) |
+| `/tmp/vpn-director/guards/{direct,tunnel,xray}` | The preferences the direct rule and each owner's guards last went in at, one line each: `16894`, `16895 16896`, `16897 16898` with the defaults (`GUARD_STATE_DIR`, `lib/guard.sh`) |
 
 `tunnel_apply` writes the first three, `vpn-director.sh` the marker (`_routes_cron_sync`, after
 every `tunnel_apply`); `tunnel_stop` walks `TUN_DIR_TABLES` to release each tunnel's table through
 `vpd_tunnel_slot_release`, then removes the first three files.
+
+`lib/guard.sh` keeps a record per kind of the preferences its rules last went in at, both modules'
+alike: the guards carry no mark a release could find them by. Once `guard_direct_ensure` has its
+rule in, or a `guard_sync` every line, the rules of the kind's shape at the preferences its record
+names go - after a change of `pref_base`, `mark_mask` or `mark_shift`, the former ones - and the
+record names the current ones; it is written through a file beside it and a rename, and only when
+it changes. `guard_clear` and `guard_direct_release` take the rules at the current and the recorded
+preferences, then the record. A sync with a line refused leaves the former preferences and the
+record as they are: the former guards are all that guard those clients until the list is whole. A
+preference a record names that is a current one of another kind - after a `pref_base` moved by less
+than five - keeps its guards for that kind to reconcile: an owner's sync takes every guard at its
+preferences as its own, and `guard_direct_ensure` every guard at the direct rule's; a former direct
+rule there goes with `guard_direct_ensure` all the same, no other kind's rule having its shape.
+Without a record nothing says where the rules were, and none at another preference goes; a write
+that fails is a WARN, and the next change of `pref_base` leaves the rules where they were. The
+directory is made `0755` whatever the umask, its parent too: `/tmp/vpn-director` is watchd's
+runtime directory as well.
 
 The hash and `TUN_DIR_TABLES` can be out of step in one direction: a tunnel with clients that the
 platform does not list keeps a slot in `TUN_DIR_TABLES` - its clients' MARK rules and the slot's

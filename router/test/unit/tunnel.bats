@@ -2756,7 +2756,8 @@ refuse_block_rules() {
 }
 
 # With nothing refused the same move ends with every slot on its new
-# preferences and nothing of the old layout left.
+# preferences and nothing of the old layout left: the direct rule and the
+# guards move with pref_base too, from 16894 and 16895 to 16895 and 16896.
 @test "tunnel_apply: a pref_base moved by one ends with each slot on its new preferences alone" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
     run tunnel_apply
@@ -2772,6 +2773,12 @@ refuse_block_rules() {
     assert_line $'16386:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
     assert_line $'16641:\tfrom all fwmark 0x20000/0xff0000 prohibit'
     assert_equal "$(grep -c 'fwmark 0x[0-9a-f]*/0xff0000 ' <<< "$output")" 4
+    refute_line --partial '16894:'
+    assert_equal "$(grep -c '^16895:' <<< "$output")" 1
+    assert_line $'16895:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_equal "$(grep -c 'iif br0' <<< "$output")" 4
+    run guard_list tunnel
+    assert_output $'16896:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16896:\tfrom 192.168.1.5 iif br0 prohibit\n16896:\tfrom 192.168.1.6 iif br0 lookup wgc2\n16896:\tfrom 192.168.1.6 iif br0 prohibit'
 }
 
 # The rebuild's new slot makes way the same way: ovpnc1 takes the slot wgc1

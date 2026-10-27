@@ -40,6 +40,10 @@ setup() {
     # otherwise - the file the bot on the machine running the suite would read.
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
 
+    # guard.sh records where its rules went in, under /tmp/vpn-director/guards
+    # unless told otherwise: each test keeps a record of its own.
+    export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
+
     # Clean log file
     : > "$LOG_FILE"
 
