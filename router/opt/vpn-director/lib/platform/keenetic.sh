@@ -263,8 +263,9 @@ platform_tunnel_table_release() {
 # fastroute entry test, and the same target sets FOE_ALG_SKIP, which closes the
 # hardware path too. The flag lives as long as the conntrack entry.
 #
-# Xray needs none of this: TPROXY terminates the connection in a local socket,
-# so there is no forwarded flow left to accelerate.
+# A flow TPROXY takes needs none of this: it terminates in a local socket, so
+# there is no forwarded flow left to accelerate. What XRAY_TPROXY lets through
+# is forwarded, and tproxy.sh opts it out as well.
 platform_tunnel_offload_target() {
     printf 'PPE\n'
 }

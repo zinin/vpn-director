@@ -763,7 +763,9 @@ duplicate_last_rule() {
 
 # Two rules decide who the targets take at all: without the "! XRAY_CLIENTS"
 # return TPROXY takes every LAN client, without the private ranges traffic to
-# the router and the rest of the LAN. errexit is off under "if !", so a failed
+# the router and the rest of the LAN. The direct mark decides where the rest
+# goes: without it what the chain lets through meets the guards instead of the
+# direct rule, and Xray's refuse it. errexit is off under "if !", so a failed
 # one has to stop the build itself - before the targets - and the chain built so
 # far must never take the jumps: the chain already in place stays.
 @test "_tproxy_setup_iptables: fails before the TPROXY targets when a rule that bounds them fails" {
@@ -776,6 +778,7 @@ duplicate_last_rule() {
     for failing in \
         "-N XRAY_TPROXY_NEW" \
         "-A XRAY_TPROXY_NEW -m set ! --match-set XRAY_CLIENTS src -j RETURN" \
+        "-A XRAY_TPROXY_NEW -j MARK --set-xmark 0x200/0x200" \
         "-A XRAY_TPROXY_NEW -d 10.0.0.0/8 -j RETURN" \
         "-A XRAY_TPROXY_NEW -d 172.16.0.0/12 -j RETURN" \
         "-A XRAY_TPROXY_NEW -d 192.168.0.0/16 -j RETURN"
@@ -803,15 +806,19 @@ duplicate_last_rule() {
 # ranges, multicast, broadcast, an excluded country. Leaving the setup at a
 # missing one - a busy xtables lock was enough - left a flushed chain that took
 # nothing while the jumps stayed, and every Xray client went out through the
-# WAN. The targets go in; only the marker waits for a clean apply.
-@test "_tproxy_setup_iptables: a RETURN that only narrows the proxy keeps the TPROXY targets" {
+# WAN. The platform's offload opt-out only decides whether the fast path may take
+# what Xray lets through. The targets go in; only the marker waits for a clean
+# apply.
+@test "_tproxy_setup_iptables: a RETURN that only narrows the proxy, or the offload opt-out, keeps the TPROXY targets" {
     load_tproxy_module
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
     local failing
     iptables() {
         [[ $* == *"$FAILING"* ]] && return 4
         command iptables "$@"
     }
     for failing in \
+        "-A XRAY_TPROXY_NEW -j PPE" \
         "-A XRAY_TPROXY_NEW -m set --match-set TPROXY_BYPASS dst -j RETURN" \
         "-A XRAY_TPROXY_NEW -d 127.0.0.0/8 -j RETURN" \
         "-A XRAY_TPROXY_NEW -d 169.254.0.0/16 -j RETURN" \
@@ -999,6 +1006,140 @@ duplicate_last_rule() {
     grep -q -- '-t mangle -X XRAY_TPROXY_NEW' /tmp/bats_iptables_calls.log
     grep -qx 'ipset destroy XRAY_CLIENTS_NEW' /tmp/bats_ipset_calls.log
     grep -qx 'ipset destroy TPROXY_BYPASS_NEW' /tmp/bats_ipset_calls.log
+}
+
+# ============================================================================
+# The direct mark and the fast path: what XRAY_TPROXY lets through
+# ============================================================================
+
+# Xray's guards (lib/guard.sh) refuse an unmarked packet of an Xray client, but
+# for the private ranges and xray.exclude_ips: what XRAY_TPROXY lets go direct
+# has to carry the direct mark, which the direct rule sends to main ahead of
+# every guard. Set right after rule 1, it is on every packet of an Xray client:
+# one TPROXY takes meets Xray's rule at 200 first, and the rest - what the
+# RETURNs let go, a protocol TPROXY does not take - leave the chain with it.
+@test "tproxy_apply: every Xray client's packet carries the direct mark right after rule 1" {
+    load_tproxy_module
+    use_stateful_iptables
+    run tproxy_apply
+    assert_success
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line --index 1 '-A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN'
+    assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x200/0x200'
+}
+
+# KeeneticOS's fast path takes a forwarded flow past mangle after its first
+# packets and routes it by the ip rules alone, never by a mark: an accelerated
+# flow that Xray lets through would meet the guards. The opt-out follows the
+# direct mark, so none is accelerated. A flow TPROXY takes ends in a local
+# socket, and no fast path ever took one.
+@test "tproxy_apply: the platform's offload target follows the direct mark" {
+    load_tproxy_module
+    use_stateful_iptables
+    platform_tunnel_offload_target() { printf 'PPE\n'; }
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x200/0x200'
+    assert_line --index 3 '-A XRAY_TPROXY -j PPE'
+    assert_line --index 4 '-A XRAY_TPROXY -m set --match-set TPROXY_BYPASS dst -j RETURN'
+    assert_equal "${#lines[@]}" 15
+}
+
+# Merlin names no target (platform_tunnel_offload_target returns 1), and the
+# chain then holds no opt-out at all: a rule naming a target the kernel does not
+# have would be refused on every apply.
+@test "tproxy_apply: no offload rule when the platform names no target" {
+    load_tproxy_module
+    use_stateful_iptables
+    run tproxy_apply
+    assert_success
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x200/0x200'
+    assert_line --index 3 '-A XRAY_TPROXY -m set --match-set TPROXY_BYPASS dst -j RETURN'
+    assert_equal "${#lines[@]}" 14
+}
+
+# From the swap on, the chain marks what it lets through direct, and the direct
+# rule is what sends that to main ahead of the guards: it goes in first.
+@test "tproxy_apply: puts the direct rule in before the chain" {
+    load_tproxy_module
+    ip() {
+        [[ ${1:-} == rule && ${2:-} == add ]] && echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command ip "$@"
+    }
+    iptables() {
+        [[ $* == *" -N "* ]] && echo "iptables $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command iptables "$@"
+    }
+    run tproxy_apply
+    assert_success
+    local direct chain
+    direct=$(grep -nxF 'ip rule add pref 16894 fwmark 0x200/0x200 lookup main' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    chain=$(grep -nxF 'iptables -t mangle -N XRAY_TPROXY_NEW' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    [[ -n $direct && -n $chain ]]
+    (( direct < chain ))
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+}
+
+# Without the direct rule, what the chain marks direct meets the guards instead
+# of main. The marker waits for an apply that puts the rule in; the chain goes in
+# all the same.
+@test "tproxy_apply: a refused direct rule withholds ready, and the chain goes in all the same" {
+    load_tproxy_module
+    use_stateful_iptables
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && ${4:-} == 16894 ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "Guards: the direct rule did not go in"
+    assert_output --partial "The direct rule is not in place; TPROXY readiness withheld"
+    [ ! -e "$XRAY_TPROXY_READY" ]
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x200/0x200'
+
+    unset -f ip
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+}
+
+# Inside Xray's fwmark_mask, a packet marked direct would read as one TPROXY
+# took, and Xray's rule would send it to the local table. The refusal comes
+# before anything is touched - no route, no rule, no set, no chain - and ends
+# the run, as tunnel_apply's does. config.sh makes the Xray marks readonly, so
+# they go in through a copy of the fixture.
+@test "tproxy_apply: refuses a direct mark that collides with its own, before touching anything" {
+    load_common
+    jq '.advanced.xray.fwmark = "0x200" | .advanced.xray.fwmark_mask = "0x200"' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$BATS_TEST_TMPDIR/vpn-director.json"
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/tproxy.sh" --source-only
+    use_stateful_iptables
+    : > /tmp/bats_ip_calls.log
+    : > /tmp/bats_ipset_calls.log
+    : > /tmp/bats_iptables_calls.log
+    run tproxy_apply
+    assert_failure
+    assert_output --partial "direct_mark 0x200 is a bit of Xray's fwmark_mask (0x200); rules not applied"
+    [ ! -s /tmp/bats_ip_calls.log ]
+    [ ! -s /tmp/bats_ipset_calls.log ]
+    [ ! -s /tmp/bats_iptables_calls.log ]
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_failure
 }
 
 # ============================================================================

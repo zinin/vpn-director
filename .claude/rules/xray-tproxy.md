@@ -177,6 +177,8 @@ put the inbound back on 12345.
 PREROUTING (pos 1)
     └─→ XRAY_TPROXY
           ├─ ! src clients → RETURN
+          ├─ → MARK 0x200 (direct)
+          ├─ → PPE                     (Keenetic only)
           ├─ dst servers → RETURN
           ├─ dst 127.0.0.0/8 → RETURN
           ├─ dst 10.0.0.0/8 → RETURN
@@ -194,6 +196,21 @@ mangle INPUT (Keenetic, pos 1):
     (so TPROXY-marked HTTPS never reaches _NDM_HTTP_INPUT_TLS_)
 ```
 
+Every packet of an Xray client gets the direct mark (`advanced.tunnel_director.direct_mark`,
+`0x200`; `lib/guard.sh`) right after rule 1. What the RETURNs let go leaves the chain with it, and
+so does a protocol TPROXY does not take, such as ICMP. The direct rule at 16894,
+`fwmark 0x200/0x200 lookup main`, sends it to main ahead of the guards, which would refuse it. A
+packet TPROXY takes gets Xray's mark beside it and meets the rule at 200 first. `TUN_DIR` tests
+its own field alone, so what Xray lets through of a client that is on a tunnel too is still
+marked for the tunnel, whose lookup rule comes before the direct rule. `tproxy_apply` puts the
+direct rule in (`guard_direct_ensure`) before the chain, and leaves one in place alone.
+
+The platform's offload opt-out follows: `platform_tunnel_offload_target` prints `PPE` on Keenetic
+(nothing, rc 1 on Merlin, where the rule does not exist). The fast path routes a flow it took over
+by the ip rules alone, never by a mark, so an accelerated flow that Xray lets through would meet
+the guards after its first packets (`packet-flow.md`, "The firmware fast path"). A flow TPROXY
+takes ends in a local socket, and no fast path takes it.
+
 ## Routing Setup
 
 ```bash
@@ -202,9 +219,14 @@ ip route add local default dev lo table $XRAY_ROUTE_TABLE
 
 # ip rule (fwmark-based lookup)
 ip rule add pref $XRAY_RULE_PREF fwmark $XRAY_FWMARK/$XRAY_FWMARK_MASK table $XRAY_ROUTE_TABLE
+
+# The direct rule, Tunnel Director's as well (guard_direct_ensure, lib/guard.sh)
+ip rule add pref 16894 fwmark 0x200/0x200 lookup main
 ```
 
-**Fwmark bit allocation**: `0x100` (bit 8) is free from firmware VPN marking (bit 0) and Tunnel Director (bits 16-23).
+**Fwmark bit allocation**: `0x100` (bit 8) is free from firmware VPN marking (bit 0), Tunnel
+Director (bits 16-23) and the direct mark (bit 9), which `guard_layout_check` keeps out of
+`fwmark_mask`.
 
 The TPROXY ip rule uses pref 200. On KeeneticOS 5.1.5 that preference was free of
 NDM connection policies (a user policy landed at prefs 102/103, table 4097; no
@@ -231,6 +253,12 @@ may still intercept with it, and a client moving from a tunnel to Xray has to be
 > reasons: `_tproxy_exclude_sets` drops it with a WARN before the check, so a
 > typo cannot abort apply.
 
+A direct mark or guard preferences that `guard_layout_check` refuses (`lib/guard.sh`: a mark that
+is not one bit, or lies in `fwmark_mask` or in Tunnel Director's `mark_mask`; guards that would
+reach main's rule at 32766) are no soft-fail: `tproxy_apply` logs the ERROR and returns 1 before
+it touches anything - no module, route, rule, set, chain or marker - and the run ends there, as
+`tunnel_apply` would end it.
+
 ## Extended Exclusion Sets
 
 Prefers `{set}_ext` variant if exists:
@@ -245,7 +273,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | Function | Purpose |
 |----------|---------|
 | `tproxy_status()` | Show XRAY_TPROXY chain, routing, xray process |
-| `tproxy_apply()` | The make half of an apply: routing, sets, chain swapped in; clients added, never removed; soft-fail if unavailable |
+| `tproxy_apply()` | The make half of an apply: routing, sets, the direct rule, chain swapped in; clients added, never removed; soft-fail if unavailable; rc 1, nothing touched, for a layout `guard_layout_check` refuses |
 | `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; always returns 0 and leaves the ready marker alone |
 | `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) |
 | `tproxy_restart_process()` | Restart Xray process via Entware init script |
@@ -268,28 +296,31 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | `_tproxy_swap_set(name)` | `ipset swap` of `<name>_NEW` into `<name>`, then destroy the shadow |
 | `_tproxy_setup_bypass_ipset()` | Build `TPROXY_BYPASS_NEW` from the three sources and swap it in |
 | `_tproxy_validate_ipv4_cidr()` | Validate IPv4 CIDR format |
-| `_tproxy_build_chain(chain)` | Fill a fresh chain with the TPROXY rules: 0, 1 (a narrowing RETURN missing), 2 (a bounding RETURN or a target missing) |
+| `_tproxy_build_chain(chain)` | Fill a fresh chain with the TPROXY rules: 0, 1 (a narrowing RETURN or the offload opt-out missing), 2 (a bounding RETURN, the direct mark or a target missing) |
 | `_tproxy_jump_pos()` | Position of the first jump: 1 |
 | `_tproxy_setup_iptables()` | Platform rules, then `XRAY_TPROXY` swapped in with its jumps |
 | `_tproxy_teardown_iptables()` | Remove chain and ipsets |
 
-**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client.
+**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client. A layout `guard_layout_check` refuses is the one failure it returns 1 for ("Fail-Safe").
 
 **Ready marker**: `tproxy_apply()` writes `/tmp/xray_tproxy/ready` (`XRAY_TPROXY_READY`) only when
 every rule went in, the platform's own included, and removes it on any soft-fail.
 watchd's subscription watch waits for it before Xray clients leave the fallback tunnel. A failed
 `platform_tproxy_extra_rules apply` (Keenetic's mangle INPUT accept) fails `_tproxy_setup_iptables`
 only after the PREROUTING jumps are in place, so interception stays as it was and only the marker
-is withheld. Rule 1 (`! XRAY_CLIENTS`), a private-range RETURN or a TPROXY target that does not
-go in keeps the rebuilt chain out (`_tproxy_build_chain` returns 2): the chain already in place
-keeps working and the marker is withheld. Without rule 1 or the private-range RETURNs the
-targets would take every LAN client, or traffic to the router and the rest of the LAN. Every
-other RETURN (bypass, loopback, link-local, multicast, broadcast, an exclusion) only decides
-what a client reaches directly instead of through the proxy: its failure is logged, the targets
-and the jumps still go in, and only the marker is withheld — ending the setup there left every
-Xray client on the WAN over one busy xtables lock. A PREROUTING jump that does not go in
-withholds the marker as well: `swap_fw_chain` returns 3, and that interface stays on the old
-chain until the next apply finishes the swap.
+is withheld. Rule 1 (`! XRAY_CLIENTS`), the direct mark, a private-range RETURN or a TPROXY
+target that does not go in keeps the rebuilt chain out (`_tproxy_build_chain` returns 2): the
+chain already in place keeps working and the marker is withheld. Without rule 1 or the
+private-range RETURNs the targets would take every LAN client, or traffic to the router and the
+rest of the LAN; without the direct mark what the chain lets through would meet the guards
+instead of the direct rule, and Xray's refuse it. Every other RETURN (bypass, loopback,
+link-local, multicast, broadcast, an exclusion) only decides what a client reaches directly
+instead of through the proxy, and the offload opt-out (`PPE`) only whether the fast path may take
+it: its failure is logged, the targets and the jumps still go in, and only the marker is withheld
+— ending the setup there left every Xray client on the WAN over one busy xtables lock. A direct
+rule that does not go in (`guard_direct_ensure`) withholds the marker too, and the chain goes in
+all the same. A PREROUTING jump that does not go in withholds the marker as well: `swap_fw_chain`
+returns 3, and that interface stays on the old chain until the next apply finishes the swap.
 `XRAY_CLIENTS` has to be complete too: nothing validates `xray.clients`, and an address the set
 does not take is RETURNed by rule 1 and left unproxied, so `_tproxy_setup_clients_ipset` reports it
 and the marker is withheld although the chain itself is in place. The adds pass `-exist`, so a

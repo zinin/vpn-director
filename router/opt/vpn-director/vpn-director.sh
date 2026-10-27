@@ -310,7 +310,9 @@ cmd_apply() {
             # Director in one step, a client moving to a tunnel was on neither for the length
             # of tunnel_apply and left through the WAN.
             #
-            # tproxy_apply soft-fails (a WARN and rc 0). tunnel_apply hard-fails under
+            # tproxy_apply soft-fails (a WARN and rc 0), but for a direct mark or guard
+            # preferences guard_layout_check refuses, which end the run with rc 1 before it
+            # touches anything, Tunnel Director included. tunnel_apply hard-fails under
             # errexit when it cannot apply at all - a malformed tunnels object, no LAN
             # interface - and the run ends before the prune: the clients that left Xray stay
             # proxied rather than leak. On a soft failure - a refused rule, a swap that did not

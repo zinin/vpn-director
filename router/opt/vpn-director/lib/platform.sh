@@ -69,11 +69,13 @@
 #     tunnel_director.tunnels.<id>.gateway (validated, or empty) and tproxy.sh
 #     passes "$XRAY_FWMARK/$XRAY_FWMARK_MASK". Wireguard ignores the gateway
 #     on both platforms; Merlin ignores the TPROXY mark (it has no extra rule).
-#   * platform_tunnel_offload_target names a target, not a rule: tunnel.sh owns
-#     where it goes. It builds the rule with the same match as the MARK rule of
-#     the client it belongs to and puts it at the head of that client's block,
-#     ahead of the exclusions, so no flow of a Tunnel Director client is
-#     accelerated - those to its excluded destinations included.
+#   * platform_tunnel_offload_target names a target, not a rule: the core owns
+#     where it goes. tunnel.sh builds the rule with the same match as the MARK
+#     rule of the client it belongs to and puts it at the head of that client's
+#     block, ahead of the exclusions, so no flow of a Tunnel Director client is
+#     accelerated - those to its excluded destinations included. tproxy.sh puts
+#     it right after rule 1 of XRAY_TPROXY and the direct mark, so no flow that
+#     Xray lets through is accelerated either.
 #     A platform that needs no opt-out must print nothing - a target name the
 #     kernel does not have fails the append and takes the apply down with it.
 #   * Keenetic's tunnel tables are KEENETIC_TABLE_BASE + idx (keenetic.sh).

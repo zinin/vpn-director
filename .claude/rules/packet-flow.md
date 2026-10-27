@@ -96,7 +96,8 @@ before TUN_DIR lets it go in step 2. A Tunnel Director failure that stops the ap
 that is no object, a tunnel name that is empty or holds whitespace or a control character, block
 rules that would reach main's rule at 32766, a direct mark or guard preferences
 `guard_layout_check` refuses, no LAN interface, no PREROUTING position) ends the run
-before step 3. One that
+before step 3; `tproxy_apply` refuses such a direct mark or such guard preferences first, before
+step 1 touches anything. One that
 costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
 tunnel the platform does not list, a slot whose route, lookup rule or block rule is not in place, a client outside
 RFC1918 - and step 2 reports the clients it cost. Step 3 keeps each of them that `XRAY_CLIENTS`
@@ -173,18 +174,24 @@ Examples:
 ```
 XRAY_TPROXY chain:
   1. ! --match-set XRAY_CLIENTS src → RETURN
-  2. --match-set TPROXY_BYPASS dst → RETURN
-  3. -d 127.0.0.0/8 → RETURN (loopback)
-  4. -d 10.0.0.0/8 → RETURN (RFC1918)
-  5. -d 172.16.0.0/12 → RETURN (RFC1918)
-  6. -d 192.168.0.0/16 → RETURN (RFC1918)
-  7. -d 169.254.0.0/16 → RETURN (link-local)
-  8. -d 224.0.0.0/4 → RETURN (multicast)
-  9. -d 255.255.255.255/32 → RETURN (broadcast)
-  10. --match-set {exclude_set} dst → RETURN (for each exclude_set)
-  11. -p tcp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
-  12. -p udp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
+  2. → MARK 0x200/0x200 (direct; every packet past rule 1)
+  3. → PPE (Keenetic only)
+  4. --match-set TPROXY_BYPASS dst → RETURN
+  5. -d 127.0.0.0/8 → RETURN (loopback)
+  6. -d 10.0.0.0/8 → RETURN (RFC1918)
+  7. -d 172.16.0.0/12 → RETURN (RFC1918)
+  8. -d 192.168.0.0/16 → RETURN (RFC1918)
+  9. -d 169.254.0.0/16 → RETURN (link-local)
+  10. -d 224.0.0.0/4 → RETURN (multicast)
+  11. -d 255.255.255.255/32 → RETURN (broadcast)
+  12. --match-set {exclude_set} dst → RETURN (for each exclude_set)
+  13. -p tcp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
+  14. -p udp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
 ```
+
+What the RETURNs let go, and what falls off the end (a protocol TPROXY does not take), leaves
+with the direct mark, which the direct rule (`fwmark 0x200/0x200 lookup main`, `lib/guard.sh`)
+sends to main; a packet TPROXY takes meets pref 200 first (`xray-tproxy.md`, "Chain Structure").
 
 ### IPSets
 
@@ -261,8 +268,10 @@ Placement carries the meaning: the opt-out opens each client's block with the `M
 match, ahead of the exclusions, so no flow of a Tunnel Director client is accelerated - one to an
 excluded destination included.
 
-Xray needs none of this — TPROXY terminates the connection in a local socket, so no forwarded
-flow is left to accelerate. That is why Xray worked on KeeneticOS while Tunnel Director did not.
+A flow TPROXY takes needs none of this — it terminates in a local socket, so no forwarded flow is
+left to accelerate. That is why Xray worked on KeeneticOS while Tunnel Director did not. What
+`XRAY_TPROXY` lets through is forwarded, though: the opt-out follows its direct mark, right after
+rule 1, so no flow of an Xray client is accelerated either.
 
 A flow already bound to the fast path stays bound until its conntrack entry expires; new flows
 are correct immediately. A router upgraded with its configuration unchanged gets the rules of a
@@ -328,7 +337,7 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 
 Packet from 192.168.50.10 to 203.0.113.1 (excluded country):
 1. XRAY_TPROXY: src in XRAY_CLIENTS? Yes
-2. dst in excluded country? Yes → **RETURN**
+2. dst in excluded country? Yes → **RETURN** with the direct mark 0x200
 3. TUN_DIR: no rules for this client
 4. **Goes to main table → WAN (direct)**
 
