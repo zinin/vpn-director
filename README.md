@@ -188,6 +188,12 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 
 > **Upgrading from v0.11.x or earlier.** The updater built into those releases downloads a fixed file list without `lib/platform.sh`, so pressing «Update» installs this release incompletely: the shell CLI, the firewall hooks and the daily update stop working (the Xray TPROXY and Tunnel Director rules are no longer re-applied after a firewall restart) until you re-run the [Quick Install](#quick-install) command once. The Web UI and the bot themselves keep running. Every later update reads the release manifest and needs no such step.
 
+> **Upgrading from v0.22.0 or earlier.** This release adds routing rules per client that keep clients on Xray or Tunnel Director off the WAN while the firmware rebuilds its firewall (ip rule preferences 16894-16898 with the default `pref_base`), and its firewall hooks put the chains back from a snapshot of the last apply.
+>
+> - Going back to v0.22.0 or earlier: run `vpn-director.sh stop` with this release first. It removes the rules at 16894-16898, the snapshot and the records of where the rules went in. An older release knows none of them, and they would send its tunnel clients' traffic to excluded countries into the tunnel, and refuse what its Xray clients send direct, except to private networks and the addresses of `xray.exclude_ips`. A reboot clears them too.
+> - A configuration whose Xray `fwmark_mask` or Tunnel Director `mark_mask` holds bit `0x200` takes another bit for its direct mark, the bit the chains set on what they let go direct; a WARN in the log names it, and `advanced.tunnel_director.direct_mark` pins it. `advanced.xray.rule_pref` must stay below 16894: an apply refuses a value at or above it.
+> - On KeeneticOS the first apply after the upgrade resets, once, the connections the firmware had already accelerated: those of a client on Xray or Tunnel Director to the destinations it reaches directly. New connections are not affected.
+
 ## Telegram Bot
 
 Remote management via Telegram with username-based authorization.
