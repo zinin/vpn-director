@@ -25,6 +25,7 @@ common   router/opt/vpn-director/lib/config.sh
 common   router/opt/vpn-director/lib/ipset.sh
 common   router/opt/vpn-director/lib/tunnel.sh
 common   router/opt/vpn-director/lib/tproxy.sh
+common   router/opt/vpn-director/lib/fwsnap.sh
 common   router/opt/vpn-director/lib/xrayconf.sh
 common   router/opt/vpn-director/lib/subscription.sh
 common   router/opt/vpn-director/lib/substore.sh

@@ -387,6 +387,7 @@ prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clien
 | `/tmp/tunnel_director/iftunnels` | The applied interface tunnels, `<iface> <table>` per line (`IFTUNNEL_STATE_FILE`) |
 | `/tmp/tunnel_director/routes_cron` | Marker: the cron job of `ensure-routes` is scheduled (`IFTUNNEL_CRON_MARKER`) |
 | `/tmp/vpn-director/guards/{direct,tunnel,xray}` | The preferences the direct rule and each owner's guards last went in at, one line each: `16894`, `16895 16896`, `16897 16898` with the defaults (`GUARD_STATE_DIR`, `lib/guard.sh`) |
+| `/tmp/vpn-director/fwsnap/{mangle,nat}.rules` | The snapshot of our rules the last apply left, as `iptables-restore --noflush` input, for the firmware hooks to restore after a rebuild of the firewall (`FWSNAP_DIR`, `lib/fwsnap.sh`) |
 
 `tunnel_apply` writes the first three, `vpn-director.sh` the marker (`_routes_cron_sync`, after
 every `tunnel_apply`); `tunnel_stop` walks `TUN_DIR_TABLES` to release each tunnel's table through
@@ -408,6 +409,19 @@ left on a guard's, are never live there and go with their former owner, on `stop
 where the rules were, and none at another preference goes; a write that fails is a WARN, and the
 next change of `pref_base` leaves the rules where they were. The directory is made `0755` whatever
 the umask, its parent too: `/tmp/vpn-director` is watchd's runtime directory as well.
+
+`vpn-director.sh` ends every apply that gets there - in full, of one component, `update`,
+`restart` - with `fwsnap_save`, which snapshots the rules that apply left, a file per table.
+`mangle.rules` declares each of `XRAY_TPROXY` and `TUN_DIR` that exists (never the `_NEW` an
+interrupted swap leaves), fills it with its rules as `iptables -S` lists them, and inserts the
+PREROUTING jumps from the top, Xray's first, the mangle INPUT accept of Xray's mark (KeeneticOS) at
+the head of INPUT and the interface tunnels' MSS rules at the head of FORWARD. `nat.rules` holds
+`-o <iface> -j MASQUERADE` for each interface tunnel whose rule is in place. A file with nothing to
+hold goes: `mangle.rules` while neither chain exists, `nat.rules` without such a rule. An apply that
+fails part-way ends before the snapshot, and the one of an earlier apply stays; `stop` removes it
+before it tears anything down, whichever component it stops. A listing or a write that fails is a
+WARN, the earlier snapshot stays, and the apply goes on. The directory is made `0755` whatever the
+umask, its parent too, and the files `0644`: the hooks hand them to `iptables-restore` as root.
 
 The hash and `TUN_DIR_TABLES` can be out of step in one direction: a tunnel with clients that the
 platform does not list keeps a slot in `TUN_DIR_TABLES` - its clients' MARK rules and the slot's

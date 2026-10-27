@@ -20,9 +20,11 @@ setup() {
     export RT_TABLES_FILE="$TEST_ROOT/fixtures/rt_tables"
     # And the ready marker: tproxy_apply would otherwise write the machine's own
     # /tmp/xray_tproxy/ready. So would guard.sh its record of the preferences
-    # its rules went in at, under /tmp/vpn-director/guards.
+    # its rules went in at, under /tmp/vpn-director/guards, and every apply its
+    # snapshot of the rules, under /tmp/vpn-director/fwsnap.
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
     export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
+    export FWSNAP_DIR="$BATS_TEST_TMPDIR/fwsnap"
     : > "$LOG_FILE"
 }
 
@@ -282,6 +284,50 @@ run_stubbed_cli() {
     assert_output "755"
 }
 
+# The hooks restore the snapshot of the rules after a firewall rebuild. A stop takes it away
+# first, whichever component it stops: a rebuild during the teardown or after it would bring back
+# what the stop took away. A component it does not know stops nothing, and the snapshot stays.
+@test "vpn-director: stop removes the snapshot before it tears anything down" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    local args
+    for args in stop "stop tunnel" "stop xray" "stop badcomp"; do
+        mkdir -p "$FWSNAP_DIR"
+        printf '*mangle\n:TUN_DIR - [0:0]\nCOMMIT\n' > "$FWSNAP_DIR/mangle.rules"
+        printf -- '-o awg1 -j MASQUERADE\n' > "$FWSNAP_DIR/nat.rules"
+        rm -f "$BATS_TEST_TMPDIR/calls"
+        # shellcheck disable=SC2086
+        run bash -c '
+            script=$1 calls=$2
+            shift 2
+            source "$script" --source-only "$@"
+            _load_modules
+            acquire_lock() { :; }
+            seen() {
+                if [[ -e $FWSNAP_DIR/mangle.rules || -e $FWSNAP_DIR/nat.rules ]]; then
+                    echo "$1 with the snapshot"
+                else
+                    echo "$1"
+                fi
+            }
+            tproxy_stop() { seen tproxy_stop >> "$calls"; }
+            tunnel_stop() { seen tunnel_stop >> "$calls"; }
+            "cmd_$COMMAND"
+        ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" $args
+        if [[ $args == "stop badcomp" ]]; then
+            assert_failure
+            [ -f "$FWSNAP_DIR/mangle.rules" ]
+            [ -f "$FWSNAP_DIR/nat.rules" ]
+            continue
+        fi
+        assert_success
+        [ ! -e "$FWSNAP_DIR/mangle.rules" ]
+        [ ! -e "$FWSNAP_DIR/nat.rules" ]
+        run cat "$BATS_TEST_TMPDIR/calls"
+        assert_success
+        refute_output --partial "with the snapshot"
+    done
+}
+
 # The subscription watch writes config.json for each server it tries and needs
 # only the process to pick it up. "restart xray" would apply the TPROXY rules
 # again after each one for nothing.
@@ -350,6 +396,22 @@ run_stubbed_cli() {
     assert_failure
     run cat "$BATS_TEST_TMPDIR/calls"
     assert_output $'tproxy_apply\ntunnel_apply'
+}
+
+# An apply that ends part-way writes no snapshot of the rules it left half-changed: the one of an
+# earlier apply stays, and the apply the hooks queue after restoring it reconciles what is stale.
+# A snapshot written here would have gone instead: the stateless iptables lists no chain of ours.
+@test "vpn-director: an apply that fails part-way leaves the snapshot of an earlier one" {
+    mkdir -p "$FWSNAP_DIR"
+    printf '*mangle\n:TUN_DIR - [0:0]\nCOMMIT\n' > "$FWSNAP_DIR/mangle.rules"
+    export TUNNEL_APPLY_RC=1
+    local args
+    for args in apply update "restart tunnel"; do
+        # shellcheck disable=SC2086
+        run_stubbed_cli $args
+        assert_failure
+        assert_equal "$(cat "$FWSNAP_DIR/mangle.rules")" $'*mangle\n:TUN_DIR - [0:0]\nCOMMIT'
+    done
 }
 
 # C1: tunnel_apply soft-fails with 0 - a refused rule, a tunnel the platform
@@ -1016,6 +1078,39 @@ applied_then_moved_by_hand() {
     assert_failure
     run ipset test XRAY_CLIENTS 192.168.1.101
     assert_success
+}
+
+# ============================================================================
+# The snapshot of the rules, for the hooks to restore after a firewall rebuild
+# ============================================================================
+
+# Every apply that gets to its end leaves the snapshot of the rules it put in place: in full, of
+# one component, the update and the restart. The fixture's: Xray's client from br0 at 1, TUN_DIR
+# for wgc1 behind it.
+@test "vpn-director: every apply writes the snapshot of the rules it leaves" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    run cat "$FWSNAP_DIR/mangle.rules"
+    assert_success
+    assert_line --index 0 '*mangle'
+    assert_line --index 1 ':XRAY_TPROXY - [0:0]'
+    assert_line --index 2 ':TUN_DIR - [0:0]'
+    assert_line '-A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN'
+    assert_line '-A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_line '-I PREROUTING 1 -i br0 -j XRAY_TPROXY'
+    assert_line '-I PREROUTING 2 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    assert_equal "${lines[-1]}" COMMIT
+
+    local args
+    for args in "apply tunnel" "apply xray" update restart "restart tunnel" "restart xray"; do
+        rm -f "$FWSNAP_DIR/mangle.rules"
+        # shellcheck disable=SC2086
+        run_cli $args
+        assert_success
+        [ -f "$FWSNAP_DIR/mangle.rules" ]
+    done
 }
 
 # Only path declarations are rehomed; init control flow remains production code.

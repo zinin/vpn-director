@@ -41,8 +41,10 @@ setup() {
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
 
     # guard.sh records where its rules went in, under /tmp/vpn-director/guards
-    # unless told otherwise: each test keeps a record of its own.
+    # unless told otherwise: each test keeps a record of its own. So does
+    # fwsnap.sh its snapshot of the rules, under /tmp/vpn-director/fwsnap.
     export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
+    export FWSNAP_DIR="$BATS_TEST_TMPDIR/fwsnap"
 
     # Clean log file
     : > "$LOG_FILE"

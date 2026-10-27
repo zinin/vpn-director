@@ -165,6 +165,7 @@ _load_modules() {
     . "$SCRIPT_DIR/lib/ipset.sh" --source-only
     . "$SCRIPT_DIR/lib/tunnel.sh" --source-only
     . "$SCRIPT_DIR/lib/tproxy.sh" --source-only
+    . "$SCRIPT_DIR/lib/fwsnap.sh"
     _MODULES_LOADED=1
 }
 
@@ -290,6 +291,10 @@ cmd_apply() {
 
     local required_ipsets=""
 
+    # Every branch that applies ends with the snapshot of the rules it leaves (fwsnap_save),
+    # which the firmware hooks restore after a rebuild of the firewall, ahead of the apply they
+    # queue. A branch that fails part-way ends the run before it, and the snapshot of an earlier
+    # apply stays.
     case "$COMPONENT" in
         ""|all)
             required_ipsets="$(tunnel_get_required_ipsets) $(tproxy_get_required_ipsets)"
@@ -327,6 +332,7 @@ cmd_apply() {
             tunnel_apply
             _prune_keeping "$(tunnel_uncarried)"
             _routes_cron_sync
+            fwsnap_save
             ;;
         tunnel)
             required_ipsets=$(tunnel_get_required_ipsets)
@@ -336,6 +342,7 @@ cmd_apply() {
             fi
             tunnel_apply
             _routes_cron_sync
+            fwsnap_save
             ;;
         xray|tproxy)
             required_ipsets=$(tproxy_get_required_ipsets)
@@ -350,6 +357,7 @@ cmd_apply() {
             # them: main is no tunnel, and a client of it that no rule marks goes direct.
             tproxy_apply
             _prune_keeping "$(tunnel_clients)"
+            fwsnap_save
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2
@@ -375,15 +383,21 @@ cmd_stop() {
             printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
             ;;
     esac
+    # Then the snapshot of the rules goes, whichever component stops: the hooks restore it after
+    # a rebuild of the firewall, and a rebuild during the teardown or after it would bring back
+    # what the stop takes away. An unknown component stops nothing and keeps it.
     case "$COMPONENT" in
         ""|all)
+            fwsnap_remove
             tproxy_stop
             tunnel_stop
             ;;
         tunnel)
+            fwsnap_remove
             tunnel_stop
             ;;
         xray|tproxy)
+            fwsnap_remove
             tproxy_stop
             ;;
         *)
@@ -458,11 +472,13 @@ cmd_update() {
         _ensure_ipsets $required_ipsets
     fi
 
-    # Make before break, for the reason spelled out in cmd_apply.
+    # Make before break, for the reason spelled out in cmd_apply, and the
+    # snapshot of the rules last, as there.
     tproxy_apply
     tunnel_apply
     _prune_keeping "$(tunnel_uncarried)"
     _routes_cron_sync
+    fwsnap_save
 
     log "Update complete"
 }
