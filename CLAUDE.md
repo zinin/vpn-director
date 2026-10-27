@@ -68,6 +68,9 @@ cd server && go run ./cmd/watchd --dev
 | `router/opt/vpn-director/lib/ipset.sh` | IPSet module: ensure, update, status |
 | `router/opt/vpn-director/lib/tunnel.sh` | Tunnel Director module: apply, stop, status |
 | `router/opt/vpn-director/lib/tproxy.sh` | Xray TPROXY module: apply, stop, status |
+| `router/opt/vpn-director/lib/guard.sh` | ip rule guards by source and LAN interface (16895-16898) and the direct rule (`fwmark 0x200/0x200 lookup main`, 16894): what keeps protected clients off the WAN while a firmware rebuild has taken our chains away |
+| `router/opt/vpn-director/lib/fwsnap.sh` | Snapshot of our mangle and nat rules after every apply (`/tmp/vpn-director/fwsnap/`), removed by `stop` |
+| `router/opt/vpn-director/lib/fwsnap-restore.sh` | POSIX sh the firmware hooks run before their apply: puts the snapshot back (`iptables-restore --noflush`) unless the table still holds our rules |
 | `router/opt/vpn-director/lib/xrayconf.sh` | Xray config.json from a server's stored outbound (legacy VLESS records built), `xray run -test` before it replaces the live one |
 | `router/opt/vpn-director/lib/subscription.sh` | Subscription decoder: share links (vless, vmess, trojan, ss, hysteria2), base64 or plain, and Xray JSON, into servers with a ready outbound |
 | `testdata/subscription/` | Cases both subscription decoders (shell and Go) must decode alike |
@@ -131,7 +134,9 @@ shutdown, durable notification and recovery contracts.
 - A tunnel whose table holds no route refuses its clients' traffic (a `prohibit` rule per slot
   after the lookup range); one the platform does not list keeps a slot whose block rule refuses
   its clients while its table has no route (KeeneticOS keeps routing `WireguardN` while RCI is
-  silent)
+  silent). While a firmware rebuild of the firewall has taken `TUN_DIR` away, each client's guards
+  (`lib/guard.sh`: ip rules by source and LAN interface) keep it in its tunnel or refused, its
+  address and CIDR exclusions direct
 - `exclude` takes IPv4 addresses and CIDRs beside country codes
 - Optional `gateway` is the OpenVPN next hop; ignored on WireGuard. On Merlin it
   is also what fills ovpncN when the server does not push redirect-gateway.
@@ -164,7 +169,8 @@ shutdown, durable notification and recovery contracts.
 - Shebang: sourced libraries keep `#!/usr/bin/env bash`; a script a router executes
   (`vpn-director.sh`, `configure.sh`, `import_server_list.sh`, `setup_telegram_bot.sh`,
   `lib/send-email.sh`, `install.sh`) starts `#!/bin/sh` and hands over to bash by absolute path — KeeneticOS
-  has no `/usr/bin/env`. Both forms then `set -euo pipefail`
+  has no `/usr/bin/env`. Both forms then `set -euo pipefail`. `lib/fwsnap-restore.sh`, which the
+  firmware hooks run, stays POSIX sh (no hand-over, no errexit) and always exits 0
 - Debug: `DEBUG=1 ./script.sh` enables tracing with informative PS4
 - Conditionals: Use `[[ ]]` instead of `[ ]`
 - Logging: `log -l ERROR|WARN|INFO|DEBUG|TRACE "message"`

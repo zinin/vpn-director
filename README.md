@@ -78,6 +78,13 @@ interface: Tunnel Director would route them into the router's own server tunnel,
 traffic is dropped. Telling servers apart needs a router that has one to check the RCI fields
 against; that check is still open.
 
+On KeeneticOS no connection of a client on Xray or Tunnel Director is accelerated by the
+firmware, in software or in hardware - not even one to a destination the client excludes: an
+accelerated connection is routed by the router's routing rules alone, and the rules that keep
+such a client off the WAN while the firmware rebuilds its firewall would send that connection
+into the tunnel or refuse it. Every other device keeps its acceleration. Traffic such a client
+sends to its excluded destinations no longer follows KeeneticOS's domain-based routes either.
+
 ### Optional
 
 - `opkg install wget-ssl` — faster and more reliable downloads for country zone files (recommended)
@@ -308,7 +315,7 @@ Pick another route for a client in the Web UI (the Route column) or in the bot (
 
 What remains:
 
-- The firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again.
+- The firmware's own firewall rebuilds (a firewall restart on Merlin; an NDM rebuild on KeeneticOS, which every renewal of the WAN's DHCP lease brings) take the chains away. The hook puts them back at once from a snapshot of the last apply, then applies again. Until the chains are back, routing rules per client, which the rebuild leaves alone, keep a tunnel client in its tunnel, where its connections carry on, and refuse an Xray client's new connections. Meanwhile a tunnel client's traffic to an excluded country goes through the tunnel (on KeeneticOS a connection opened then stays there until it closes), and an Xray client's is refused; excluded addresses and CIDRs, and an Xray client's traffic to private networks and the addresses of `xray.exclude_ips`, still go direct.
 - A tunnel that is down refuses its clients' traffic until it is up (excluded destinations still go direct). The Web UI and the bot ask before they move a client to a tunnel that is down or that the router does not list.
 - On Asuswrt-Merlin, an OpenVPN client in "VPN Director (policy rules)" mode whose server pushes no redirect-gateway gets the WAN's default route copied into its table by the firmware each time the client starts, and vpn-director ships no hook for a VPN client's start: until the next apply puts the tunnel's default back, that tunnel's clients go out through the WAN. Run `vpn-director.sh apply` after restarting such a client.
 - A move changes the route of new connections. An open connection may break (reconnect it) or, on KeeneticOS, keep its old route until its conntrack entry expires. A UDP flow moved from Xray to a tunnel can stall until its conntrack entry expires.
@@ -331,10 +338,10 @@ This project uses Entware init.d for automatic startup:
 | Script | When Called | Purpose |
 |--------|-------------|---------|
 | `/opt/etc/init.d/S99vpn-director` | After Entware initialized | Runs `vpn-director.sh apply` to initialize all components |
-| `/jffs/scripts/firewall-start` | After firewall rules applied (Merlin) | Reapplies configuration after firewall reload |
+| `/jffs/scripts/firewall-start` | After firewall rules applied (Merlin) | Puts the chains back from the last apply's snapshot, then reapplies configuration after firewall reload |
 | `/jffs/scripts/wan-event` | On WAN connected (Merlin) | Runs `vpn-director.sh apply` on WAN connection |
-| `/jffs/scripts/nat-start` | After the nat table is rebuilt (Merlin) | Runs `vpn-director.sh --wait apply`, so interface tunnels get their `MASQUERADE` back |
-| `/opt/etc/ndm/netfilter.d`, `wan.d`, `iflayerchanged.d` (`50-vpn-director.sh`) | NDM firewall rebuild / WAN start / VPN client IPv4 layer (KeeneticOS) | Detached `vpn-director.sh --wait apply` |
+| `/jffs/scripts/nat-start` | After the nat table is rebuilt (Merlin) | Puts the interface tunnels' `MASQUERADE` back from the last apply's snapshot, then runs `vpn-director.sh --wait apply` |
+| `/opt/etc/ndm/netfilter.d`, `wan.d`, `iflayerchanged.d` (`50-vpn-director.sh`) | NDM firewall rebuild / WAN start / VPN client IPv4 layer (KeeneticOS) | Detached `vpn-director.sh --wait apply`; `netfilter.d` first puts the rebuilt table's rules back from the last apply's snapshot |
 
 **Note:** The init.d script ensures Entware bash is available before running vpn-director scripts.
 
