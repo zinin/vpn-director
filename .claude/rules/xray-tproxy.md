@@ -55,7 +55,8 @@ watch trying one server after another.
 - The guards follow `XRAY_CLIENTS` ("Fail-Safe"): `tproxy_apply` syncs them once the chain is in,
   and the set only grows there, so a client that left Xray keeps its guards until `tproxy_prune`,
   whose sync after the swap takes them away. Each sync puts the new list in before the old one
-  goes (`guard_sync`).
+  goes (`guard_sync`). While the chain does not answer for its direct mark, the prune puts no guard
+  in, but still takes away those of a client the swap let go (`_tproxy_guards_prune`).
 - A name from `advanced.xray.chain` leaves room for `_NEW` (24 characters at most), and so does
   one from `advanced.xray.clients_ipset` or `bypass_ipset` (27).
 
@@ -300,16 +301,21 @@ gets its guard only where ip and ipset read it as written (`is_ipv4_net`) and it
 no `hash:net` set takes: IPv6, a leading zero (ipset refuses it, ip reads `010` as 8) or a `/0`
 gets none, and costs the apply nothing.
 
-`_tproxy_guard_lines` takes the members from `ipset list`, sorted - the kernel lists them in hash
-order, which a swap of the set changes - and `_tproxy_guards_sync` hands their guards to
-`guard_sync`, which writes the new list at one preference while the old one guards from the other.
+`_tproxy_guard_lines` takes the members from `ipset list` (`_tproxy_members`), sorted - the kernel
+lists them in hash order, which a swap of the set changes - and `_tproxy_guards_sync` hands their
+guards to `guard_sync`, which writes the new list at one preference while the old one guards from
+the other.
 It syncs only while the live chain holds the direct-mark rule (`_tproxy_guards_wanted`, rule 2 in
 the exact form `_tproxy_build_chain` writes it): a chain an earlier version left returns bare from
 every exclusion, and the guards would refuse what it lets go direct; without a chain - no
 xt_TPROXY, the firmware's rebuild - Xray proxies nobody. The guards then stay as they are.
 `tproxy_apply` syncs once `_tproxy_setup_iptables` has run, and the soft-fails above sync too. The
 set only grows there, so a client that left Xray keeps its guards until `tproxy_prune`, which syncs
-after its swap. A guard the kernel refuses is an ERROR and withholds the ready marker of
+after its swap. Where the check finds no direct mark, the prune adds no guard but still drops those
+of the clients the swap let go, with a WARN (`_tproxy_guards_prune`): rule 1 returns their packets
+unmarked, and their refusal would meet them in normal operation, where they go direct. It hands
+`guard_sync` the guards in place of the members the set still holds, so no line goes in that was
+not there. A guard the kernel refuses is an ERROR and withholds the ready marker of
 `tproxy_apply`, and so does a check that finds no direct mark in the chain it has just swapped in
 ("Ready marker"); the prune leaves the marker alone, and the old guards of every client the set
 still holds stay (`guard_sync`). `tproxy_stop` removes the guards (`guard_clear`), those a former
@@ -332,7 +338,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 |----------|---------|
 | `tproxy_status()` | Show XRAY_TPROXY chain, routing, the direct rule and the guards, xray process |
 | `tproxy_apply()` | The make half of an apply: routing, sets, the direct rule, chain swapped in, then the guards; clients added, never removed; soft-fail if unavailable; rc 1, nothing touched, for a layout `guard_layout_check` refuses |
-| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; the guards follow the set after the swap; always returns 0 and leaves the ready marker alone |
+| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; the guards follow the set after the swap, and while the chain does not answer for its direct mark only those of the clients it let go are dropped; always returns 0 and leaves the ready marker alone |
 | `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) and Xray's guards; the direct rule once neither module needs it |
 | `tproxy_restart_process()` | Restart Xray process via Entware init script |
 | `tproxy_get_required_ipsets()` | Return list of valid exclude ipsets (unknown codes dropped with a WARN) |
@@ -358,8 +364,10 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | `_tproxy_jump_pos()` | Position of the first jump: 1 |
 | `_tproxy_setup_iptables()` | Platform rules, then `XRAY_TPROXY` swapped in with its jumps |
 | `_tproxy_guards_wanted()` | Does the live `XRAY_TPROXY` hold the direct-mark rule, in the form `_tproxy_build_chain` writes it? No guard is synced without it |
+| `_tproxy_members()` | The members of `XRAY_CLIENTS`, `/32` dropped, sorted (the kernel lists hash order); rc 1 with an ERROR when the set cannot be listed |
 | `_tproxy_guard_lines()` | The guards of every member of `XRAY_CLIENTS`, sorted, per LAN interface: the private ranges and `exclude_ips` direct, then the refusal; rc 1 when the platform names no LAN interface or the set cannot be listed |
 | `_tproxy_guards_sync()` | Make Xray's guards those of the set (`guard_sync`) while the live chain marks direct; rc 2, the guards left as they are, when it does not; rc 1 when one did not go in |
+| `_tproxy_guards_prune()` | For the prune while the chain does not answer for its direct mark: hand `guard_sync` the guards in place of the members the set still holds, so those of the clients it let go go and none goes in; nothing when none is to go or `guard_list` prints nothing |
 | `_tproxy_teardown_iptables()` | Remove chain and ipsets |
 
 **Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client, and they get their guards while the live chain marks direct. A layout `guard_layout_check` refuses is the one failure it returns 1 for ("Fail-Safe").

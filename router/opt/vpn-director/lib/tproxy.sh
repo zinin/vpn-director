@@ -50,8 +50,10 @@
 #   _tproxy_jump_pos()              - where the first XRAY_TPROXY jump goes: position 1
 #   _tproxy_setup_iptables()        - platform rules, then the chain swapped in with its jumps
 #   _tproxy_guards_wanted()         - does the live chain mark what it lets through direct?
+#   _tproxy_members()               - the members of the clients ipset, sorted
 #   _tproxy_guard_lines()           - the guards of what the clients ipset holds, in order
 #   _tproxy_guards_sync()           - make the guards those of the clients ipset (guard_sync)
+#   _tproxy_guards_prune()          - drop the guards of the clients the ipset let go, add none
 #   _tproxy_validate_ipv4_cidr()    - validate IPv4 address or CIDR notation
 #   _tproxy_teardown_iptables()     - remove iptables rules and ipsets
 #   _tproxy_init()                  - initialize module state
@@ -707,6 +709,25 @@ _tproxy_guards_wanted() {
 }
 
 # -------------------------------------------------------------------------------------------------
+# _tproxy_members - the members of XRAY_CLIENTS_IPSET, one per line, sorted
+# -------------------------------------------------------------------------------------------------
+# The first word of each line after "Members:" of "ipset list", "/32" dropped, as "ip rule show"
+# prints a host in a guard's from. Sorted: the kernel lists them in hash order, which a swap of
+# the set changes, and the same guards in another order would be written anew. Returns 1 with an
+# ERROR, printing nothing, when the set cannot be listed.
+# -------------------------------------------------------------------------------------------------
+_tproxy_members() {
+    local listing members
+    if ! listing="$(ipset list "$XRAY_CLIENTS_IPSET" 2>/dev/null)" ||
+        ! members="$(awk 'm && NF { sub(/\/32$/, "", $1); print $1 } /^Members:/ { m = 1 }' \
+            <<< "$listing" | LC_ALL=C sort)"; then
+        log -l ERROR "Xray: cannot list $XRAY_CLIENTS_IPSET; the guards stay as they are"
+        return 1
+    fi
+    [[ -z $members ]] || printf '%s\n' "$members"
+}
+
+# -------------------------------------------------------------------------------------------------
 # _tproxy_guard_lines - Xray's guards, one ip rule's selectors per line, in the order they are to
 # match (guard_sync)
 # -------------------------------------------------------------------------------------------------
@@ -722,11 +743,10 @@ _tproxy_guards_wanted() {
 #   from <X> iif L prohibit              everything else
 #
 # A packet the chain marked - for Xray, or direct - meets Xray's rule or the direct rule first, so
-# in normal operation none reaches a guard. The members are what the set holds: in tproxy_apply
-# the clients it added and those an earlier apply left, after tproxy_prune the effective clients
-# and those it kept. They are read from the lines after "Members:", and sorted: the kernel lists
-# them in hash order, which a swap of the set changes, and the same guards in another order would
-# be written anew. Which member comes first changes no route: each gets the same guards.
+# in normal operation none reaches a guard. The members are what the set holds (_tproxy_members):
+# in tproxy_apply the clients it added and those an earlier apply left, after tproxy_prune the
+# effective clients and those it kept. They come sorted, and which comes first changes no route:
+# each gets the same guards.
 #
 # "iif" keeps the router's own traffic out - a client's CIDR may hold the router's LAN address -
 # and the local table, at preference 0, answers traffic to the router before any guard. An entry
@@ -740,7 +760,7 @@ _tproxy_guards_wanted() {
 # LAN interface or the set cannot be listed: the empty list would take every guard away.
 # -------------------------------------------------------------------------------------------------
 _tproxy_guard_lines() {
-    local lan_ifaces listing members member lan_if range excl
+    local lan_ifaces members member lan_if range excl
     local -a ranges=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4)
     local -a excludes=()
     lan_ifaces="$(platform_lan_ifaces)" || lan_ifaces=""
@@ -748,12 +768,7 @@ _tproxy_guard_lines() {
         log -l ERROR "Xray: cannot determine the LAN interfaces; the guards stay as they are"
         return 1
     fi
-    if ! listing="$(ipset list "$XRAY_CLIENTS_IPSET" 2>/dev/null)" ||
-        ! members="$(awk 'm && NF { sub(/\/32$/, "", $1); print $1 } /^Members:/ { m = 1 }' \
-            <<< "$listing" | LC_ALL=C sort)"; then
-        log -l ERROR "Xray: cannot list $XRAY_CLIENTS_IPSET; the guards stay as they are"
-        return 1
-    fi
+    members="$(_tproxy_members)" || return 1
     [[ -z ${XRAY_EXCLUDE_IPS:-} ]] || read -ra excludes <<< "$XRAY_EXCLUDE_IPS"
 
     while IFS= read -r member; do
@@ -788,6 +803,41 @@ _tproxy_guards_sync() {
     _tproxy_guards_wanted || return 2
     lines="$(_tproxy_guard_lines)" || return 1
     guard_sync xray "$lines"
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tproxy_guards_prune - drop the guards of the clients XRAY_CLIENTS_IPSET no longer holds, and
+# add none
+# -------------------------------------------------------------------------------------------------
+# For tproxy_prune while the live chain does not answer for its direct mark (_tproxy_guards_sync
+# returned 2). No guard may go in then, but a client the swap let go is returned by rule 1
+# unmarked, and in normal operation its refusal would meet it where it goes direct. guard_sync gets
+# the guards in place (guard_list, the preference stripped, in their order) of every member the
+# set still holds, its from compared with the members as _tproxy_guard_lines reads them
+# (_tproxy_members): it writes no line that is not in place already, and takes the rest. Nothing
+# changes when no guard is to go, nor when guard_list prints nothing: no guard, or a listing that
+# failed, which it does not tell apart, and the empty list would take every guard away. Returns 1
+# when the members cannot be read (the ERROR is logged) or guard_sync returns 1.
+# -------------------------------------------------------------------------------------------------
+_tproxy_guards_prune() {
+    local members listed line from kept="" dropped=0
+    local -a words=()
+    members="$(_tproxy_members)" || return 1
+    listed="$(guard_list xray)"
+    [[ -n $listed ]] || return 0
+    while IFS= read -r line; do
+        read -ra words <<< "${line#*:}"
+        [[ ${#words[@]} -gt 0 ]] || continue
+        from=""
+        [[ ${words[0]} != from ]] || from="${words[1]:-}"
+        if [[ -n $from && $'\n'$members$'\n' == *$'\n'"${from%/32}"$'\n'* ]]; then
+            kept+="${words[*]}"$'\n'
+        else
+            dropped=1
+        fi
+    done <<< "$listed"
+    [[ $dropped -eq 1 ]] || return 0
+    guard_sync xray "$kept"
 }
 
 # -------------------------------------------------------------------------------------------------
@@ -1119,8 +1169,10 @@ tproxy_apply() {
 # A client the new set does not take would lose its interception with the swap, so the prune stops
 # there instead: the clients that left stay proxied until the next apply, which is no leak. Once
 # the set is swapped in, the guards follow it (_tproxy_guards_sync): a client it let go loses its
-# guards then, and not before. Always returns 0, and leaves the ready marker alone: every
-# effective client is in the set either way, and keeps its guards when a new one is refused.
+# guards then, and not before. While the chain does not answer for its direct mark, no guard goes
+# in, and only those of the clients the set let go are taken away (_tproxy_guards_prune). Always
+# returns 0, and leaves the ready marker alone: every effective client is in the set either way,
+# and keeps its guards when a new one is refused.
 # -------------------------------------------------------------------------------------------------
 tproxy_prune() {
     _tproxy_init
@@ -1175,8 +1227,16 @@ tproxy_prune() {
     # The guards follow the set, after the swap: a client it let go was proxied
     # until then, and its guards kept it off the WAN in a rebuild of the firewall.
     # A guard that does not go in (guard_sync logs the ERROR) leaves the old ones
-    # of the clients the set still holds.
-    _tproxy_guards_sync || true
+    # of the clients the set still holds. While the chain does not answer for its
+    # direct mark (rc 2), no guard may go in, but those of a client the set let
+    # go are taken away all the same: rule 1 returns its packets unmarked now,
+    # and its refusal would meet them in normal operation.
+    local guards_rc=0
+    _tproxy_guards_sync || guards_rc=$?
+    if [[ $guards_rc -eq 2 ]]; then
+        log -l WARN "The direct mark was not found in $XRAY_CHAIN; the Xray guards were not synced, only those of the clients that left the set removed"
+        _tproxy_guards_prune || true
+    fi
     return 0
 }
 

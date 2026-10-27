@@ -1468,6 +1468,40 @@ load_tproxy_module_with_clients() {
     assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
 }
 
+# Once the swap has let a client go, rule 1 returns its packets unmarked. While
+# the check finds no direct mark in the chain - a busy xtables lock - the prune
+# may add no guard, but that client's still go: in normal operation it goes
+# direct, and its refusal would meet it until the next apply. The guards of the
+# clients the set holds stay as they are, and a member without guards - one the
+# prune keeps, here added by hand - gets none.
+@test "tproxy_prune: a check that finds no direct mark still drops the guards of a client that left Xray" {
+    load_tproxy_module               # the fixture's xray.clients: 192.168.1.100
+    use_stateful_iptables
+    live_xray_clients 192.168.1.8    # on Xray before, gone from the config now (paused, deleted)
+    run tproxy_apply
+    assert_success
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.8 iif br0 prohibit'
+    ipset add XRAY_CLIENTS 192.168.1.9
+    iptables() {
+        [[ $* == "-t mangle -C XRAY_TPROXY -j MARK --set-xmark 0x200/0x200" ]] && return 4
+        command iptables "$@"
+    }
+
+    run tproxy_prune 192.168.1.9
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.9"
+    assert_output --partial "The direct mark was not found in XRAY_TPROXY; the Xray guards were not synced, only those of the clients that left the set removed"
+    run ipset test XRAY_CLIENTS 192.168.1.8
+    assert_failure
+    run guard_list xray
+    refute_output --partial '192.168.1.8'
+    refute_output --partial '192.168.1.9'
+    assert_line $'16898:\tfrom 192.168.1.100 to 10.0.0.0/8 iif br0 lookup main'
+    assert_line $'16898:\tfrom 192.168.1.100 iif br0 prohibit'
+    assert_equal "${#lines[@]}" 8
+}
+
 # The watch takes Xray clients off the fallback tunnel on the marker, and a client
 # moved without its guard would leave through the WAN in the next rebuild of the
 # firewall. The next apply puts the guard in.
