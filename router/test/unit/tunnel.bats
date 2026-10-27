@@ -2062,6 +2062,22 @@ move_100_to_wgc1() {
     assert_failure
 }
 
+# While the chains are gone, a client on Xray and on a tunnel goes through the
+# tunnel, as a Tunnel Director client: Tunnel Director's guards take preferences
+# ahead of Xray's, and the kernel tries the rules in the order of their
+# preferences (the mock lists them in the order they went in).
+@test "full apply: a client on Xray and on a tunnel meets the tunnel's guard first" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101 100.64.0.8 192.168.1.5'
+
+    run full_apply
+    assert_success
+    run ip rule show
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1'
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 prohibit'
+    assert_line $'16897:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
 # ============================================================================
 # main is no tunnel: its clients are never reported, nor kept on Xray
 # ============================================================================

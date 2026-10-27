@@ -52,6 +52,10 @@ watch trying one server after another.
   gets no element of its own: `ipset test` finds a host through any network the set holds, so a host
   inside an effective network is in through that network, and `x/32` of an effective `x` is `x`. A
   WARN names the clients kept.
+- The guards follow `XRAY_CLIENTS` ("Fail-Safe"): `tproxy_apply` syncs them once the chain is in,
+  and the set only grows there, so a client that left Xray keeps its guards until `tproxy_prune`,
+  whose sync after the swap takes them away. Each sync puts the new list in before the old one
+  goes (`guard_sync`).
 - A name from `advanced.xray.chain` leaves room for `_NEW` (24 characters at most), and so does
   one from `advanced.xray.clients_ipset` or `bypass_ipset` (27).
 
@@ -222,6 +226,11 @@ ip rule add pref $XRAY_RULE_PREF fwmark $XRAY_FWMARK/$XRAY_FWMARK_MASK table $XR
 
 # The direct rule, Tunnel Director's as well (guard_direct_ensure, lib/guard.sh)
 ip rule add pref 16894 fwmark 0x200/0x200 lookup main
+
+# The guards of every client XRAY_CLIENTS holds, per LAN interface, at 16897 or 16898
+# (guard_sync, lib/guard.sh; see "Fail-Safe"): its direct destinations, then the refusal
+ip rule add pref 16897 from 192.168.1.100 to 10.0.0.0/8 iif br0 lookup main
+ip rule add pref 16897 from 192.168.1.100 iif br0 prohibit
 ```
 
 **Fwmark bit allocation**: `0x100` (bit 8) is free from firmware VPN marking (bit 0), Tunnel
@@ -247,7 +256,8 @@ mark or our table, because other firmware versions may still park policies at 20
 
 It still adds every effective client to an `XRAY_CLIENTS` that exists: the rules of an earlier apply
 may still intercept with it, and a client moving from a tunnel to Xray has to be in it before
-`tunnel_apply` takes its mark away.
+`tunnel_apply` takes its mark away. While the live chain marks direct, the clients get their guards
+there as well (below): such a client loses its tunnel guard in `tunnel_apply`.
 
 > An unknown country code in `xray.exclude_sets` is **not** one of those
 > reasons: `_tproxy_exclude_sets` drops it with a WARN before the check, so a
@@ -258,6 +268,53 @@ is not one bit, or lies in `fwmark_mask` or in Tunnel Director's `mark_mask`; gu
 reach main's rule at 32766) are no soft-fail: `tproxy_apply` logs the ERROR and returns 1 before
 it touches anything - no module, route, rule, set, chain or marker - and the run ends there, as
 `tunnel_apply` would end it.
+
+The firmware's firewall rebuilds take `XRAY_TPROXY` away: KeeneticOS's NDM deletes it (every WAN
+lease renewal did on the KN-4521), Merlin's firewall start empties it (`iptables -t mangle -F`).
+Until the hook's apply puts it back, an Xray client's packets are neither proxied nor marked, and
+they would reach main and the WAN. ip rules survive both, so every client `XRAY_CLIENTS` holds has
+guards (`lib/guard.sh`): ip rules by source and LAN interface (`platform_lan_ifaces`; `iif` takes
+one name, so each interface has its own) at Xray's guard preferences, 16897-16898, after Tunnel
+Director's 16895-16896 and the direct rule at 16894. Xray cannot be reached without the chain, so
+they refuse a client's packets, but for the private ranges and its address exclusions, which go
+direct. The fixture's client, with `exclude_ips` `5.6.7.8` and `10.20.0.0/16`:
+
+```
+16897: from 192.168.1.100 to 10.0.0.0/8 iif br0 lookup main     # likewise 172.16.0.0/12,
+                                                                # 192.168.0.0/16, 169.254.0.0/16,
+                                                                # 224.0.0.0/4
+16897: from 192.168.1.100 to 5.6.7.8 iif br0 lookup main        # each address or CIDR
+16897: from 192.168.1.100 to 10.20.0.0/16 iif br0 lookup main   # of exclude_ips
+16897: from 192.168.1.100 iif br0 prohibit                      # everything else refused
+```
+
+A packet the chain marked - for Xray, or direct - meets Xray's rule at 200 or the direct rule
+first, so in normal operation none reaches a guard. While the chain is gone, a client's new
+connections are refused and its proxied ones stall until the chain is back. A country of
+`exclude_sets` is no ip rule (no rule matches a set), and the Xray servers and the firmware's VPN
+endpoints in `TPROXY_BYPASS` get no guard either: their traffic is refused as well. A client on
+Xray and on a tunnel meets Tunnel Director's guards first, and goes through its tunnel. `iif` keeps
+the router's own traffic out - a client CIDR may hold the router's LAN address - and the local
+table, at preference 0, answers traffic to the router before any guard. An `exclude_ips` entry
+gets its guard only where ip and ipset read it as written (`is_ipv4_net`) and it is no `/0`, which
+no `hash:net` set takes: IPv6, a leading zero (ipset refuses it, ip reads `010` as 8) or a `/0`
+gets none, and costs the apply nothing.
+
+`_tproxy_guard_lines` takes the members from `ipset list`, sorted - the kernel lists them in hash
+order, which a swap of the set changes - and `_tproxy_guards_sync` hands their guards to
+`guard_sync`, which writes the new list at one preference while the old one guards from the other.
+It syncs only while the live chain holds the direct-mark rule (`_tproxy_guards_wanted`, rule 2 in
+the exact form `_tproxy_build_chain` writes it): a chain an earlier version left returns bare from
+every exclusion, and the guards would refuse what it lets go direct; without a chain - no
+xt_TPROXY, the firmware's rebuild - Xray proxies nobody. The guards then stay as they are.
+`tproxy_apply` syncs once `_tproxy_setup_iptables` has run, and the soft-fails above sync too. The
+set only grows there, so a client that left Xray keeps its guards until `tproxy_prune`, which syncs
+after its swap. A guard the kernel refuses is an ERROR and withholds the ready marker of
+`tproxy_apply`; the prune leaves the marker alone, and the old guards of every client the set
+still holds stay (`guard_sync`). `tproxy_stop` removes the guards (`guard_clear`), those a former
+`pref_base` left too, then the direct rule once neither module needs it (`guard_direct_release`:
+not while `TUN_DIR` is in mangle or Tunnel Director has guards). `status xray` lists the direct rule
+and the guards.
 
 ## Extended Exclusion Sets
 
@@ -272,10 +329,10 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 
 | Function | Purpose |
 |----------|---------|
-| `tproxy_status()` | Show XRAY_TPROXY chain, routing, xray process |
-| `tproxy_apply()` | The make half of an apply: routing, sets, the direct rule, chain swapped in; clients added, never removed; soft-fail if unavailable; rc 1, nothing touched, for a layout `guard_layout_check` refuses |
-| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; always returns 0 and leaves the ready marker alone |
-| `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) |
+| `tproxy_status()` | Show XRAY_TPROXY chain, routing, the direct rule and the guards, xray process |
+| `tproxy_apply()` | The make half of an apply: routing, sets, the direct rule, chain swapped in, then the guards; clients added, never removed; soft-fail if unavailable; rc 1, nothing touched, for a layout `guard_layout_check` refuses |
+| `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; the guards follow the set after the swap; always returns 0 and leaves the ready marker alone |
+| `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) and Xray's guards; the direct rule once neither module needs it |
 | `tproxy_restart_process()` | Restart Xray process via Entware init script |
 | `tproxy_get_required_ipsets()` | Return list of valid exclude ipsets (unknown codes dropped with a WARN) |
 
@@ -299,9 +356,12 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | `_tproxy_build_chain(chain)` | Fill a fresh chain with the TPROXY rules: 0, 1 (a narrowing RETURN or the offload opt-out missing), 2 (a bounding RETURN, the direct mark or a target missing) |
 | `_tproxy_jump_pos()` | Position of the first jump: 1 |
 | `_tproxy_setup_iptables()` | Platform rules, then `XRAY_TPROXY` swapped in with its jumps |
+| `_tproxy_guards_wanted()` | Does the live `XRAY_TPROXY` hold the direct-mark rule, in the form `_tproxy_build_chain` writes it? No guard is synced without it |
+| `_tproxy_guard_lines()` | The guards of every member of `XRAY_CLIENTS`, sorted, per LAN interface: the private ranges and `exclude_ips` direct, then the refusal; rc 1 when the platform names no LAN interface or the set cannot be listed |
+| `_tproxy_guards_sync()` | Make Xray's guards those of the set (`guard_sync`) while the live chain marks direct; rc 1 when one did not go in |
 | `_tproxy_teardown_iptables()` | Remove chain and ipsets |
 
-**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client. A layout `guard_layout_check` refuses is the one failure it returns 1 for ("Fail-Safe").
+**Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client, and they get their guards while the live chain marks direct. A layout `guard_layout_check` refuses is the one failure it returns 1 for ("Fail-Safe").
 
 **Ready marker**: `tproxy_apply()` writes `/tmp/xray_tproxy/ready` (`XRAY_TPROXY_READY`) only when
 every rule went in, the platform's own included, and removes it on any soft-fail.
@@ -327,4 +387,8 @@ and the marker is withheld although the chain itself is in place. The adds pass 
 repeated address is not a failure, and an entry that is no IPv4 address or CIDR (`is_ipv4_net`: an
 IPv6 address an older Web UI saved, a typo like `192.168.1.1000`) is skipped with a WARN and does
 not count — no set takes it, no tunnel carries it, and waiting for it held every restore of the
-LAN on the fallback tunnel.
+LAN on the fallback tunnel. Every client the set holds needs its guards as well ("Fail-Safe"): a
+guard that does not go in (`guard_sync` logs the ERROR), or a set or LAN interfaces
+`_tproxy_guard_lines` cannot read, withholds the marker. The watch takes the clients off the
+fallback tunnel on it, and one without its guards would leave through the WAN in the next rebuild
+of the firewall.

@@ -1215,19 +1215,25 @@ live_xray_clients() {
     assert_failure
 }
 
-# load_tproxy_module_with_clients <json array> - load_tproxy_module on a copy of
-# the fixture whose xray.clients is <json array>: config.sh marks XRAY_CLIENTS
-# readonly, so a test cannot set it afterwards.
-load_tproxy_module_with_clients() {
+# load_tproxy_module_jq <jq arguments...> - load_tproxy_module on a copy of the
+# fixture that jq rewrites with <jq arguments...>, its options and then its
+# filter: config.sh marks every setting readonly, so a test cannot set one
+# afterwards.
+load_tproxy_module_jq() {
     load_common
-    jq --argjson c "$1" '.xray.clients = $c' "$TEST_ROOT/fixtures/vpn-director.json" \
-        > "$BATS_TEST_TMPDIR/vpn-director.json"
+    jq "$@" "$TEST_ROOT/fixtures/vpn-director.json" > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
     source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only
+}
+
+# load_tproxy_module_with_clients <json array> - the same, with xray.clients
+# <json array>.
+load_tproxy_module_with_clients() {
+    load_tproxy_module_jq --argjson c "$1" '.xray.clients = $c'
 }
 
 # The overlap packet-flow.md documents ("Example 3"): the network on Xray, a host
@@ -1314,4 +1320,295 @@ load_tproxy_module_with_clients() {
     assert_success
     run ipset list -n XRAY_CLIENTS
     assert_failure
+}
+
+# ============================================================================
+# Guards: an Xray client refused, not leaked, while XRAY_TPROXY is gone
+# ============================================================================
+
+# The firmware's rebuilds take XRAY_TPROXY away, and until the apply puts it back
+# an Xray client's packets are neither proxied nor marked: they would reach main
+# and leave through the WAN. ip rules survive the rebuilds. Xray cannot be reached
+# without the chain, so the client's guards, behind the direct rule, refuse them,
+# but for the private ranges and xray.exclude_ips, which go direct.
+@test "tproxy_apply: an Xray client gets its guards once the chain is in" {
+    load_tproxy_module_with_clients '["192.168.1.100"]'   # the fixture's exclude_ips: 5.6.7.8, 10.20.0.0/16
+    use_stateful_iptables
+    use_stateful_ipset
+    run tproxy_apply
+    assert_success
+    run ip rule show
+    assert_line --index 3 $'16897:\tfrom 192.168.1.100 to 10.0.0.0/8 iif br0 lookup main'
+    assert_line --index 7 $'16897:\tfrom 192.168.1.100 to 224.0.0.0/4 iif br0 lookup main'
+    assert_line --index 8 $'16897:\tfrom 192.168.1.100 to 5.6.7.8 iif br0 lookup main'
+    assert_line --index 9 $'16897:\tfrom 192.168.1.100 to 10.20.0.0/16 iif br0 lookup main'
+    assert_line --index 10 $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+}
+
+# Without the chain Xray proxies nobody, and a guard would refuse what goes direct
+# then. The soft-fail still adds the clients to the live set, and syncs no guard.
+@test "tproxy_apply: no Xray guard while the chain is not in place" {
+    load_tproxy_module
+    use_stateful_iptables
+    live_xray_clients 192.168.1.7
+    platform_load_module() { return 1; }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "xt_TPROXY module not available"
+    run ipset test XRAY_CLIENTS 192.168.1.100
+    assert_success
+    run ip rule show
+    refute_line --regexp '^1689[78]:'
+}
+
+# The chain an earlier version put in returns bare from every exclusion: what it
+# lets through carries no direct mark, and the guards would refuse it in normal
+# operation. Its soft-fail syncs no guard; the apply that swaps in a chain that
+# marks direct gives the clients theirs.
+@test "tproxy_apply: no Xray guard while the live chain marks nothing direct" {
+    load_tproxy_module
+    use_stateful_iptables
+    live_xray_clients 192.168.1.100
+    iptables -t mangle -N XRAY_TPROXY
+    iptables -t mangle -A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN
+    iptables -t mangle -A PREROUTING -i br0 -j XRAY_TPROXY
+    _tproxy_check_required_ipsets() { return 1; }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "Required ipsets not ready"
+    run ip rule show
+    refute_line --regexp '^1689[78]:'
+
+    # The module's own check again.
+    source "$LIB_DIR/tproxy.sh" --source-only
+    run tproxy_apply
+    assert_success
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x200/0x200'
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+}
+
+# A soft-fail adds every effective client to a live XRAY_CLIENTS, which the live
+# chain intercepts with: a client new to it - one moving from a tunnel to Xray,
+# whose tunnel guard tunnel_apply takes next - gets its guards there as well.
+@test "tproxy_apply: a soft-fail gives the clients it adds to a live XRAY_CLIENTS their guards" {
+    load_tproxy_module_with_clients '["192.168.1.100","192.168.1.5"]'
+    use_stateful_iptables
+    use_stateful_ipset
+    ipset() {
+        [[ ${1:-} == add && $* == *"XRAY_CLIENTS 192.168.1.5" ]] && return 1
+        command ipset "$@"
+    }
+    run tproxy_apply
+    assert_success
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+    refute_output --partial '192.168.1.5'
+
+    unset -f ipset
+    _tproxy_check_required_ipsets() { return 1; }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "Required ipsets not ready"
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+    assert_line $'16897:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# Make before break: a client that left Xray is proxied until the swap, and in a
+# firewall rebuild its guards keep it off the WAN until then.
+@test "tproxy_prune: a client that left Xray loses its guards after the swap" {
+    load_tproxy_module
+    use_stateful_iptables
+    live_xray_clients 192.168.1.8
+    run tproxy_apply
+    assert_success
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.8 iif br0 prohibit'
+    ip() {
+        [[ ${1:-} == rule && ${2:-} == del ]] && echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command ip "$@"
+    }
+    ipset() {
+        [[ ${1:-} == swap ]] && echo "ipset $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command ipset "$@"
+    }
+
+    run tproxy_prune
+    assert_success
+    local swap del
+    swap=$(grep -nxF 'ipset swap XRAY_CLIENTS_NEW XRAY_CLIENTS' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    del=$(grep -nxF 'ip rule del pref 16897 from 192.168.1.8 iif br0 prohibit' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    [[ -n $swap && -n $del ]]
+    (( swap < del ))
+    run guard_list xray
+    refute_output --partial '192.168.1.8'
+    assert_line $'16898:\tfrom 192.168.1.100 iif br0 prohibit'
+}
+
+# A client Tunnel Director does not carry stays proxied (tproxy_prune), and keeps
+# its guards with it.
+@test "tproxy_prune: a client the prune keeps keeps its guards" {
+    load_tproxy_module
+    use_stateful_iptables
+    live_xray_clients 192.168.1.7
+    run tproxy_apply
+    assert_success
+
+    run tproxy_prune 192.168.1.7
+    assert_success
+    assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.7 - they stay proxied"
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.7 iif br0 prohibit'
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+}
+
+# The watch takes Xray clients off the fallback tunnel on the marker, and a client
+# moved without its guard would leave through the WAN in the next rebuild of the
+# firewall. The next apply puts the guard in.
+@test "tproxy_apply: a refused guard withholds ready" {
+    load_tproxy_module
+    use_stateful_iptables
+    use_stateful_ipset
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" iif br0 prohibit "* ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "Guard of xray not installed at pref 16897: from 192.168.1.100 iif br0 prohibit"
+    assert_output --partial "Not every Xray client has its guards; TPROXY readiness withheld"
+    [ ! -e "$XRAY_TPROXY_READY" ]
+
+    unset -f ip
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+}
+
+# Review Focus: config.sh takes a paused client out of xray.clients, so it never
+# joins the set, and no guard names it; the other client keeps its own.
+@test "tproxy_apply: a paused client gets no guard" {
+    load_tproxy_module_jq '.xray.clients = ["192.168.1.100", "192.168.1.7"] | .paused_clients = ["192.168.1.7"]'
+    use_stateful_iptables
+    use_stateful_ipset
+    run tproxy_apply
+    assert_success
+    run tproxy_prune
+    assert_success
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+    refute_output --partial '192.168.1.7'
+}
+
+# What ip or ipset would read otherwise is no address to a guard: IPv6, 010 that
+# ip reads as 8 (ipset takes neither), and a /0, which no hash:net set holds - the
+# bypass set never had it, and its guard would send everything direct. None costs
+# the apply anything.
+@test "tproxy_apply: an exclude_ips entry the bypass set cannot hold gets no guard, and the apply succeeds" {
+    load_tproxy_module_jq '.xray.exclude_ips = ["5.6.7.8/32", "2001:db8::1", "203.0.113.010", "0.0.0.0/0"]'
+    use_stateful_iptables
+    use_stateful_ipset
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+    local direct
+    direct=$(printf 'from 192.168.1.100 to %s iif br0 lookup main\n' \
+        10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 5.6.7.8)
+    run _tproxy_guard_lines
+    assert_success
+    assert_output "$direct"$'\nfrom 192.168.1.100 iif br0 prohibit'
+}
+
+# The kernel lists a set's members in hash order, which a swap changes: sorted, the
+# list reads the same from one apply to the next, and guard_sync leaves it alone.
+# "iif" takes one name, so each LAN interface has guards of its own; it keeps the
+# router's own traffic out, and the local table at preference 0 answers traffic to
+# the router before any guard.
+@test "_tproxy_guard_lines: the members sorted, each with its guards per LAN interface" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.7 192.168.1.0/28
+    platform_lan_ifaces() { printf 'br0\nbr1\n'; }
+    run _tproxy_guard_lines
+    assert_success
+    assert_equal "${#lines[@]}" 32
+    assert_line --index 0 'from 192.168.1.0/28 to 10.0.0.0/8 iif br0 lookup main'
+    assert_line --index 7 'from 192.168.1.0/28 iif br0 prohibit'
+    assert_line --index 8 'from 192.168.1.0/28 to 10.0.0.0/8 iif br1 lookup main'
+    assert_line --index 15 'from 192.168.1.0/28 iif br1 prohibit'
+    assert_line --index 16 'from 192.168.1.7 to 10.0.0.0/8 iif br0 lookup main'
+    assert_line --index 31 'from 192.168.1.7 iif br1 prohibit'
+}
+
+# An empty list would take every guard away.
+@test "_tproxy_guard_lines: a set that cannot be listed is an error, not a list without clients" {
+    load_tproxy_module
+    live_xray_clients 192.168.1.100
+    ipset() {
+        [[ ${1:-} == list ]] && return 1
+        command ipset "$@"
+    }
+    run _tproxy_guard_lines
+    assert_failure
+    assert_output --partial "Xray: cannot list XRAY_CLIENTS; the guards stay as they are"
+    refute_output --partial "from 192.168.1.100"
+}
+
+# With XRAY_TPROXY gone and no TUN_DIR, nothing marks a packet direct any more: the
+# direct rule goes with the guards.
+@test "tproxy_stop: removes the Xray guards" {
+    load_tproxy_module
+    use_stateful_iptables
+    use_stateful_ipset
+    run tproxy_apply
+    assert_success
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+
+    run tproxy_stop
+    assert_success
+    run ip rule show
+    refute_line --regexp '^1689[4-8]:'
+}
+
+# "stop xray" with Tunnel Director still running: TUN_DIR marks its clients'
+# exclusions direct, and the direct rule stays for it.
+@test "tproxy_stop: leaves the direct rule while TUN_DIR is in place" {
+    load_tproxy_module
+    use_stateful_iptables
+    use_stateful_ipset
+    iptables -t mangle -N TUN_DIR
+    run tproxy_apply
+    assert_success
+
+    run tproxy_stop
+    assert_success
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+    refute_line --regexp '^1689[78]:'
+}
+
+# The routing section lists Xray's own rule alone: the table number matched any
+# rule holding its digits, and listed the guards of 192.168.1.100 there as well.
+@test "tproxy_status: lists the Xray guards" {
+    load_tproxy_module
+    use_stateful_iptables
+    use_stateful_ipset
+    run tproxy_apply
+    assert_success
+    run tproxy_status
+    assert_success
+    local section direct
+    section=$(sed -n '/^IP Rules:$/,/^$/p' <<< "$output")
+    assert_equal "$section" $'IP Rules:\n200:\tfrom all fwmark 0x100/0x100 lookup wan0'
+    direct=$(printf '16897:\tfrom 192.168.1.100 to %s iif br0 lookup main\n' \
+        10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4 5.6.7.8 10.20.0.0/16)
+    section=$(sed -n '/^--- Guards (ip rules by source) ---$/,/^$/p' <<< "$output")
+    assert_equal "$section" $'--- Guards (ip rules by source) ---\n16894:\tfrom all fwmark 0x200/0x200 lookup main\n'"$direct"$'\n16897:\tfrom 192.168.1.100 iif br0 prohibit'
 }
