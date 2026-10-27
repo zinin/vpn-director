@@ -125,6 +125,7 @@ load '../test_helper'
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only
+    use_stateful_iptables   # its -C finds the direct-mark rule the marker waits for
 
     run tproxy_apply
     assert_success
@@ -253,6 +254,7 @@ load '../test_helper'
 # -exist, so a duplicate does not cost the whole LAN its marker.
 @test "tproxy_apply: records ready when a client is already in the ipset" {
     load_tproxy_module
+    use_stateful_iptables   # its -C finds the direct-mark rule the marker waits for
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
     ipset() {
         if [[ $1 == add && $* != *-exist* ]]; then
@@ -279,6 +281,7 @@ load '../test_helper'
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only
+    use_stateful_iptables   # its -C finds the direct-mark rule the marker waits for
     # The kernel takes neither: hash:net is IPv4, and 1000 is no octet.
     ipset() {
         if [[ $1 == add && ( $* == *fd00::10* || $* == *192.168.1.1000* ) ]]; then
@@ -308,6 +311,7 @@ load '../test_helper'
 
 @test "tproxy_apply: records ready when rules are installed" {
     load_tproxy_module
+    use_stateful_iptables   # its -C finds the direct-mark rule the marker waits for
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/tproxy_ready"
     run tproxy_apply
     assert_success
@@ -1485,6 +1489,36 @@ load_tproxy_module_with_clients() {
     [ ! -e "$XRAY_TPROXY_READY" ]
 
     unset -f ip
+    run tproxy_apply
+    assert_success
+    [ -f "$XRAY_TPROXY_READY" ]
+    run guard_list xray
+    assert_line $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+}
+
+# The chain was just built with the direct-mark rule, so a check that does not
+# find it is an error of the moment - a busy xtables lock - and no guard was
+# synced: written, the marker would let the watch take the clients off the
+# fallback tunnel with no Xray guard behind them. The next apply checks again.
+@test "tproxy_apply: a check that finds no direct mark in the chain just swapped in withholds ready" {
+    load_tproxy_module
+    use_stateful_iptables
+    use_stateful_ipset
+    printf 'stale\n' > "$XRAY_TPROXY_READY"
+    iptables() {
+        [[ $* == "-t mangle -C XRAY_TPROXY -j MARK --set-xmark 0x200/0x200" ]] && return 4
+        command iptables "$@"
+    }
+    run tproxy_apply
+    assert_success
+    assert_output --partial "The direct mark was not found in XRAY_TPROXY; the Xray guards were not synced, TPROXY readiness withheld"
+    [ ! -e "$XRAY_TPROXY_READY" ]
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x200/0x200'
+    run ip rule show
+    refute_line --regexp '^1689[78]:'
+
+    unset -f iptables
     run tproxy_apply
     assert_success
     [ -f "$XRAY_TPROXY_READY" ]

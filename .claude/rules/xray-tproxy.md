@@ -310,7 +310,8 @@ xt_TPROXY, the firmware's rebuild - Xray proxies nobody. The guards then stay as
 `tproxy_apply` syncs once `_tproxy_setup_iptables` has run, and the soft-fails above sync too. The
 set only grows there, so a client that left Xray keeps its guards until `tproxy_prune`, which syncs
 after its swap. A guard the kernel refuses is an ERROR and withholds the ready marker of
-`tproxy_apply`; the prune leaves the marker alone, and the old guards of every client the set
+`tproxy_apply`, and so does a check that finds no direct mark in the chain it has just swapped in
+("Ready marker"); the prune leaves the marker alone, and the old guards of every client the set
 still holds stay (`guard_sync`). `tproxy_stop` removes the guards (`guard_clear`), those a former
 `pref_base` left too, then the direct rule once neither module needs it (`guard_direct_release`:
 not while `TUN_DIR` is in mangle or Tunnel Director has guards). `status xray` lists the direct rule
@@ -358,7 +359,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 | `_tproxy_setup_iptables()` | Platform rules, then `XRAY_TPROXY` swapped in with its jumps |
 | `_tproxy_guards_wanted()` | Does the live `XRAY_TPROXY` hold the direct-mark rule, in the form `_tproxy_build_chain` writes it? No guard is synced without it |
 | `_tproxy_guard_lines()` | The guards of every member of `XRAY_CLIENTS`, sorted, per LAN interface: the private ranges and `exclude_ips` direct, then the refusal; rc 1 when the platform names no LAN interface or the set cannot be listed |
-| `_tproxy_guards_sync()` | Make Xray's guards those of the set (`guard_sync`) while the live chain marks direct; rc 1 when one did not go in |
+| `_tproxy_guards_sync()` | Make Xray's guards those of the set (`guard_sync`) while the live chain marks direct; rc 2, the guards left as they are, when it does not; rc 1 when one did not go in |
 | `_tproxy_teardown_iptables()` | Remove chain and ipsets |
 
 **Soft-fail behavior**: `tproxy_apply()` returns 0 even if xt_TPROXY unavailable or ipsets missing, allowing caller scripts to continue; a live `XRAY_CLIENTS` still gets every effective client, and they get their guards while the live chain marks direct. A layout `guard_layout_check` refuses is the one failure it returns 1 for ("Fail-Safe").
@@ -378,9 +379,12 @@ link-local, multicast, broadcast, an exclusion) only decides what a client reach
 instead of through the proxy, and the offload opt-out (`PPE`) only whether the fast path may take
 it: its failure is logged, the targets and the jumps still go in, and only the marker is withheld
 — ending the setup there left every Xray client on the WAN over one busy xtables lock. A direct
-rule that does not go in (`guard_direct_ensure`) withholds the marker too, and the chain goes in
-all the same. A PREROUTING jump that does not go in withholds the marker as well: `swap_fw_chain`
-returns 3, and that interface stays on the old chain until the next apply finishes the swap.
+rule that does not go in (`guard_direct_ensure`) withholds the marker too, and the chain and the
+guards go in all the same, the side that leaks nothing: until an apply puts the rule in, what the
+chain lets through meets the guards and is refused rather than sent direct, all but the private
+ranges and `exclude_ips`, which the guards send direct themselves. A PREROUTING jump that does not
+go in withholds the marker as well: `swap_fw_chain` returns 3, and that interface stays on the old
+chain until the next apply finishes the swap.
 `XRAY_CLIENTS` has to be complete too: nothing validates `xray.clients`, and an address the set
 does not take is RETURNed by rule 1 and left unproxied, so `_tproxy_setup_clients_ipset` reports it
 and the marker is withheld although the chain itself is in place. The adds pass `-exist`, so a
@@ -389,6 +393,8 @@ IPv6 address an older Web UI saved, a typo like `192.168.1.1000`) is skipped wit
 not count — no set takes it, no tunnel carries it, and waiting for it held every restore of the
 LAN on the fallback tunnel. Every client the set holds needs its guards as well ("Fail-Safe"): a
 guard that does not go in (`guard_sync` logs the ERROR), or a set or LAN interfaces
-`_tproxy_guard_lines` cannot read, withholds the marker. The watch takes the clients off the
-fallback tunnel on it, and one without its guards would leave through the WAN in the next rebuild
-of the firewall.
+`_tproxy_guard_lines` cannot read, withholds the marker. So does a check that finds no direct mark
+in the chain the apply has just swapped in (`_tproxy_guards_wanted`): the chain was built with that
+rule, so the failure is one of the moment - a busy xtables lock - and no guard was synced. The
+watch takes the clients off the fallback tunnel on the marker, and one without its guards would
+leave through the WAN in the next rebuild of the firewall.

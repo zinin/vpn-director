@@ -779,13 +779,13 @@ _tproxy_guard_lines() {
 # -------------------------------------------------------------------------------------------------
 # The new list goes in before the old one goes (guard_sync), and only while the live chain marks
 # what it lets through direct (_tproxy_guards_wanted): otherwise the guards stay as they are, and
-# it returns 0. Returns 1 when a guard did not go in - guard_sync logs an ERROR for each and keeps
+# it returns 2. Returns 1 when a guard did not go in - guard_sync logs an ERROR for each and keeps
 # the old guards of the clients the list still names - or when _tproxy_guard_lines cannot say what
 # they are (it logs the ERROR), the guards left as they are.
 # -------------------------------------------------------------------------------------------------
 _tproxy_guards_sync() {
     local lines
-    _tproxy_guards_wanted || return 0
+    _tproxy_guards_wanted || return 2
     lines="$(_tproxy_guard_lines)" || return 1
     guard_sync xray "$lines"
 }
@@ -975,9 +975,10 @@ tproxy_stop() {
 # routes it (guard_direct_ensure) goes in before the chain; one that does not withholds the ready
 # marker. Once the chain is in, every client the set holds gets its guards, which refuse its
 # packets while the firmware has deleted the chain (_tproxy_guards_sync); a guard that does not go
-# in withholds the marker too. The soft-fails sync them as well, for the clients they add to a
-# live set. A direct mark or guard preferences that guard_layout_check refuses return 1 before
-# anything is touched, and the run ends there, as it would in tunnel_apply.
+# in withholds the marker too, and so does a check that finds no direct mark in the chain just
+# swapped in. The soft-fails sync them as well, for the clients they add to a live set. A direct
+# mark or guard preferences that guard_layout_check refuses return 1 before anything is touched,
+# and the run ends there, as it would in tunnel_apply.
 # -------------------------------------------------------------------------------------------------
 tproxy_apply() {
     _tproxy_init
@@ -1027,7 +1028,10 @@ tproxy_apply() {
     # client carries the direct mark, and the rule sends what the chain lets
     # through to main ahead of the guards. One in place is left alone. One that
     # does not go in (guard_direct_ensure logs the ERROR) withholds the marker
-    # below; the chain goes in all the same.
+    # below; the chain and the guards go in all the same, the side that leaks
+    # nothing: until an apply puts the rule in, what the chain lets through
+    # meets the guards and is refused, but for the private ranges and
+    # xray.exclude_ips, which they send direct themselves.
     local direct_ok=1
     if ! guard_direct_ensure; then
         direct_ok=0
@@ -1043,11 +1047,10 @@ tproxy_apply() {
     # stayed out, the one in place decides (_tproxy_guards_wanted). They follow
     # what XRAY_CLIENTS holds, which only grows here: a client that left Xray keeps
     # its guards until the prune lets it go. One that does not go in (guard_sync
-    # logs the ERROR) withholds the marker below.
-    local guards_ok=1
-    if ! _tproxy_guards_sync; then
-        guards_ok=0
-    fi
+    # logs the ERROR) withholds the marker below, and so does a check that finds
+    # no direct mark in the chain (rc 2).
+    local guards_rc=0
+    _tproxy_guards_sync || guards_rc=$?
 
     # Soft-fail if iptables setup fails
     if [[ $iptables_ok -eq 0 ]]; then
@@ -1076,8 +1079,15 @@ tproxy_apply() {
 
     # The watch takes Xray clients off the fallback tunnel on the marker, and one
     # without its guards would leave through the WAN in the next rebuild of the
-    # firewall.
-    if [[ $guards_ok -eq 0 ]]; then
+    # firewall. The chain was just built with the direct-mark rule, so a check
+    # that does not find it is an error of the moment - a busy xtables lock - and
+    # no guard was synced; the next apply checks again.
+    if [[ $guards_rc -eq 2 ]]; then
+        log -l WARN "The direct mark was not found in $XRAY_CHAIN; the Xray guards were not synced, TPROXY readiness withheld"
+        rm -f "$XRAY_TPROXY_READY"
+        return 0
+    fi
+    if [[ $guards_rc -ne 0 ]]; then
         log -l WARN "Not every Xray client has its guards; TPROXY readiness withheld"
         rm -f "$XRAY_TPROXY_READY"
         return 0
