@@ -381,8 +381,8 @@ guard_direct_mark_hex() {
 # bit left to pick is refused. The direct rule and the guards stay ahead of main's rule at 32766,
 # as tunnel_apply keeps the block rules there; their preferences follow the block range, so they
 # never overlap it. Xray's rule_pref, when it is set, stays below the direct rule: a packet TPROXY
-# takes carries the direct mark too - --tproxy-mark changes the bits of fwmark_mask alone - and met
-# the direct rule first it would go to main for forwarding, where a packet TPROXY took is dropped,
+# takes carries the direct mark too - --tproxy-mark changes the bits of fwmark_mask alone - and one
+# that meets the direct rule first goes to main to be forwarded, which drops a packet TPROXY took,
 # while the ready marker says Xray is ready. Returns 1 with an ERROR naming the setting or the
 # preferences, for a caller that refuses the apply before it touches a rule.
 # -------------------------------------------------------------------------------------------------
