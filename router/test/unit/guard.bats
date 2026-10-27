@@ -135,7 +135,8 @@ load_guard() {
     refute_output --partial "WARN"
 }
 
-# Xray's 0xff00ff00 and Tunnel Director's field take every bit from 0x100 up.
+# Xray's 0xff00ff00 and Tunnel Director's field take every bit from 0x100 up. The direct rule has no
+# mark to go in with either.
 @test "guard_layout_check: without direct_mark and no bit left outside the masks, refuses" {
     load_guard
     XRAY_FWMARK_MASK=0xff00ff00
@@ -146,6 +147,9 @@ load_guard() {
     assert_failure
     assert_output --partial "ERROR"
     assert_output --partial "direct_mark is not set, and every bit from 0x200 to 0x80000000 is taken by Tunnel Director's mark field (mark_mask 0x00ff0000) or Xray's fwmark_mask (0xff00ff00); rules not applied"
+    run guard_direct_ensure
+    assert_failure
+    assert_output --partial "the direct rule did not go in (pref 16894): no bit outside the mark masks is left for the direct mark"
 }
 
 # A full apply checks the layout twice, tproxy_apply and tunnel_apply each in the CLI's shell: the
