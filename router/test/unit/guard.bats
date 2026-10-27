@@ -87,6 +87,78 @@ load_guard() {
     done
 }
 
+# Every install from before direct_mark has no such key, and one whose masks hold 0x200 would fail
+# every apply on it. Without the key the mark is the lowest bit above 0x100 outside both masks, and
+# a WARN names it. Xray's 0xff00 holds 0x200 to 0x8000, Tunnel Director's field 0x10000 to
+# 0x800000; 0x300 holds 0x200 alone; a mark field at bits 8-15 holds it too.
+@test "guard_layout_check: without direct_mark, a mask that holds 0x200 makes it the lowest bit outside both" {
+    load_guard
+    XRAY_FWMARK_MASK=0xff00
+    assert_equal "$(guard_direct_mark_hex)" 0x1000000
+    run guard_layout_check
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "direct_mark is not set, and 0x200 is a bit of Xray's fwmark_mask (0xff00): the direct mark is 0x1000000"
+    assert_output --partial 'set advanced.tunnel_director.direct_mark to "0x1000000" to pin it'
+
+    XRAY_FWMARK_MASK=0x300
+    assert_equal "$(guard_direct_mark_hex)" 0x400
+    run guard_layout_check
+    assert_success
+    assert_output --partial "the direct mark is 0x400"
+
+    unset XRAY_FWMARK_MASK
+    TUN_DIR_MARK_MASK=0x0000ff00 TUN_DIR_MARK_SHIFT=8
+    assert_equal "$(guard_direct_mark_hex)" 0x10000
+    run guard_layout_check
+    assert_success
+    assert_output --partial "0x200 lies in Tunnel Director's mark field (mark_mask 0x0000ff00): the direct mark is 0x10000"
+}
+
+@test "guard_layout_check: without direct_mark and with 0x200 free, the mark is 0x200 and nothing is said" {
+    load_guard
+    XRAY_FWMARK_MASK=0x100
+    assert_equal "$(guard_direct_mark_hex)" 0x200
+    run guard_layout_check
+    assert_success
+    refute_output
+}
+
+# A value that is set is the user's: in a mask it is refused, never moved.
+@test "guard_layout_check: a direct_mark that is set is refused in a mask, not moved" {
+    load_guard
+    TUN_DIR_DIRECT_MARK=0x200 XRAY_FWMARK_MASK=0x300
+    run guard_layout_check
+    assert_failure
+    assert_output --partial "ERROR"
+    assert_output --partial "direct_mark 0x200 is a bit of Xray's fwmark_mask (0x300); rules not applied"
+    refute_output --partial "WARN"
+}
+
+# Xray's 0xff00ff00 and Tunnel Director's field take every bit from 0x100 up.
+@test "guard_layout_check: without direct_mark and no bit left outside the masks, refuses" {
+    load_guard
+    XRAY_FWMARK_MASK=0xff00ff00
+    run guard_direct_mark_hex
+    assert_failure
+    refute_output
+    run guard_layout_check
+    assert_failure
+    assert_output --partial "ERROR"
+    assert_output --partial "direct_mark is not set, and every bit from 0x200 to 0x80000000 is taken by Tunnel Director's mark field (mark_mask 0x00ff0000) or Xray's fwmark_mask (0xff00ff00); rules not applied"
+}
+
+# A full apply checks the layout twice, tproxy_apply and tunnel_apply each in the CLI's shell: the
+# WARN of a picked mark comes once. Counted on stderr: the log file common.sh names holds the
+# earlier tests' lines too.
+@test "guard_layout_check: the WARN of a picked mark comes once per run" {
+    load_guard
+    XRAY_FWMARK_MASK=0x300
+    guard_layout_check 2>> "$BATS_TEST_TMPDIR/stderr"
+    guard_layout_check 2>> "$BATS_TEST_TMPDIR/stderr"
+    assert_equal "$(grep -c 'WARN.*the direct mark is 0x400' "$BATS_TEST_TMPDIR/stderr")" 1
+}
+
 # 32252: the block range still fits (32252 + 2 * 255 = 32762 is the direct rule), and the last
 # Xray guard would sit on main's rule at 32766. One less, and it ends at 32765.
 @test "guard_layout_check: refuses guards that would reach main's rule" {

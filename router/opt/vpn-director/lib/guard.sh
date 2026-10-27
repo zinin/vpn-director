@@ -16,7 +16,9 @@
 #   <mark>/<mark> lookup main", right after Tunnel Director's block range - sends that to main
 #   ahead of every guard. Both modules need it, so it lives here, and it stays while either has a
 #   chain or a guard (guard_direct_release). At its preference it stands alone: once it is in, the
-#   rule of an earlier direct_mark goes, and so does any guard there - a former layout's.
+#   rule of an earlier direct_mark goes, and so does any guard there - a former layout's. The mark
+#   is direct_mark, or without it 0x200 - the lowest bit above it outside both mark masks where
+#   one of them holds 0x200 (_guard_direct_mark).
 #
 #   Preferences, with field_max = mark_mask >> mark_shift (255 by default): the direct rule at
 #   pref_base + 2 * field_max (16894), Tunnel Director's guards at the next two (16895, 16896),
@@ -47,9 +49,10 @@
 #   - firewall.sh (fw_chain_exists)
 #   - config.sh (TUN_DIR_PREF_BASE, TUN_DIR_MARK_MASK, TUN_DIR_MARK_SHIFT, TUN_DIR_DIRECT_MARK,
 #                TUN_DIR_CHAIN; XRAY_CHAIN and XRAY_FWMARK_MASK). Read when a function runs, never
-#                when this file is sourced. Each TUN_DIR_* setting has its default here, so a test
-#                that skips config.sh can call everything; an XRAY_* one that is unset or empty is
-#                no Xray to look at.
+#                when this file is sourced. Each TUN_DIR_* setting has its default here -
+#                TUN_DIR_DIRECT_MARK the bit _guard_direct_mark picks outside the mark masks - so a
+#                test that skips config.sh can call everything; an XRAY_* one that is unset or empty
+#                is no Xray to look at.
 #   - GUARD_STATE_DIR: the directory of the records, /tmp/vpn-director/guards unless set. /tmp
 #     goes at a reboot, as the ip rules do.
 #
@@ -65,7 +68,8 @@
 #   guard_list <owner>         - print an owner's guards as "ip rule show" lists them
 #
 # Internal functions (for testing):
-#   _guard_direct_mark()       - the direct mark as a number; rc 1 for a value that is none
+#   _guard_direct_mark()       - the direct mark as a number, direct_mark or the bit picked without
+#                                it; rc 1 for a value that is none, or no bit free
 #   _guard_norm()              - an ip rule's selectors as they compare
 #   _guard_is()                - is a rule of a shape this layer owns: the direct rule's, a guard?
 #   _guard_client()            - the client a guard is for: its from and its iif
@@ -95,11 +99,29 @@ fi
 # Internal helper functions
 ###################################################################################################
 
-# _guard_direct_mark - the direct mark as a number. rc 1, printing nothing, for a value that is
-# none: 0x and 1-8 hex digits, or a decimal without a leading zero, which bash would read as
-# octal. Bash arithmetic on anything else ends the caller with an error of its own, not an ERROR.
+# The WARN guard_layout_check last logged for a mark _guard_direct_mark picked: a full apply
+# checks the layout twice, in tproxy_apply and in tunnel_apply, and the WARN comes once per value.
+_guard_direct_warned=""
+
+# _guard_direct_mark - the direct mark as a number. direct_mark when it is set: rc 1, printing
+# nothing, for a value that is none - 0x and 1-8 hex digits, or a decimal without a leading zero,
+# which bash would read as octal. Bash arithmetic on anything else ends the caller with an error of
+# its own, not an ERROR. Without it - every install from before the setting - 0x200, unless that
+# bit lies in Tunnel Director's mark_mask or in Xray's fwmark_mask, where guard_layout_check would
+# refuse every apply: then the lowest bit above it outside both, up to 0x80000000. The same masks
+# give the same bit; rc 1 when they take every one.
 _guard_direct_mark() {
-    local raw="${TUN_DIR_DIRECT_MARK:-0x200}"
+    local raw="${TUN_DIR_DIRECT_MARK:-}" taken bit
+    if [[ -z $raw ]]; then
+        taken=$(( ${TUN_DIR_MARK_MASK:-0x00ff0000} | ${XRAY_FWMARK_MASK:-0} ))
+        for (( bit = 0x200; bit <= 0x80000000; bit <<= 1 )); do
+            if (( (bit & taken) == 0 )); then
+                printf '%d' "$bit"
+                return 0
+            fi
+        done
+        return 1
+    fi
     [[ $raw =~ ^(0[xX][0-9a-fA-F]{1,8}|[1-9][0-9]{0,9})$ ]] || return 1
     printf '%d' $((raw))
 }
@@ -336,8 +358,9 @@ guard_owner_prefs() {
 # -------------------------------------------------------------------------------------------------
 # guard_direct_mark_hex - the direct mark as ip prints it
 # -------------------------------------------------------------------------------------------------
-# Lowercase hex, 0x200 by default. rc 1 for a value that is no number (guard_layout_check refuses
-# it).
+# Lowercase hex: direct_mark, or without it the bit _guard_direct_mark picks, 0x200 unless a mark
+# mask holds that bit. rc 1 for a value that is no number, and without direct_mark when no bit is
+# free (guard_layout_check refuses both).
 # -------------------------------------------------------------------------------------------------
 guard_direct_mark_hex() {
     local mark
@@ -351,25 +374,52 @@ guard_direct_mark_hex() {
 # The direct mark is one bit of the 32-bit fwmark, outside Tunnel Director's mark field and
 # outside Xray's fwmark_mask: inside either, a packet marked direct would read as one marked for a
 # tunnel or for Xray. Xray's mask is looked at only when it is set - Tunnel Director's tests run
-# without it. The direct rule and the guards stay ahead of main's rule at 32766, as tunnel_apply
-# keeps the block rules there; their preferences follow the block range, so they never overlap it.
-# Returns 1 with an ERROR naming the setting or the preferences, for a caller that refuses the
-# apply before it touches a rule.
+# without it. A direct_mark that is set is the user's, and refused there. Without it the mark is
+# the bit _guard_direct_mark picks outside both, and one that is not 0x200 moves whenever the masks
+# do: a WARN names it, the mask that holds 0x200 and the setting that pins it, once per value. No
+# bit left to pick is refused. The direct rule and the guards stay ahead of main's rule at 32766,
+# as tunnel_apply keeps the block rules there; their preferences follow the block range, so they
+# never overlap it. Returns 1 with an ERROR naming the setting or the preferences, for a caller
+# that refuses the apply before it touches a rule.
 # -------------------------------------------------------------------------------------------------
 guard_layout_check() {
-    local raw="${TUN_DIR_DIRECT_MARK:-0x200}" mark direct
-    mark=$(_guard_direct_mark) || mark=0
-    if (( mark == 0 || mark > 0xffffffff || (mark & (mark - 1)) != 0 )); then
-        log -l ERROR "advanced.tunnel_director.direct_mark '$raw' is not a single bit of the fwmark (such as 0x200); rules not applied"
-        return 1
-    fi
-    if (( mark & ${TUN_DIR_MARK_MASK:-0x00ff0000} )); then
-        log -l ERROR "advanced.tunnel_director.direct_mark $(guard_direct_mark_hex) lies in Tunnel Director's mark field (mark_mask ${TUN_DIR_MARK_MASK:-0x00ff0000}); rules not applied"
-        return 1
-    fi
-    if [[ -n ${XRAY_FWMARK_MASK:-} ]] && (( mark & XRAY_FWMARK_MASK )); then
-        log -l ERROR "advanced.tunnel_director.direct_mark $(guard_direct_mark_hex) is a bit of Xray's fwmark_mask ($XRAY_FWMARK_MASK); rules not applied"
-        return 1
+    local raw="${TUN_DIR_DIRECT_MARK:-}" td_mask="${TUN_DIR_MARK_MASK:-0x00ff0000}" mark hex direct
+    local masks held="" warning
+    if [[ -z $raw ]]; then
+        if ! mark=$(_guard_direct_mark); then
+            masks="Tunnel Director's mark field (mark_mask $td_mask)"
+            [[ -z ${XRAY_FWMARK_MASK:-} ]] || masks+=" or Xray's fwmark_mask ($XRAY_FWMARK_MASK)"
+            log -l ERROR "advanced.tunnel_director.direct_mark is not set, and every bit from 0x200 to 0x80000000 is taken by $masks; rules not applied"
+            return 1
+        fi
+        if (( mark != 0x200 )); then
+            printf -v hex '0x%x' "$mark"
+            if (( 0x200 & td_mask )); then
+                held="lies in Tunnel Director's mark field (mark_mask $td_mask)"
+            fi
+            if [[ -n ${XRAY_FWMARK_MASK:-} ]] && (( 0x200 & XRAY_FWMARK_MASK )); then
+                held+="${held:+ and }is a bit of Xray's fwmark_mask ($XRAY_FWMARK_MASK)"
+            fi
+            warning="advanced.tunnel_director.direct_mark is not set, and 0x200 $held: the direct mark is $hex; set advanced.tunnel_director.direct_mark to \"$hex\" to pin it"
+            if [[ $warning != "$_guard_direct_warned" ]]; then
+                log -l WARN "$warning"
+                _guard_direct_warned=$warning
+            fi
+        fi
+    else
+        mark=$(_guard_direct_mark) || mark=0
+        if (( mark == 0 || mark > 0xffffffff || (mark & (mark - 1)) != 0 )); then
+            log -l ERROR "advanced.tunnel_director.direct_mark '$raw' is not a single bit of the fwmark (such as 0x200); rules not applied"
+            return 1
+        fi
+        if (( mark & td_mask )); then
+            log -l ERROR "advanced.tunnel_director.direct_mark $(guard_direct_mark_hex) lies in Tunnel Director's mark field (mark_mask $td_mask); rules not applied"
+            return 1
+        fi
+        if [[ -n ${XRAY_FWMARK_MASK:-} ]] && (( mark & XRAY_FWMARK_MASK )); then
+            log -l ERROR "advanced.tunnel_director.direct_mark $(guard_direct_mark_hex) is a bit of Xray's fwmark_mask ($XRAY_FWMARK_MASK); rules not applied"
+            return 1
+        fi
     fi
     direct=$(guard_direct_pref)
     if (( direct + 4 >= 32766 )); then
@@ -400,10 +450,12 @@ guard_layout_check() {
 # and the record as it was.
 # -------------------------------------------------------------------------------------------------
 guard_direct_ensure() {
-    local pref mark rules listed want listed_ok=1
+    local pref mark rules listed want why listed_ok=1
     pref=$(guard_direct_pref)
     if ! mark=$(guard_direct_mark_hex); then
-        log -l ERROR "Guards: the direct rule did not go in (pref $pref): advanced.tunnel_director.direct_mark '${TUN_DIR_DIRECT_MARK:-}' is no mark"
+        why="advanced.tunnel_director.direct_mark '${TUN_DIR_DIRECT_MARK:-}' is no mark"
+        [[ -n ${TUN_DIR_DIRECT_MARK:-} ]] || why="no bit outside the mark masks is left for the direct mark"
+        log -l ERROR "Guards: the direct rule did not go in (pref $pref): $why"
         return 1
     fi
     if (( pref >= 32766 )); then

@@ -141,9 +141,9 @@ TUN_DIR_MARK_MASK=$(_cfg '.advanced.tunnel_director.mark_mask')
 TUN_DIR_MARK_SHIFT=$(_cfg '.advanced.tunnel_director.mark_shift')
 
 # The direct mark (lib/guard.sh): the bit both chains set on what they let go direct. Installs
-# from before the setting have no such key, and take the default.
+# from before the setting have no such key: it stays empty, and guard.sh picks the bit - 0x200,
+# unless Tunnel Director's or Xray's mark mask holds it.
 TUN_DIR_DIRECT_MARK=$(_cfg '.advanced.tunnel_director.direct_mark')
-TUN_DIR_DIRECT_MARK="${TUN_DIR_DIRECT_MARK:-0x200}"
 
 ###################################################################################################
 # 8. Advanced: Boot

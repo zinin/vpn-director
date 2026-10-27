@@ -235,8 +235,10 @@ ip rule add pref 16897 from 192.168.1.100 iif br0 prohibit
 ```
 
 **Fwmark bit allocation**: `0x100` (bit 8) is free from firmware VPN marking (bit 0), Tunnel
-Director (bits 16-23) and the direct mark (bit 9), which `guard_layout_check` keeps out of
-`fwmark_mask`.
+Director (bits 16-23) and the direct mark (bit 9 by default), which stays out of `fwmark_mask`.
+Without `advanced.tunnel_director.direct_mark`, a `fwmark_mask` that holds bit 9 (`0x300`,
+`0xff00`) moves the direct mark to the lowest bit above it outside both masks, with a WARN;
+`guard_layout_check` refuses a `direct_mark` that is set there (`lib/guard.sh`).
 
 The TPROXY ip rule uses pref 200. On KeeneticOS 5.1.5 that preference was free of
 NDM connection policies (a user policy landed at prefs 102/103, table 4097; no
@@ -264,9 +266,10 @@ there as well (below): such a client loses its tunnel guard in `tunnel_apply`.
 > reasons: `_tproxy_exclude_sets` drops it with a WARN before the check, so a
 > typo cannot abort apply.
 
-A direct mark or guard preferences that `guard_layout_check` refuses (`lib/guard.sh`: a mark that
-is not one bit, or lies in `fwmark_mask` or in Tunnel Director's `mark_mask`; guards that would
-reach main's rule at 32766) are no soft-fail: `tproxy_apply` logs the ERROR and returns 1 before
+A direct mark or guard preferences that `guard_layout_check` refuses (`lib/guard.sh`: a
+`direct_mark` that is not one bit, or lies in `fwmark_mask` or in Tunnel Director's `mark_mask`;
+without the key, masks that leave no bit free; guards that would reach main's rule at 32766) are
+no soft-fail: `tproxy_apply` logs the ERROR and returns 1 before
 it touches anything - no module, route, rule, set, chain or marker - and the run ends there, as
 `tunnel_apply` would end it.
 

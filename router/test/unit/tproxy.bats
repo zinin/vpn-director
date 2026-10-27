@@ -1118,13 +1118,14 @@ duplicate_last_rule() {
 }
 
 # Inside Xray's fwmark_mask, a packet marked direct would read as one TPROXY
-# took, and Xray's rule would send it to the local table. The refusal comes
-# before anything is touched - no route, no rule, no set, no chain - and ends
-# the run, as tunnel_apply's does. config.sh makes the Xray marks readonly, so
-# they go in through a copy of the fixture.
+# took, and Xray's rule would send it to the local table. The refusal of a
+# direct_mark that is set comes before anything is touched - no route, no rule,
+# no set, no chain - and ends the run, as tunnel_apply's does. config.sh makes
+# the Xray marks readonly, so they go in through a copy of the fixture.
 @test "tproxy_apply: refuses a direct mark that collides with its own, before touching anything" {
     load_common
-    jq '.advanced.xray.fwmark = "0x200" | .advanced.xray.fwmark_mask = "0x200"' \
+    jq '.advanced.xray.fwmark = "0x200" | .advanced.xray.fwmark_mask = "0x200"
+        | .advanced.tunnel_director.direct_mark = "0x200"' \
         "$TEST_ROOT/fixtures/vpn-director.json" > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
@@ -1144,6 +1145,29 @@ duplicate_last_rule() {
     [ ! -s /tmp/bats_iptables_calls.log ]
     run iptables -t mangle -S XRAY_TPROXY
     assert_failure
+}
+
+# The configuration of an install from before direct_mark has no such key, and its fwmark_mask can
+# hold 0x200. The mark is then the next bit outside both masks, and the apply goes through: both
+# chains mark with that bit, and the direct rule routes it.
+@test "tproxy_apply: without direct_mark, a fwmark_mask that holds 0x200 takes another bit and applies" {
+    load_tproxy_module_jq '.advanced.xray.fwmark_mask = "0x300"'
+    source "$LIB_DIR/tunnel.sh" --source-only
+    use_stateful_iptables
+    run tproxy_apply
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "the direct mark is 0x400"
+    [ -f "$XRAY_TPROXY_READY" ]
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x400/0x400'
+    run tunnel_apply
+    assert_success
+    run iptables -t mangle -S TUN_DIR
+    assert_line '-A TUN_DIR -s 192.168.50.0/24 -m set --match-set ru dst -j MARK --set-xmark 0x400/0x400'
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x400/0x400 lookup main'
+    refute_line --partial '0x200/0x200'
 }
 
 # ============================================================================
