@@ -48,11 +48,11 @@
 #   - common.sh (log, rt_table_label)
 #   - firewall.sh (fw_chain_exists)
 #   - config.sh (TUN_DIR_PREF_BASE, TUN_DIR_MARK_MASK, TUN_DIR_MARK_SHIFT, TUN_DIR_DIRECT_MARK,
-#                TUN_DIR_CHAIN; XRAY_CHAIN and XRAY_FWMARK_MASK). Read when a function runs, never
-#                when this file is sourced. Each TUN_DIR_* setting has its default here -
-#                TUN_DIR_DIRECT_MARK the bit _guard_direct_mark picks outside the mark masks - so a
-#                test that skips config.sh can call everything; an XRAY_* one that is unset or empty
-#                is no Xray to look at.
+#                TUN_DIR_CHAIN; XRAY_CHAIN, XRAY_FWMARK_MASK and XRAY_RULE_PREF). Read when a
+#                function runs, never when this file is sourced. Each TUN_DIR_* setting has its
+#                default here - TUN_DIR_DIRECT_MARK the bit _guard_direct_mark picks outside the
+#                mark masks - so a test that skips config.sh can call everything; an XRAY_* one
+#                that is unset or empty is no Xray to look at.
 #   - GUARD_STATE_DIR: the directory of the records, /tmp/vpn-director/guards unless set. /tmp
 #     goes at a reboot, as the ip rules do.
 #
@@ -60,7 +60,8 @@
 #   guard_direct_pref          - the preference of the direct rule
 #   guard_owner_prefs <owner>  - the two preferences of an owner's guards (tunnel, xray)
 #   guard_direct_mark_hex      - the direct mark as ip prints it
-#   guard_layout_check         - refuse a direct mark or guard preferences that cannot work
+#   guard_layout_check         - refuse a direct mark, guard preferences or an Xray rule_pref that
+#                                cannot work
 #   guard_direct_ensure        - the direct rule, alone at its preference; a former one goes
 #   guard_direct_release       - remove the direct rule once neither module needs it
 #   guard_sync <owner> <lines> - make an owner's guards exactly <lines>, make before break
@@ -369,7 +370,7 @@ guard_direct_mark_hex() {
 }
 
 # -------------------------------------------------------------------------------------------------
-# guard_layout_check - can the direct mark and the guard preferences work?
+# guard_layout_check - can the direct mark, the guard preferences and Xray's rule_pref work?
 # -------------------------------------------------------------------------------------------------
 # The direct mark is one bit of the 32-bit fwmark, outside Tunnel Director's mark field and
 # outside Xray's fwmark_mask: inside either, a packet marked direct would read as one marked for a
@@ -379,8 +380,11 @@ guard_direct_mark_hex() {
 # do: a WARN names it, the mask that holds 0x200 and the setting that pins it, once per value. No
 # bit left to pick is refused. The direct rule and the guards stay ahead of main's rule at 32766,
 # as tunnel_apply keeps the block rules there; their preferences follow the block range, so they
-# never overlap it. Returns 1 with an ERROR naming the setting or the preferences, for a caller
-# that refuses the apply before it touches a rule.
+# never overlap it. Xray's rule_pref, when it is set, stays below the direct rule: a packet TPROXY
+# takes carries the direct mark too - --tproxy-mark changes the bits of fwmark_mask alone - and met
+# the direct rule first it would go to main for forwarding, where a packet TPROXY took is dropped,
+# while the ready marker says Xray is ready. Returns 1 with an ERROR naming the setting or the
+# preferences, for a caller that refuses the apply before it touches a rule.
 # -------------------------------------------------------------------------------------------------
 guard_layout_check() {
     local raw="${TUN_DIR_DIRECT_MARK:-}" td_mask="${TUN_DIR_MARK_MASK:-0x00ff0000}" mark hex direct
@@ -424,6 +428,10 @@ guard_layout_check() {
     direct=$(guard_direct_pref)
     if (( direct + 4 >= 32766 )); then
         log -l ERROR "Guards: the direct rule and the guards would take preferences $direct-$((direct + 4)) and reach main's rule (32766) with pref_base ${TUN_DIR_PREF_BASE:-16384}; rules not applied"
+        return 1
+    fi
+    if [[ ${XRAY_RULE_PREF:-} =~ ^[0-9]{1,10}$ ]] && (( 10#$XRAY_RULE_PREF >= direct )); then
+        log -l ERROR "advanced.xray.rule_pref $XRAY_RULE_PREF must be below $direct, the direct rule's preference: what TPROXY takes carries the direct mark too, and would be routed to main and dropped instead of reaching Xray; rules not applied"
         return 1
     fi
     return 0

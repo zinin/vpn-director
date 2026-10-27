@@ -174,6 +174,22 @@ load_guard() {
     assert_success
 }
 
+# A packet TPROXY takes carries the direct bit beside Xray's: --tproxy-mark changes the bits of
+# fwmark_mask alone. Xray's rule at the direct rule's preference or after it would never see such a
+# packet: main would route it for forwarding instead of delivering it to Xray, and drop it.
+@test "guard_layout_check: refuses an Xray rule_pref at or above the direct rule" {
+    load_guard
+    XRAY_RULE_PREF=16894
+    run guard_layout_check
+    assert_failure
+    assert_output --partial "ERROR"
+    assert_output --partial "advanced.xray.rule_pref 16894 must be below 16894, the direct rule's preference"
+    XRAY_RULE_PREF=200
+    run guard_layout_check
+    assert_success
+    refute_output
+}
+
 # ============================================================================
 # guard_direct_ensure / guard_direct_release
 # ============================================================================

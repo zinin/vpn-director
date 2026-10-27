@@ -155,7 +155,7 @@ In `vpn-director.json`:
 | `xray.exclude_sets` | `[]` | Country codes/ipsets to skip |
 | `advanced.xray.tproxy_port` | `12345` | Xray dokodemo-door port |
 | `advanced.xray.route_table` | `100` | ip route table number |
-| `advanced.xray.rule_pref` | `200` | ip rule priority |
+| `advanced.xray.rule_pref` | `200` | ip rule priority. Below the direct rule (`pref_base + 2 × field_max`, 16894 with the defaults; `lib/guard.sh`): a packet TPROXY takes carries the direct mark too, and meeting the direct rule first it would go to main and be dropped. `guard_layout_check` refuses a value at or above that preference with an ERROR |
 | `advanced.xray.fwmark` | `0x100` | Routing fwmark (bit 8) |
 | `advanced.xray.fwmark_mask` | `0x100` | Fwmark mask |
 | `advanced.xray.chain` | `XRAY_TPROXY` | mangle chain name |
@@ -266,12 +266,12 @@ there as well (below): such a client loses its tunnel guard in `tunnel_apply`.
 > reasons: `_tproxy_exclude_sets` drops it with a WARN before the check, so a
 > typo cannot abort apply.
 
-A direct mark or guard preferences that `guard_layout_check` refuses (`lib/guard.sh`: a
-`direct_mark` that is not one bit, or lies in `fwmark_mask` or in Tunnel Director's `mark_mask`;
-without the key, masks that leave no bit free; guards that would reach main's rule at 32766) are
-no soft-fail: `tproxy_apply` logs the ERROR and returns 1 before
-it touches anything - no module, route, rule, set, chain or marker - and the run ends there, as
-`tunnel_apply` would end it.
+A direct mark, guard preferences or a `rule_pref` that `guard_layout_check` refuses (`lib/guard.sh`:
+a `direct_mark` that is not one bit, or lies in `fwmark_mask` or in Tunnel Director's `mark_mask`;
+without the key, masks that leave no bit free; guards that would reach main's rule at 32766; a
+`rule_pref` at or above the direct rule's preference) are no soft-fail: `tproxy_apply` logs the
+ERROR and returns 1 before it touches anything - no module, route, rule, set, chain or marker -
+and the run ends there, as `tunnel_apply` would end it.
 
 The firmware's firewall rebuilds take `XRAY_TPROXY` away: KeeneticOS's NDM deletes it (every WAN
 lease renewal did on the KN-4521), Merlin's firewall start empties it (`iptables -t mangle -F`).
