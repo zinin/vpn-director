@@ -65,7 +65,7 @@ router/test/
 │   ├── platform.bats        # platform_detect and loader
 │   ├── platform_merlin.bats
 │   ├── platform_keenetic.bats
-│   ├── hooks.bats           # NDM hooks
+│   ├── hooks.bats           # NDM hooks; Merlin's firewall-start, nat-start and wan-event
 │   ├── install.bats
 │   ├── configure.bats
 │   ├── subscription.bats    # lib/subscription.sh on the shared cases in testdata/subscription
@@ -158,7 +158,7 @@ Mocks are shell scripts in `router/test/mocks/` that simulate router commands:
 - **stateful-ipset/ipset**: Remembers `XRAY_CLIENTS`, `TPROXY_BYPASS` and their `_NEW` shadows under `$BATS_IPSET_DIR` (`list`, `create`, `add`, `del`, `test`, `flush`, `destroy`, `swap`). Members compare as in the kernel's `hash:net` sets: `x` and `x/32` are one element, kept as `x`; `add` and `del` take an element as written, so a host inside a network the set holds is added as an element of its own; `test` of a host (no prefix, or `/32`) finds it through any element that holds it, the address itself or a network around it, and `test` of a network finds only the identical element. Everything else goes to the stateless mock. Turned on per test by `use_stateful_ipset`; the processes a test starts inherit it
 - **nslookup**: Returns mock DNS responses
 - **logger**: Silent (no syslog in tests)
-- **ip**: Returns mock interface info; keeps ip rules (lookup and prohibit) with their `from`, `to`, `fwmark` and `iif` selectors and lists them as the kernel does: in iproute2's order, `from all` when no source was given, a `/32` without its length, `from x/0` as `from all` and `to x/0` not at all. `add` refuses a rule identical to one it holds; `del` takes the first rule identical to the selectors given, or with a preference alone the first rule there. Per table it keeps the routes add/replace put in and del/flush took out; `link show` answers from `ip_links`
+- **ip**: Returns mock interface info; keeps ip rules (lookup and prohibit) with their `from`, `to`, `fwmark` and `iif` selectors and renders each rule's selectors as iproute2 lists them: in iproute2's order, `from all` when no source was given, a `/32` without its length, `from x/0` as `from all` and `to x/0` not at all. It lists the rules after `0: from all lookup local` in the order they were added, not by preference, and prints no rule at 32766 or 32767 (main's and default's) but those a test adds. `add` refuses a rule identical to one it holds; `del` takes the first rule identical to the selectors given, or with a preference alone the first rule there. Per table it keeps the routes add/replace put in and del/flush took out; `link show` answers from `ip_links`
 - **insmod**: Records module loads (Keenetic)
 - **cru**: Merlin cron helper
 - **keenetic/curl**: Serves RCI fixtures; put on PATH per test

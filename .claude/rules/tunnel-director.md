@@ -278,8 +278,9 @@ Each client's block opens with the offload opt-out: `platform_tunnel_offload_tar
 on Keenetic (nothing, rc 1 on Merlin), and `tunnel.sh` gives it the `MARK` rule's match, ahead of
 the exclusions. No flow of a Tunnel Director client is accelerated, a client of `main` and the
 flows to excluded destinations included: the fast path routes a flow it took over by the ip
-rules alone, never by a mark, and the client's guard would take an accelerated flow to an
-excluded destination into the tunnel, where it dies. Every other device keeps its acceleration.
+rules alone, never by a mark, and an accelerated flow to an excluded country would follow the
+client's guards into the tunnel, where it dies, or be refused. Every other device keeps its
+acceleration.
 
 Each exclusion sets the direct mark (`direct_mark`, `0x200`; see "Advanced Configuration") and
 returns, both with its own match. The direct rule sends the mark to main ahead of the guards,

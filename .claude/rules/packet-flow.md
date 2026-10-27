@@ -71,9 +71,9 @@ below): ip rules by source and LAN interface, which the rebuild leaves alone, on
 (`iif` takes one name). The local table at preference 0 answers traffic to the router before any
 of them. Tunnel Director's come first, so a client on Xray and on a tunnel goes through its tunnel
 meanwhile. The direct rule and the guards follow the block range and move with `pref_base`
-(`lib/guard.sh`); an owner's list sits at one of its two preferences while a changed one goes in at
-the other (`guard_sync`). The rules in full: `tunnel-director.md`, "The kill switch", and
-`xray-tproxy.md`, "Fail-Safe".
+(`lib/guard.sh`); an owner's changed list goes in before the old one goes, and an extended one is
+appended at the same preference (`guard_sync`). The rules in full: `tunnel-director.md`, "The kill
+switch", and `xray-tproxy.md`, "Fail-Safe".
 
 On KeeneticOS 5.1.5 pref 200 was free of NDM policies (no tables in the 40s).
 Built-in LTE backup stays at prefs 100/101, fwmark `0xffffaaa`, table 4096.
@@ -96,7 +96,7 @@ every `_NDM_*` jump. `tunnel_apply` then counts the `XRAY_TPROXY` jumps already
 in PREROUTING and goes behind them when the base position would land among
 them, so the order is `[XRAY_TPROXY, TUN_DIR]` on both platforms.
 
-**Implication**: If a client IP is in both `xray.clients` and a TD rule, traffic goes through Xray only. TD rule is ignored for that client.
+**Implication**: A client in both `xray.clients` and a TD rule goes through Xray; what Xray lets through goes on to TUN_DIR and into its tunnel unless the tunnel excludes it too (`0x00010200` below), and while a firmware rebuild has taken the chains away the client goes through its tunnel, as Tunnel Director's guards come first.
 
 ## The apply: make before break
 
@@ -137,18 +137,18 @@ nothing; while the Xray process restarts, TPROXY drops what no socket takes.
 Left open:
 
 - A firewall rebuild of the firmware (Merlin's `iptables -t mangle -F` on a firewall start, an NDM
-  rebuild on KeeneticOS, which every renewal of the WAN's DHCP lease brings: `keenetic.md`) takes
-  our chains away until the hook puts them back, and the guards route the protected clients
-  meanwhile ("Packet Processing Order"). A Tunnel Director client stays in its tunnel, or is
-  refused while the tunnel has no route, and its connections survive. An Xray client's new
-  connections are refused and its proxied ones stall, but for the private ranges and
+  rebuild on KeeneticOS, which on a KN-4521 with a DHCP WAN every renewal of the lease brought:
+  `keenetic.md`) takes our chains away until the hook puts them back, and the guards route the
+  protected clients meanwhile ("Packet Processing Order"). A Tunnel Director client stays in its
+  tunnel, or is refused while the tunnel has no route, and its connections survive. An Xray
+  client's new connections are refused and its proxied ones stall, but for the private ranges and
   `xray.exclude_ips`, which go direct. A country exclusion is no ip rule, so a tunnel client's
   excluded-country traffic goes through its tunnel, and an Xray client's is refused. On KeeneticOS
-  a flow opened then keeps that route for its whole life: `PPE` went with the chain ("The firmware
-  fast path"). The hook shortens the window, which the apply alone held open for 1 to 4 s on the
-  KN-4521 (from the DHCP ACK to a client's MARK rule): before it queues the apply, it restores the
-  chains from the snapshot the last apply left, in one `iptables-restore`
-  (`lib/fwsnap-restore.sh`; `tunnel-director.md`, "State Tracking").
+  a flow opened then can be bound to the fast path and keep that route for its whole life: `PPE`
+  went with the chain ("The firmware fast path"). The hook shortens the window, which the apply
+  alone held open for 1 to 4 s on the KN-4521 (from the DHCP ACK to a client's MARK rule): before
+  it queues the apply, it restores the chains from the snapshot the last apply left, in one
+  `iptables-restore` (`lib/fwsnap-restore.sh`; `tunnel-director.md`, "State Tracking").
 - A tunnel that is down refuses its clients' traffic (the block rule after its lookup rule);
   excluded destinations still go direct. One that comes from Xray while the tunnel's route cannot
   be installed stays proxied instead (step 3).
@@ -296,9 +296,10 @@ The `--mark 0x0/0xff0000` condition ensures **first-match-wins**: once a packet 
 KeeneticOS binds an established **forwarded** flow to a NAT/route fast path that runs before
 `mangle` and never returns to it — the conntrack hook sits at priority -200, `mangle` at -150.
 Once a flow is bound, its packets never reach `TUN_DIR`, so the `MARK` is applied to the first
-few packets only and the rest miss `ip rule 16384` and leave through the WAN carrying the
-tunnel's source address. Measured on a KN-4521: conntrack counted 24 packets of one flow while
-`TUN_DIR` counted 6, and a 1 MB download stalled at exactly one TCP window (20610 bytes).
+few packets only: before the opt-out below, the rest missed `ip rule 16384` and left through the
+WAN carrying the tunnel's source address. Measured on a KN-4521: conntrack counted 24 packets of
+one flow while `TUN_DIR` counted 6, and a 1 MB download stalled at exactly one TCP window (20610
+bytes).
 
 `platform_tunnel_offload_target` names the mangle target that opts a flow out of it — `PPE` on
 Keenetic, which sets `ct->fast_ext` (a condition of both the `fastnat` and the `fastroute` entry
@@ -315,8 +316,8 @@ while the chains were gone, and why every flow of a protected client is kept off
 
 Placement carries the meaning: the opt-out opens each client's block with the `MARK` rule's
 match, ahead of the exclusions, so no flow of a Tunnel Director client is accelerated - one to an
-excluded destination included, which its guard would take into the tunnel. Every other device
-keeps its acceleration.
+excluded destination included: an accelerated connection to an excluded country would follow the
+client's guards into the tunnel, or be refused. Every other device keeps its acceleration.
 
 A flow TPROXY takes needs none of this — it terminates in a local socket, so no forwarded flow is
 left to accelerate. That is why Xray worked on KeeneticOS while Tunnel Director did not. What
@@ -481,6 +482,9 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 |------|---------|
 | `/tmp/tunnel_director/tun_dir_rules.sha256` | Hash of applied TD rules |
 | `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`); a tunnel keeps its idx while it has clients; during a rebuild, the union of both layouts |
+| `/tmp/tunnel_director/restored` | Marker: a firmware hook put the mangle rules back from the snapshot (`TUN_DIR_RESTORED`, `lib/fwsnap-restore.sh`); the next apply rebuilds, and no apply records the hash while it is there |
+| `/tmp/vpn-director/guards/{direct,tunnel,xray}` | The preferences the direct rule and each owner's guards last went in at (`GUARD_STATE_DIR`, `lib/guard.sh`) |
+| `/tmp/vpn-director/fwsnap/{mangle,nat}.rules` | The snapshot of our rules the last apply left, as `iptables-restore --noflush` input, for the firmware hooks to restore (`FWSNAP_DIR`, `lib/fwsnap.sh`); `stop` removes it |
 
 ## Key Code Locations
 
