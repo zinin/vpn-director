@@ -81,8 +81,8 @@ load 'test_helper'
     [[ $TUN_DIR_PREF_BASE == "16384" ]]
 }
 
-# Installs from before the setting have no such key. It stays empty, and lib/guard.sh picks the
-# mark: 0x200, unless a mark mask holds that bit.
+# The template leaves the key out, and so does the fixture. It stays empty, and lib/guard.sh picks
+# the mark: 0x200, unless a mark mask holds that bit.
 @test "config.sh: TUN_DIR_DIRECT_MARK is empty without the key" {
     load_config
     [ "$(jq '.advanced.tunnel_director | has("direct_mark")' "$VPD_CONFIG_FILE")" = "false" ]

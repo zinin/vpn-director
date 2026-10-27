@@ -107,10 +107,10 @@ _guard_direct_warned=""
 # _guard_direct_mark - the direct mark as a number. direct_mark when it is set: rc 1, printing
 # nothing, for a value that is none - 0x and 1-8 hex digits, or a decimal without a leading zero,
 # which bash would read as octal. Bash arithmetic on anything else ends the caller with an error of
-# its own, not an ERROR. Without it - every install from before the setting - 0x200, unless that
-# bit lies in Tunnel Director's mark_mask or in Xray's fwmark_mask, where guard_layout_check would
-# refuse every apply: then the lowest bit above it outside both, up to 0x80000000. The same masks
-# give the same bit; rc 1 when they take every one.
+# its own, not an ERROR. Without it - the template leaves it out, so it is set only where the user
+# set it - 0x200, unless that bit lies in Tunnel Director's mark_mask or in Xray's fwmark_mask,
+# where guard_layout_check would refuse every apply: then the lowest bit above it outside both, up
+# to 0x80000000. The same masks give the same bit; rc 1 when they take every one.
 _guard_direct_mark() {
     local raw="${TUN_DIR_DIRECT_MARK:-}" taken bit
     if [[ -z $raw ]]; then

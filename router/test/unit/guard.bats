@@ -87,10 +87,11 @@ load_guard() {
     done
 }
 
-# Every install from before direct_mark has no such key, and one whose masks hold 0x200 would fail
-# every apply on it. Without the key the mark is the lowest bit above 0x100 outside both masks, and
-# a WARN names it. Xray's 0xff00 holds 0x200 to 0x8000, Tunnel Director's field 0x10000 to
-# 0x800000; 0x300 holds 0x200 alone; a mark field at bits 8-15 holds it too.
+# A configuration has no direct_mark unless the user set one - the template leaves it out - and one
+# whose masks hold 0x200 would fail every apply on it. Without the key the mark is the lowest bit
+# above 0x100 outside both masks, and a WARN names it. Xray's 0xff00 holds 0x200 to 0x8000, Tunnel
+# Director's field 0x10000 to 0x800000; 0x300 holds 0x200 alone; a mark field at bits 8-15 holds it
+# too.
 @test "guard_layout_check: without direct_mark, a mask that holds 0x200 makes it the lowest bit outside both" {
     load_guard
     XRAY_FWMARK_MASK=0xff00

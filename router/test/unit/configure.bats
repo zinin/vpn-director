@@ -274,6 +274,35 @@ write_subscriptions() {
     assert_output "from-the-template"
 }
 
+# The template goes under the existing config, so a key the config lacks comes from the template.
+# A direct_mark from there would be one that is set: lib/guard.sh refuses it in a mask that holds
+# its bit, where without the key it picks another, and one run of the wizard would leave every
+# apply refused. The template leaves the key out: a config without one keeps none, and one that
+# sets it keeps its value.
+@test "step_generate_configs: adds no direct_mark from the template, and keeps one the config sets" {
+    load_wizard
+    write_daemon_config
+    jq 'del(.advanced.tunnel_director.direct_mark)' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/cfg.new"
+    mv "$VPD_DIR/cfg.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq '.advanced.tunnel_director | has("direct_mark")' "$VPD_DIR/vpn-director.json"
+    assert_output "false"
+
+    jq '.advanced.tunnel_director.direct_mark = "0x400"' \
+        "$VPD_DIR/vpn-director.json" > "$VPD_DIR/cfg.new"
+    mv "$VPD_DIR/cfg.new" "$VPD_DIR/vpn-director.json"
+
+    run step_generate_configs
+
+    assert_success
+    run jq -r '.advanced.tunnel_director.direct_mark' "$VPD_DIR/vpn-director.json"
+    assert_output "0x400"
+}
+
 @test "step_generate_configs: refuses while another writer holds the config lock" {
     load_wizard
     write_daemon_config

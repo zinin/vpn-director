@@ -1147,9 +1147,9 @@ duplicate_last_rule() {
     assert_failure
 }
 
-# The configuration of an install from before direct_mark has no such key, and its fwmark_mask can
-# hold 0x200. The mark is then the next bit outside both masks, and the apply goes through: both
-# chains mark with that bit, and the direct rule routes it.
+# A configuration has no direct_mark unless the user set one - the template leaves it out - and its
+# fwmark_mask can hold 0x200. The mark is then the next bit outside both masks, and the apply goes
+# through: both chains mark with that bit, and the direct rule routes it.
 @test "tproxy_apply: without direct_mark, a fwmark_mask that holds 0x200 takes another bit and applies" {
     load_tproxy_module_jq '.advanced.xray.fwmark_mask = "0x300"'
     source "$LIB_DIR/tunnel.sh" --source-only
