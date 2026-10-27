@@ -38,9 +38,9 @@
 #   in GUARD_STATE_DIR of the preferences its rules last went in at. Once the rules are in at the
 #   current ones, those at the recorded ones go, and guard_clear and guard_direct_release take
 #   both, the record with them. A pref_base moved by less than five puts a former preference of
-#   one kind on a current one of another: the guards there are the other kind's to take, as its
-#   own (_guard_release_former), and a former direct rule there goes with guard_direct_ensure, no
-#   rule of another kind having its shape.
+#   one kind on a current one of another. A guard left on another owner's is that owner's to take,
+#   as its own; a guard left on the direct rule's, and a direct rule left on a guard's, are never
+#   live there, and go with their former owner, on stop as on an apply (_guard_release_former).
 #
 # Dependencies:
 #   - common.sh (log, rt_table_label)
@@ -72,7 +72,6 @@
 #   _guard_listed()            - the rules of a shape a listing holds at one preference
 #   _guard_in_order()          - are the rules of one list rules of another, in its order?
 #   _guard_pref_clear()        - delete the rules of a shape a listing holds at one preference
-#   _guard_current_prefs()     - the preferences of every kind, as the settings put them now
 #   _guard_record()            - the preferences a kind's rules last went in at
 #   _guard_record_set()        - record them
 #   _guard_record_drop()       - remove a kind's record
@@ -239,15 +238,6 @@ _guard_pref_clear() {
     return 0
 }
 
-# _guard_current_prefs - the preferences of every kind as the settings put them now, on one line:
-# the direct rule's, Tunnel Director's two, Xray's two.
-_guard_current_prefs() {
-    local direct
-    direct=$(guard_direct_pref)
-    printf '%d %d %d %d %d\n' "$direct" $((direct + 1)) $((direct + 2)) \
-        $((direct + 3)) $((direct + 4))
-}
-
 # _guard_record <kind> - print the preferences the record of <kind> (direct, tunnel, xray) names,
 # on one line: where its rules last went in. Nothing when there is no record; a word that is no
 # preference is left out.
@@ -288,20 +278,25 @@ _guard_record_drop() {
 }
 
 # _guard_release_former <kind> <shape> <rules> - delete the rules of <shape> (_guard_pref_clear)
-# the listing <rules> holds at each preference the record of <kind> names, but at a current
-# preference of any kind (_guard_current_prefs). The kind's own current ones are its to reconcile
-# as such. A pref_base moved by less than five puts a former preference of one kind on a current
-# one of another, and released there, its rules would go with that kind's live ones - "stop xray"
-# taking Tunnel Director's guards. The kind that holds it now takes it instead: an owner's sync
-# lists every guard at its preferences as its own and replaces them make before break, and
-# guard_direct_ensure deletes every guard at the direct rule's.
+# the listing <rules> holds at each preference the record of <kind> names, but where a rule of that
+# shape can be live: a guard at an owner's current preference, Tunnel Director's two or Xray's two,
+# a direct rule at the direct rule's current one. The kind's own current ones it reconciles as
+# such. A pref_base moved by less than five puts a former preference of one kind on a current one
+# of another. Released at another owner's, a guard would go with that owner's live guards - "stop
+# xray" taking Tunnel Director's - so that owner's sync takes it instead, as one of its own. A guard
+# at the direct rule's preference and a direct rule at a guard's are never live there, and go with
+# their former owner, on stop as on an apply.
 _guard_release_former() {
-    local current p
+    local live p
     local -a recorded=()
     read -ra recorded <<< "$(_guard_record "$1")"
-    current=" $(_guard_current_prefs) "
+    if [[ $2 == guard ]]; then
+        live=" $(guard_owner_prefs tunnel) $(guard_owner_prefs xray) "
+    else
+        live=" $(guard_direct_pref) "
+    fi
     for p in ${recorded[@]+"${recorded[@]}"}; do
-        [[ $current == *" $p "* ]] || _guard_pref_clear "$p" "$3" "$2"
+        [[ $live == *" $p "* ]] || _guard_pref_clear "$p" "$3" "$2"
     done
     return 0
 }
@@ -395,18 +390,17 @@ guard_layout_check() {
 # does every guard there: none belongs there, so any is a former layout's - a pref_base raised by
 # one or two puts the direct rule on Tunnel Director's former guards - and, tried ahead of the
 # rule, it would take what the chains mark direct. Then the rules of its shape go at the
-# preference the record names, when that is another one: after a raise of pref_base the former
-# rule sits ahead of the new lookup range, and sends a packet that carries a tunnel's mark beside
-# the direct bit to main. They go even where that preference is another kind's now: no rule of
-# that kind has their shape, and nothing else would take them. Each goes by its full selector, a
-# rule of another shape stays, and the record then names the current preference. Whether a rule is
-# listed is read from the whole listing; one that fails releases nothing. Returns 1 when the rule
-# did not go in - an ERROR, or a WARN for a preference from main's rule (32766) on - with nothing
-# deleted and the record as it was.
+# preference the record names, when that is another one (_guard_release_former): after a raise of
+# pref_base the former rule sits ahead of the new lookup range, and sends a packet that carries a
+# tunnel's mark beside the direct bit to main. They go even where that preference is a guard
+# preference now: no live rule there has their shape. Each goes by its full selector, a rule of
+# another shape stays, and the record then names the current preference. Whether a rule is listed
+# is read from the whole listing; one that fails releases nothing. Returns 1 when the rule did not
+# go in - an ERROR, or a WARN for a preference from main's rule (32766) on - with nothing deleted
+# and the record as it was.
 # -------------------------------------------------------------------------------------------------
 guard_direct_ensure() {
-    local pref mark rules listed want p listed_ok=1
-    local -a recorded=()
+    local pref mark rules listed want listed_ok=1
     pref=$(guard_direct_pref)
     if ! mark=$(guard_direct_mark_hex); then
         log -l ERROR "Guards: the direct rule did not go in (pref $pref): advanced.tunnel_director.direct_mark '${TUN_DIR_DIRECT_MARK:-}' is no mark"
@@ -428,10 +422,7 @@ guard_direct_ensure() {
     [[ $listed_ok -eq 1 ]] || return 0
     _guard_pref_clear "$pref" "$rules" direct "$want"
     _guard_pref_clear "$pref" "$rules" guard
-    read -ra recorded <<< "$(_guard_record direct)"
-    for p in ${recorded[@]+"${recorded[@]}"}; do
-        [[ $p == "$pref" ]] || _guard_pref_clear "$p" "$rules" direct
-    done
+    _guard_release_former direct direct "$rules"
     _guard_record_set direct "$pref"
     return 0
 }
@@ -442,7 +433,7 @@ guard_direct_ensure() {
 # Only when neither TUN_DIR_CHAIN nor XRAY_CHAIN is in mangle - either could still mark a packet
 # direct - and no guard is listed at either owner's preferences, current or recorded, which would
 # take such a packet instead. Then every rule of its shape goes, at its preference and at the one
-# its record names unless another kind holds that now (_guard_release_former) - the rule of an
+# its record names, a guard preference now included (_guard_release_former) - the rule of an
 # earlier direct_mark too, and that of a former pref_base - and the record with them. Each
 # module's stop calls it once its own chain and guards are gone, so the one that stops last
 # removes it. A listing that fails says nothing about the guards, and the rule stays. Returns 0.

@@ -707,6 +707,67 @@ log_rule_changes() {
     assert_line $'16897:\tfrom 192.168.1.5 iif br0 lookup wgc2'
 }
 
+# A raise by one to four puts the direct rule's preference on a former guard preference: one of
+# Tunnel Director's by one or two, one of Xray's by three or four - here each holds a guard, a list
+# or what an interrupted sync left. No live guard belongs at the direct rule's preference, so a stop
+# with no apply since takes what their former owner left there, as a sync would.
+@test "a stop after pref_base raised by one to four leaves no guard at the new direct preference" {
+    load_guard
+    use_stateful_iptables
+    local k direct
+    for k in 1 2 3 4; do
+        TUN_DIR_PREF_BASE=16384
+        guard_direct_ensure
+        guard_sync tunnel 'from 192.168.1.5 iif br0 lookup wgc1'
+        guard_sync xray 'from 192.168.1.100 iif br0 prohibit'
+        ip rule add pref 16896 from 192.168.1.6 iif br0 lookup wgc1
+        ip rule add pref 16898 from 192.168.1.101 iif br0 prohibit
+        TUN_DIR_PREF_BASE=$((16384 + k))
+        direct=$(guard_direct_pref)
+        run guard_clear xray
+        assert_success
+        run guard_clear tunnel
+        assert_success
+        run guard_direct_release
+        assert_success
+        run ip rule show
+        refute_line --partial "$direct:"
+        refute_line --partial 'iif br0'
+        refute_line --partial 'fwmark 0x200/0x200'
+        [ ! -e "$GUARD_STATE_DIR/direct" ]
+        [ ! -e "$GUARD_STATE_DIR/tunnel" ]
+        [ ! -e "$GUARD_STATE_DIR/xray" ]
+    done
+}
+
+# Lowered by one to four, the direct rule's former preference is a guard preference now. No live
+# direct rule belongs there, so the release takes it, and nothing is left for good once the records
+# are gone.
+@test "a stop after pref_base lowered by one to four leaves no direct rule at a guard preference" {
+    load_guard
+    use_stateful_iptables
+    local k
+    for k in 1 2 3 4; do
+        TUN_DIR_PREF_BASE=16384
+        guard_direct_ensure
+        guard_sync tunnel 'from 192.168.1.5 iif br0 lookup wgc1'
+        guard_sync xray 'from 192.168.1.100 iif br0 prohibit'
+        TUN_DIR_PREF_BASE=$((16384 - k))
+        run guard_clear xray
+        assert_success
+        run guard_clear tunnel
+        assert_success
+        run guard_direct_release
+        assert_success
+        run ip rule show
+        refute_line --partial 'fwmark 0x200/0x200'
+        refute_line --partial 'iif br0'
+        [ ! -e "$GUARD_STATE_DIR/direct" ]
+        [ ! -e "$GUARD_STATE_DIR/tunnel" ]
+        [ ! -e "$GUARD_STATE_DIR/xray" ]
+    done
+}
+
 # The cost of a record that cannot be written is the release of a later change of pref_base.
 @test "a record that cannot be written is a WARN" {
     load_guard

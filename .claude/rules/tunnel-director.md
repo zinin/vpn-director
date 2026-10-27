@@ -400,14 +400,14 @@ record names the current ones; it is written through a file beside it and a rena
 it changes. `guard_clear` and `guard_direct_release` take the rules at the current and the recorded
 preferences, then the record. A sync with a line refused leaves the former preferences and the
 record as they are: the former guards are all that guard those clients until the list is whole. A
-preference a record names that is a current one of another kind - after a `pref_base` moved by less
-than five - keeps its guards for that kind to reconcile: an owner's sync takes every guard at its
-preferences as its own, and `guard_direct_ensure` every guard at the direct rule's; a former direct
-rule there goes with `guard_direct_ensure` all the same, no other kind's rule having its shape.
-Without a record nothing says where the rules were, and none at another preference goes; a write
-that fails is a WARN, and the next change of `pref_base` leaves the rules where they were. The
-directory is made `0755` whatever the umask, its parent too: `/tmp/vpn-director` is watchd's
-runtime directory as well.
+`pref_base` moved by less than five puts a preference a record names on a current one of another
+kind. A guard left on another owner's preference stays for that owner's sync, which takes every
+guard at its preferences as its own. A guard left on the direct rule's preference, and a direct rule
+left on a guard's, are never live there and go with their former owner, on `stop` as on an apply;
+`guard_direct_ensure` also deletes every guard at its preference. Without a record nothing says
+where the rules were, and none at another preference goes; a write that fails is a WARN, and the
+next change of `pref_base` leaves the rules where they were. The directory is made `0755` whatever
+the umask, its parent too: `/tmp/vpn-director` is watchd's runtime directory as well.
 
 The hash and `TUN_DIR_TABLES` can be out of step in one direction: a tunnel with clients that the
 platform does not list keeps a slot in `TUN_DIR_TABLES` - its clients' MARK rules and the slot's
