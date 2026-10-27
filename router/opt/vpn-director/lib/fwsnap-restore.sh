@@ -21,12 +21,13 @@
 #           must not add a second jump. The snapshot's INPUT and FORWARD rules (KeeneticOS's
 #           accept of Xray's mark, the interface tunnels' MSS rules) go in only where
 #           "iptables -C" does not find them: a rebuild that took the jumps and left those would
-#           have them twice, and a doubled MSS rule outlives its tunnel's release. A restore that
-#           went in removes Tunnel Director's hash and leaves the restored marker (tunnel.sh), so
-#           the apply that follows rebuilds over whatever the snapshot held that is stale;
+#           have them twice, and a doubled MSS rule outlives its tunnel's release. A -C that
+#           answers neither way (a busy xtables lock) restores nothing. A restore that went in
+#           removes Tunnel Director's hash and leaves the restored marker (tunnel.sh), so the
+#           apply that follows rebuilds over whatever the snapshot held that is stale;
 #           tproxy_apply rebuilds its chain on every apply anyway.
-#   nat     each "-o <iface> -j MASQUERADE" of $FWSNAP_DIR/nat.rules that nat POSTROUTING does
-#           not hold, inserted at its head.
+#   nat     each "-o <iface> -j MASQUERADE" of $FWSNAP_DIR/nat.rules that "iptables -C" does not
+#           find in nat POSTROUTING, inserted at its head.
 #   Nothing for any other table, without the table's snapshot, or once stop has left its marker;
 #   stop removes the snapshot as well.
 #
@@ -69,9 +70,11 @@ restore_mangle() {
 
     # The copy iptables-restore reads, made in one pass. The snapshot's chains are its ":NAME"
     # lines, which come ahead of every rule: a jump to any of them is a table that still holds our
-    # rules, and nothing is restored. An INPUT or FORWARD rule iptables -C finds is left out, and the
-    # others of its chain are numbered from 1 again, so each goes in at the head of the chain, in
-    # the snapshot's order, at a position the chain has.
+    # rules, and nothing is restored. An INPUT or FORWARD rule iptables -C finds (0) is left out,
+    # and the others of its chain (1) are numbered from 1 again, so each goes in at the head of the
+    # chain, in the snapshot's order, at a position the chain has. Any other status - 4 for a busy
+    # xtables lock, an apply's among them - says nothing of the rule, and nothing is restored, as
+    # for a listing that failed: one read as missing would go in a second time.
     out="" input=0 forward=0
     while IFS= read -r line; do
         case "$line" in
@@ -89,9 +92,12 @@ restore_mangle() {
                 spec="${chain#* }"
                 chain="${chain%% *}"
                 spec="${spec#* }"
-                if iptables -t mangle -C "$chain" $spec 2>/dev/null; then
-                    continue
-                fi
+                iptables -t mangle -C "$chain" $spec 2>/dev/null
+                case $? in
+                    0) continue ;;
+                    1) ;;
+                    *) return 0 ;;
+                esac
                 if [ "$chain" = INPUT ]; then
                     input=$((input + 1))
                     line="-I INPUT $input $spec"
@@ -119,15 +125,19 @@ restore_mangle() {
     fi
 }
 
-# restore_nat - each MASQUERADE of the snapshot that nat POSTROUTING does not hold, at its head.
+# restore_nat - each MASQUERADE of the snapshot that nat POSTROUTING does not hold, at its head:
+# only where iptables -C says it is not there (1). Any other status says nothing - a busy xtables
+# lock, as above - and the rule is left to the apply the hook queues.
 # shellcheck disable=SC2086  # as above
 restore_nat() {
     snap="$FWSNAP_DIR/nat.rules"
     [ -f "$snap" ] || return 0
     while IFS= read -r spec; do
         [ -n "$spec" ] || continue
-        iptables -t nat -C POSTROUTING $spec 2>/dev/null ||
+        iptables -t nat -C POSTROUTING $spec 2>/dev/null
+        if [ $? -eq 1 ]; then
             iptables -t nat -I POSTROUTING 1 $spec 2>/dev/null
+        fi
     done < "$snap"
 }
 

@@ -430,8 +430,10 @@ table it was called for, Merlin's `firewall-start` mangle and `nat-start` nat. N
 once `stop` has left its marker. Mangle goes back in one `iptables-restore --noflush`, and only
 while PREROUTING jumps to no chain the snapshot declares: NDM calls the hook for mangle several
 times in one rebuild, and a hook for a table the rebuild left whole must not add a second jump. Its
-INPUT and FORWARD rules go in only where `iptables -C` does not find them, renumbered from the head
-of their chains. A restore of mangle that went in removes the hash and leaves the restored marker,
+INPUT and FORWARD rules go in only where `iptables -C` does not find them (status 1), renumbered
+from the head of their chains; any other status - iptables 1.4.21 exits 4 at once on a busy xtables
+lock - restores nothing, as a PREROUTING listing that fails does: a rule read as missing would go
+in twice. A restore of mangle that went in removes the hash and leaves the restored marker,
 both rebuild triggers: the snapshot may be older than the configuration, and the up-to-date path
 looks for the MARK rules alone. The marker covers the race the hash alone loses - an apply that was
 rebuilding while the restore ran would record its hash after it, and the apply the hook queued would
@@ -439,7 +441,8 @@ take the up-to-date path over the snapshot's chain - because no rebuild records 
 marker is there. A rebuild removes it at its start, and a restore that lands while that rebuild
 runs leaves a new one; the rebuild's swap deletes every jump to the chain it replaces, the
 restore's included (`swap_fw_chain`). A nat restore inserts each `MASQUERADE` of `nat.rules` that
-POSTROUTING does not hold at its head.
+`iptables -C` does not find in POSTROUTING (1) at its head, and leaves one it gets no answer for to
+the apply the hook queues.
 
 The hash and `TUN_DIR_TABLES` can be out of step in one direction: a tunnel with clients that the
 platform does not list keeps a slot in `TUN_DIR_TABLES` - its clients' MARK rules and the slot's

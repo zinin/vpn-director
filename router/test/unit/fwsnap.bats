@@ -619,6 +619,61 @@ LIST
     assert_equal "$(iptables -t mangle -S INPUT)" "$input"
 }
 
+# iptables 1.4.21 exits 4 at once while another iptables holds the xtables lock, and the restore
+# races the applies by design. Such a -C says nothing of the rule: read as "not there", it doubled
+# a rule that was, and the copy outlived the rule's release - every later snapshot carried both.
+# Mangle restores nothing then, as for a failed listing of PREROUTING; nat inserts nothing, and the
+# apply the hook queues puts a missing rule back. With the lock free, -C answers 0 for a rule that
+# is there and 1 for one that is not, and the restore goes as before.
+@test "fwsnap-restore: an iptables -C that cannot answer restores no mangle rule and inserts no MASQUERADE" {
+    load_fwsnap
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    printf 'awg1 2000\n' > "$IFTUNNEL_STATE_FILE"
+    tun_dir_applied
+    iptables -t mangle -A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -t nat -A POSTROUTING -o awg1 -j MASQUERADE
+    fwsnap_save
+    local tun_dir forward nat
+    tun_dir="$(iptables -t mangle -S TUN_DIR)"
+    forward="$(iptables -t mangle -S FORWARD)"
+    nat="$(iptables -t nat -S POSTROUTING)"
+    # A rebuild that took our chains and their jumps, and left FORWARD and nat as they were.
+    ndm_rebuild
+    mkdir "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/iptables" <<EOF
+#!/bin/bash
+[[ " \$* " == *" -C "* ]] && exit 4
+exec "$TEST_ROOT/mocks/stateful/iptables" "\$@"
+EOF
+    chmod +x "$BATS_TEST_TMPDIR/bin/iptables"
+    local path="$RESTORE_PATH"
+    RESTORE_PATH="$BATS_TEST_TMPDIR/bin:$RESTORE_PATH"
+    : > /tmp/bats_iptables_calls.log
+
+    restore mangle
+    assert_success
+    refute grep -q '^iptables-restore' /tmp/bats_iptables_calls.log
+    run iptables -t mangle -S PREROUTING
+    assert_output '-P PREROUTING ACCEPT'
+    assert_equal "$(iptables -t mangle -S FORWARD)" "$forward"
+    [ ! -e "$TUN_DIR_RESTORED" ]
+    restore nat
+    assert_success
+    assert_equal "$(iptables -t nat -S POSTROUTING)" "$nat"
+
+    # The lock free: the FORWARD rule found (0) stays single, the chain comes back; the
+    # MASQUERADE a rebuild of nat took is not found (1) and goes back in.
+    RESTORE_PATH="$path"
+    restore mangle
+    assert_success
+    assert_equal "$(iptables -t mangle -S TUN_DIR)" "$tun_dir"
+    assert_equal "$(iptables -t mangle -S FORWARD)" "$forward"
+    iptables -t nat -D POSTROUTING -o awg1 -j MASQUERADE
+    restore nat
+    assert_success
+    assert_equal "$(iptables -t nat -S POSTROUTING)" "$nat"
+}
+
 # The hooks name no state file: the restore's own defaults have to be the files tunnel.sh keeps
 # its hash in and looks for the marker at (TUN_DIR_HASH, TUN_DIR_RESTORED).
 @test "fwsnap-restore: by default it drops the hash and leaves the marker where tunnel.sh looks" {
