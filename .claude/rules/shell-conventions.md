@@ -9,7 +9,11 @@ paths: "**/*.sh, jffs/**/*"
 - Shebang: `#!/usr/bin/env bash` for libraries, which are only ever sourced - except
   `lib/send-email.sh`, which `S99vpn-director` executes. A script a router executes starts
   `#!/bin/sh` and hands over to bash itself (see "No `/usr/bin/env`
-  on KeeneticOS" below). Both forms then `set -euo pipefail`
+  on KeeneticOS" below). Both forms then `set -euo pipefail`. The exception is
+  `lib/fwsnap-restore.sh`, which the firmware hooks run and wait for before they queue the apply:
+  it stays POSIX sh - no hand-over to bash, no errexit - and always exits 0. The hooks rely on
+  that: a few commands under the firmware's `/bin/sh`, inside NDM's 24-second timeout, and nothing
+  it fails at stops the apply that follows (`tunnel-director.md`, "State Tracking")
 - Debug mode: `DEBUG=1 ./script.sh` enables `set -x` with informative PS4
 - shellcheck annotations for intentional expansions/externals (SC2086, SC2155, SC2034)
 
