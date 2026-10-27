@@ -59,6 +59,11 @@ TUN_DIRECTOR_DIR="/tmp/tunnel_director"
 # State files
 TUN_DIR_HASH="$TUN_DIRECTOR_DIR/tun_dir_rules.sha256"
 
+# Left by a firmware hook that put the chain back from the snapshot of the last
+# apply (fwsnap-restore.sh, which names this path itself): the next apply
+# rebuilds, and none records the hash until a rebuild has replaced that chain.
+TUN_DIR_RESTORED="$TUN_DIRECTOR_DIR/restored"
+
 # Applied tunnels as "<idx> <id>" lines; tunnel.sh re-ensures their routes on
 # every apply and releases their tables on stop.
 TUN_DIR_TABLES="$TUN_DIRECTOR_DIR/tun_dir_tables"
@@ -71,7 +76,7 @@ TUN_DIR_FAILOVER_READY="$TUN_DIRECTOR_DIR/failover_ready"
 mkdir -p "$IPS_BUILDER_DIR" "$TUN_DIRECTOR_DIR"
 
 # Export for use by other modules
-export IPS_BUILDER_DIR TUN_DIRECTOR_DIR TUN_DIR_HASH TUN_DIR_TABLES TUN_DIR_FAILOVER_READY
+export IPS_BUILDER_DIR TUN_DIRECTOR_DIR TUN_DIR_HASH TUN_DIR_RESTORED TUN_DIR_TABLES TUN_DIR_FAILOVER_READY
 
 ###################################################################################################
 # Constants (defined before --source-only for testability)

@@ -56,8 +56,8 @@ Interface names are a convention RCI does not expose: `OpenVPNN` → `ovpn_brN` 
 
 | Directory | Invocation | Our hook |
 |-----------|------------|----------|
-| `netfilter.d` | `$type` (`iptables`/`ip6tables`), `$table` (`filter`/`nat`/`mangle`), once per table and family | detached `vpn-director.sh --wait apply` for every IPv4 table |
+| `netfilter.d` | `$type` (`iptables`/`ip6tables`), `$table` (`filter`/`nat`/`mangle`), once per table and family | for every IPv4 table: first, waited for, `lib/fwsnap-restore.sh "$table"`, which puts the last apply's rules back from its snapshot unless the table still holds them; then a detached `vpn-director.sh --wait apply` |
 | `wan.d` | `$1` = `start`/`stop`; `$interface`, `$address`, `$mask`, `$gateway` | apply on `start` |
 | `iflayerchanged.d` | `$1` = `hook`; `$id`, `$system_name`, `$layer` (`conf`/`link`/`ipv4`/`ipv6`/`ctrl`), `$level` (`running`/`detached`/`disabled`/`pending`) | apply for `$layer = ipv4` of `OpenVPN*`/`Wireguard*`. On 5.1.5 `ifstatechanged.d` also fires (10 invocations per OpenVPN0 down/up, `change=connected` only on the way up); we use `iflayerchanged.d` because it gives one clean `layer=ipv4` event per direction. `ifstatechanged.d` is obsolete since 4.0. |
 
-`--wait` queues an apply behind a running one, so a burst of hook calls converges; `nohup … &` keeps NDM's timeout off the apply.
+`--wait` queues an apply behind a running one, so a burst of hook calls converges; `nohup … &` keeps NDM's timeout off the apply. The restore is a few commands under the firmware's `/bin/sh` - no common.sh, no jq, no lock - and it does nothing for a mangle whose PREROUTING still jumps to our chains, so the six mangle calls of one interface cycle leave one jump per chain and interface (`tunnel-director.md`, "State Tracking").

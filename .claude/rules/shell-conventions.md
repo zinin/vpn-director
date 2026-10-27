@@ -250,6 +250,19 @@ starts `firewall-start` and `wan-event` without waiting for them
 a flush that landed during a running apply stayed empty until the next event.
 Both hooks pass `--wait`, as the KeeneticOS hooks do.
 
+Ahead of that apply, `firewall-start` refills our chains from the snapshot the
+last apply left (`lib/fwsnap-restore.sh mangle`, `tunnel-director.md`, "State
+Tracking"): `iptables-restore --noflush` flushes each chain it declares that
+exists and fills it in the same commit, and puts the jumps back at the top of
+PREROUTING. One command, where the apply takes seconds; until it has run, the
+guards refuse the Xray clients and send a tunnel client's excluded countries
+through its tunnel. The restore leaves a mangle whose PREROUTING
+still jumps to our chains alone - a firewall start with QoS on keeps them - and
+one that went in takes Tunnel Director's hash away and leaves the restored
+marker, so the apply that follows rebuilds instead of reading the restored
+chain as applied. `nat-start` puts the interface tunnels' `MASQUERADE` back the
+same way, ahead of its apply.
+
 ### An apply never flushes a live chain or set
 
 **Problem**: `create_fw_chain -f` on a chain the PREROUTING jumps lead to,
@@ -351,7 +364,8 @@ have_cmd() {
 
 Scripts that reach bash run under Entware's bash (`/opt/bin/bash`), where
 `command -v` works; the rule above is for what stays in `#!/bin/sh`: the
-generated update script, the init scripts and the NDM hooks. KeeneticOS's
+generated update script, the init scripts, the NDM hooks and
+`lib/fwsnap-restore.sh`, which the firmware hooks run. KeeneticOS's
 `/bin/sh` does have `command` (measured on 5.1.5), Asuswrt-Merlin's does not,
 so anything shipped to both platforms must assume it is missing.
 

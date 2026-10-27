@@ -1663,6 +1663,68 @@ ip_rule_show_cut_short() {
     refute_output --partial "up-to-date"
 }
 
+# A firmware hook restores the chain from the snapshot of the last apply
+# (fwsnap-restore.sh), which can be older than the configuration, and leaves the
+# restored marker. With the chain, the record and every MARK rule in place the
+# apply would read up to date; the marker makes it a rebuild, which takes the
+# marker away.
+@test "tunnel_apply: the restored marker makes an otherwise up-to-date apply rebuild" {
+    load_tunnel_module
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+
+    : > "$TUN_DIR_RESTORED"
+    run tunnel_apply
+    assert_success
+    assert_output --partial "restored from the snapshot; rebuilding in place"
+    refute_output --partial "up-to-date"
+    [ -f "$TUN_DIR_HASH" ]
+    [ ! -e "$TUN_DIR_RESTORED" ]
+}
+
+# The restore takes no lock, and the hook's restore can land while an apply
+# that started before it rebuilds. Removing the hash alone loses then: that apply
+# would record its hash after the restore, and the apply the hook queued would
+# take the up-to-date path over the snapshot's chain. While the marker is there
+# no apply records the hash, and the next one rebuilds and records it.
+@test "tunnel_apply: a restore during a rebuild leaves no hash, and the next apply rebuilds and records it" {
+    load_tunnel_module
+    use_stateful_iptables
+    eval "real_$(declare -f _tunnel_guards_sync)"
+    _tunnel_guards_sync() {
+        : > "$TUN_DIR_RESTORED"
+        real__tunnel_guards_sync "$@"
+    }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "restored from the snapshot during this rebuild"
+    refute_output --partial "WARN"
+    [ ! -e "$TUN_DIR_HASH" ]
+    [ -e "$TUN_DIR_RESTORED" ]
+
+    _tunnel_guards_sync() { real__tunnel_guards_sync "$@"; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "rebuilding"
+    [ -f "$TUN_DIR_HASH" ]
+    [ ! -e "$TUN_DIR_RESTORED" ]
+}
+
+@test "tunnel_stop: removes the restored marker" {
+    load_tunnel_module
+    run tunnel_apply
+    assert_success
+    : > "$TUN_DIR_RESTORED"
+
+    run tunnel_stop
+    assert_success
+    [ ! -e "$TUN_DIR_RESTORED" ]
+}
+
 @test "tunnel_stop: removes a shadow chain an interrupted swap left" {
     load_tunnel_module
     : > /tmp/bats_iptables_calls.log

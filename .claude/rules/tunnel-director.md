@@ -388,10 +388,11 @@ prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clien
 | `/tmp/tunnel_director/routes_cron` | Marker: the cron job of `ensure-routes` is scheduled (`IFTUNNEL_CRON_MARKER`) |
 | `/tmp/vpn-director/guards/{direct,tunnel,xray}` | The preferences the direct rule and each owner's guards last went in at, one line each: `16894`, `16895 16896`, `16897 16898` with the defaults (`GUARD_STATE_DIR`, `lib/guard.sh`) |
 | `/tmp/vpn-director/fwsnap/{mangle,nat}.rules` | The snapshot of our rules the last apply left, as `iptables-restore --noflush` input, for the firmware hooks to restore after a rebuild of the firewall (`FWSNAP_DIR`, `lib/fwsnap.sh`) |
+| `/tmp/tunnel_director/restored` | Marker: a firmware hook put the mangle rules back from the snapshot (`TUN_DIR_RESTORED`, `lib/fwsnap-restore.sh`); the next apply rebuilds, and no apply records the hash while it is there |
 
-`tunnel_apply` writes the first three, `vpn-director.sh` the marker (`_routes_cron_sync`, after
+`tunnel_apply` writes the first three, `vpn-director.sh` the cron marker (`_routes_cron_sync`, after
 every `tunnel_apply`); `tunnel_stop` walks `TUN_DIR_TABLES` to release each tunnel's table through
-`vpd_tunnel_slot_release`, then removes the first three files.
+`vpd_tunnel_slot_release`, then removes the first three files and the restored marker.
 
 `lib/guard.sh` keeps a record per kind of the preferences its rules last went in at, both modules'
 alike: the guards carry no mark a release could find them by. Once `guard_direct_ensure` has its
@@ -422,6 +423,23 @@ fails part-way ends before the snapshot, and the one of an earlier apply stays; 
 before it tears anything down, whichever component it stops. A listing or a write that fails is a
 WARN, the earlier snapshot stays, and the apply goes on. The directory is made `0755` whatever the
 umask, its parent too, and the files `0644`: the hooks hand them to `iptables-restore` as root.
+
+The firmware hooks restore the snapshot, and wait for that, before they queue the apply
+(`lib/fwsnap-restore.sh`, POSIX sh, no common.sh and no lock): KeeneticOS's `netfilter.d` hook the
+table it was called for, Merlin's `firewall-start` mangle and `nat-start` nat. Nothing is restored
+once `stop` has left its marker. Mangle goes back in one `iptables-restore --noflush`, and only
+while PREROUTING jumps to no chain the snapshot declares: NDM calls the hook for mangle several
+times in one rebuild, and a hook for a table the rebuild left whole must not add a second jump. Its
+INPUT and FORWARD rules go in only where `iptables -C` does not find them, renumbered from the head
+of their chains. A restore of mangle that went in removes the hash and leaves the restored marker,
+both rebuild triggers: the snapshot may be older than the configuration, and the up-to-date path
+looks for the MARK rules alone. The marker covers the race the hash alone loses - an apply that was
+rebuilding while the restore ran would record its hash after it, and the apply the hook queued would
+take the up-to-date path over the snapshot's chain - because no rebuild records the hash while the
+marker is there. A rebuild removes it at its start, and a restore that lands while that rebuild
+runs leaves a new one; the rebuild's swap deletes every jump to the chain it replaces, the
+restore's included (`swap_fw_chain`). A nat restore inserts each `MASQUERADE` of `nat.rules` that
+POSTROUTING does not hold at its head.
 
 The hash and `TUN_DIR_TABLES` can be out of step in one direction: a tunnel with clients that the
 platform does not list keeps a slot in `TUN_DIR_TABLES` - its clients' MARK rules and the slot's
@@ -494,6 +512,8 @@ slot's table is never released: it is carrying traffic.
 - Chain does not exist
 - `TUN_DIR_TABLES` is missing
 - A client's MARK rule is missing from the chain (`_tunnel_marks_present`)
+- The restored marker (`TUN_DIR_RESTORED`): a firmware hook put the chain back from the snapshot
+  of the last apply (see the restore above)
 - `TUN_DIR_FORCE_REBUILD=1` (`restart`, `restart tunnel`)
 
 ## Key Functions
@@ -544,7 +564,8 @@ From `lib/common.sh`: `log`, `tmp_file`, `compute_hash`, `is_lan_ip`
 
 From `lib/firewall.sh`: `swap_fw_chain`, `delete_fw_chain`, `ensure_fw_rule`, `sync_fw_rule`, `purge_fw_rules`, `find_fw_rules`, `fw_chain_exists`
 
-From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`, `TUN_DIR_TABLES`
+From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`,
+`TUN_DIR_RESTORED`, `TUN_DIR_TABLES`
 
 From `lib/guard.sh`: `guard_layout_check`, `guard_direct_mark_hex`, `guard_direct_ensure`,
 `guard_direct_pref`, `guard_direct_release`, `guard_sync`, `guard_clear`, `guard_list`

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Simple mock that tracks calls and returns success, as the iptables mock does;
+# what it is fed goes unread. use_stateful_iptables puts the one that restores
+# (mocks/stateful/iptables-restore) ahead of it.
+echo "iptables-restore $*" >> /tmp/bats_iptables_calls.log
+exit 0

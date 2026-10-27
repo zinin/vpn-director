@@ -22,6 +22,16 @@ EOF
     printf '#!/bin/bash\n' > "$BATS_TEST_TMPDIR/vpn-director.sh"
     chmod +x "$BATS_TEST_TMPDIR/vpn-director.sh"
     export VPD_SCRIPT="$BATS_TEST_TMPDIR/vpn-director.sh"
+    fake_restore "$BATS_TEST_TMPDIR/nohup.log"
+}
+
+# fake_restore <log> - the restore the hooks run before they queue the apply
+# notes what it was asked in <log>, the one the apply is noted in, so one log
+# shows the order. Nothing on this machine is restored.
+fake_restore() {
+    printf '#!/bin/sh\necho "restore $*" >> "%s"\n' "$1" > "$BATS_TEST_TMPDIR/fwsnap-restore.sh"
+    chmod +x "$BATS_TEST_TMPDIR/fwsnap-restore.sh"
+    export VPD_RESTORE="$BATS_TEST_TMPDIR/fwsnap-restore.sh"
 }
 
 # run_hook <hook> [argv...] - source the hook in a POSIX shell that already
@@ -33,11 +43,12 @@ run_hook() {
         50-vpn-director.sh "$BATS_TEST_TMPDIR/fakes.sh" "$hook" "$@"
 }
 
-# The hook backgrounds nohup and exits at once; give the child a moment.
+# The hook backgrounds nohup and exits at once; give the child a moment. The
+# restore's line comes first and at once, so the wait is for the apply's.
 wait_for_apply() {
     local i
     for i in 1 2 3 4 5 6 7 8 9 10; do
-        [[ -s "$BATS_TEST_TMPDIR/nohup.log" ]] && return 0
+        grep -q -- '--wait apply' "$BATS_TEST_TMPDIR/nohup.log" 2>/dev/null && return 0
         sleep 0.2
     done
     return 1
@@ -45,7 +56,7 @@ wait_for_apply() {
 
 assert_no_apply() {
     sleep 0.5
-    [ ! -e "$BATS_TEST_TMPDIR/nohup.log" ]
+    ! grep -q -- '--wait apply' "$BATS_TEST_TMPDIR/nohup.log" 2>/dev/null
 }
 
 # ---------------------------------------------------------------- netfilter.d
@@ -62,7 +73,30 @@ assert_no_apply() {
     assert_success
     wait_for_apply
     run cat "$BATS_TEST_TMPDIR/nohup.log"
-    assert_output "$VPD_SCRIPT --wait apply"
+    assert_line "$VPD_SCRIPT --wait apply"
+}
+
+# The rules of the last apply go back first, from its snapshot, and the hook
+# waits for that: until then the guards refuse the Xray clients' connections and
+# send a tunnel client's excluded countries through its tunnel. The restore
+# leaves a table that holds our rules alone, so NDM's several calls for one
+# rebuild add nothing; the apply follows detached, as before.
+@test "netfilter.d: restores the table it was called for, then queues the apply" {
+    setup_hook_env
+    type=iptables table=mangle run_hook "$HOOKS/netfilter.d/50-vpn-director.sh" start
+    assert_success
+    wait_for_apply
+    run cat "$BATS_TEST_TMPDIR/nohup.log"
+    assert_output "restore mangle
+$VPD_SCRIPT --wait apply"
+
+    rm -f "$BATS_TEST_TMPDIR/nohup.log"
+    type=iptables table=nat run_hook "$HOOKS/netfilter.d/50-vpn-director.sh" start
+    assert_success
+    wait_for_apply
+    run cat "$BATS_TEST_TMPDIR/nohup.log"
+    assert_output "restore nat
+$VPD_SCRIPT --wait apply"
 }
 
 @test "netfilter.d: every table NDM rebuilds counts" {
@@ -84,6 +118,8 @@ assert_no_apply() {
     type=iptables table=raw run_hook "$HOOKS/netfilter.d/50-vpn-director.sh" start
     assert_success
     assert_no_apply
+    # Nor is anything restored.
+    [ ! -e "$BATS_TEST_TMPDIR/nohup.log" ]
 }
 
 # ---------------------------------------------------------------------- wan.d
@@ -150,10 +186,12 @@ assert_no_apply() {
 # was the apply of the last firewall start, the chains stayed empty until the
 # next event. --wait queues it behind the running one instead.
 
-# setup_merlin_hook_env - the fakes, and a CLI that notes what it was asked.
+# setup_merlin_hook_env - the fakes, and a CLI that notes what it was asked, in
+# the log the restore notes its table in.
 setup_merlin_hook_env() {
     setup_hook_env
     printf '#!/bin/sh\necho "$*" >> "%s/apply.log"\n' "$BATS_TEST_TMPDIR" > "$VPD_SCRIPT"
+    fake_restore "$BATS_TEST_TMPDIR/apply.log"
 }
 
 @test "firewall-start: re-applies, queued behind a running apply" {
@@ -161,7 +199,17 @@ setup_merlin_hook_env() {
     run_hook "$MERLIN_HOOKS/firewall-start" eth0
     assert_success
     run cat "$BATS_TEST_TMPDIR/apply.log"
-    assert_output "--wait apply"
+    assert_line "--wait apply"
+}
+
+# The firewall start has emptied every mangle chain. The restore refills ours
+# from the last apply's snapshot first: the apply after it takes seconds.
+@test "firewall-start: restores mangle, then queues the apply" {
+    setup_merlin_hook_env
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output $'restore mangle\n--wait apply'
 }
 
 @test "wan-event: re-applies when a WAN connection comes up, queued behind a running apply" {
@@ -186,7 +234,15 @@ setup_merlin_hook_env() {
     run_hook "$MERLIN_HOOKS/nat-start"
     assert_success
     run cat "$BATS_TEST_TMPDIR/apply.log"
-    assert_output "--wait apply"
+    assert_line "--wait apply"
+}
+
+@test "nat-start: restores nat, then queues the apply" {
+    setup_merlin_hook_env
+    run_hook "$MERLIN_HOOKS/nat-start"
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output $'restore nat\n--wait apply'
 }
 
 @test "nat-start: is POSIX sh and executable in the tree" {
@@ -212,6 +268,8 @@ setup_merlin_hook_env() {
     assert_success
     assert_no_apply
     grep -q "vpn-director not found" "$BATS_TEST_TMPDIR/logger.log"
+    # Nor is anything restored: the install it would restore for is not there.
+    [ ! -e "$BATS_TEST_TMPDIR/nohup.log" ]
 }
 
 # nohup is Entware's coreutils-nohup, which a partially provisioned router can
@@ -236,6 +294,53 @@ EOF
     assert_no_apply
     run grep -c "opkg install coreutils-nohup" "$BATS_TEST_TMPDIR/logger.log"
     assert_output "3"
+    # The restore needs no nohup, and netfilter.d still runs it.
+    run cat "$BATS_TEST_TMPDIR/nohup.log"
+    assert_output "restore mangle"
+}
+
+# The restore only shortens the window; the apply is what puts everything back.
+# A router the restore script has not reached - or lost - still applies.
+@test "hooks: a missing restore script does not stop the apply" {
+    setup_hook_env
+    export VPD_RESTORE="$BATS_TEST_TMPDIR/absent.sh"
+    type=iptables table=mangle run_hook "$HOOKS/netfilter.d/50-vpn-director.sh" start
+    assert_success
+    wait_for_apply
+    run cat "$BATS_TEST_TMPDIR/nohup.log"
+    assert_output "$VPD_SCRIPT --wait apply"
+
+    setup_merlin_hook_env
+    export VPD_RESTORE="$BATS_TEST_TMPDIR/absent.sh"
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    assert_success
+    run_hook "$MERLIN_HOOKS/nat-start"
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output $'--wait apply\n--wait apply'
+}
+
+# The restore exits 0 whatever it could not do; one that fails all the same -
+# killed, a broken install - neither keeps the apply from being queued nor
+# reaches the hook's output.
+@test "hooks: a restore that fails does not stop the apply" {
+    setup_hook_env
+    printf '#!/bin/sh\necho restoring\necho "cannot restore" >&2\nexit 1\n' > "$VPD_RESTORE"
+    type=iptables table=mangle run_hook "$HOOKS/netfilter.d/50-vpn-director.sh" start
+    assert_success
+    refute_output
+    wait_for_apply
+
+    setup_merlin_hook_env
+    printf '#!/bin/sh\necho restoring\necho "cannot restore" >&2\nexit 1\n' > "$VPD_RESTORE"
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    assert_success
+    refute_output
+    run_hook "$MERLIN_HOOKS/nat-start"
+    assert_success
+    refute_output
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output $'--wait apply\n--wait apply'
 }
 
 @test "hooks: are POSIX sh and executable in the tree" {

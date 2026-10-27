@@ -25,7 +25,8 @@
 #               guard_sync, guard_clear, guard_list, guard_direct_pref,
 #               guard_direct_release: the guards, which route a client while the
 #               firmware has deleted the chain)
-#   - ipset.sh (_ipset_exists, parse_exclude_sets_from_json, TUN_DIR_HASH, TUN_DIR_TABLES)
+#   - ipset.sh (_ipset_exists, parse_exclude_sets_from_json, TUN_DIR_HASH, TUN_DIR_RESTORED,
+#               TUN_DIR_TABLES)
 #
 # Public API:
 #   tunnel_status()              - show TUN_DIR chain, ip rules, the guards, configured tunnels
@@ -1363,7 +1364,7 @@ tunnel_stop() {
     fi
 
     # Clear hash file
-    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY" "$IFTUNNEL_STATE_FILE"
+    rm -f "$TUN_DIR_HASH" "$TUN_DIR_RESTORED" "$TUN_DIR_FAILOVER_READY" "$IFTUNNEL_STATE_FILE"
 
     log "Tunnel Director stopped"
     return 0
@@ -1487,9 +1488,18 @@ tunnel_apply() {
     empty_hash=$(printf '' | compute_hash)
     old_hash=$(cat "$TUN_DIR_HASH" 2>/dev/null || printf '%s' "$empty_hash")
 
-    # Check if rebuild needed
-    local rebuild=0
+    # Check if rebuild needed. A firmware hook that put the chain back from the
+    # snapshot (fwsnap-restore.sh) removed the hash and left the restored marker:
+    # the snapshot is the last apply's and may be older than the configuration,
+    # and the up-to-date path looks for the MARK rules alone. The marker holds
+    # where the hash alone does not - an apply rebuilding while the restore ran
+    # can record its hash after it: it stays until a rebuild that starts later
+    # takes it away, and no rebuild records the hash while it is there (4. below).
+    local rebuild=0 restored=0
+    [[ ! -e $TUN_DIR_RESTORED ]] || restored=1
     if [[ ${TUN_DIR_FORCE_REBUILD:-0} == 1 ]]; then
+        rebuild=1
+    elif [[ $restored -eq 1 ]]; then
         rebuild=1
     elif [[ $new_hash != "$old_hash" ]]; then
         rebuild=1
@@ -1552,8 +1562,10 @@ tunnel_apply() {
     # slots it left on record. The failover marker goes with the hash, as it
     # went with the tunnel_stop a rebuild used to start with: the watch trusts
     # the marker over the apply's exit status, so a rebuild that is refused or
-    # dies part-way must not leave a stale "ready" behind.
-    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY"
+    # dies part-way must not leave a stale "ready" behind. The restored marker
+    # goes too: the chain this rebuild swaps in replaces what a restore brought
+    # back. A restore that lands while it runs leaves a new one.
+    rm -f "$TUN_DIR_HASH" "$TUN_DIR_FAILOVER_READY" "$TUN_DIR_RESTORED"
 
     # The PREROUTING jumps below are what make the chain matter, so ask for the
     # LAN interfaces before touching any firewall state. A platform that cannot
@@ -1578,6 +1590,9 @@ tunnel_apply() {
 
     if [[ ${TUN_DIR_FORCE_REBUILD:-0} == 1 ]]; then
         log "Rebuilding Tunnel Director in place..."
+    elif [[ $restored -eq 1 ]]; then
+        # The restore took the hash away as well: no change of the configuration.
+        log "The rules were restored from the snapshot; rebuilding in place..."
     elif [[ $new_hash != "$old_hash" ]]; then
         log "Configuration changed; rebuilding in place..."
     else
@@ -1769,8 +1784,11 @@ tunnel_apply() {
     # chain rule is the same: the up-to-date branch looks for the MARK rules
     # alone, so a refused exclusion or offload rule would stay missing, and only
     # a rebuild retries it. A direct rule or a guard that did not go in keeps it
-    # out too.
-    if [[ $skipped_unknown -eq 0 && $incomplete -eq 0 && $jumps_ok -eq 1 ]]; then
+    # out too, and so does the restored marker: a firmware hook put the snapshot
+    # back while this rebuild ran, and the live chain may be that one. The apply
+    # the hook queued rebuilds; a hash recorded here would send it down the
+    # up-to-date branch.
+    if [[ $skipped_unknown -eq 0 && $incomplete -eq 0 && $jumps_ok -eq 1 && ! -e $TUN_DIR_RESTORED ]]; then
         printf '%s\n' "$new_hash" > "$TUN_DIR_HASH"
     elif [[ $skipped_unknown -ne 0 ]]; then
         log -l WARN "Tunnel Director: a configured tunnel is not in the platform list (see the warning above); this apply is not recorded as up-to-date and the next apply retries"
@@ -1780,8 +1798,10 @@ tunnel_apply() {
         log -l WARN "Tunnel Director: the direct rule did not go in; this apply is not recorded as up-to-date and the next apply rebuilds"
     elif [[ $guards_ok -eq 0 ]]; then
         log -l WARN "Tunnel Director: a guard did not go in; this apply is not recorded as up-to-date and the next apply rebuilds"
-    else
+    elif [[ $incomplete -ne 0 ]]; then
         log -l WARN "Tunnel Director: a client rule did not go in; this apply is not recorded as up-to-date and the next apply rebuilds"
+    else
+        log "Tunnel Director: the rules were restored from the snapshot during this rebuild; this apply is not recorded as up-to-date and the next apply rebuilds"
     fi
 
     # A failover tunnel that is not ready does not fail the apply: S99 start,
