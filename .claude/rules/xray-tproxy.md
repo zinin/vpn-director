@@ -238,7 +238,8 @@ ip rule add pref 16897 from 192.168.1.100 iif br0 prohibit
 Director (bits 16-23) and the direct mark (bit 9 by default), which stays out of `fwmark_mask`.
 Without `advanced.tunnel_director.direct_mark`, a `fwmark_mask` that holds bit 9 (`0x300`,
 `0xff00`) moves the direct mark to the lowest bit above it outside both masks, with a WARN;
-`guard_layout_check` refuses a `direct_mark` that is set there (`lib/guard.sh`).
+`guard_layout_check` refuses a `direct_mark` that is set there, and one set in the firmware's mark
+byte, bits 0-7 (`lib/guard.sh`).
 
 The TPROXY ip rule uses pref 200. On KeeneticOS 5.1.5 that preference was free of
 NDM connection policies (a user policy landed at prefs 102/103, table 4097; no
@@ -267,11 +268,11 @@ there as well (below): such a client loses its tunnel guard in `tunnel_apply`.
 > typo cannot abort apply.
 
 A direct mark, guard preferences or a `rule_pref` that `guard_layout_check` refuses (`lib/guard.sh`:
-a `direct_mark` that is not one bit, or lies in `fwmark_mask` or in Tunnel Director's `mark_mask`;
-without the key, masks that leave no bit free; guards that would reach main's rule at 32766; a
-`rule_pref` at or above the direct rule's preference) are no soft-fail: `tproxy_apply` logs the
-ERROR and returns 1 before it touches anything - no module, route, rule, set, chain or marker -
-and the run ends there, as `tunnel_apply` would end it.
+a `direct_mark` that is not one bit, or lies in the firmware's mark byte (`0xff`), in `fwmark_mask`
+or in Tunnel Director's `mark_mask`; without the key, masks that leave no bit free; guards that
+would reach main's rule at 32766; a `rule_pref` at or above the direct rule's preference) are no
+soft-fail: `tproxy_apply` logs the ERROR and returns 1 before it touches anything - no module,
+route, rule, set, chain or marker - and the run ends there, as `tunnel_apply` would end it.
 
 The firmware's firewall rebuilds take `XRAY_TPROXY` away: KeeneticOS's NDM deletes it (every WAN
 lease renewal did on the KN-4521), Merlin's firewall start empties it (`iptables -t mangle -F`).

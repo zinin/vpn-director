@@ -87,6 +87,20 @@ load_guard() {
     done
 }
 
+# The low byte is the firmware's (0x01 its VPN mark): a direct mark there would read as one of the
+# firmware's marks. Without direct_mark the pick starts at 0x200, above that byte.
+@test "guard_layout_check: refuses a direct mark in the firmware's mark byte" {
+    load_guard
+    local mark
+    for mark in 0x1 0x80; do
+        TUN_DIR_DIRECT_MARK=$mark
+        run guard_layout_check
+        assert_failure 1
+        assert_output --partial "ERROR"
+        assert_output --partial "advanced.tunnel_director.direct_mark $mark lies in the firmware's mark byte (0xff); rules not applied"
+    done
+}
+
 # A configuration has no direct_mark unless the user set one - the template leaves it out - and one
 # whose masks hold 0x200 would fail every apply on it. Without the key the mark is the lowest bit
 # above 0x100 outside both masks, and a WARN names it. Xray's 0xff00 holds 0x200 to 0x8000, Tunnel

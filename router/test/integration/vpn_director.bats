@@ -64,6 +64,19 @@ setup() {
     assert_output --partial "Unknown option"
 }
 
+# A router a partially copied update left without lib/guard.sh died on bash's bare "No such file
+# or directory" in every command. The CLI names the missing library and the way out, and fails.
+@test "vpn-director: a router tree without lib/guard.sh names it and fails" {
+    local tree="$BATS_TEST_TMPDIR/vpn-director"
+    cp -R "$SCRIPTS_DIR" "$tree"
+    rm "$tree/lib/guard.sh"
+    run "$tree/vpn-director.sh" status
+    assert_failure
+    assert_output --partial "ERROR"
+    assert_output --partial "Guard library not found: $tree/lib/guard.sh - re-run install.sh to reinstall it"
+    refute_output --partial "No such file or directory"
+}
+
 # ============================================================================
 # Status command tests
 # ============================================================================

@@ -202,9 +202,9 @@ Examples:
 ```
 
 The direct mark is `advanced.tunnel_director.direct_mark`; `guard_layout_check` refuses a value
-that is not one bit or lies in `mark_mask` or in Xray's `fwmark_mask`. Without the key it is
-`0x200`, or, where one of those masks holds that bit, the lowest bit above it outside both, with a
-WARN (`lib/guard.sh`). NDM's policy marks on
+that is not one bit or lies in the firmware's mark byte (`0xff`), in `mark_mask` or in Xray's
+`fwmark_mask`. Without the key it is `0x200`, or, where one of those masks holds that bit, the
+lowest bit above it outside both, with a WARN (`lib/guard.sh`). NDM's policy marks on
 KeeneticOS have bit 9 set as well, and NDM's own rules at prefs 100-105 route them first
 (`keenetic.md`); Merlin's marks are unverified.
 

@@ -156,15 +156,27 @@ _load_common() {
     _COMMON_LOADED=1
 }
 
+# guard.sh and fwsnap.sh are newer than the rest: a router a partially copied update left without
+# one would otherwise die on the shell's bare "No such file or directory" in every command. Name
+# the missing library and the way out, as common.sh does for platform.sh, and fail: every caller
+# runs this as a plain command, so errexit ends the run.
 _load_modules() {
     [[ ${_MODULES_LOADED:-0} -eq 1 ]] && return 0
     _load_common
     . "$SCRIPT_DIR/lib/firewall.sh"
     . "$SCRIPT_DIR/lib/config.sh"
+    if [[ ! -f "$SCRIPT_DIR/lib/guard.sh" ]]; then
+        log -l ERROR "Guard library not found: $SCRIPT_DIR/lib/guard.sh - re-run install.sh to reinstall it"
+        return 1
+    fi
     . "$SCRIPT_DIR/lib/guard.sh"
     . "$SCRIPT_DIR/lib/ipset.sh" --source-only
     . "$SCRIPT_DIR/lib/tunnel.sh" --source-only
     . "$SCRIPT_DIR/lib/tproxy.sh" --source-only
+    if [[ ! -f "$SCRIPT_DIR/lib/fwsnap.sh" ]]; then
+        log -l ERROR "Firewall snapshot library not found: $SCRIPT_DIR/lib/fwsnap.sh - re-run install.sh to reinstall it"
+        return 1
+    fi
     . "$SCRIPT_DIR/lib/fwsnap.sh"
     _MODULES_LOADED=1
 }

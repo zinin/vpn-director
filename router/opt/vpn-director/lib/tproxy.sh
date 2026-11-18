@@ -1133,7 +1133,7 @@ tproxy_apply() {
     # that does not find it is an error of the moment - a busy xtables lock - and
     # no guard was synced; the next apply checks again.
     if [[ $guards_rc -eq 2 ]]; then
-        log -l WARN "The direct mark was not found in $XRAY_CHAIN; the Xray guards were not synced, TPROXY readiness withheld"
+        log -l WARN "The direct mark was not found in $XRAY_CHAIN, or iptables could not check it (a busy xtables lock); the Xray guards were not synced, TPROXY readiness withheld"
         rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
@@ -1234,7 +1234,7 @@ tproxy_prune() {
     local guards_rc=0
     _tproxy_guards_sync || guards_rc=$?
     if [[ $guards_rc -eq 2 ]]; then
-        log -l WARN "The direct mark was not found in $XRAY_CHAIN; the Xray guards were not synced, only those of the clients that left the set removed"
+        log -l WARN "The direct mark was not found in $XRAY_CHAIN, or iptables could not check it (a busy xtables lock); the Xray guards were not synced, only those of the clients that left the set removed"
         _tproxy_guards_prune || true
     fi
     return 0

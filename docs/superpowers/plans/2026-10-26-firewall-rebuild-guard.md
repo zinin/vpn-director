@@ -110,5 +110,7 @@ allows each router change. Traffic of the owner's own sessions crosses this rout
 - [ ] **Step 5: Asuswrt-Merlin, if the owner has a router at hand:** the same steps with
   `service restart_firewall` as the rebuild, checking in addition that its acceleration keeps an excluded
   flow direct and that bit `0x200` carries no firmware mark (`iptables-save -t mangle | grep 0x200`).
+  Check `ip rule show` as well for firmware rules between 16895 and 32765, which a protected client's
+  direct traffic met before this change and now skips.
 - [ ] **Step 6: Report** the measurements to the owner. On any failure, restore the backup and run
   `vpn-director.sh apply`.

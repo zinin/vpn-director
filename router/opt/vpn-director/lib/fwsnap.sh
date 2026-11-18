@@ -84,11 +84,14 @@ _fwsnap_ifaces() {
 # only once declared. The jumps are numbered in listing order, Xray's first; on Merlin that puts
 # TUN_DIR's ahead of the firmware's iface-mark rules, which match other interfaces, until the
 # rebuild that follows the restore puts it back behind them (platform_prerouting_base_pos). The
-# MSS rules keep their order at the head of FORWARD, where iftunnel.sh puts them. The listing is
-# read into an array once: bash reads a here-string one byte per read call, and this walks the
-# listing up to five times.
+# MSS rules are the two iftunnel.sh puts in for an interface tunnel, exactly as "iptables -S" lists
+# them - "-o <iface> ... -j TCPMSS --clamp-mss-to-pmtu" and "-i <iface> ... -j TCPMSS --set-mss
+# <digits>", the name compared as written (it may hold dots) - and no other: another package's MSS
+# rule for that interface is not ours to put back at the head of FORWARD. They keep their order
+# there, where iftunnel.sh puts them. The listing is read into an array once: bash reads a
+# here-string one byte per read call, and this walks the listing up to five times.
 _fwsnap_mangle() {
-    local chain line spec iface accept n=0
+    local chain line spec iface accept mss_out mss_in mss n=0
     local -a lines=() ifaces=() chains=()
     mapfile -t lines <<< "$1"
     mapfile -t ifaces <<< "$2"
@@ -129,7 +132,10 @@ _fwsnap_mangle() {
         [[ $line == "-A FORWARD "* && "$line " == *" -j TCPMSS "* ]] || continue
         for iface in "${ifaces[@]}"; do
             [[ -n $iface ]] || continue
-            if [[ "$line " == *" -i $iface "* || "$line " == *" -o $iface "* ]]; then
+            mss_out="-A FORWARD -o $iface -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu"
+            mss_in="-A FORWARD -i $iface -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "
+            mss="${line#"$mss_in"}"
+            if [[ $line == "$mss_out" || ( $line == "$mss_in"* && $mss =~ ^[0-9]+$ ) ]]; then
                 n=$((n + 1))
                 printf -- '-I FORWARD %s %s\n' "$n" "${line#"-A FORWARD "}"
                 break

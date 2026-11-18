@@ -375,7 +375,8 @@ guard_direct_mark_hex() {
 # The direct mark is one bit of the 32-bit fwmark, outside Tunnel Director's mark field and
 # outside Xray's fwmark_mask: inside either, a packet marked direct would read as one marked for a
 # tunnel or for Xray. Xray's mask is looked at only when it is set - Tunnel Director's tests run
-# without it. A direct_mark that is set is the user's, and refused there. Without it the mark is
+# without it. A direct_mark that is set is the user's, and refused there, and in the firmware's
+# mark byte (0xff) too: the mark layout gives the firmware the low byte. Without it the mark is
 # the bit _guard_direct_mark picks outside both, and one that is not 0x200 moves whenever the masks
 # do: a WARN names it, the mask that holds 0x200 and the setting that pins it, once per value. No
 # bit left to pick is refused. The direct rule and the guards stay ahead of main's rule at 32766,
@@ -414,6 +415,10 @@ guard_layout_check() {
         mark=$(_guard_direct_mark) || mark=0
         if (( mark == 0 || mark > 0xffffffff || (mark & (mark - 1)) != 0 )); then
             log -l ERROR "advanced.tunnel_director.direct_mark '$raw' is not a single bit of the fwmark (such as 0x200); rules not applied"
+            return 1
+        fi
+        if (( mark & 0xff )); then
+            log -l ERROR "advanced.tunnel_director.direct_mark $(guard_direct_mark_hex) lies in the firmware's mark byte (0xff); rules not applied"
             return 1
         fi
         if (( mark & td_mask )); then

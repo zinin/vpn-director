@@ -1721,12 +1721,15 @@ tunnel_apply() {
     # 2. The chain, built beside the live one and swapped in, one jump per LAN
     # interface. The mark test on the jump makes the first match win: a packet an
     # earlier rule marked skips this chain.
-    local lan_if swap_rc=0 jumps_ok=1
+    local lan_if swap_rc=0 jumps_ok=1 guard_lines guard_lines_ok=1
     local -a jump_matches=()
     while IFS= read -r lan_if; do
         [[ -n $lan_if ]] || continue
         jump_matches+=("-i $lan_if -m mark --mark 0x0/$_tunnel_mark_mask_hex")
     done <<< "$lan_ifaces"
+    # The lines of the new layout's guards, computed before the swap and synced
+    # after it (below).
+    guard_lines=$(_tunnel_guard_lines "$slots_tmp") || guard_lines_ok=0
     swap_fw_chain mangle "$TUN_DIR_CHAIN" _tunnel_build_chain _tunnel_prerouting_pos "${jump_matches[@]}" || swap_rc=$?
     if [[ $swap_rc -ge 2 ]]; then
         log -l ERROR "Tunnel Director: the rebuilt chain did not take over every LAN interface; the next apply finishes it"
@@ -1741,11 +1744,16 @@ tunnel_apply() {
     # the old guards route the old layout's clients until then, and the slots
     # they route into go only in 3. Not before the swap: the chain an earlier
     # version left returns bare from every exclusion, and that traffic would
-    # meet the new guards and go into the tunnel. A guard that did not go in
-    # (guard_sync logs the ERROR) leaves the rebuild unrecorded, so the next
-    # apply tries again, and the failover not ready.
+    # meet the new guards and go into the tunnel. Their lines were computed
+    # before the swap - they depend only on the configuration and on the
+    # lookup rules step 1 put in - so that only the sync falls in the window
+    # in which a client new to the layout has no guard. A guard that did not
+    # go in (guard_sync logs the ERROR), or lines that could not be computed
+    # (_tunnel_guard_lines logged the ERROR), leave the rebuild unrecorded, so
+    # the next apply tries again, and the failover not ready.
     local guards_ok=1
-    if [[ $jumps_ok -eq 1 ]] && ! _tunnel_guards_sync "$slots_tmp"; then
+    if [[ $jumps_ok -eq 1 ]] &&
+        { [[ $guard_lines_ok -eq 0 ]] || ! guard_sync tunnel "$guard_lines"; }; then
         warnings=1
         incomplete=1
         guards_ok=0

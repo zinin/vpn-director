@@ -1694,10 +1694,10 @@ ip_rule_show_cut_short() {
 @test "tunnel_apply: a restore during a rebuild leaves no hash, and the next apply rebuilds and records it" {
     load_tunnel_module
     use_stateful_iptables
-    eval "real_$(declare -f _tunnel_guards_sync)"
-    _tunnel_guards_sync() {
+    eval "real_$(declare -f guard_sync)"
+    guard_sync() {
         : > "$TUN_DIR_RESTORED"
-        real__tunnel_guards_sync "$@"
+        real_guard_sync "$@"
     }
     run tunnel_apply
     assert_success
@@ -1706,7 +1706,7 @@ ip_rule_show_cut_short() {
     [ ! -e "$TUN_DIR_HASH" ]
     [ -e "$TUN_DIR_RESTORED" ]
 
-    _tunnel_guards_sync() { real__tunnel_guards_sync "$@"; }
+    guard_sync() { real_guard_sync "$@"; }
     run tunnel_apply
     assert_success
     assert_output --partial "rebuilding"

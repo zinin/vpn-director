@@ -169,6 +169,35 @@ EOF
     [ ! -e "$FWSNAP_DIR/nat.rules" ]
 }
 
+# Only the two MSS rules iftunnel.sh puts in for an interface tunnel go with the snapshot: another
+# package's MSS rule that names the interface is not ours, and the restore would put it back at the
+# head of FORWARD. Both foreign rules here sit between and after the own ones, which keep their
+# order and their numbers.
+@test "fwsnap_save: another package's MSS rule for an interface tunnel stays out of the snapshot" {
+    load_fwsnap
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    printf 'awg1 2000\n' > "$IFTUNNEL_STATE_FILE"
+    tun_dir_applied
+    iptables -t mangle -A FORWARD -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
+    iptables -t mangle -A FORWARD -d 10.0.0.0/8 -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -t mangle -A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    iptables -t mangle -A FORWARD -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
+
+    fwsnap_save
+    local want
+    want="$(cat <<'EOF'
+*mangle
+:TUN_DIR - [0:0]
+-A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000
+-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR
+-I FORWARD 1 -i awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1240
+-I FORWARD 2 -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+COMMIT
+EOF
+)"
+    assert_equal "$(cat "$FWSNAP_DIR/mangle.rules")" "$want"
+}
+
 # ============================================================================
 # fwsnap_save: what it never costs
 # ============================================================================

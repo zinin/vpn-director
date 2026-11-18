@@ -1515,7 +1515,7 @@ load_tproxy_module_with_clients() {
     run tproxy_prune 192.168.1.9
     assert_success
     assert_output --partial "Kept in XRAY_CLIENTS: 192.168.1.9"
-    assert_output --partial "The direct mark was not found in XRAY_TPROXY; the Xray guards were not synced, only those of the clients that left the set removed"
+    assert_output --partial "The direct mark was not found in XRAY_TPROXY, or iptables could not check it (a busy xtables lock); the Xray guards were not synced, only those of the clients that left the set removed"
     run ipset test XRAY_CLIENTS 192.168.1.8
     assert_failure
     run guard_list xray
@@ -1569,7 +1569,7 @@ load_tproxy_module_with_clients() {
     }
     run tproxy_apply
     assert_success
-    assert_output --partial "The direct mark was not found in XRAY_TPROXY; the Xray guards were not synced, TPROXY readiness withheld"
+    assert_output --partial "The direct mark was not found in XRAY_TPROXY, or iptables could not check it (a busy xtables lock); the Xray guards were not synced, TPROXY readiness withheld"
     [ ! -e "$XRAY_TPROXY_READY" ]
     run iptables -t mangle -S XRAY_TPROXY
     assert_line --index 2 '-A XRAY_TPROXY -j MARK --set-xmark 0x200/0x200'
