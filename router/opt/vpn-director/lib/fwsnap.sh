@@ -167,8 +167,11 @@ _fwsnap_nat() {
 # whatever the umask, one that group or others can write to loses that write - /tmp/vpn-director
 # is also watchd's runtime directory, which an older release's stop left 0777 under Merlin's umask
 # 0 - and a symlink, no directory or another user's is refused with a WARN naming it, nothing
-# written. The file is written under umask 077, then made 0644 and renamed into place. A refusal
-# or a write that fails is a WARN, and the file an earlier apply wrote stays.
+# written and nothing removed there: the restore refuses such a directory anyway, and nothing is
+# deleted through a symlink. The file is written under umask 077, then made 0644 and renamed into
+# place. A write that fails there is a WARN, and takes the file an earlier apply wrote away with
+# the one it could not finish: left in place, that stale file would put back, after the next
+# rebuild of the firewall, rules the configuration has dropped since.
 _fwsnap_put() {
     local file="$FWSNAP_DIR/$1" dir
     if [[ -z $2 ]]; then
@@ -177,14 +180,14 @@ _fwsnap_put() {
     fi
     for dir in "${FWSNAP_DIR%/*}" "$FWSNAP_DIR"; do
         if ! ensure_owned_dir "$dir"; then
-            log -l WARN "Firewall snapshot: cannot write $file: $dir is a symlink, no directory or not this user's alone; a firewall rebuild restores the snapshot of an earlier apply, if there is one"
+            log -l WARN "Firewall snapshot: cannot write $file: $dir is a symlink, no directory or not this user's alone; nothing there is touched, and a firewall rebuild restores nothing from it"
             return 0
         fi
     done
     if ! { ( umask 077; printf '%s\n' "$2" > "$file.new" ) && chmod 644 "$file.new" &&
         mv -f "$file.new" "$file"; } 2>/dev/null; then
-        rm -f "$file.new" 2>/dev/null || true
-        log -l WARN "Firewall snapshot: cannot write $file; a firewall rebuild restores the snapshot of an earlier apply, if there is one"
+        rm -f "$file.new" "$file" 2>/dev/null || true
+        log -l WARN "Firewall snapshot: cannot write $file; the one of an earlier apply removed, so a firewall rebuild restores nothing from it until an apply writes one"
     fi
     return 0
 }
@@ -201,21 +204,28 @@ _fwsnap_put() {
 # jumps, the INPUT accept and the MSS rules, all as they stood at one moment; nat is listed only
 # while there are interface tunnels. Returns 0 always: the snapshot only shortens a window the
 # guards keep off the WAN already, and an apply never fails over it. A listing or a write that
-# fails is a WARN, and the snapshot of an earlier apply stays.
+# fails is a WARN, and removes what of an earlier apply's snapshot this run cannot bring up to
+# date: a failed listing of mangle both files (the run ends there), one of nat POSTROUTING
+# nat.rules alone (mangle.rules is this run's), a failed write its own file (_fwsnap_put). Left
+# in place, a stale snapshot would put back, after the next rebuild of the firewall, rules the
+# configuration has dropped since - an address taken out of a tunnel's exclude, marked direct
+# and sent to main ahead of the new guards - until the hook's apply rebuilds.
 # -------------------------------------------------------------------------------------------------
 fwsnap_save() {
     local listing ifaces nat=""
     ifaces="$(_fwsnap_ifaces 2>/dev/null)" || ifaces=""
 
     if ! listing="$(iptables -t mangle -S 2>/dev/null)"; then
-        log -l WARN "Firewall snapshot: cannot list mangle; a firewall rebuild restores the snapshot of an earlier apply, if there is one"
+        fwsnap_remove
+        log -l WARN "Firewall snapshot: cannot list mangle; the snapshot of an earlier apply removed, so a firewall rebuild restores nothing until an apply writes one"
         return 0
     fi
     _fwsnap_put mangle.rules "$(_fwsnap_mangle "$listing" "$ifaces")"
 
     if [[ -n $ifaces ]]; then
         if ! listing="$(iptables -t nat -S POSTROUTING 2>/dev/null)"; then
-            log -l WARN "Firewall snapshot: cannot list nat POSTROUTING; a firewall rebuild restores the snapshot of an earlier apply, if there is one"
+            rm -f "$FWSNAP_DIR/nat.rules" 2>/dev/null || true
+            log -l WARN "Firewall snapshot: cannot list nat POSTROUTING; the nat snapshot of an earlier apply removed, so a rebuild of nat restores nothing until an apply writes one"
             return 0
         fi
         nat="$(_fwsnap_nat "$listing" "$ifaces")"

@@ -427,12 +427,17 @@ the head of INPUT and the interface tunnels' MSS rules at the head of FORWARD. `
 hold goes: `mangle.rules` while neither chain exists, `nat.rules` without such a rule. An apply that
 fails part-way ends before the snapshot, and the one of an earlier apply stays; `stop` removes it
 before it tears anything down, whichever component it stops. A listing or a write that fails is a
-WARN, the earlier snapshot stays, and the apply goes on. The hooks hand the files to
-`iptables-restore` as root, so the directory and its parent are held to watchd's `OwnedDir` policy
-(`ensure_owned_dir`): a missing one is made `0755` whatever the umask, one of root's own that group
-or others can write to loses that write, and a symlink, no directory or another user's gets
-nothing written, with a WARN naming it. A file is written under umask 077, then made `0644` and
-renamed into place.
+WARN, and the apply goes on without the part of an earlier apply's snapshot it cannot bring up to
+date: a failed listing of mangle removes both files, one of nat POSTROUTING `nat.rules` alone (the
+`mangle.rules` that run wrote is current), a failed write its own file. Left in place, a stale file
+would put back, after the next rebuild of the firewall, rules the configuration has dropped since -
+an address taken out of a tunnel's `exclude`, marked direct and sent to main ahead of the new
+guards - until the hook's apply rebuilds. The hooks hand the files to `iptables-restore` as root,
+so the directory and its parent are held to watchd's `OwnedDir` policy (`ensure_owned_dir`): a
+missing one is made `0755` whatever the umask, one of root's own that group or others can write to
+loses that write, and a symlink, no directory or another user's gets nothing written and nothing
+removed, with a WARN naming it - the restore refuses such a directory anyway. A file is written
+under umask 077, then made `0644` and renamed into place.
 
 The firmware hooks restore the snapshot, and wait for that, before they queue the apply
 (`lib/fwsnap-restore.sh`, POSIX sh, no common.sh and no lock): KeeneticOS's `netfilter.d` hook the

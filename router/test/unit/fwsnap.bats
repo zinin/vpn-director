@@ -256,12 +256,14 @@ EOF
     refute_output
 }
 
-# A listing that fails says nothing of the rules in place: the snapshot of an earlier apply stays,
-# and the apply the hooks queue after restoring it reconciles what it holds that is stale.
-@test "fwsnap_save: a listing that fails leaves the snapshot as it was" {
+# A listing of mangle that fails says nothing of the rules in place, and the run ends there: the
+# snapshot of an earlier apply goes, both files. Left in place, it would put back after the next
+# rebuild of the firewall rules the configuration may have dropped since.
+@test "fwsnap_save: a mangle listing that fails removes the snapshot of an earlier apply" {
     load_fwsnap
     mkdir -p "$FWSNAP_DIR"
     printf '*mangle\n:TUN_DIR - [0:0]\nCOMMIT\n' > "$FWSNAP_DIR/mangle.rules"
+    printf -- '-o awg1 -j MASQUERADE\n' > "$FWSNAP_DIR/nat.rules"
     tun_dir_applied
     iptables() {
         [[ ${1:-} == -t && ${2:-} == mangle && ${3:-} == -S ]] && return 4
@@ -271,8 +273,51 @@ EOF
     run fwsnap_save
     assert_success
     assert_output --partial "WARN"
-    assert_output --partial "Firewall snapshot: cannot list mangle"
-    assert_equal "$(cat "$FWSNAP_DIR/mangle.rules")" $'*mangle\n:TUN_DIR - [0:0]\nCOMMIT'
+    assert_output --partial "Firewall snapshot: cannot list mangle; the snapshot of an earlier apply removed"
+    [ ! -e "$FWSNAP_DIR/mangle.rules" ]
+    [ ! -e "$FWSNAP_DIR/nat.rules" ]
+}
+
+# One of nat POSTROUTING that fails takes nat.rules alone: the mangle.rules this run has just
+# written is current, and stays.
+@test "fwsnap_save: a nat listing that fails removes nat.rules and keeps the new mangle.rules" {
+    load_fwsnap
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    printf 'awg1 2000\n' > "$IFTUNNEL_STATE_FILE"
+    tun_dir_applied
+    iptables -t nat -A POSTROUTING -o awg1 -j MASQUERADE
+    fwsnap_save
+    [ -f "$FWSNAP_DIR/nat.rules" ]
+    printf '*mangle\nCOMMIT\n' > "$FWSNAP_DIR/mangle.rules"
+    iptables() {
+        [[ ${1:-} == -t && ${2:-} == nat && ${3:-} == -S ]] && return 4
+        command iptables "$@"
+    }
+
+    run fwsnap_save
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "Firewall snapshot: cannot list nat POSTROUTING; the nat snapshot of an earlier apply removed"
+    [ ! -e "$FWSNAP_DIR/nat.rules" ]
+    run cat "$FWSNAP_DIR/mangle.rules"
+    assert_line ':TUN_DIR - [0:0]'
+    assert_line '-A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+}
+
+# A write that fails in the directory it vetted - here the file beside the snapshot is a
+# directory, so nothing goes in - takes the file of an earlier apply away with it.
+@test "fwsnap_save: a write that fails removes the file of an earlier apply" {
+    load_fwsnap
+    tun_dir_applied
+    mkdir -p "$FWSNAP_DIR"
+    printf '*mangle\n:TUN_DIR - [0:0]\nCOMMIT\n' > "$FWSNAP_DIR/mangle.rules"
+    mkdir "$FWSNAP_DIR/mangle.rules.new"
+
+    run fwsnap_save
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "Firewall snapshot: cannot write $FWSNAP_DIR/mangle.rules; the one of an earlier apply removed"
+    [ ! -e "$FWSNAP_DIR/mangle.rules" ]
 }
 
 # ============================================================================
