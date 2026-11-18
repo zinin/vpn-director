@@ -1210,8 +1210,8 @@ watchd_start_alive_case() {
     load_installer
     local step
     for step in print_header detect_platform check_environment resolve_release_tag create_directories \
-        download_scripts load_platform_lib install_hooks download_telegram_bot download_webui download_watchd \
-        generate_tls_cert start_webui print_next_steps; do
+        download_scripts load_platform_lib install_hooks repair_modes download_telegram_bot download_webui \
+        download_watchd generate_tls_cert start_webui print_next_steps; do
         eval "$step() { printf '%s\\n' '$step' >> \"\$BATS_TEST_TMPDIR/main.calls\"; }"
     done
     setup_webui_config() {
@@ -1227,7 +1227,7 @@ watchd_start_alive_case() {
 
     assert_success
     run cat "$BATS_TEST_TMPDIR/main.calls"
-    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\ndownload_scripts\nload_platform_lib\ninstall_hooks\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
+    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\ndownload_scripts\nload_platform_lib\ninstall_hooks\nrepair_modes\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
 }
 
 # Asuswrt-Merlin's /jffs/scripts hooks are shared with the owner and other
@@ -1252,4 +1252,104 @@ watchd_start_alive_case() {
     run install_hooks
     assert_success
     assert_output --partial "run $VPD_DIR/vpn-director.sh hooks"
+}
+
+# Asuswrt-Merlin runs everything under umask 0, and an earlier install left what it created
+# writable by every process: the directories of /opt/vpn-director 0777, its files and our runtime
+# files in /tmp and /var/lock 0666, telegram-bot.json - the bot token - among them.
+make_world_writable_install() {
+    mkdir -p "$VPD_DIR/lib" "$VPD_DIR/data/ipsets" "$VPD_DIR/backup-v0.10.0" \
+        "$INSTALL_ROOT/tmp/tunnel_director" "$INSTALL_ROOT/tmp/xray_tproxy" "$INSTALL_ROOT/var/lock"
+    printf 'x\n' > "$VPD_DIR/data/ipsets/ru.dump"
+    printf 'x\n' > "$VPD_DIR/backup-v0.10.0/vpn-director.sh"
+    printf '1 ovpnc4\n' > "$INSTALL_ROOT/tmp/tunnel_director/tun_dir_tables"
+    printf 'ok\n' > "$INSTALL_ROOT/tmp/xray_tproxy/ready"
+    printf 'log\n' > "$INSTALL_ROOT/tmp/vpn-director.log"
+    : > "$INSTALL_ROOT/var/lock/vpn-director.lock"
+    printf '{}\n' > "$VPD_DIR/telegram-bot.json"
+    chmod 777 "$VPD_DIR" "$VPD_DIR/lib" "$VPD_DIR/data" "$VPD_DIR/data/ipsets" "$VPD_DIR/backup-v0.10.0" \
+        "$VPD_DIR/backup-v0.10.0/vpn-director.sh" \
+        "$INSTALL_ROOT/tmp/tunnel_director" "$INSTALL_ROOT/tmp/xray_tproxy"
+    chmod 666 "$VPD_DIR/data/ipsets/ru.dump" "$INSTALL_ROOT/tmp/tunnel_director/tun_dir_tables" \
+        "$INSTALL_ROOT/tmp/xray_tproxy/ready" "$INSTALL_ROOT/tmp/vpn-director.log" \
+        "$INSTALL_ROOT/var/lock/vpn-director.lock" "$VPD_DIR/telegram-bot.json"
+}
+
+@test "repair_modes: takes group and other write away from what an earlier install left" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    make_world_writable_install
+
+    run repair_modes
+
+    assert_success
+    run find "$VPD_DIR" "$INSTALL_ROOT/tmp/tunnel_director" "$INSTALL_ROOT/tmp/xray_tproxy" \
+        "$INSTALL_ROOT/tmp/vpn-director.log" "$INSTALL_ROOT/var/lock/vpn-director.lock" ! -type l -perm /022
+    assert_output ""
+    assert_equal "$(stat -c %a "$VPD_DIR/telegram-bot.json")" 600
+    assert_equal "$(stat -c %a "$VPD_DIR/lib")" 755
+    assert_equal "$(stat -c %a "$VPD_DIR/data/ipsets/ru.dump")" 644
+    assert_equal "$(stat -c %a "$VPD_DIR/backup-v0.10.0/vpn-director.sh")" 755
+}
+
+@test "repair_modes: a symlink in the tree leaves its target's mode alone" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    printf 'x\n' > "$BATS_TEST_TMPDIR/outside"
+    chmod 666 "$BATS_TEST_TMPDIR/outside"
+    ln -s "$BATS_TEST_TMPDIR/outside" "$VPD_DIR/link"
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$BATS_TEST_TMPDIR/outside")" 666
+}
+
+# chmod follows a symlink named on its command line, -R included: a /tmp/xray_tproxy any process
+# planted as a link to / would have the write taken from everything under it.
+@test "repair_modes: a symlink at one of our paths is left alone, whatever it points to" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local elsewhere="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$elsewhere" "$INSTALL_ROOT/tmp"
+    printf 'x\n' > "$elsewhere/file"
+    chmod 777 "$elsewhere"
+    chmod 666 "$elsewhere/file"
+    ln -s "$elsewhere" "$INSTALL_ROOT/tmp/tunnel_director"
+    ln -s "$elsewhere/file" "$INSTALL_ROOT/tmp/vpn-director.log"
+    ln -s "$elsewhere/file" "$VPD_DIR/telegram-bot.json"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "$INSTALL_ROOT/tmp/tunnel_director is a symlink"
+    assert_equal "$(stat -c %a "$elsewhere")" 777
+    assert_equal "$(stat -c %a "$elsewhere/file")" 666
+}
+
+@test "repair_modes: a fresh install has nothing to repair and no warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+
+    run repair_modes
+
+    assert_success
+    refute_output --partial "Warning"
+}
+
+@test "repair_modes: a chmod that fails is a warning, and every other path is still repaired" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    printf '{}\n' > "$VPD_DIR/telegram-bot.json"
+    chmod 666 "$VPD_DIR/telegram-bot.json"
+    chmod() {
+        [[ "$*" == "-R go-w $VPD_DIR" ]] && return 1
+        command chmod "$@"
+    }
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: could not remove write access for others from $VPD_DIR"
+    assert_equal "$(stat -c %a "$VPD_DIR/telegram-bot.json")" 600
 }

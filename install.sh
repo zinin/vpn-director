@@ -396,6 +396,52 @@ install_hooks() {
 }
 
 ###############################################################################
+# Take write away from group and others where an earlier install left it
+###############################################################################
+
+# _repair_path <path> <chmod mode args...>
+#   chmod one path of ours: nothing for a missing one; a warning and rc 1 for one that is a
+#   symlink - chmod would follow it, -R included, and a link any process planted in /tmp would
+#   take the write from whatever it points to - and for a chmod that fails.
+_repair_path() {
+    local path="$1"
+    shift
+    if [[ -L $path ]]; then
+        print_info "Warning: $path is a symlink; left as it is"
+        return 1
+    fi
+    [[ -e $path ]] || return 0
+    chmod "$@" "$path" && return 0
+    print_info "Warning: could not remove write access for others from $path"
+    return 1
+}
+
+# repair_modes
+#   Asuswrt-Merlin runs everything under umask 0, and earlier releases created their directories
+#   and files without a mode: every process on the router could write to them, and root runs the
+#   scripts and binaries there. Takes that write away from the whole of $VPD_DIR (the owner's own
+#   files in it included) and from our runtime files in /tmp and /var/lock, and makes
+#   telegram-bot.json, which holds the bot token, 0600. Each path on its own, a missing one
+#   skipped; $VPD_DIR is taken as given. rc 1, after every path, when one was not repaired.
+repair_modes() {
+    local rc=0 path
+
+    print_info "Removing write access for others..."
+    if [[ -e $VPD_DIR ]] && ! chmod -R go-w "$VPD_DIR"; then
+        print_info "Warning: could not remove write access for others from $VPD_DIR"
+        rc=1
+    fi
+    for path in "${INSTALL_ROOT}/tmp/tunnel_director" "${INSTALL_ROOT}/tmp/xray_tproxy"; do
+        _repair_path "$path" -R go-w || rc=1
+    done
+    for path in "${INSTALL_ROOT}/tmp/vpn-director.log" "${INSTALL_ROOT}/var/lock/vpn-director.lock"; do
+        _repair_path "$path" go-w || rc=1
+    done
+    _repair_path "$VPD_DIR/telegram-bot.json" 600 || rc=1
+    return "$rc"
+}
+
+###############################################################################
 # Download telegram bot binary (optional)
 ###############################################################################
 
@@ -732,6 +778,7 @@ main() {
     download_scripts
     load_platform_lib || print_info "Platform library not installed; using default LAN facts"
     install_hooks
+    repair_modes || print_info "Warning: something above keeps write access for others; run chmod -R go-w $VPD_DIR"
     download_telegram_bot
     download_webui
     download_watchd
