@@ -209,6 +209,29 @@ load_guard() {
     refute_output
 }
 
+# ip reads a preference written in hex or with a leading zero as another number - 0x4200 is 16896,
+# past the direct rule - and a check of a decimal string alone let it through. Only a decimal
+# without a leading zero is a rule_pref; an unset or empty one stays unchecked.
+@test "guard_layout_check: refuses an Xray rule_pref that is no decimal preference" {
+    load_guard
+    local pref
+    for pref in 0x4200 016000; do
+        XRAY_RULE_PREF=$pref
+        run guard_layout_check
+        assert_failure 1
+        assert_output --partial "ERROR"
+        assert_output --partial "advanced.xray.rule_pref '$pref' is not a decimal preference (such as 200); rules not applied"
+    done
+    XRAY_RULE_PREF=200
+    run guard_layout_check
+    assert_success
+    refute_output
+    XRAY_RULE_PREF=""
+    run guard_layout_check
+    assert_success
+    refute_output
+}
+
 # An apply of Xray alone moves the direct rule and runs no tunnel_apply: after a change of pref_base
 # it would leave Tunnel Director's rules at the former base. Moved: the record names another
 # preference than the configuration gives, while TUN_DIR is in mangle.
