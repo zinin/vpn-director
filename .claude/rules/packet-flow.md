@@ -70,10 +70,12 @@ exist for the moment a firmware rebuild of the firewall has taken the chains awa
 below): ip rules by source and LAN interface, which the rebuild leaves alone, one per interface
 (`iif` takes one name). The local table at preference 0 answers traffic to the router before any
 of them. Tunnel Director's come first, so a client on Xray and on a tunnel goes through its tunnel
-meanwhile. The direct rule and the guards follow the block range and move with `pref_base`
-(`lib/guard.sh`); an owner's changed list goes in before the old one goes, and an extended one is
-appended at the same preference (`guard_sync`). The rules in full: `tunnel-director.md`, "The kill
-switch", and `xray-tproxy.md`, "Fail-Safe".
+meanwhile, but for what Xray lets through while an apply that finds both chains gone has put
+`XRAY_TPROXY` back and not yet `TUN_DIR` ("Left open" below). The direct rule and the guards
+follow the block range and move with `pref_base` (`lib/guard.sh`); an owner's changed list goes
+in before the old one goes, and an extended one is appended at the same preference
+(`guard_sync`). The rules in full: `tunnel-director.md`, "The kill switch", and `xray-tproxy.md`,
+"Fail-Safe".
 
 On KeeneticOS 5.1.5 pref 200 was free of NDM policies (no tables in the 40s).
 Built-in LTE backup stays at prefs 100/101, fwmark `0xffffaaa`, table 4096.
@@ -96,7 +98,7 @@ every `_NDM_*` jump. `tunnel_apply` then counts the `XRAY_TPROXY` jumps already
 in PREROUTING and goes behind them when the base position would land among
 them, so the order is `[XRAY_TPROXY, TUN_DIR]` on both platforms.
 
-**Implication**: A client in both `xray.clients` and a TD rule goes through Xray; what Xray lets through goes on to TUN_DIR and into its tunnel unless the tunnel excludes it too (`0x00010200` below), and while a firmware rebuild has taken the chains away the client goes through its tunnel, as Tunnel Director's guards come first.
+**Implication**: A client in both `xray.clients` and a TD rule goes through Xray; what Xray lets through goes on to TUN_DIR and into its tunnel unless the tunnel excludes it too (`0x00010200` below), and while a firmware rebuild has taken the chains away the client goes through its tunnel, as Tunnel Director's guards come first - but for what Xray lets through between `tproxy_apply` and `tunnel_apply` of a full apply that finds both chains gone ("Left open" under "The apply: make before break").
 
 ## The apply: make before break
 
@@ -140,15 +142,25 @@ Left open:
   rebuild on KeeneticOS, which on a KN-4521 with a DHCP WAN every renewal of the lease brought:
   `keenetic.md`) takes our chains away until the hook puts them back, and the guards route the
   protected clients meanwhile ("Packet Processing Order"). A Tunnel Director client stays in its
-  tunnel, or is refused while the tunnel has no route, and its connections survive. An Xray
-  client's new connections are refused and its proxied ones stall, but for the private ranges and
-  `xray.exclude_ips`, which go direct. A country exclusion is no ip rule, so a tunnel client's
-  excluded-country traffic goes through its tunnel, and an Xray client's is refused. On KeeneticOS
-  a flow opened then can be bound to the fast path and keep that route for its whole life: `PPE`
-  went with the chain ("The firmware fast path"). The hook shortens the window, which the apply
-  alone held open for 1 to 4 s on the KN-4521 (from the DHCP ACK to a client's MARK rule): before
-  it queues the apply, it restores the chains from the snapshot the last apply left, in one
-  `iptables-restore` (`lib/fwsnap-restore.sh`; `tunnel-director.md`, "State Tracking").
+  tunnel (one on Xray too: the next item), or is refused while the tunnel has no route, and its
+  connections survive. An Xray client's new connections are refused and its proxied ones stall,
+  but for the private ranges and `xray.exclude_ips`, which go direct. A country exclusion is no ip
+  rule, so a tunnel client's excluded-country traffic goes through its tunnel, and an Xray
+  client's is refused. On KeeneticOS a flow opened then can be bound to the fast path and keep
+  that route for its whole life: `PPE` went with the chain ("The firmware fast path"). The hook
+  shortens the window, which the apply alone held open for 1 to 4 s on the KN-4521 (from the DHCP
+  ACK to a client's MARK rule): before it queues the apply, it restores the chains from the
+  snapshot the last apply left, in one `iptables-restore` (`lib/fwsnap-restore.sh`;
+  `tunnel-director.md`, "State Tracking").
+- A client on Xray and on a tunnel, between `tproxy_apply` and `tunnel_apply` of a full apply that
+  finds both chains gone because no restore of the rebuild brought them back - no snapshot, a busy
+  xtables lock on every call of the hook, a refused `iptables-restore`. From the moment
+  `XRAY_TPROXY` is swapped in, what Xray lets through (a protocol TPROXY does not take, such as
+  ICMP, its exclusions and `TPROXY_BYPASS`) carries the direct mark alone, and the direct rule at
+  16894 sends it to main ahead of the client's tunnel guard: out through the WAN, until
+  `tunnel_apply` swaps `TUN_DIR` in - one `tunnel_apply`. Its TCP and UDP to other destinations go
+  to Xray. Closing it would take a direct bit and rule of Xray's own, placed after Tunnel
+  Director's guards: a change of the mark layout of both modules, not made.
 - A tunnel that is down refuses its clients' traffic (the block rule after its lookup rule);
   excluded destinations still go direct. One that comes from Xray while the tunnel's route cannot
   be installed stays proxied instead (step 3).

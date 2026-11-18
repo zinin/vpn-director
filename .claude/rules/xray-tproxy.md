@@ -298,9 +298,11 @@ first, so in normal operation none reaches a guard. While the chain is gone, a c
 connections are refused and its proxied ones stall until the chain is back. A country of
 `exclude_sets` is no ip rule (no rule matches a set), and the Xray servers and the firmware's VPN
 endpoints in `TPROXY_BYPASS` get no guard either: their traffic is refused as well. A client on
-Xray and on a tunnel meets Tunnel Director's guards first, and goes through its tunnel. `iif` keeps
-the router's own traffic out - a client CIDR may hold the router's LAN address - and the local
-table, at preference 0, answers traffic to the router before any guard. An `exclude_ips` entry
+Xray and on a tunnel meets Tunnel Director's guards first, and goes through its tunnel - but for
+what Xray lets through between `tproxy_apply` and `tunnel_apply` of a full apply that finds both
+chains gone, which the direct rule sends to main (`packet-flow.md`, "Left open"). `iif` keeps the
+router's own traffic out - a client CIDR may hold the router's LAN address - and the local table,
+at preference 0, answers traffic to the router before any guard. An `exclude_ips` entry
 gets its guard only where ip and ipset read it as written (`is_ipv4_net`) and it is no `/0`, which
 no `hash:net` set takes: IPv6, a leading zero (ipset refuses it, ip reads `010` as 8) or a `/0`
 gets none, and costs the apply nothing.

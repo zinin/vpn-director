@@ -351,7 +351,9 @@ guard_direct_pref() {
 # -------------------------------------------------------------------------------------------------
 # Tunnel Director's (tunnel) right after the direct rule, Xray's (xray) after those: 16895 16896
 # and 16897 16898 with the defaults. Tunnel Director's come first, so a client on a tunnel and on
-# Xray stays in its tunnel while the chains are gone. rc 1 for any other owner.
+# Xray stays in its tunnel while the chains are gone - but for what Xray lets through between
+# tproxy_apply and tunnel_apply of a full apply that finds both chains gone, which the direct rule
+# sends to main (packet-flow.md, "Left open"). rc 1 for any other owner.
 # -------------------------------------------------------------------------------------------------
 guard_owner_prefs() {
     local direct
