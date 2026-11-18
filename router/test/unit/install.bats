@@ -1353,3 +1353,51 @@ make_world_writable_install() {
     assert_output --partial "Warning: could not remove write access for others from $VPD_DIR"
     assert_equal "$(stat -c %a "$VPD_DIR/telegram-bot.json")" 600
 }
+
+# curl -o writes into a file that is there and keeps its mode: an earlier install under Merlin's
+# umask 0 left the init scripts 0777 and the Xray template 0666 outside /opt/vpn-director, which
+# root runs or reads, and a reinstall must not keep them so.
+@test "download_scripts: a file an earlier install left writable by others loses that write" {
+    load_installer
+    fake_curl
+    local repo="$BATS_TEST_TMPDIR/repo/router"
+    mkdir -p "$repo/opt/etc/init.d" "$repo/opt/etc/xray"
+    cat > "$repo/files.manifest" <<'MANIFEST'
+common   router/opt/etc/init.d/S99vpn-director
+common   router/opt/etc/xray/config.json.template
+MANIFEST
+    echo "init" > "$repo/opt/etc/init.d/S99vpn-director"
+    echo "{}" > "$repo/opt/etc/xray/config.json.template"
+    REPO_URL="https://raw.example/zinin/vpn-director/refs/tags/v1.0.0"
+    PLATFORM="merlin"
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$INSTALL_ROOT/opt/etc/init.d" "$INSTALL_ROOT/opt/etc/xray"
+    echo "old" > "$INSTALL_ROOT/opt/etc/init.d/S99vpn-director"
+    echo "old" > "$INSTALL_ROOT/opt/etc/xray/config.json.template"
+    chmod 777 "$INSTALL_ROOT/opt/etc/init.d/S99vpn-director"
+    chmod 666 "$INSTALL_ROOT/opt/etc/xray/config.json.template"
+
+    run download_scripts
+
+    assert_success
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/opt/etc/init.d/S99vpn-director")" 755
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/opt/etc/xray/config.json.template")" 644
+}
+
+# Asuswrt-Merlin runs /jffs/scripts/<hook> as root on every firewall start, and the hook line's
+# rewrite keeps the file's mode (cp -p): one an earlier release left 0777 stays so.
+@test "repair_modes: the shared hooks in /jffs/scripts lose write for others, an owner's +x kept" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$INSTALL_ROOT/jffs/scripts"
+    printf '#!/bin/sh\n' > "$INSTALL_ROOT/jffs/scripts/firewall-start"
+    printf '#!/bin/sh\n' > "$INSTALL_ROOT/jffs/scripts/nat-start"
+    chmod 777 "$INSTALL_ROOT/jffs/scripts/firewall-start"
+    chmod 666 "$INSTALL_ROOT/jffs/scripts/nat-start"
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/jffs/scripts/firewall-start")" 755
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/jffs/scripts/nat-start")" 644
+}

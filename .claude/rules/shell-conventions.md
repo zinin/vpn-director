@@ -15,8 +15,8 @@ paths: "**/*.sh, jffs/**/*"
   that: a few commands under the firmware's `/bin/sh`, inside NDM's 24-second timeout, and nothing
   it fails at stops the apply that follows (`tunnel-director.md`, "State Tracking")
 - Umask: every script a router executes makes `umask 022` its first command. That covers the entry
-  scripts, the init scripts and the Merlin and NDM hooks. In an entry script the line comes ahead
-  of the hand-over block. `lib/fwsnap-restore.sh` runs under `umask 077`. See "Asuswrt-Merlin runs
+  scripts, the init scripts, the Merlin and NDM hooks and the update script the updater generates.
+  In an entry script the line comes ahead of the hand-over block. `lib/fwsnap-restore.sh` runs under `umask 077`. See "Asuswrt-Merlin runs
   everything under umask 0" below
 - Debug mode: `DEBUG=1 ./script.sh` enables `set -x` with informative PS4
 - shellcheck annotations for intentional expansions/externals (SC2086, SC2155, SC2034)
@@ -627,12 +627,22 @@ under umask 0022.
 - the Merlin and NDM hooks;
 - the update script the updater generates (`update_script.sh.tmpl`).
 
-`router/test/unit/entrypoints.bats` pins it in each one. In an entry script the line comes ahead of
-the hand-over block, which `bash script` and `curl … | bash` skip.
+`router/test/unit/entrypoints.bats` pins it in each one but the update script, which
+`server/internal/updater/script_test.go` pins. In an entry script the line comes ahead of the
+hand-over block, which `bash script` and `curl … | bash` skip.
 
 A secret needs more than that, because umask 022 still lets everyone read it. Write it with
 `mktemp` in its own directory, then `chmod 600`, then `mv -f` it into place. The `mv` gives it a new
 inode, so an old 0666 file does not keep its mode. `lib/fwsnap-restore.sh` runs under `umask 077`.
 
 Install and the update take group and other write away from what an earlier release left
-(`repair_modes`).
+(`repair_modes`):
+
+- the whole `/opt/vpn-director` tree;
+- every file they install outside it - the init scripts, the Xray template, the NDM hooks. `curl -o`
+  and `cp -f` keep the mode of a file that is there;
+- Asuswrt-Merlin's shared hooks in `/jffs/scripts`, whose rewrite (`cp -p`) keeps their mode;
+- our runtime files in `/tmp` and `/var/lock`.
+
+A path that is a symlink is left alone, with a warning: `chmod` follows a symlink named on its
+command line, `-R` included.

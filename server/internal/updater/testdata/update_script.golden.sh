@@ -88,10 +88,14 @@ repair_path() {
 # releases created their directories and files without a mode: every process on
 # the router could write to them, and root runs the scripts and binaries there.
 # Takes that write away from the whole of /opt/vpn-director (the owner's own
-# files in it included) and from our runtime files in /tmp and /var/lock, and
-# makes telegram-bot.json, which holds the bot token, 0600. The twin of
-# install.sh's. Each path on its own, a missing one skipped; status 1, after
-# every path, when one was not repaired.
+# files in it included), from every file this update installs outside it - the
+# init scripts, the Xray template: cp -f keeps the mode of a destination that
+# is there -, from our runtime files in /tmp and /var/lock and from
+# Asuswrt-Merlin's shared hooks in /jffs/scripts, which root runs on every
+# firewall start and whose rewrite keeps their mode, and makes
+# telegram-bot.json, which holds the bot token, 0600. The twin of install.sh's.
+# Each path on its own, a missing one skipped; status 1, after every path, when
+# one was not repaired.
 repair_modes() {
     rm_rc=0
     if [ -e /opt/vpn-director ] && ! chmod -R go-w /opt/vpn-director; then
@@ -101,7 +105,12 @@ repair_modes() {
     for rm_path in /tmp/tunnel_director /tmp/xray_tproxy; do
         repair_path "$rm_path" -R go-w || rm_rc=1
     done
-    for rm_path in /tmp/vpn-director.log /var/lock/vpn-director.lock; do
+    for rm_entry in $FILES; do
+        rm_rest="${rm_entry#*|}"
+        repair_path "${rm_rest%%|*}" go-w || rm_rc=1
+    done
+    for rm_path in /tmp/vpn-director.log /var/lock/vpn-director.lock \
+        /jffs/scripts/firewall-start /jffs/scripts/wan-event /jffs/scripts/nat-start; do
         repair_path "$rm_path" go-w || rm_rc=1
     done
     repair_path /opt/vpn-director/telegram-bot.json 600 || rm_rc=1

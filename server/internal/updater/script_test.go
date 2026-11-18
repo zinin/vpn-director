@@ -2259,3 +2259,91 @@ func TestGenerateScript_RepairsModesOnceTheFilesAreInPlace(t *testing.T) {
 		t.Error("the repair would follow a symlink at one of our paths")
 	}
 }
+
+// The template's repair_path and repair_modes, run under /bin/sh with their paths moved into a
+// scratch root - the twin of install.sh's, which install.bats runs. Beside /opt/vpn-director and
+// the runtime files, the repair has to reach every file the update installs outside the tree (the
+// init scripts, the Xray template: cp -f keeps the mode of a destination that is there) and
+// Asuswrt-Merlin's shared hooks, which root runs on every firewall start.
+func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
+	script := cleanupScript(t)
+	root := t.TempDir()
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts/", root+"/jffs/scripts/",
+	)
+	place := func(rel string, mode os.FileMode, dir bool) string {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if dir {
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(path, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	want := map[string]os.FileMode{
+		place("opt/vpn-director/lib", 0o777, true):                0o755,
+		place("opt/vpn-director/telegram-bot.json", 0o666, false): 0o600,
+		place("tmp/tunnel_director", 0o777, true):                 0o755,
+		place("tmp/tunnel_director/tun_dir_tables", 0o666, false): 0o644,
+		place("tmp/xray_tproxy/ready", 0o666, false):              0o644,
+		place("tmp/vpn-director.log", 0o666, false):               0o644,
+		place("var/lock/vpn-director.lock", 0o666, false):         0o644,
+		place("opt/etc/init.d/S99vpn-director", 0o777, false):     0o755,
+		place("opt/etc/xray/config.json.template", 0o666, false):  0o644,
+		place("jffs/scripts/firewall-start", 0o777, false):        0o755,
+		place("jffs/scripts/nat-start", 0o666, false):             0o644,
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(outside, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "jffs/scripts/wan-event")); err != nil {
+		t.Fatal(err)
+	}
+
+	files := "a|" + root + "/opt/etc/init.d/S99vpn-director|x b|" + root + "/opt/etc/xray/config.json.template|-"
+	prog := "set -e\nFILES='" + files + "'\n" +
+		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
+		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+	if err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "rc=1") || !strings.Contains(string(out), "wan-event is a symlink; left as it is") {
+		t.Errorf("a symlinked hook must be left alone with a warning and status 1; got:\n%s", out)
+	}
+	for path, mode := range want {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != mode {
+			t.Errorf("%s is %o, want %o", strings.TrimPrefix(path, root), got, mode)
+		}
+	}
+	info, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o666 {
+		t.Errorf("the symlink's target must keep 0666, got %o", info.Mode().Perm())
+	}
+}

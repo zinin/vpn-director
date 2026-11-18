@@ -193,10 +193,10 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 > **Upgrading from v0.23.0 or earlier on Asuswrt-Merlin.** The firmware runs everything under umask 0, and earlier releases left `/opt/vpn-director` writable by every process on the router, `telegram-bot.json` with the bot token included. The update:
 >
 > - takes that write away from the whole `/opt/vpn-director` tree, your own files there included;
-> - does the same for VPN Director's files in `/tmp` and `/var/lock`;
+> - does the same for the files it installs elsewhere (the init scripts, the Xray config template), for the shared `/jffs/scripts/firewall-start`, `wan-event` and `nat-start`, and for VPN Director's files in `/tmp` and `/var/lock`;
 > - makes `telegram-bot.json` readable by root alone (0600).
 >
-> A path of VPN Director's that is a symlink is left as it is, with a warning in the update log.
+> A path of VPN Director's that is a symlink is left as it is.
 
 > **Upgrading from v0.22.0 or earlier.** This release adds routing rules per client that keep clients on Xray or Tunnel Director off the WAN while the firmware rebuilds its firewall (ip rule preferences 16894-16898 with the default `pref_base`), and its firewall hooks put the chains back from a snapshot of the last apply.
 >
