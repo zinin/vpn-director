@@ -241,10 +241,20 @@ _guard_in_order() {
 
 # _guard_pref_clear <pref> <rules> <shape> [<keep>] - delete every rule of <shape> the listing
 # <rules> holds at <pref> but those <keep> holds (rules one per line, as _guard_norm writes them),
-# one by one, each by its full selector as listed: a delete takes the rule it names or none, where
-# "ip rule del pref <pref>" alone takes whichever rule is first there by then. One that does not
-# go is logged and costs nothing else. A rule of another shape stays, and nothing goes at a <pref>
-# from 32766 on.
+# one by one, in listing order, each by its selectors as listed. The kernel matches only the
+# selectors a delete gives, and takes the first rule at the preference that matches them all: one
+# with the same selectors and more - a to, a fwmark - listed earlier goes instead of the one named.
+# The deletes here take the rules listed all the same. In listing order such a rule of ours has
+# gone by then unless it is kept, and a client's guards go together or stay together (guard_sync
+# splits by client, its from and iif). Every guard names its from and its iif, and the direct rule
+# its fwmark and table, so no delete of ours matches another client's guard or a rule of another
+# shape; a slot rule of Tunnel Director's that a change of pref_base leaves on a guard preference
+# carries a fwmark and no iif, and a guard's delete, which names an iif, never takes it. Left: a
+# foreign rule at one of these preferences with the same from, iif and action and one selector
+# more, listed ahead of ours, goes instead of ours. A change that deletes some of a client's guards
+# and keeps others has to take this into account; the ip mock deletes only an identical rule, so
+# the tests do not show it. A delete that fails is logged and costs nothing else. A rule of another
+# shape stays, and nothing goes at a <pref> from 32766 on.
 _guard_pref_clear() {
     local line norm keep=$'\n'"${4:-}"$'\n'
     local -a sel=()
