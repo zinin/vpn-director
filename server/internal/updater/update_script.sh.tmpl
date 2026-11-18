@@ -67,6 +67,13 @@ have_cmd() {
     type "$1" >/dev/null 2>&1 || which "$1" >/dev/null 2>&1
 }
 
+# repair_warn $1=message - a warning of the repair, into update.log through
+# stdout and into syslog: the bot deletes update.log after a successful update.
+repair_warn() {
+    echo "WARN: $1"
+    logger -t vpn-director "WARN: $1" 2>/dev/null || true
+}
+
 # repair_path $1=path, then chmod's mode arguments - one path of ours: nothing for
 # a missing one; a warning and status 1 for one that is a symlink - chmod would
 # follow it, -R included, and a link any process planted in /tmp would take the
@@ -75,12 +82,12 @@ repair_path() {
     rp_path=$1
     shift
     if [ -L "$rp_path" ]; then
-        echo "WARN: $rp_path is a symlink; left as it is"
+        repair_warn "$rp_path is a symlink; left as it is"
         return 1
     fi
     [ -e "$rp_path" ] || return 0
     chmod "$@" "$rp_path" && return 0
-    echo "WARN: could not remove write access for others from $rp_path"
+    repair_warn "could not remove write access for others from $rp_path"
     return 1
 }
 
@@ -98,8 +105,11 @@ repair_path() {
 # one was not repaired.
 repair_modes() {
     rm_rc=0
-    if [ -e /opt/vpn-director ] && ! chmod -R go-w /opt/vpn-director; then
-        echo "WARN: could not remove write access for others from /opt/vpn-director"
+    # The trailing slash: BusyBox's chmod -R, given a symlink to a directory,
+    # changes that directory alone and exits 0; an install moved elsewhere and
+    # linked back is repaired too.
+    if [ -e /opt/vpn-director ] && ! chmod -R go-w /opt/vpn-director/; then
+        repair_warn "could not remove write access for others from /opt/vpn-director"
         rm_rc=1
     fi
     for rm_path in /tmp/tunnel_director /tmp/xray_tproxy; do

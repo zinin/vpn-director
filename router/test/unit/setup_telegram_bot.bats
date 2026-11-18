@@ -34,3 +34,24 @@ setup() {
     run compgen -G "$CONFIG.*"
     assert_failure
 }
+
+# /proc/<pid>/cmdline is readable by every process on the router, the `nobody` ones among them: a
+# token on jq's command line would be theirs for as long as jq runs. /proc/<pid>/environ is root's.
+@test "bot_config_write: the token never reaches jq's command line" {
+    local real_jq
+    real_jq=$(command -v jq)
+    mkdir -p "$BATS_TEST_TMPDIR/bin"
+    cat > "$BATS_TEST_TMPDIR/bin/jq" <<RECORDER
+#!/bin/sh
+printf '%s\n' "\$@" >> "$BATS_TEST_TMPDIR/jq.argv"
+exec "$real_jq" "\$@"
+RECORDER
+    chmod +x "$BATS_TEST_TMPDIR/bin/jq"
+
+    PATH="$BATS_TEST_TMPDIR/bin:$PATH" bot_config_write "$CONFIG" "123:secret-token" '["alice"]'
+
+    assert_equal "$(jq -r .bot_token "$CONFIG")" "123:secret-token"
+    [[ -s "$BATS_TEST_TMPDIR/jq.argv" ]] || fail "jq was not called through the recorder"
+    run grep -c 'secret-token' "$BATS_TEST_TMPDIR/jq.argv"
+    assert_output "0"
+}

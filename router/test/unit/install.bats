@@ -1343,7 +1343,7 @@ make_world_writable_install() {
     printf '{}\n' > "$VPD_DIR/telegram-bot.json"
     chmod 666 "$VPD_DIR/telegram-bot.json"
     chmod() {
-        [[ "$*" == "-R go-w $VPD_DIR" ]] && return 1
+        [[ "$*" == "-R go-w $VPD_DIR/" ]] && return 1
         command chmod "$@"
     }
 
@@ -1400,4 +1400,27 @@ MANIFEST
     assert_success
     assert_equal "$(stat -c %a "$INSTALL_ROOT/jffs/scripts/firewall-start")" 755
     assert_equal "$(stat -c %a "$INSTALL_ROOT/jffs/scripts/nat-start")" 644
+}
+
+# BusyBox's chmod -R, given a symlink to a directory, changes that directory alone and exits 0: an
+# owner who moved /opt/vpn-director elsewhere and linked it back would keep every file in it
+# writable by everyone.
+@test "repair_modes: a VPD_DIR that is a symlink is repaired all the way down, by BusyBox's chmod too" {
+    command -v busybox >/dev/null || skip "busybox not installed"
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local elsewhere="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$elsewhere/lib"
+    printf 'x\n' > "$elsewhere/lib/common.sh"
+    chmod 777 "$elsewhere/lib"
+    chmod 666 "$elsewhere/lib/common.sh"
+    rm -rf "$VPD_DIR"
+    ln -s "$elsewhere" "$VPD_DIR"
+    chmod() { busybox chmod "$@"; }
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$elsewhere/lib")" 755
+    assert_equal "$(stat -c %a "$elsewhere/lib/common.sh")" 644
 }

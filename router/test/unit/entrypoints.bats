@@ -20,12 +20,13 @@ entry_scripts() {
 }
 
 # Every script a router executes: the entry scripts, the init scripts that start the daemons,
-# and the firmware hooks.
+# and the firmware hooks - every file of their directories, so a new init script or hook joins
+# the check on its own. hooks/legacy/ holds the earlier releases' hook bodies, which the hook
+# migration matches byte for byte and nothing executes.
 executed_scripts() {
     entry_scripts
-    printf '%s\n' "$PROJECT_ROOT"/opt/etc/init.d/S9* \
-        "$SCRIPTS_DIR/hooks/firewall-start" "$SCRIPTS_DIR/hooks/wan-event" "$SCRIPTS_DIR/hooks/nat-start" \
-        "$PROJECT_ROOT"/opt/etc/ndm/*/50-vpn-director.sh
+    printf '%s\n' "$PROJECT_ROOT"/opt/etc/init.d/* "$PROJECT_ROOT"/opt/etc/ndm/*/*
+    find "$SCRIPTS_DIR/hooks" -maxdepth 1 -type f | sort
 }
 
 @test "executed scripts do not depend on /usr/bin/env" {

@@ -196,7 +196,7 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 > - does the same for the files it installs elsewhere (the init scripts, the Xray config template), for the shared `/jffs/scripts/firewall-start`, `wan-event` and `nat-start`, and for VPN Director's files in `/tmp` and `/var/lock`;
 > - makes `telegram-bot.json` readable by root alone (0600).
 >
-> A path of VPN Director's that is a symlink is left as it is.
+> A symlink at one of those paths is left as it is, with a warning in the system log. `/opt/vpn-director` itself is repaired wherever it points.
 
 > **Upgrading from v0.22.0 or earlier.** This release adds routing rules per client that keep clients on Xray or Tunnel Director off the WAN while the firmware rebuilds its firewall (ip rule preferences 16894-16898 with the default `pref_base`), and its firewall hooks put the chains back from a snapshot of the last apply.
 >

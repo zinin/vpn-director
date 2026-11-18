@@ -432,7 +432,9 @@ repair_modes() {
     local rc=0 path
 
     print_info "Removing write access for others..."
-    if [[ -e $VPD_DIR ]] && ! chmod -R go-w "$VPD_DIR"; then
+    # The trailing slash: BusyBox's chmod -R, given a symlink to a directory, changes that
+    # directory alone and exits 0; an install moved elsewhere and linked back is repaired too.
+    if [[ -e $VPD_DIR ]] && ! chmod -R go-w "$VPD_DIR/"; then
         print_info "Warning: could not remove write access for others from $VPD_DIR"
         rc=1
     fi

@@ -645,4 +645,9 @@ Install and the update take group and other write away from what an earlier rele
 - our runtime files in `/tmp` and `/var/lock`.
 
 A path that is a symlink is left alone, with a warning: `chmod` follows a symlink named on its
-command line, `-R` included.
+command line, `-R` included. The update also sends that warning to syslog, since the bot deletes
+`update.log` after a successful update.
+
+`/opt/vpn-director` itself is taken as given, and handed to `chmod -R` with a trailing slash.
+BusyBox's `chmod -R`, given a symlink to a directory, changes only that directory and exits 0; the
+slash makes it recurse.

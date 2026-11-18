@@ -28,12 +28,14 @@ CONFIG_FILE="$VPD_DIR/telegram-bot.json"
 #   Writes the bot's config. Its token drives the bot, which manages the router as root, so the
 #   file is 0600 from the moment it exists: a temp file beside <file>, which mktemp makes 0600,
 #   renamed into place. The rename gives it a new inode, so a 0666 file an earlier release left
-#   does not keep its mode. rc 1 - the temp file removed, <file> left as it was - when a step fails.
+#   does not keep its mode. The token reaches jq through its environment, which only root can read
+#   (/proc/<pid>/environ), never its command line, which every process can (/proc/<pid>/cmdline).
+#   rc 1 - the temp file removed, <file> left as it was - when a step fails.
 bot_config_write() {
     local file="$1" token="$2" users="$3" tmp
     tmp=$(mktemp "$file.XXXXXX") || return 1
-    if ! jq -n --arg token "$token" --argjson users "$users" \
-            '{bot_token: $token, allowed_users: $users, log_level: "info", update_check_interval: "24h"}' \
+    if ! VPD_BOT_TOKEN="$token" jq -n --argjson users "$users" \
+            '{bot_token: env.VPD_BOT_TOKEN, allowed_users: $users, log_level: "info", update_check_interval: "24h"}' \
             > "$tmp" ||
         ! chmod 600 "$tmp" || ! mv -f "$tmp" "$file"; then
         rm -f "$tmp"

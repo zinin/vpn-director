@@ -2316,8 +2316,16 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The bot deletes update.log after a successful update: a warning has to reach syslog too.
+	bin := t.TempDir()
+	logged := filepath.Join(t.TempDir(), "logger.calls")
+	if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+logged+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
 	files := "a|" + root + "/opt/etc/init.d/S99vpn-director|x b|" + root + "/opt/etc/xray/config.json.template|-"
-	prog := "set -e\nFILES='" + files + "'\n" +
+	prog := "set -e\nPATH='" + bin + "':$PATH\nFILES='" + files + "'\n" +
+		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
 		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
 		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
 		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
@@ -2329,6 +2337,9 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "rc=1") || !strings.Contains(string(out), "wan-event is a symlink; left as it is") {
 		t.Errorf("a symlinked hook must be left alone with a warning and status 1; got:\n%s", out)
+	}
+	if calls, _ := os.ReadFile(logged); !strings.Contains(string(calls), "wan-event is a symlink; left as it is") {
+		t.Errorf("the warning never reached syslog; logger got %q", calls)
 	}
 	for path, mode := range want {
 		info, err := os.Lstat(path)
@@ -2345,5 +2356,68 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o666 {
 		t.Errorf("the symlink's target must keep 0666, got %o", info.Mode().Perm())
+	}
+}
+
+// BusyBox's chmod -R, given a symlink to a directory, changes that directory alone and exits 0: an
+// owner who moved /opt/vpn-director elsewhere and linked it back would keep every file in it
+// writable by everyone. Run with the machine's busybox as chmod, where there is one.
+func TestGenerateScript_RepairModesRecursesIntoALinkedTreeUnderBusyBox(t *testing.T) {
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		t.Skip("busybox not installed")
+	}
+	script := cleanupScript(t)
+	root := t.TempDir()
+	elsewhere := filepath.Join(root, "elsewhere")
+	lib := filepath.Join(elsewhere, "lib")
+	file := filepath.Join(lib, "common.sh")
+	if err := os.MkdirAll(lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lib, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "opt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(root, "opt", "vpn-director")); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.Symlink(busybox, filepath.Join(bin, "chmod")); err != nil {
+		t.Fatal(err)
+	}
+
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts/", root+"/jffs/scripts/",
+	)
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" +
+		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
+		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
+		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+		"repair_modes || true\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput(); err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, out)
+	}
+	for path, want := range map[string]os.FileMode{lib: 0o755, file: 0o644} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s is %o, want %o", strings.TrimPrefix(path, root), got, want)
+		}
 	}
 }
