@@ -125,6 +125,28 @@ setup() {
     assert_output --partial "Unknown component"
 }
 
+# The bot's /status keeps the tail of the full status, and the guards of a few Xray clients, every
+# one listed, pushed Tunnel Director's section out of it. The full status counts them per
+# preference (run_cli: the real modules on the stateful mocks, after an apply of the fixture);
+# the status of a component lists them.
+@test "vpn-director: the full status counts the guards per preference, status xray lists them" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+
+    run_cli status
+    assert_success
+    assert_output --partial $'--- Guards (ip rules by source) ---\n16894:\tfrom all fwmark 0x200/0x200 lookup main\nPref 16895: 2 guards\n"vpn-director.sh status tunnel" lists them\n'
+    assert_output --partial $'--- Guards (ip rules by source) ---\n16894:\tfrom all fwmark 0x200/0x200 lookup main\nPref 16897: 8 guards\n"vpn-director.sh status xray" lists them\n'
+    refute_output --partial $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+
+    run_cli status xray
+    assert_success
+    assert_output --partial $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+    refute_output --partial 'Pref 16897'
+}
+
 # ============================================================================
 # apply command tests
 # ============================================================================

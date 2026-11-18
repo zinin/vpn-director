@@ -230,11 +230,14 @@ cmd_status() {
     _load_modules
     case "$COMPONENT" in
         ""|all)
+            # The guards counted per preference, not listed (guard_status): the bot's /status
+            # keeps the tail of this, and the guards of a few Xray clients alone pushed Tunnel
+            # Director's section out of it. "status tunnel" and "status xray" list them.
             ipset_status
             echo ""
-            tunnel_status
+            GUARD_STATUS_BRIEF=1 tunnel_status
             echo ""
-            tproxy_status
+            GUARD_STATUS_BRIEF=1 tproxy_status
             ;;
         ipset)
             ipset_status

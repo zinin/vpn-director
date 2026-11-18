@@ -22,9 +22,9 @@
 #                PREROUTING jump behind the Xray jumps)
 #   - guard.sh (guard_layout_check, guard_direct_mark_hex, guard_direct_ensure: the
 #               direct mark the exclusions set, and the direct rule that routes it;
-#               guard_sync, guard_clear, guard_list, guard_direct_pref,
-#               guard_direct_release: the guards, which route a client while the
-#               firmware has deleted the chain)
+#               guard_sync, guard_clear, guard_status, guard_direct_release: the
+#               guards, which route a client while the firmware has deleted the
+#               chain)
 #   - ipset.sh (_ipset_exists, parse_exclude_sets_from_json, TUN_DIR_HASH, TUN_DIR_RESTORED,
 #               TUN_DIR_TABLES)
 #
@@ -1201,17 +1201,10 @@ tunnel_status() {
     printf '\n'
 
     # Show the guards, which route a client's packets while the firmware has deleted the chain,
-    # and the direct rule ahead of them, which sends what the chains mark direct to main.
+    # and the direct rule ahead of them, which sends what the chains mark direct to main: listed,
+    # or counted per preference in the full status (GUARD_STATUS_BRIEF=1, guard_status).
     printf '%s\n' "--- Guards (ip rules by source) ---"
-    local direct guards
-    direct=$(ip rule show 2>/dev/null | grep "^$(guard_direct_pref):" || true)
-    guards=$(guard_list tunnel)
-    if [[ -z $direct && -z $guards ]]; then
-        printf '%s\n' "No guards found."
-    else
-        [[ -z $direct ]] || printf '%s\n' "$direct"
-        [[ -z $guards ]] || printf '%s\n' "$guards"
-    fi
+    guard_status tunnel
     printf '\n'
 
     # Show configured tunnels

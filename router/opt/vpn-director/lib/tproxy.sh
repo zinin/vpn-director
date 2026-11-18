@@ -15,7 +15,7 @@
 #   - config.sh (XRAY_* variables)
 #   - guard.sh (guard_layout_check, guard_direct_mark_hex, guard_direct_ensure: the direct mark
 #               the chain sets on what it lets through, and the direct rule that routes it;
-#               guard_sync, guard_clear, guard_list, guard_direct_pref, guard_direct_release: the
+#               guard_sync, guard_clear, guard_list, guard_status, guard_direct_release: the
 #               guards, which refuse an Xray client's packets while the firmware has deleted the
 #               chain)
 #   - ipset.sh (_is_valid_country_code, _ipset_exists)
@@ -917,17 +917,10 @@ tproxy_status() {
     printf '\n'
 
     # The guards, which refuse an Xray client's packets while the firmware has deleted the chain,
-    # and the direct rule ahead of them, which sends what the chains mark direct to main.
+    # and the direct rule ahead of them, which sends what the chains mark direct to main: listed,
+    # or counted per preference in the full status (GUARD_STATUS_BRIEF=1, guard_status).
     printf '%s\n' "--- Guards (ip rules by source) ---"
-    local direct guards
-    direct=$(ip rule show 2>/dev/null | grep "^$(guard_direct_pref):" || true)
-    guards=$(guard_list xray)
-    if [[ -z $direct && -z $guards ]]; then
-        printf '%s\n' "No guards found."
-    else
-        [[ -z $direct ]] || printf '%s\n' "$direct"
-        [[ -z $guards ]] || printf '%s\n' "$guards"
-    fi
+    guard_status xray
     printf '\n'
 
     printf '%s\n' "--- Clients Ipset ---"

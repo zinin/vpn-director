@@ -332,7 +332,9 @@ not there. A guard the kernel refuses is an ERROR and withholds the ready marker
 still holds stay (`guard_sync`). `tproxy_stop` removes the guards (`guard_clear`), those a former
 `pref_base` left too, then the direct rule once neither module needs it (`guard_direct_release`:
 not while `TUN_DIR` is in mangle or Tunnel Director has guards). `status xray` lists the direct rule
-and the guards.
+and the guards; the full `status` shows the direct rule and counts the guards per preference
+(`guard_status`): a few clients' guards run to dozens of lines, and the bot's `/status` keeps only
+the tail of the full status, which ends with Xray's section.
 
 ## Extended Exclusion Sets
 
@@ -347,7 +349,7 @@ resolve_exclude_set "<country_code>"  # Returns: <country_code>_ext if exists, e
 
 | Function | Purpose |
 |----------|---------|
-| `tproxy_status()` | Show XRAY_TPROXY chain, routing, the direct rule and the guards, xray process |
+| `tproxy_status()` | Show XRAY_TPROXY chain, routing, the direct rule and the guards - listed, or counted per preference under `GUARD_STATUS_BRIEF=1`, as the full `status` runs it - xray process |
 | `tproxy_apply()` | The make half of an apply: routing, sets, the direct rule, chain swapped in, then the guards; clients added, never removed; soft-fail if unavailable; rc 1, nothing touched, for a layout `guard_layout_check` refuses |
 | `tproxy_prune([addr...])` | The break half: `XRAY_CLIENTS` swapped to the effective clients (paused ones subtracted, non-IPv4 entries skipped) plus every named address the live set holds; one the new set already matches (a host inside an effective network, `x/32` of an effective `x`) is not kept as an element of its own; the guards follow the set after the swap, and while the chain does not answer for its direct mark only those of the clients it let go are dropped; always returns 0 and leaves the ready marker alone |
 | `tproxy_stop()` | Remove chain and routing (an interrupted swap's shadows included) and Xray's guards; the direct rule once neither module needs it |

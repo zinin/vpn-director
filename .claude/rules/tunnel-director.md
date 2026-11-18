@@ -244,7 +244,8 @@ is in mangle or Xray has guards). `lib/guard.sh` touches nothing from main's rul
 the range loop stops short of it. A guard the kernel refuses is an ERROR: a rebuild with one missing
 records no hash, so the next apply retries it, and on either path the failover is not ready. Its
 client is not reported as not carried: while the chain is in place, it is. `status tunnel` lists
-the direct rule and the guards.
+the direct rule and the guards; the full `status` shows the direct rule and counts the guards per
+preference (`guard_status`), as the bot's `/status` keeps only the tail of it.
 
 ## Chain Architecture
 
@@ -550,7 +551,7 @@ slot's table is never released: it is carrying traffic.
 
 | Function | Purpose |
 |----------|---------|
-| `tunnel_status()` | Show chain, ip rules, the direct rule and the guards, configured tunnels |
+| `tunnel_status()` | Show chain, ip rules, the direct rule and the guards - listed, or counted per preference under `GUARD_STATUS_BRIEF=1`, as the full `status` runs it - configured tunnels |
 | `tunnel_apply()` | Apply rules from config (idempotent; a rebuild happens in place); reports the clients it does not carry in `TUNNEL_UNCARRIED` |
 | `tunnel_uncarried()` | Print `TUNNEL_UNCARRIED`, one client per line |
 | `tunnel_clients()` | Print every client the config puts on a tunnel; `main`'s and the paused ones left out |
@@ -596,7 +597,7 @@ From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_H
 `TUN_DIR_RESTORED`, `TUN_DIR_TABLES`
 
 From `lib/guard.sh`: `guard_layout_check`, `guard_direct_mark_hex`, `guard_direct_ensure`,
-`guard_direct_pref`, `guard_direct_release`, `guard_sync`, `guard_clear`, `guard_list`
+`guard_direct_release`, `guard_sync`, `guard_clear`, `guard_status`
 
 Through the `vpd_*` layer of `lib/iftunnel.sh` (sourced by `common.sh`): `vpd_tunnels`,
 `vpd_tunnel_unlisted_reason`, `vpd_tunnel_table`, `vpd_tunnel_route_ensure`,

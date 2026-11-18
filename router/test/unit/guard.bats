@@ -652,6 +652,57 @@ last_add_before_first_del() {
     assert_output $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
 }
 
+# The guards section of a status: the direct rule, then the owner's guards as guard_list prints
+# them; in the brief form the full status takes, one line per preference that holds guards with
+# their number, and the status that lists them. "No guards found." with neither.
+@test "guard_status: the direct rule and the guards, listed or counted per preference" {
+    load_tunnel_module
+    run guard_status tunnel
+    assert_success
+    assert_output "No guards found."
+
+    guard_direct_ensure
+    run guard_status xray
+    assert_success
+    assert_output $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+
+    guard_sync tunnel $'from 192.168.1.5 iif br0 lookup wgc1\nfrom 192.168.1.5 iif br0 prohibit\nfrom 192.168.1.6 iif br0 prohibit'
+    ip rule add pref 16896 from 192.168.1.7 iif br0 prohibit
+    run guard_status tunnel
+    assert_success
+    assert_output "$(cat <<'LIST'
+16894:	from all fwmark 0x200/0x200 lookup main
+16895:	from 192.168.1.5 iif br0 lookup wgc1
+16895:	from 192.168.1.5 iif br0 prohibit
+16895:	from 192.168.1.6 iif br0 prohibit
+16896:	from 192.168.1.7 iif br0 prohibit
+LIST
+)"
+
+    export GUARD_STATUS_BRIEF=1
+    run guard_status tunnel
+    assert_success
+    assert_output "$(cat <<'LIST'
+16894:	from all fwmark 0x200/0x200 lookup main
+Pref 16895: 3 guards
+Pref 16896: 1 guard
+"vpn-director.sh status tunnel" lists them
+LIST
+)"
+}
+
+# Nothing from main's rule on is this layer's, in a status either: a pref_base that puts the direct
+# rule on 32766 shows none there.
+@test "guard_status: shows nothing from 32766 on" {
+    load_guard
+    printf '%s\n' $'32766:\tfrom all fwmark 0x200/0x200 lookup main' $'32767:\tfrom 192.168.1.5 iif br0 prohibit' \
+        >> "${BATS_IP_RULES_FILE:-/tmp/bats_test_ip_rules}"
+    TUN_DIR_PREF_BASE=32256
+    run guard_status tunnel
+    assert_success
+    assert_output "No guards found."
+}
+
 # ============================================================================
 # Preferences that move with pref_base: the record
 # ============================================================================

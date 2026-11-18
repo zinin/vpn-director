@@ -70,6 +70,8 @@
 #   guard_sync <owner> <lines> - make an owner's guards exactly <lines>, make before break
 #   guard_clear <owner>        - remove an owner's guards, at its former preferences too
 #   guard_list <owner>         - print an owner's guards as "ip rule show" lists them
+#   guard_status <owner>       - the guards section of a status: the direct rule and the owner's
+#                                guards, listed, or counted per preference (GUARD_STATUS_BRIEF=1)
 #
 # Internal functions (for testing):
 #   _guard_direct_mark()       - the direct mark as a number, direct_mark or the bit picked without
@@ -736,5 +738,60 @@ guard_list() {
         _guard_is guard "${line#*:}" || continue
         printf '%s\n' "$line"
     done <<< "$rules"
+    return 0
+}
+
+# -------------------------------------------------------------------------------------------------
+# guard_status <owner> - the body of a status's guards section, for tunnel or xray
+# -------------------------------------------------------------------------------------------------
+# The direct rule as "ip rule show" lists it, when there is one: the line at guard_direct_pref.
+# Then the owner's guards as guard_list prints them, from the same listing, read once and whole -
+# or, with GUARD_STATUS_BRIEF=1, a line per preference of the owner that holds guards, with their
+# number, and one naming the status that lists them. The full status takes the brief form: it
+# prints Tunnel Director's section before Xray's, the guards of a few Xray clients run to dozens of
+# lines, and the bot's /status keeps the tail of it. "No guards found." with neither a direct rule
+# nor a guard. Nothing from main's rule (32766) on is printed. rc 0; rc 1 for an owner that is
+# neither.
+# -------------------------------------------------------------------------------------------------
+guard_status() {
+    local owner="${1:-}" prefs p0 p1 direct_pref rules line pref direct="" guards=""
+    local n0=0 n1=0 n word
+    prefs=$(guard_owner_prefs "$owner") || return 1
+    read -r p0 p1 <<< "$prefs"
+    direct_pref=$(guard_direct_pref)
+    rules=$(ip rule show 2>/dev/null) || rules=""
+    while IFS= read -r line; do
+        pref=${line%%:*}
+        [[ $pref =~ ^[0-9]+$ ]] && (( pref < 32766 )) || continue
+        if [[ $pref == "$direct_pref" ]]; then
+            direct+="$line"$'\n'
+        elif [[ $pref == "$p0" || $pref == "$p1" ]] && _guard_is guard "${line#*:}"; then
+            guards+="$line"$'\n'
+            if [[ $pref == "$p0" ]]; then
+                n0=$((n0 + 1))
+            else
+                n1=$((n1 + 1))
+            fi
+        fi
+    done <<< "$rules"
+    if [[ -z $direct && -z $guards ]]; then
+        printf '%s\n' "No guards found."
+        return 0
+    fi
+    [[ -z $direct ]] || printf '%s' "$direct"
+    [[ -n $guards ]] || return 0
+    if [[ ${GUARD_STATUS_BRIEF:-0} != 1 ]]; then
+        printf '%s' "$guards"
+        return 0
+    fi
+    for pref in "$p0" "$p1"; do
+        n=$n0
+        [[ $pref == "$p0" ]] || n=$n1
+        (( n > 0 )) || continue
+        word=guards
+        (( n != 1 )) || word=guard
+        printf 'Pref %s: %d %s\n' "$pref" "$n" "$word"
+    done
+    printf '%s\n' "\"vpn-director.sh status $owner\" lists them"
     return 0
 }
