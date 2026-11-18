@@ -624,7 +624,8 @@ under umask 0022.
 
 - the entry scripts;
 - the init scripts - the daemons, and everything they start, inherit the umask;
-- the Merlin and NDM hooks.
+- the Merlin and NDM hooks;
+- the update script the updater generates (`update_script.sh.tmpl`).
 
 `router/test/unit/entrypoints.bats` pins it in each one. In an entry script the line comes ahead of
 the hand-over block, which `bash script` and `curl … | bash` skip.

@@ -2185,3 +2185,77 @@ func TestGenerateScript_SetsTheHooksOnceTheFilesAreInPlace(t *testing.T) {
 		t.Error("a failure of vpn-director.sh hooks must not end the update")
 	}
 }
+
+// Asuswrt-Merlin runs everything under umask 0, the daemon that runs this script included:
+// whatever the script creates before a umask of its own - a directory a release adds - would be
+// writable by every process on the router.
+func TestGenerateScript_SetsUmask022BeforeAnything(t *testing.T) {
+	s := &Service{updateDir: t.TempDir()}
+	writeTestManifest(t, s)
+	script, err := s.generateScript(validOpts())
+	if err != nil {
+		t.Fatalf("generateScript() error = %v", err)
+	}
+
+	for _, line := range strings.Split(script, "\n")[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if line != "umask 022" {
+			t.Fatalf("the first command is %q, want \"umask 022\"", line)
+		}
+		return
+	}
+	t.Fatal("the script has no command")
+}
+
+// Earlier releases left /opt/vpn-director and our runtime files writable by every process. The
+// update takes that write away once the new files are in place - the twin of install.sh's
+// repair_modes - and a failure there must not end an update whose files are copied already.
+func TestGenerateScript_RepairsModesOnceTheFilesAreInPlace(t *testing.T) {
+	s := &Service{updateDir: t.TempDir()}
+	writeTestManifest(t, s)
+	script, err := s.generateScript(validOpts())
+	if err != nil {
+		t.Fatalf("generateScript() error = %v", err)
+	}
+
+	body := afterOnExit(t, script)
+	call := strings.Index(body, "if ! repair_modes")
+	hooks := strings.Index(body, "/opt/vpn-director/vpn-director.sh hooks")
+	started := strings.Index(body, "# 6. Start everyone")
+	switch {
+	case call < 0:
+		t.Fatal("the update never repairs the modes, or a failure there would end it")
+	case hooks < 0 || call < hooks:
+		t.Error("the modes are repaired before the hooks step")
+	case started < 0 || call > started:
+		t.Error("the modes are repaired after the daemons start")
+	}
+
+	start := strings.Index(script, "\nrepair_modes() {\n")
+	if start < 0 {
+		t.Fatal("the script defines no repair_modes")
+	}
+	fn := script[start:]
+	if end := strings.Index(fn, "\n}\n"); end >= 0 {
+		fn = fn[:end]
+	}
+	for _, want := range []string{
+		"chmod -R go-w /opt/vpn-director",
+		"/tmp/tunnel_director",
+		"/tmp/xray_tproxy",
+		"/tmp/vpn-director.log",
+		"/var/lock/vpn-director.lock",
+		"/opt/vpn-director/telegram-bot.json 600",
+	} {
+		if !strings.Contains(fn, want) {
+			t.Errorf("repair_modes misses %q", want)
+		}
+	}
+	// chmod follows a symlink named on its command line, -R included.
+	if !strings.Contains(script, "is a symlink; left as it is") {
+		t.Error("the repair would follow a symlink at one of our paths")
+	}
+}

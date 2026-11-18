@@ -173,7 +173,8 @@ shutdown, durable notification and recovery contracts.
   has no `/usr/bin/env`. Both forms then `set -euo pipefail`. `lib/fwsnap-restore.sh`, which the
   firmware hooks run, stays POSIX sh (no hand-over, no errexit) and always exits 0
 - Umask: Asuswrt-Merlin runs everything under umask 0. So every script a router executes starts
-  with `umask 022`: those six, the init scripts, and the Merlin and NDM hooks. In those six the line
+  with `umask 022`: those six, the init scripts, the Merlin and NDM hooks, and the update script the
+  updater generates. In those six the line
   comes ahead of the hand-over, since `bash script` skips the block. A secret needs more than that,
   because umask 022 still lets everyone read it: write it with `mktemp` beside it, then
   `chmod 600`, then `mv`

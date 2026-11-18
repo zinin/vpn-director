@@ -190,6 +190,14 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 
 > **Upgrading from v0.11.x or earlier.** The updater built into those releases downloads a fixed file list without `lib/platform.sh`, so pressing «Update» installs this release incompletely: the shell CLI, the firewall hooks and the daily update stop working (the Xray TPROXY and Tunnel Director rules are no longer re-applied after a firewall restart) until you re-run the [Quick Install](#quick-install) command once. The Web UI and the bot themselves keep running. Every later update reads the release manifest and needs no such step.
 
+> **Upgrading from v0.23.0 or earlier on Asuswrt-Merlin.** The firmware runs everything under umask 0, and earlier releases left `/opt/vpn-director` writable by every process on the router, `telegram-bot.json` with the bot token included. The update:
+>
+> - takes that write away from the whole `/opt/vpn-director` tree, your own files there included;
+> - does the same for VPN Director's files in `/tmp` and `/var/lock`;
+> - makes `telegram-bot.json` readable by root alone (0600).
+>
+> A path of VPN Director's that is a symlink is left as it is, with a warning in the update log.
+
 > **Upgrading from v0.22.0 or earlier.** This release adds routing rules per client that keep clients on Xray or Tunnel Director off the WAN while the firmware rebuilds its firewall (ip rule preferences 16894-16898 with the default `pref_base`), and its firewall hooks put the chains back from a snapshot of the last apply.
 >
 > - Going back to v0.22.0 or earlier: run `vpn-director.sh stop` with this release first. It removes the rules at 16894-16898, the snapshot and the records of where the rules went in. An older release knows none of them, and they would send its tunnel clients' traffic to excluded countries into the tunnel, and refuse what its Xray clients send direct, except to private networks and the addresses of `xray.exclude_ips`. A reboot clears them too.
