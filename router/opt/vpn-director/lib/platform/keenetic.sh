@@ -350,6 +350,17 @@ platform_cron_requirements() {
         "$init" "$dir"
 }
 
+# The NDM hooks (/opt/etc/ndm/*/50-vpn-director.sh) are files of our own, which
+# install and update replace whole: no shared hook to put a line into, and
+# nothing to show for one.
+platform_hooks_install() {
+    return 0
+}
+
+platform_hooks_status() {
+    return 1
+}
+
 # mangle INPUT jumps port 443 to _NDM_HTTP_INPUT_TLS_, which drops every TLS
 # ClientHello whose SNI is not the router's own; TPROXY keeps the original
 # port, so proxied HTTPS would die there. ACCEPT in mangle INPUT ends that

@@ -300,6 +300,50 @@ assert_no_merlin_apply() {
     assert_output "merlin"
 }
 
+# The firmware runs the shared /jffs/scripts/<hook>: #!/bin/sh, our line
+# (platform_hooks_install puts it in), and whatever the owner and other add-ons
+# keep there. Ours must neither end that file early nor make it wait.
+
+# install_shared_hook <hook> <owner line> - the shared hook as
+# platform_hooks_install leaves one that held the owner's line.
+install_shared_hook() {
+    mkdir -p "$VPD_JFFS_SCRIPTS_DIR"
+    printf '#!/bin/sh\n%s\n' "$2" > "$VPD_JFFS_SCRIPTS_DIR/$1"
+    chmod 755 "$VPD_JFFS_SCRIPTS_DIR/$1"
+    (
+        export VPD_PLATFORM=merlin
+        . "$LIB_DIR/platform.sh"
+        _merlin_hook_ensure "$1" >/dev/null
+    )
+}
+
+@test "shared wan-event: the owner's line after ours runs on every WAN event" {
+    setup_merlin_hook_env
+    install_shared_hook wan-event "echo \"owner \$2\" >> \"$BATS_TEST_TMPDIR/owner.log\""
+    run sh "$VPD_JFFS_SCRIPTS_DIR/wan-event" 0 disconnected 3>&-
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/owner.log"
+    assert_output "owner disconnected"
+    assert_no_merlin_apply
+}
+
+@test "shared firewall-start: the owner's line after ours runs before the apply ends" {
+    setup_merlin_hook_env
+    printf '#!/bin/sh\nsleep 1\necho apply >> "%s/order.log"\n' "$BATS_TEST_TMPDIR" > "$VPD_SCRIPT"
+    install_shared_hook firewall-start "echo owner >> \"$BATS_TEST_TMPDIR/order.log\""
+    run sh "$VPD_JFFS_SCRIPTS_DIR/firewall-start" eth0 3>&-
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/order.log"
+    assert_output "owner"
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        grep -q '^apply$' "$BATS_TEST_TMPDIR/order.log" && break
+        sleep 0.2
+    done
+    run cat "$BATS_TEST_TMPDIR/order.log"
+    assert_output $'owner\napply'
+}
+
 # ------------------------------------------------------------------- common
 
 @test "hooks: exit 0 and log when the CLI is not installed" {

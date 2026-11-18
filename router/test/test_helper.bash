@@ -46,6 +46,13 @@ setup() {
     export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
     export FWSNAP_DIR="$BATS_TEST_TMPDIR/fwsnap"
 
+    # platform_hooks_install (Asuswrt-Merlin) writes the firmware's shared
+    # hooks under /jffs/scripts unless told otherwise, and the line it puts in
+    # calls an install's hooks under /opt/vpn-director/hooks: each test gets a
+    # /jffs/scripts of its own, and the line calls the tree's hooks.
+    export VPD_JFFS_SCRIPTS_DIR="$BATS_TEST_TMPDIR/jffs-scripts"
+    export VPD_HOOKS_DIR="$PROJECT_ROOT/opt/vpn-director/hooks"
+
     # Clean log file
     : > "$LOG_FILE"
 

@@ -320,6 +320,181 @@ platform_cron_requirements() {
     return 1
 }
 
+# ------------------------------------------------------------------ Shared hooks
+#
+# The firmware runs /jffs/scripts/<hook> for its events, one file per event,
+# shared with the owner and with other add-ons (Skynet, Diversion, amtm, ...).
+# VPN Director's logic lives in files of its own, /opt/vpn-director/hooks/<hook>,
+# which an update replaces whole; each shared hook gets one line of ours,
+# ending in " # vpn-director", and nothing else in it is ours. Releases up to
+# v0.22.0 wrote the whole shared file: their bodies, kept byte for byte under
+# hooks/legacy/<hook>.<version>, are cut out where one is found whole.
+# VPD_JFFS_SCRIPTS_DIR and VPD_HOOKS_DIR move both directories for the tests.
+
+_MERLIN_HOOKS="firewall-start wan-event nat-start"
+_MERLIN_HOOK_MARK=" # vpn-director"
+
+# _merlin_hook_line <hook> - our line for the shared <hook>: our hook with the
+# firmware's arguments, skipped while Entware is not mounted.
+_merlin_hook_line() {
+    local dir="${VPD_HOOKS_DIR:-/opt/vpn-director/hooks}"
+    printf '[ -x %s/%s ] && %s/%s "$@"%s\n' "$dir" "$1" "$dir" "$1" "$_MERLIN_HOOK_MARK"
+}
+
+# _merlin_hook_ensure <hook> - our line in the shared <hook>, everything else in
+# it kept; the lines and the status of platform_hooks_install for one hook. A
+# rewrite goes through a file beside the hook, renamed over it, and only when
+# something changes; a file renamed over a symlink would put a file in place of
+# the owner's link, so a symlinked hook is rewritten by hand.
+_merlin_hook_ensure() {
+    local hook="$1" dir="${VPD_JFFS_SCRIPTS_DIR:-/jffs/scripts}"
+    local file tmp line body version text i j n found first=-1 replaced=0 dups=0 joined
+    local -a lines=() old=() kept=() changes=()
+    file="$dir/$hook"
+    tmp="$dir/.$hook.vpd-new"
+    line=$(_merlin_hook_line "$hook")
+
+    # No hook, or an empty one: the firmware runs nothing there yet.
+    if [[ ! -s $file ]]; then
+        if { mkdir -p "$dir" && printf '#!/bin/sh\n%s\n' "$line" > "$tmp" && chmod 755 "$tmp" &&
+            mv -f "$tmp" "$file"; } 2>/dev/null; then
+            printf 'ok: %s: created\n' "$file"
+            return 0
+        fi
+        rm -f "$tmp" 2>/dev/null || true
+        printf 'warn: %s: cannot write it; the hook is as it was\n' "$file"
+        return 1
+    fi
+
+    mapfile -t lines < "$file"
+    # Without "#!" the firmware cannot run the file; giving it one would start
+    # running commands that do not run now, which is the owner's call.
+    if [[ ${lines[0]:-} != '#!'* ]]; then
+        printf 'warn: %s: left alone: no #! line, so the firmware does not run it; add #!/bin/sh as its first line, then run vpn-director.sh hooks\n' "$file"
+        return 1
+    fi
+
+    # An earlier release's body, found whole after the file's own "#!" line, is
+    # ours to remove; a single line of it never is - a "fi" of ours reads like
+    # a "fi" of theirs.
+    for body in "${VPD_HOOKS_DIR:-/opt/vpn-director/hooks}/legacy/$hook".*; do
+        [[ -f $body ]] || continue
+        version=${body##*/"$hook".}
+        mapfile -t old < "$body"
+        old=("${old[@]:1}")
+        n=${#old[@]}
+        if (( n == 0 )); then
+            continue
+        fi
+        found=-1
+        for (( i = 1; i + n <= ${#lines[@]}; i++ )); do
+            for (( j = 0; j < n; j++ )); do
+                [[ ${lines[i + j]} == "${old[j]}" ]] || break
+            done
+            if (( j == n )); then
+                found=$i
+                break
+            fi
+        done
+        if (( found >= 0 )); then
+            lines=("${lines[@]:0:found}" "${lines[@]:found + n}")
+            changes+=("$version body removed")
+        fi
+    done
+
+    # Our line: the first marked one keeps its place with the current text, any
+    # other marked one goes, and with none ours goes in after the "#!" line.
+    for i in "${!lines[@]}"; do
+        if [[ ${lines[i]} == *"$_MERLIN_HOOK_MARK" ]]; then
+            if (( first < 0 )); then
+                first=${#kept[@]}
+                if [[ ${lines[i]} != "$line" ]]; then
+                    replaced=1
+                fi
+                kept+=("$line")
+            else
+                dups=1
+            fi
+        else
+            kept+=("${lines[i]}")
+        fi
+    done
+    if (( first < 0 )); then
+        kept=("${kept[0]}" "$line" "${kept[@]:1}")
+        changes+=("line added")
+    elif (( replaced )); then
+        changes+=("line replaced")
+    fi
+    if (( dups )); then
+        changes+=("duplicate lines removed")
+    fi
+    if [[ ! -x $file ]]; then
+        changes+=("made executable")
+    fi
+
+    if (( ${#changes[@]} == 0 )); then
+        printf 'ok: %s: unchanged\n' "$file"
+    elif [[ ${changes[*]} == "made executable" ]]; then
+        if ! chmod 755 "$file" 2>/dev/null; then
+            printf 'warn: %s: cannot write it; the hook is as it was\n' "$file"
+            return 1
+        fi
+        printf 'ok: %s: updated (made executable)\n' "$file"
+    elif [[ -L $file ]]; then
+        printf 'warn: %s: left alone: it is a symlink, which a rewrite would replace with a file; put this line after the #! line of the file it points to: %s\n' "$file" "$line"
+        return 1
+    else
+        if ! { printf '%s\n' "${kept[@]}" > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$file"; } 2>/dev/null; then
+            rm -f "$tmp" 2>/dev/null || true
+            printf 'warn: %s: cannot write it; the hook is as it was\n' "$file"
+            return 1
+        fi
+        printf -v joined '%s, ' "${changes[@]}"
+        printf 'ok: %s: updated (%s)\n' "$file" "${joined%, }"
+    fi
+
+    # A call of the CLI left outside our line - an earlier body someone edited,
+    # so it was not recognized - would apply a second time on every event.
+    for i in "${!kept[@]}"; do
+        [[ ${kept[i]} != "$line" ]] || continue
+        text=${kept[i]#"${kept[i]%%[![:space:]]*}"}
+        [[ $text != '#'* ]] || continue
+        if [[ $text == *vpn-director.sh* ]]; then
+            printf 'warn: %s: still calls vpn-director.sh outside the vpn-director line; remove that call by hand\n' "$file"
+            break
+        fi
+    done
+    return 0
+}
+
+# One line per shared hook, "ok: <file>: <what was done>" or "warn: <file>:
+# <what the owner has to do>", for the caller to log; rc 1 when a hook is left
+# without our line or cannot run it.
+platform_hooks_install() {
+    local hook rc=0
+    for hook in $_MERLIN_HOOKS; do
+        _merlin_hook_ensure "$hook" || rc=1
+    done
+    return "$rc"
+}
+
+platform_hooks_status() {
+    local hook file line
+    for hook in $_MERLIN_HOOKS; do
+        file="${VPD_JFFS_SCRIPTS_DIR:-/jffs/scripts}/$hook"
+        line=$(_merlin_hook_line "$hook")
+        if [[ -f $file ]] && grep -qxF -- "$line" "$file"; then
+            if [[ -x $file ]]; then
+                printf '%s: vpn-director line in place\n' "$file"
+            else
+                printf '%s: not executable; run vpn-director.sh hooks\n' "$file"
+            fi
+        else
+            printf '%s: no vpn-director line; run vpn-director.sh hooks\n' "$file"
+        fi
+    done
+}
+
 # Nothing to add outside our own chain on Merlin. The verb is still checked:
 # accepting anything would let a typo in a future call site pass as a clean
 # no-op on this platform and only surface on the one that acts on it.

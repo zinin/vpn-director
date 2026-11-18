@@ -1,0 +1,17 @@
+#!/bin/sh
+
+###################################################################################################
+# wan-event - Asuswrt-Merlin hook invoked when WAN state changes
+# Arguments: $1 = WAN unit (0, 1, ...), $2 = event type
+###################################################################################################
+
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Skip if Entware not ready (during early boot)
+[ -x /opt/bin/bash ] || exit 0
+
+case "$2" in
+    connected)
+        /jffs/scripts/vpn-director/vpn-director.sh apply
+        ;;
+esac

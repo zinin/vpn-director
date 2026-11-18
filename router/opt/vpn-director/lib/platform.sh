@@ -41,6 +41,15 @@
 #   platform_cron_add <name> <schedule> <cmd> / platform_cron_del <name>
 #   platform_cron_requirements            what the user must install before cron runs the
 #                                         job; nothing and rc 1 when there is nothing owed
+#   platform_hooks_install                 put the call of VPN Director's hooks into the
+#                                          firmware's shared hook scripts, keeping the rest
+#                                          of each: a line per hook, "ok: <file>: <done>" or
+#                                          "warn: <file>: <what the owner has to do>", for
+#                                          the caller to log; rc 1 when a hook is left
+#                                          without the call. A platform whose hooks are
+#                                          files of VPN Director's own prints nothing, rc 0
+#   platform_hooks_status                  a line per shared hook: is the call in place;
+#                                          nothing and rc 1 without shared hooks
 #   platform_tproxy_extra_rules apply|stop [mark/mask] platform-only firewall rules for TPROXY
 #   platform_prerouting_base_pos           insert position for TUN_DIR in mangle PREROUTING
 #   platform_password_file                 file the Web UI verifies passwords against

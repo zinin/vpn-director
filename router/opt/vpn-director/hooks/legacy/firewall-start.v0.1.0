@@ -1,0 +1,11 @@
+#!/bin/sh
+
+###################################################################################################
+# firewall-start - Asuswrt-Merlin hook invoked when the firewall stack reloads
+###################################################################################################
+
+# Skip if Entware not ready (during early boot)
+[ -x /opt/bin/bash ] || exit 0
+
+# Apply Tunnel Director rules
+/jffs/scripts/vpn-director/tunnel_director.sh

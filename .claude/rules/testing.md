@@ -142,6 +142,8 @@ prefixes every path `platform_detect` looks at. Seams for Keenetic unit tests:
 | `PROJECT_ROOT` | test_helper.bash | Project root directory |
 | `GUARD_STATE_DIR` | test_helper.bash `setup()` | Per test: where guard.sh records the preferences its rules went in at (`$BATS_TEST_TMPDIR/guards`) |
 | `FWSNAP_DIR` | test_helper.bash `setup()` | Per test: the snapshot fwsnap.sh writes and fwsnap-restore.sh reads (`$BATS_TEST_TMPDIR/fwsnap`) |
+| `VPD_JFFS_SCRIPTS_DIR` | test_helper.bash `setup()` | Per test: the firmware's shared hooks `platform_hooks_install` (Asuswrt-Merlin) writes (`$BATS_TEST_TMPDIR/jffs-scripts`, absent until a test or the function makes it) |
+| `VPD_HOOKS_DIR` | test_helper.bash `setup()` | The hooks the shared hook's line calls and the earlier releases' bodies it cuts out (`hooks/legacy/`): the tree's `router/opt/vpn-director/hooks` |
 | `VPD_RESTORE_PATH` | `restore` in fwsnap.bats | The PATH fwsnap-restore.sh runs with: the stateful mocks, the stateless ones, `/usr/bin:/bin`. Without it the script takes the router's directories, which on a workstation hold the real `iptables`; `restore` fails the test when `iptables` or `iptables-restore` resolves outside the mocks and the test's own fakes. `VPD_STOPPED_FILE`, `VPD_TUN_DIR_HASH` and `VPD_TUN_DIR_RESTORED` point it at the test's stop marker and Tunnel Director state |
 | `VPD_RESTORE` | `fake_restore` in hooks.bats | The restore the hooks run: a fake that notes its table in the log the apply is noted in, so one log shows the order |
 
