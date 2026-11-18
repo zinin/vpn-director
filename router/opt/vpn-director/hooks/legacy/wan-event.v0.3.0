@@ -1,0 +1,12 @@
+#!/bin/sh
+
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+VPD_SCRIPT="/opt/vpn-director/vpn-director.sh"
+
+[ "$2" = "connected" ] || exit 0
+
+if [ -x "$VPD_SCRIPT" ]; then
+    "$VPD_SCRIPT" apply
+else
+    logger -t "wan-event" "vpn-director not found at $VPD_SCRIPT"
+fi

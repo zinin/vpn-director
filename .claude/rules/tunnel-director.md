@@ -197,6 +197,56 @@ before touching a rule, a `pref_base` and mark field whose block range would rea
 32766. The firmware's own killswitch (`vpn_clientN_enforce`, `wgcN_enforce`) no longer matters for
 Tunnel Director's clients.
 
+The kill switch rests on the mark, and the firmware's firewall rebuilds take the chain that sets it
+away: KeeneticOS's NDM deletes `TUN_DIR` (every WAN lease renewal did on the KN-4521), Merlin's
+firewall start empties it (`iptables -t mangle -F`). Until the hook's apply puts it back, a client's
+packets carry no mark: the lookup and block rules never see them, and they would reach main and the
+WAN. ip rules survive both, so every client the chain marks for a tunnel also has guards
+(`lib/guard.sh`): ip rules by source and LAN interface (`platform_lan_ifaces`; `iif` takes one name,
+so each interface has its own) at Tunnel Director's guard preferences, 16895-16896, behind the
+direct rule at 16894. The client of awg1 in "Configuration Format", in slot 3:
+
+```
+16895: from 192.168.1.30 to 203.0.113.7 iif br0 lookup main   # each address or CIDR exclusion
+16895: from 192.168.1.30 iif br0 lookup 2003                  # while the slot's lookup rule is in
+16895: from 192.168.1.30 iif br0 prohibit                     # refused when it holds no route
+```
+
+A packet the chain marked - for its tunnel, or direct - meets the fwmark rules or the direct rule
+first, so in normal operation only an unmarked packet reaches a guard. While the chain is gone, a
+client goes on through its tunnel or is refused, and its address and CIDR exclusions go direct. A
+country exclusion is no ip rule (no rule matches a set): that traffic goes through the tunnel until
+the chain is back. `iif` keeps the router's own traffic out - a client CIDR may hold the router's
+LAN address - and the local table, at preference 0, answers traffic to the router before any guard.
+
+`_tunnel_guard_lines` lists the guards in the chain's order, so the first match is the same one:
+the failover clients still on the failover tunnel first, then the clients of each slot. The lookup
+guard follows the slot's lookup rule: it is written only while that rule is listed (one
+`ip rule show` read for every slot), so an unmarked packet goes where the slot sends its marks. A
+slot whose lookup rule is not in place - refused, as Merlin's iproute2 refuses a `wgcN` its
+rt_tables does not name, or taken off a slot with no table to route through - gets the refusing
+guard alone, as its marks meet the block rule. A guard line refused on every apply would keep
+`guard_sync` from ever completing: the list that guarded before would stay at its other preference,
+less the guards of the clients the new list no longer names, and the failover would never be ready.
+No guard goes to a client of `main` - it goes direct anyway, and a guard sending it to main would
+take it past the guard of an Xray client entry that covers it - nor to a client the chain skips (no
+IPv4 address or CIDR, outside RFC1918) or a paused one, and an exclusion that is IPv6 or that
+iptables would misread gets none.
+
+A rebuild syncs the guards (`guard_sync`) right after the swap, once the new chain carries every
+interface: the old guards route the old layout's clients until then, and a dropped slot is released
+only after the sync. Not before the swap: the chain an earlier version left returns bare from every
+exclusion, and that traffic would meet the new guards and go into the tunnel. The up-to-date path
+syncs them after the routes: a guard that is gone goes back in, one in place is left alone.
+`tunnel_stop` removes them, those a former `pref_base` left too (see "State Tracking"), and the
+direct rule with them once neither module needs it (`guard_direct_release`: not while `XRAY_TPROXY`
+is in mangle or Xray has guards). `lib/guard.sh` touches nothing from main's rule at 32766 on, as
+the range loop stops short of it. A guard the kernel refuses is an ERROR: a rebuild with one missing
+records no hash, so the next apply retries it, and on either path the failover is not ready. Its
+client is not reported as not carried: while the chain is in place, it is. `status tunnel` lists
+the direct rule and the guards; the full `status` shows the direct rule and counts the guards per
+preference (`guard_status`), as the bot's `/status` keeps only the tail of it.
+
 ## Chain Architecture
 
 Single chain in mangle table:
@@ -204,33 +254,58 @@ Single chain in mangle table:
 ```
 PREROUTING
     └─> TUN_DIR
+          ├─ src 192.168.50.0/24 -> PPE                         (Keenetic only)
+          ├─ src 192.168.50.0/24 + dst <country> -> MARK 0x200  (direct)
           ├─ src 192.168.50.0/24 + dst <country> -> RETURN
-          ├─ src 192.168.50.0/24 -> PPE                  (Keenetic only)
           ├─ src 192.168.50.0/24 -> MARK 0x10000 (wgc1)
+          ├─ src 192.168.1.5 -> PPE                             (Keenetic only)
+          ├─ src 192.168.1.5 + dst <country> -> MARK 0x200      (direct)
           ├─ src 192.168.1.5 + dst <country> -> RETURN
-          ├─ src 192.168.1.5 -> PPE                      (Keenetic only)
           ├─ src 192.168.1.5 -> MARK 0x20000 (ovpnc1)
-          ├─ ...                                         (OpenVPN0: MARK 0x30000)
+          ├─ ...                                                (OpenVPN0: MARK 0x30000)
+          ├─ src 192.168.1.30 -> PPE                            (Keenetic only)
+          ├─ src 192.168.1.30 + dst <country> -> MARK 0x200     (direct)
           ├─ src 192.168.1.30 + dst <country> -> RETURN
-          ├─ src 192.168.1.30 + dst 203.0.113.7 -> RETURN (an address in exclude)
-          ├─ src 192.168.1.30 -> PPE                     (Keenetic only)
+          ├─ src 192.168.1.30 + dst 203.0.113.7 -> MARK 0x200   (direct; an address in exclude)
+          ├─ src 192.168.1.30 + dst 203.0.113.7 -> RETURN
           └─ src 192.168.1.30 -> MARK 0x40000 (awg1)
 ```
 
 The routing table for each tunnel comes from `vpd_tunnel_table`: `IFTUNNEL_TABLE_BASE + idx` for
 an interface tunnel, the platform's `platform_tunnel_table` for any other id (Merlin: the id from
-`rt_tables`; Keenetic: `KEENETIC_TABLE_BASE + idx`). `platform_tunnel_offload_target`
-prints `PPE` on Keenetic (nothing, rc 1 on Merlin); `tunnel.sh` places that target
-inside `TUN_DIR` with the identical match immediately before `MARK`.
+`rt_tables`; Keenetic: `KEENETIC_TABLE_BASE + idx`).
+
+Each client's block opens with the offload opt-out: `platform_tunnel_offload_target` prints `PPE`
+on Keenetic (nothing, rc 1 on Merlin), and `tunnel.sh` gives it the `MARK` rule's match, ahead of
+the exclusions. No flow of a Tunnel Director client is accelerated, a client of `main` and the
+flows to excluded destinations included: the fast path routes a flow it took over by the ip
+rules alone, never by a mark, and an accelerated flow to an excluded country would follow the
+client's guards into the tunnel, where it dies, or be refused. Every other device keeps its
+acceleration.
+
+Each exclusion sets the direct mark (`direct_mark`, `0x200`; see "Advanced Configuration") and
+returns, both with its own match. The direct rule sends the mark to main ahead of the guards,
+which a packet that returned bare would meet. A single `RETURN` on the direct mark would also
+return what `XRAY_TPROXY` marks direct: what Xray lets through of a client that is on a tunnel
+too would no longer reach the tunnel. `guard_direct_ensure` puts the direct rule in before
+anything a rebuild puts in, and at the head of the up-to-date path; a rebuild without it records
+no hash, and either path leaves the failover not ready.
+
+The hash input ends with the direct mark and `format: 2` (`_tunnel_format`). A new `direct_mark`
+rebuilds the chain in the same apply in which `guard_direct_ensure` takes the former direct rule
+away. A raised format makes the first apply after an upgrade that changes the rules a rebuild in
+place: the up-to-date path looks for the `MARK` rules alone and would leave the old ones - the
+bare `RETURN`s before format 2 - where they are.
 
 ## Advanced Configuration
 
 | JSON Path | Default | Purpose |
 |-----------|---------|---------|
 | `advanced.tunnel_director.chain` | `TUN_DIR` | Chain name |
-| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base. The module owns `pref_base` to `pref_base + 2 × field_max − 1` (`field_max` is 255 with the default mask): the lookup range, then the block range - 16384-16893 with the defaults. Another owner's rule on a preference there makes way for the module's, so a base near the firmware's own rules (Merlin's `ovpncN` rule sits at 10000+N) can delete one of them. A new base moves every slot's rules with the next apply: a slot's new rule goes in beside the old rule of another slot the layout holds on the same preference (`_tunnel_pref_make_way`; one of a slot no layout holds makes way), and what the former base left of a slot - a rule carrying its mark under the module's mask on any preference that is no longer its own (`_tunnel_stale_rules_release`) - goes once the slot's own lookup and block rules are in place, on both paths; a released slot and `stop` take it whatever |
+| `advanced.tunnel_director.pref_base` | `16384` | ip rule priority base. The module owns `pref_base` to `pref_base + 2 × field_max − 1` (`field_max` is 255 with the default mask): the lookup range, then the block range - 16384-16893 with the defaults. Another owner's rule on a preference there makes way for the module's, so a base near the firmware's own rules (Merlin's `ovpncN` rule sits at 10000+N) can delete one of them. A new base moves every slot's rules with the next apply: a slot's new rule goes in beside the old rule of another slot the layout holds on the same preference (`_tunnel_pref_make_way`; one of a slot no layout holds makes way), and what the former base left of a slot - a rule carrying its mark under the module's mask on any preference that is no longer its own (`_tunnel_stale_rules_release`) - goes once the slot's own lookup and block rules are in place, on both paths; a released slot and `stop` take it whatever. The direct rule and the guards after the block range move with the base too (`direct_mark` below). An apply of one component would move the direct rule and that component's rules alone: one that finds the direct rule's record at another preference than the configuration gives while the other component's chain is in mangle (`guard_layout_moved`) applies in full instead, with a WARN, and so does a change of `mark_mask` or `mark_shift` |
 | `advanced.tunnel_director.mark_mask` | `0x00ff0000` | Fwmark mask |
 | `advanced.tunnel_director.mark_shift` | `16` | Bit position |
+| `advanced.tunnel_director.direct_mark` | `0x200` | The direct mark (`lib/guard.sh`): the bit both chains set on what they let go direct. The direct rule, `fwmark <mark>/<mark> lookup main`, takes `pref_base + 2 × field_max` (16894 with the defaults), right after the block range and ahead of the guards at the four preferences after it: Tunnel Director's 16895-16896, Xray's 16897-16898. Once the rule is in, any other rule of its shape on that preference goes, one an earlier value left, and so does any guard there, a former layout's (`guard_direct_ensure`); a rule of another shape stays - `lib/guard.sh` lists, compares and deletes only its own shapes, and nothing at 32766 or above. A new `pref_base`, `mark_mask` or `mark_shift` moves the direct rule and the guards: those at the preferences `lib/guard.sh` recorded go once the new ones are in, and `stop` takes both (see "State Tracking"). A configuration without the key takes `0x200`, unless that bit lies in `mark_mask` or in Xray's `fwmark_mask`: then the lowest bit above it outside both, up to `0x80000000`, the same bit for the same masks, and a WARN once per run names it, the mask that holds `0x200` and the key that pins it. The template leaves the key out, so the wizard's merge never sets it: `configure.sh` merges the template under the existing configuration, and a `0x200` from there would be a value that is set, refused in such a mask rather than moved. The hash carries the mark, so a bit that moves with the masks rebuilds the chain as a new value does. An apply of one component after such a change runs in full, with a WARN, while the other component's chain is in mangle (`guard_direct_mark_moved`): alone it would put the rule of the new bit in place of the former one, which the other chain still sets. `guard_layout_check` refuses, with an ERROR, a value that is set and is not one bit of the fwmark or lies in the firmware's mark byte (`0xff`), in `mark_mask` or in Xray's `fwmark_mask` (a value that is set is never moved), masks that leave a configuration without the key no bit, and a `pref_base` whose guards would reach main's rule at 32766 |
 
 ## Fwmark Layout
 
@@ -254,7 +329,9 @@ A rebuild no longer starts with `tunnel_stop`:
    lookup rule replaced; a kept slot's route and rule are only ensured (`_tunnel_rule_ensure`
    leaves a correct rule alone), and its table is never released. A slot with no table to route
    through keeps the block rule alone ("Which tunnels the platform lists").
-2. `TUN_DIR_NEW` is built (`_tunnel_build_chain`) and swapped in by `swap_fw_chain`.
+2. `TUN_DIR_NEW` is built (`_tunnel_build_chain`) and swapped in by `swap_fw_chain`. Once it
+   carries every interface, the guards of the new layout replace the old ones (`guard_sync`; "The
+   kill switch").
 3. Every slot the new layout dropped loses its lookup and block rules (only when they are ours)
    and its table (`_tunnel_slot_release`) — after the swap, when no packet carries its mark.
 4. The hash and `failover_ready` are recorded. `TUN_DIR_TABLES` holds the union of both layouts
@@ -301,7 +378,11 @@ Xray to a tunnel stays proxied until an apply in which Tunnel Director carries i
 leaving through the WAN. A client that left Xray for direct is not in the list, and a client that
 was not proxied - one moving between two tunnels - is not added to Xray (`packet-flow.md`, "The
 apply: make before break"). `apply xray` and `restart xray` run no `tunnel_apply`: they hand the
-prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clients`).
+prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clients`) - unless
+`pref_base`, `mark_mask` or `mark_shift` moved the direct rule since the last apply, or its mark
+changed, when they apply in full, with a WARN (`guard_layout_moved`, `guard_direct_mark_moved`;
+"Advanced Configuration"). `apply tunnel`, `restart tunnel` and `ensure-routes` do the same while
+`XRAY_TPROXY` is in mangle: Xray's guards and the bit its chain sets have to move with the rule.
 
 ## State Tracking
 
@@ -311,10 +392,85 @@ prune every client the config puts on a tunnel, `main`'s left out (`tunnel_clien
 | `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`) |
 | `/tmp/tunnel_director/iftunnels` | The applied interface tunnels, `<iface> <table>` per line (`IFTUNNEL_STATE_FILE`) |
 | `/tmp/tunnel_director/routes_cron` | Marker: the cron job of `ensure-routes` is scheduled (`IFTUNNEL_CRON_MARKER`) |
+| `/tmp/vpn-director/guards/{direct,tunnel,xray}` | The preferences the direct rule and each owner's guards last went in at, one line each: `16894`, `16895 16896`, `16897 16898` with the defaults (`GUARD_STATE_DIR`, `lib/guard.sh`) |
+| `/tmp/vpn-director/fwsnap/{mangle,nat}.rules` | The snapshot of our rules the last apply left, as `iptables-restore --noflush` input, for the firmware hooks to restore after a rebuild of the firewall (`FWSNAP_DIR`, `lib/fwsnap.sh`) |
+| `/tmp/tunnel_director/restored` | Marker: a firmware hook put the mangle rules back from the snapshot (`TUN_DIR_RESTORED`, `lib/fwsnap-restore.sh`); the next apply rebuilds, and no apply records the hash while it is there |
 
-`tunnel_apply` writes the first three, `vpn-director.sh` the marker (`_routes_cron_sync`, after
+`tunnel_apply` writes the first three, `vpn-director.sh` the cron marker (`_routes_cron_sync`, after
 every `tunnel_apply`); `tunnel_stop` walks `TUN_DIR_TABLES` to release each tunnel's table through
-`vpd_tunnel_slot_release`, then removes the first three files.
+`vpd_tunnel_slot_release`, then removes the first three files and the restored marker.
+
+`lib/guard.sh` keeps a record per kind of the preferences its rules last went in at, both modules'
+alike: the guards carry no mark a release could find them by. Once `guard_direct_ensure` has its
+rule in, or a `guard_sync` every line, the rules of the kind's shape at the preferences its record
+names go - after a change of `pref_base`, `mark_mask` or `mark_shift`, the former ones - and the
+record names the current ones; it is written through a file beside it and a rename, and only when
+it changes. `guard_clear` and `guard_direct_release` take the rules at the current and the recorded
+preferences, then the record. A sync with a line refused leaves the former preferences and the
+record as they are: the former guards are all that guard those clients until the list is whole. A
+`pref_base` moved by less than five puts a preference a record names on a current one of another
+kind. A guard left on another owner's preference stays for that owner's sync, which takes every
+guard at its preferences as its own. A guard left on the direct rule's preference, and a direct rule
+left on a guard's, are never live there and go with their former owner, on `stop` as on an apply;
+`guard_direct_ensure` also deletes every guard at its preference. Without a record nothing says
+where the rules were, and none at another preference goes; a write that fails is a WARN, and the
+next change of `pref_base` leaves the rules where they were. A record decides at which preferences
+root deletes rules, so the directory and its parent are held to watchd's `OwnedDir` policy
+(`ensure_owned_dir`, `lib/common.sh`): a missing one is made `0755` whatever the umask, one of
+root's own that group or others can write to loses that write - `/tmp/vpn-director` is watchd's
+runtime directory as well - and a symlink, no directory or another user's records nothing, with
+the same WARN. A record is written under umask 077, and read only while it is a regular file of
+root's own, no symlink; any other reads as none.
+
+`vpn-director.sh` ends every apply that gets there - in full, of one component, `update`,
+`restart` - with `fwsnap_save`, which snapshots the rules that apply left, a file per table.
+`mangle.rules` declares each of `XRAY_TPROXY` and `TUN_DIR` that exists (never the `_NEW` an
+interrupted swap leaves), fills it with its rules as `iptables -S` lists them, and inserts the
+PREROUTING jumps from the top, Xray's first, the mangle INPUT accept of Xray's mark (KeeneticOS) at
+the head of INPUT and the interface tunnels' MSS rules at the head of FORWARD. `nat.rules` holds
+`-o <iface> -j MASQUERADE` for each interface tunnel whose rule is in place. A file with nothing to
+hold goes: `mangle.rules` while neither chain exists, `nat.rules` without such a rule. An apply that
+fails part-way ends before the snapshot, and the one of an earlier apply stays. `stop` removes it
+before it tears anything down, whichever component it stops, and a full stop leaves none; a
+component's stop then writes one of what keeps running (`fwsnap_save` declares only the chains that
+exist, and the stopped one is gone by then), so a rebuild after `stop xray` brings `TUN_DIR` back
+at once, and one after `stop tunnel` `XRAY_TPROXY`. A listing or a write that fails is a
+WARN, and the apply goes on without the part of an earlier apply's snapshot it cannot bring up to
+date: a failed listing of mangle removes both files, one of nat POSTROUTING `nat.rules` alone (the
+`mangle.rules` that run wrote is current), a failed write its own file. Left in place, a stale file
+would put back, after the next rebuild of the firewall, rules the configuration has dropped since -
+an address taken out of a tunnel's `exclude`, marked direct and sent to main ahead of the new
+guards - until the hook's apply rebuilds. The hooks hand the files to `iptables-restore` as root,
+so the directory and its parent are held to watchd's `OwnedDir` policy (`ensure_owned_dir`): a
+missing one is made `0755` whatever the umask, one of root's own that group or others can write to
+loses that write, and a symlink, no directory or another user's gets nothing written and nothing
+removed, with a WARN naming it - the restore refuses such a directory anyway. A file is written
+under umask 077, then made `0644` and renamed into place.
+
+The firmware hooks restore the snapshot, and wait for that, before they queue the apply
+(`lib/fwsnap-restore.sh`, POSIX sh, no common.sh and no lock): KeeneticOS's `netfilter.d` hook the
+table it was called for, Merlin's `firewall-start` mangle and `nat-start` nat. Nothing is restored
+once `stop` has left its marker, nor from a snapshot file root cannot trust: it has to be a regular
+file and no symlink, it, its directory and that directory's parent root's own, the two directories
+no symlinks, and none of the three writable by group or others unless it has the sticky bit;
+otherwise a syslog line says the snapshot was not restored. The restore runs under umask 077, and
+creates the restored marker anew - removed first, then made with noclobber - so a symlink planted
+at its path is never written through. Mangle goes back in one `iptables-restore --noflush`, and only
+while PREROUTING jumps to no chain the snapshot declares: NDM calls the hook for mangle several
+times in one rebuild, and a hook for a table the rebuild left whole must not add a second jump. Its
+INPUT and FORWARD rules go in only where `iptables -C` does not find them (status 1), renumbered
+from the head of their chains; any other status - iptables 1.4.21 exits 4 at once on a busy xtables
+lock - restores nothing, as a PREROUTING listing that fails does: a rule read as missing would go
+in twice. A restore of mangle that went in removes the hash and leaves the restored marker,
+both rebuild triggers: the snapshot may be older than the configuration, and the up-to-date path
+looks for the MARK rules alone. The marker covers the race the hash alone loses - an apply that was
+rebuilding while the restore ran would record its hash after it, and the apply the hook queued would
+take the up-to-date path over the snapshot's chain - because no rebuild records the hash while the
+marker is there. A rebuild removes it at its start, and a restore that lands while that rebuild
+runs leaves a new one; the rebuild's swap deletes every jump to the chain it replaces, the
+restore's included (`swap_fw_chain`). A nat restore inserts each `MASQUERADE` of `nat.rules` that
+`iptables -C` does not find in POSTROUTING (1) at its head, and leaves one it gets no answer for to
+the apply the hook queues.
 
 The hash and `TUN_DIR_TABLES` can be out of step in one direction: a tunnel with clients that the
 platform does not list keeps a slot in `TUN_DIR_TABLES` - its clients' MARK rules and the slot's
@@ -355,11 +511,13 @@ looks for the MARK rules only, not for an exclusion or offload rule.
 The PREROUTING jumps: a rebuild whose new jumps did not all go in records no hash, and the next
 apply finishes the swap. A jump that goes missing after a recorded rebuild is put back by the
 up-to-date branch (`_tunnel_jumps_ensure`), which leaves one that is there where it is.
-`failover_ready` needs the jumps, and every failover client still on the failover tunnel marked and,
-on KeeneticOS, out of the fast path (its offload opt-out in place) — one outside RFC1918 is TPROXY's
-to take but never TUN_DIR's, and dropped from Xray it would leave through the WAN; a marked one
-without its opt-out is marked for its first packets only, as the fast path takes the rest past
-mangle (`_tunnel_emit_client` returns 4).
+`failover_ready` needs the jumps, the direct rule, the guards - a sync that leaves one out withholds
+it, so the failover clients have theirs: one taken off Xray without its guard would leave through
+the WAN in the next firewall rebuild ("The kill switch") - and every failover client still on the
+failover tunnel marked and, on KeeneticOS, out of the fast path (its offload opt-out in place) —
+one outside RFC1918 is TPROXY's to take but never TUN_DIR's, and dropped from Xray it would leave
+through the WAN; a marked one without its opt-out is marked for its first packets only, as the
+fast path takes the rest past mangle (`_tunnel_emit_client` returns 4).
 
 A chain can also lose rules a recorded rebuild put in. Merlin's firewall start runs
 `iptables -t mangle -F`, which empties `TUN_DIR` without deleting it (the pitfall in
@@ -380,10 +538,13 @@ cannot be installed, would otherwise send its clients through the previous owner
 slot's table is never released: it is carrying traffic.
 
 **Rebuild triggers**:
-- Config hash changed
+- Config hash changed (it covers the direct mark and the format of the rules too; see "Chain
+  Architecture")
 - Chain does not exist
 - `TUN_DIR_TABLES` is missing
 - A client's MARK rule is missing from the chain (`_tunnel_marks_present`)
+- The restored marker (`TUN_DIR_RESTORED`): a firmware hook put the chain back from the snapshot
+  of the last apply (see the restore above)
 - `TUN_DIR_FORCE_REBUILD=1` (`restart`, `restart tunnel`)
 
 ## Key Functions
@@ -392,11 +553,11 @@ slot's table is never released: it is carrying traffic.
 
 | Function | Purpose |
 |----------|---------|
-| `tunnel_status()` | Show chain, ip rules, configured tunnels |
+| `tunnel_status()` | Show chain, ip rules, the direct rule and the guards - listed, or counted per preference under `GUARD_STATUS_BRIEF=1`, as the full `status` runs it - configured tunnels |
 | `tunnel_apply()` | Apply rules from config (idempotent; a rebuild happens in place); reports the clients it does not carry in `TUNNEL_UNCARRIED` |
 | `tunnel_uncarried()` | Print `TUNNEL_UNCARRIED`, one client per line |
 | `tunnel_clients()` | Print every client the config puts on a tunnel; `main`'s and the paused ones left out |
-| `tunnel_stop()` | Remove chain, ip rules and the tunnel tables this module owns |
+| `tunnel_stop()` | Remove chain, ip rules, the guards and the tunnel tables this module owns; the direct rule once neither module needs it |
 | `tunnel_get_required_ipsets()` | Return list of exclude ipsets needed |
 
 **Internal functions** (for testing):
@@ -409,6 +570,9 @@ slot's table is never released: it is carrying traffic.
 | `_tunnel_marks_present()` | Does `TUN_DIR` still hold every client's MARK rule; one that is gone makes the apply a rebuild |
 | `_tunnel_collect_applied(prev)` | The slot of every tunnel of the new layout: kept from `prev`, or the lowest idx neither layout holds |
 | `_tunnel_build_chain(chain)` | `swap_fw_chain`'s build_fn: every client's rules, the failover clients first |
+| `_tunnel_guard_lines(slots)` | The guards of a layout, one ip rule per line, in the chain's order; rc 1 when the platform names no LAN interface or the ip rules cannot be listed |
+| `_tunnel_slot_guards(idx, tunnel, clients, lan_ifaces, rules)` | The guards of some clients of one slot: per client and LAN interface, each address or CIDR exclusion direct, the tunnel's table while the slot's lookup rule is listed in `rules`, the refusal |
+| `_tunnel_guards_sync(slots)` | Make the guards those of a layout (`guard_sync`); rc 1 when one did not go in |
 | `_tunnel_slot_release(idx, tunnel)` | Drop the lookup and block rules (ours only) and the table of a slot the layout dropped |
 | `_tunnel_block_ensure(idx, tunnel)` | The slot's block rule, put back when it is gone |
 | `_tunnel_route_warn(tunnel)` | The warning for a route that did not go in, with the layer's reason |
@@ -431,7 +595,11 @@ From `lib/common.sh`: `log`, `tmp_file`, `compute_hash`, `is_lan_ip`
 
 From `lib/firewall.sh`: `swap_fw_chain`, `delete_fw_chain`, `ensure_fw_rule`, `sync_fw_rule`, `purge_fw_rules`, `find_fw_rules`, `fw_chain_exists`
 
-From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`, `TUN_DIR_TABLES`
+From `lib/ipset.sh`: `_ipset_exists`, `parse_exclude_sets_from_json`, `TUN_DIR_HASH`,
+`TUN_DIR_RESTORED`, `TUN_DIR_TABLES`
+
+From `lib/guard.sh`: `guard_layout_check`, `guard_direct_mark_hex`, `guard_direct_ensure`,
+`guard_direct_release`, `guard_sync`, `guard_clear`, `guard_status`
 
 Through the `vpd_*` layer of `lib/iftunnel.sh` (sourced by `common.sh`): `vpd_tunnels`,
 `vpd_tunnel_unlisted_reason`, `vpd_tunnel_table`, `vpd_tunnel_route_ensure`,

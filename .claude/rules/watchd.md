@@ -515,7 +515,10 @@ through names it creates exclusively, then renames. The prober directory must be
 `0700` directory, and a looser one is refused, not tightened: the prober's config, with every
 server's credentials, is staged there under a fixed name. `--dev` skips the socket directory
 check (see Dev mode). `vpn-director.sh stop`, which creates that directory for its marker when it
-is missing, makes it `0755` whatever the caller's umask.
+is missing, makes it `0755` whatever the caller's umask. An apply holds it to watchd's policy as
+well: `lib/guard.sh` and `lib/fwsnap.sh`, whose records and snapshot sit below it, make it `0755`
+when it is missing, take group and other write off one of root's own, and write nothing there
+while it is a symlink or another user's (`ensure_owned_dir`, `lib/common.sh`).
 
 Each client request is bounded by 2 seconds. Notification POST bodies are capped at 1 MiB
 (413 on oversize); responses are bounded by 16 MiB, pending pages by 100 messages, cursors by

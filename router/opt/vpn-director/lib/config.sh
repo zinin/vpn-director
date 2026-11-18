@@ -140,6 +140,12 @@ TUN_DIR_PREF_BASE=$(_cfg '.advanced.tunnel_director.pref_base')
 TUN_DIR_MARK_MASK=$(_cfg '.advanced.tunnel_director.mark_mask')
 TUN_DIR_MARK_SHIFT=$(_cfg '.advanced.tunnel_director.mark_shift')
 
+# The direct mark (lib/guard.sh): the bit both chains set on what they let go direct. The
+# template leaves the key out, so a configuration has it only where the user set it; without it
+# this stays empty, and guard.sh picks the bit - 0x200, unless Tunnel Director's or Xray's mark
+# mask holds it.
+TUN_DIR_DIRECT_MARK=$(_cfg '.advanced.tunnel_director.direct_mark')
+
 ###################################################################################################
 # 8. Advanced: Boot
 ###################################################################################################
@@ -158,5 +164,5 @@ readonly \
     XRAY_FWMARK XRAY_FWMARK_MASK XRAY_CHAIN \
     XRAY_CLIENTS_IPSET XRAY_BYPASS_IPSET \
     TUN_DIR_CHAIN TUN_DIR_PREF_BASE \
-    TUN_DIR_MARK_MASK TUN_DIR_MARK_SHIFT \
+    TUN_DIR_MARK_MASK TUN_DIR_MARK_SHIFT TUN_DIR_DIRECT_MARK \
     MIN_BOOT_TIME BOOT_WAIT_DELAY

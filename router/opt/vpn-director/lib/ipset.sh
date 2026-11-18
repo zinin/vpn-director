@@ -8,7 +8,7 @@
 #   Builds country ipsets for Tunnel Director and Xray TPROXY.
 #
 # Dependencies:
-#   - common.sh (log, tmp_file, compute_hash, download_file)
+#   - common.sh (log, tmp_file, compute_hash, download_file, ensure_owned_dir)
 #   - config.sh (IPS_BDR_DIR)
 #
 # Public API:
@@ -59,6 +59,11 @@ TUN_DIRECTOR_DIR="/tmp/tunnel_director"
 # State files
 TUN_DIR_HASH="$TUN_DIRECTOR_DIR/tun_dir_rules.sha256"
 
+# Left by a firmware hook that put the chain back from the snapshot of the last
+# apply (fwsnap-restore.sh, which names this path itself): the next apply
+# rebuilds, and none records the hash until a rebuild has replaced that chain.
+TUN_DIR_RESTORED="$TUN_DIRECTOR_DIR/restored"
+
 # Applied tunnels as "<idx> <id>" lines; tunnel.sh re-ensures their routes on
 # every apply and releases their tables on stop.
 TUN_DIR_TABLES="$TUN_DIRECTOR_DIR/tun_dir_tables"
@@ -67,11 +72,19 @@ TUN_DIR_TABLES="$TUN_DIRECTOR_DIR/tun_dir_tables"
 # The watch reads this so a plain apply can return 0 while Xray membership stays.
 TUN_DIR_FAILOVER_READY="$TUN_DIRECTOR_DIR/failover_ready"
 
-# Ensure directories exist
-mkdir -p "$IPS_BUILDER_DIR" "$TUN_DIRECTOR_DIR"
+# Ensure directories exist, this user's alone (ensure_owned_dir, watchd's OwnedDir policy): root
+# keeps its state there and acts on it, the restored marker fwsnap-restore.sh leaves included. A
+# missing one is made 0755 whatever the umask, one that group or others can write to loses that
+# write. A symlink, no directory or another user's is a WARN, and the run carries on.
+for _ips_dir in "$IPS_BUILDER_DIR" "$TUN_DIRECTOR_DIR"; do
+    [[ -d ${_ips_dir%/*} ]] || mkdir -p "${_ips_dir%/*}"
+    ensure_owned_dir "$_ips_dir" ||
+        log -l WARN "$_ips_dir is a symlink, no directory or not this user's alone; its state is used as it is"
+done
+unset _ips_dir
 
 # Export for use by other modules
-export IPS_BUILDER_DIR TUN_DIRECTOR_DIR TUN_DIR_HASH TUN_DIR_TABLES TUN_DIR_FAILOVER_READY
+export IPS_BUILDER_DIR TUN_DIRECTOR_DIR TUN_DIR_HASH TUN_DIR_RESTORED TUN_DIR_TABLES TUN_DIR_FAILOVER_READY
 
 ###################################################################################################
 # Constants (defined before --source-only for testability)

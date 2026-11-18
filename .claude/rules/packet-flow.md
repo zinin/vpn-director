@@ -25,6 +25,7 @@ Incoming packet from LAN (LAN interface)
 │  pos 1: ──► XRAY_TPROXY chain                               │
 │              │                                               │
 │              ├─ src NOT in XRAY_CLIENTS? ──► RETURN         │
+│              ├─ all ──► MARK 0x200 (direct), PPE (Keenetic) │
 │              ├─ dst in TPROXY_BYPASS? ──► RETURN (bypass)   │
 │              ├─ dst is private/local? ──► RETURN            │
 │              ├─ dst in exclude_sets? ──► RETURN             │
@@ -35,7 +36,8 @@ Incoming packet from LAN (LAN interface)
 │                                                              │
 │  pos N: ──► TUN_DIR chain (if mark field 0x00ff0000 == 0)   │
 │              │                                               │
-│              ├─ src + dst in exclude? ──► RETURN            │
+│              ├─ src matched? ──► PPE (Keenetic)             │
+│              ├─ src + dst excluded? ──► MARK 0x200, RETURN  │
 │              ├─ src matched? ──► MARK 0xN0000               │
 │              └─ first client match wins (linear order)      │
 │                                                              │
@@ -49,11 +51,31 @@ Incoming packet from LAN (LAN interface)
 │  pref 16384: fwmark 0x10000/0xff0000 ──► table wgc1 / 2000  │
 │  pref 16385: fwmark 0x20000/0xff0000 ──► table ovpnc1 / 2001│
 │  pref 16639+: same marks ──► prohibit (no route in table)   │
+│  pref 16894: fwmark 0x200/0x200 ──► table main (direct)     │
+│  pref 16895-16896: Tunnel Director guards, from <client>    │
+│    iif br0: to an address/CIDR exclusion ──► table main,    │
+│    else ──► its tunnel's table, then ──► prohibit           │
+│  pref 16897-16898: Xray guards, from <client> iif br0:      │
+│    to private ranges, exclude_ips ──► table main,           │
+│    else ──► prohibit                                        │
 │  ...                                                         │
-│  pref 32767: default ──► table main (WAN)                   │
+│  pref 32766: from all ──► table main (WAN)                  │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
+
+A packet a chain marked - for Xray, for a tunnel, or direct - meets its fwmark rule before any
+guard, so in normal operation only an unmarked packet of a protected client reaches one. The guards
+exist for the moment a firmware rebuild of the firewall has taken the chains away ("Left open"
+below): ip rules by source and LAN interface, which the rebuild leaves alone, one per interface
+(`iif` takes one name). The local table at preference 0 answers traffic to the router before any
+of them. Tunnel Director's come first, so a client on Xray and on a tunnel goes through its tunnel
+meanwhile, but for what Xray lets through while an apply that finds both chains gone has put
+`XRAY_TPROXY` back and not yet `TUN_DIR` ("Left open" below). The direct rule and the guards
+follow the block range and move with `pref_base` (`lib/guard.sh`); an owner's changed list goes
+in before the old one goes, and an extended one is appended at the same preference
+(`guard_sync`). The rules in full: `tunnel-director.md`, "The kill switch", and `xray-tproxy.md`,
+"Fail-Safe".
 
 On KeeneticOS 5.1.5 pref 200 was free of NDM policies (no tables in the 40s).
 Built-in LTE backup stays at prefs 100/101, fwmark `0xffffaaa`, table 4096.
@@ -76,7 +98,7 @@ every `_NDM_*` jump. `tunnel_apply` then counts the `XRAY_TPROXY` jumps already
 in PREROUTING and goes behind them when the base position would land among
 them, so the order is `[XRAY_TPROXY, TUN_DIR]` on both platforms.
 
-**Implication**: If a client IP is in both `xray.clients` and a TD rule, traffic goes through Xray only. TD rule is ignored for that client.
+**Implication**: A client in both `xray.clients` and a TD rule goes through Xray; what Xray lets through goes on to TUN_DIR and into its tunnel unless the tunnel excludes it too (`0x00010200` below), and while a firmware rebuild has taken the chains away the client goes through its tunnel, as Tunnel Director's guards come first - but for what Xray lets through between `tproxy_apply` and `tunnel_apply` of a full apply that finds both chains gone ("Left open" under "The apply: make before break").
 
 ## The apply: make before break
 
@@ -94,8 +116,10 @@ Xray wins over TUN_DIR (above). A client moving from Xray to a tunnel stays prox
 lets it go, when TUN_DIR already marks it; a client moving the other way is proxied from step 1,
 before TUN_DIR lets it go in step 2. A Tunnel Director failure that stops the apply (a tunnels value
 that is no object, a tunnel name that is empty or holds whitespace or a control character, block
-rules that would reach main's rule at 32766, no LAN interface, no PREROUTING position) ends the run
-before step 3. One that
+rules that would reach main's rule at 32766, a direct mark or guard preferences
+`guard_layout_check` refuses, no LAN interface, no PREROUTING position) ends the run
+before step 3; `tproxy_apply` refuses such a direct mark or such guard preferences first, before
+step 1 touches anything. One that
 costs some clients returns 0 - a refused rule, a swap that did not take over every interface, a
 tunnel the platform does not list, a slot whose route, lookup rule or block rule is not in place, a client outside
 RFC1918 - and step 2 reports the clients it cost. Step 3 keeps each of them that `XRAY_CLIENTS`
@@ -114,8 +138,29 @@ nothing; while the Xray process restarts, TPROXY drops what no socket takes.
 
 Left open:
 
-- The firmware flushing our chains (Merlin's `iptables -t mangle -F` on a firewall start, an NDM
-  rebuild on KeeneticOS) leaves the clients on the WAN until the hook's apply.
+- A firewall rebuild of the firmware (Merlin's `iptables -t mangle -F` on a firewall start, an NDM
+  rebuild on KeeneticOS, which on a KN-4521 with a DHCP WAN every renewal of the lease brought:
+  `keenetic.md`) takes our chains away until the hook puts them back, and the guards route the
+  protected clients meanwhile ("Packet Processing Order"). A Tunnel Director client stays in its
+  tunnel (one on Xray too: the next item), or is refused while the tunnel has no route, and its
+  connections survive. An Xray client's new connections are refused and its proxied ones stall,
+  but for the private ranges and `xray.exclude_ips`, which go direct. A country exclusion is no ip
+  rule, so a tunnel client's excluded-country traffic goes through its tunnel, and an Xray
+  client's is refused. On KeeneticOS a flow opened then can be bound to the fast path and keep
+  that route for its whole life: `PPE` went with the chain ("The firmware fast path"). The hook
+  shortens the window, which the apply alone held open for 1 to 4 s on the KN-4521 (from the DHCP
+  ACK to a client's MARK rule): before it queues the apply, it restores the chains from the
+  snapshot the last apply left, in one `iptables-restore` (`lib/fwsnap-restore.sh`;
+  `tunnel-director.md`, "State Tracking").
+- A client on Xray and on a tunnel, between `tproxy_apply` and `tunnel_apply` of a full apply that
+  finds both chains gone because no restore of the rebuild brought them back - no snapshot, a busy
+  xtables lock on every call of the hook, a refused `iptables-restore`. From the moment
+  `XRAY_TPROXY` is swapped in, what Xray lets through (a protocol TPROXY does not take, such as
+  ICMP, its exclusions and `TPROXY_BYPASS`) carries the direct mark alone, and the direct rule at
+  16894 sends it to main ahead of the client's tunnel guard: out through the WAN, until
+  `tunnel_apply` swaps `TUN_DIR` in - one `tunnel_apply`. Its TCP and UDP to other destinations go
+  to Xray. Closing it would take a direct bit and rule of Xray's own, placed after Tunnel
+  Director's guards: a change of the mark layout of both modules, not made.
 - A tunnel that is down refuses its clients' traffic (the block rule after its lookup rule);
   excluded destinations still go direct. One that comes from Xray while the tunnel's route cannot
   be installed stays proxied instead (step 3).
@@ -137,9 +182,19 @@ Left open:
   `restart xray` run no Tunnel Director, so their prune keeps every client the config puts on a
   tunnel - `main`'s left out - that `XRAY_CLIENTS` still holds: a client moved from Xray to a tunnel
   by hand stays proxied until a full apply moves it, and only a client that left Xray for direct is
-  let go.
+  let go. Once `pref_base`, `mark_mask` or `mark_shift` has moved the direct rule since the last
+  apply (`guard_layout_moved`), they apply in full instead, with a WARN: Tunnel Director's lookup
+  and block rules have to move with it, or the direct rule would come ahead of them and send a
+  packet that carries a tunnel's mark beside the direct bit to main.
   `apply tunnel` and `restart tunnel` move a client between tunnels in place, but add nothing to
   `XRAY_CLIENTS`: one moved from a tunnel to Xray leaves through the WAN until the next full apply.
+  They apply in full too, with a WARN, once the direct rule moved while `XRAY_TPROXY` is in mangle:
+  Xray's guards left at the former preferences could come ahead of it.
+  Either component's apply also runs in full when the direct mark changed - `direct_mark`, or a
+  mask that moved the bit picked without it - while the other chain is in mangle
+  (`guard_direct_mark_moved`): the rule of the new bit takes the place of the former one, and the
+  chain left alone would keep setting the former bit, which no rule routes any more - Tunnel
+  Director's exclusions into the tunnel, what Xray lets go direct refused by its guards.
   The daemons move clients with full applies; a server switch, which changes no client's route,
   runs `restart xray`.
 - `S99vpn-director restart` is `stop`, then `start` (`vpn-director.sh stop`, then `apply`), with no
@@ -149,21 +204,31 @@ Left open:
 ## Fwmark Bit Layout
 
 ```
-31                        16 15         8 7              0
-├─────────────────────────┼─────────────┼───────────────┤
-│   Tunnel Director       │   Reserved  │  Xray + VPN   │
-│   (8 bits: 0-255)       │             │  firmware     │
-├─────────────────────────┼─────────────┼───────────────┤
-│   0x00ff0000            │             │  0x100 = Xray │
-│   mark = slot << 16     │             │  0x01 = VPN   │
-└─────────────────────────┴─────────────┴───────────────┘
+31       24 23               16 15             8 7             0
+├──────────┼───────────────────┼────────────────┼───────────────┤
+│          │ Tunnel Director   │ Direct + Xray  │ VPN firmware  │
+│          │ (8 bits: 0-255)   │                │               │
+├──────────┼───────────────────┼────────────────┼───────────────┤
+│          │ 0x00ff0000        │ 0x200 = direct │ 0x01 = VPN    │
+│          │ mark = slot << 16 │ 0x100 = Xray   │               │
+└──────────┴───────────────────┴────────────────┴───────────────┘
 
 Examples:
   0x00000100 = Xray TPROXY (bit 8)
+  0x00000200 = direct (bit 9): what a chain lets go direct; the rule at 16894 sends it to main
   0x00010000 = TD rule 0 (slot 1 << 16)
   0x00020000 = TD rule 1 (slot 2 << 16)
   0x00010100 = Both Xray and TD rule 0 (theoretically, but Xray wins)
+  0x00010200 = TD rule 0 and direct: what Xray lets through of a client on a tunnel too;
+               the lookup rule at 16384 comes before the direct rule
 ```
+
+The direct mark is `advanced.tunnel_director.direct_mark`; `guard_layout_check` refuses a value
+that is not one bit or lies in the firmware's mark byte (`0xff`), in `mark_mask` or in Xray's
+`fwmark_mask`. Without the key it is `0x200`, or, where one of those masks holds that bit, the
+lowest bit above it outside both, with a WARN (`lib/guard.sh`). NDM's policy marks on
+KeeneticOS have bit 9 set as well, and NDM's own rules at prefs 100-105 route them first
+(`keenetic.md`); Merlin's marks are unverified.
 
 ## Xray TPROXY Details
 
@@ -172,18 +237,24 @@ Examples:
 ```
 XRAY_TPROXY chain:
   1. ! --match-set XRAY_CLIENTS src → RETURN
-  2. --match-set TPROXY_BYPASS dst → RETURN
-  3. -d 127.0.0.0/8 → RETURN (loopback)
-  4. -d 10.0.0.0/8 → RETURN (RFC1918)
-  5. -d 172.16.0.0/12 → RETURN (RFC1918)
-  6. -d 192.168.0.0/16 → RETURN (RFC1918)
-  7. -d 169.254.0.0/16 → RETURN (link-local)
-  8. -d 224.0.0.0/4 → RETURN (multicast)
-  9. -d 255.255.255.255/32 → RETURN (broadcast)
-  10. --match-set {exclude_set} dst → RETURN (for each exclude_set)
-  11. -p tcp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
-  12. -p udp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
+  2. → MARK 0x200/0x200 (direct; every packet past rule 1)
+  3. → PPE (Keenetic only)
+  4. --match-set TPROXY_BYPASS dst → RETURN
+  5. -d 127.0.0.0/8 → RETURN (loopback)
+  6. -d 10.0.0.0/8 → RETURN (RFC1918)
+  7. -d 172.16.0.0/12 → RETURN (RFC1918)
+  8. -d 192.168.0.0/16 → RETURN (RFC1918)
+  9. -d 169.254.0.0/16 → RETURN (link-local)
+  10. -d 224.0.0.0/4 → RETURN (multicast)
+  11. -d 255.255.255.255/32 → RETURN (broadcast)
+  12. --match-set {exclude_set} dst → RETURN (for each exclude_set)
+  13. -p tcp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
+  14. -p udp → TPROXY --on-port PORT --tproxy-mark 0x100/0x100
 ```
+
+What the RETURNs let go, and what falls off the end (a protocol TPROXY does not take), leaves
+with the direct mark, which the direct rule (`fwmark 0x200/0x200 lookup main`, `lib/guard.sh`)
+sends to main; a packet TPROXY takes meets pref 200 first (`xray-tproxy.md`, "Chain Structure").
 
 ### IPSets
 
@@ -216,16 +287,23 @@ Single chain with rules for all clients:
 ```
 TUN_DIR chain:
   # Client 1 (wgc1)
+  -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 → PPE                    (Keenetic only)
+  -s 192.168.50.0/24 -m set --match-set <country> dst → MARK 0x200/0x200  (direct)
   -s 192.168.50.0/24 -m set --match-set <country> dst → RETURN
-  -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 → PPE       (Keenetic only)
   -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 → MARK 0x10000
 
   # Client 2 (ovpnc1)
+  -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → PPE                        (Keenetic only)
+  -s 192.168.1.5 -m set --match-set <country> dst → MARK 0x200/0x200      (direct)
   -s 192.168.1.5 -m set --match-set <country> dst → RETURN
-  -s 192.168.1.5 -d 203.0.113.7 → RETURN                     (an address in exclude)
-  -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → PPE           (Keenetic only)
+  -s 192.168.1.5 -d 203.0.113.7 → MARK 0x200/0x200                        (an address in exclude)
+  -s 192.168.1.5 -d 203.0.113.7 → RETURN
   -s 192.168.1.5 -m mark --mark 0x0/0xff0000 → MARK 0x20000
 ```
+
+Each exclusion sets the direct mark and returns, both with its own match; the direct rule
+(`fwmark 0x200/0x200 lookup main`, `lib/guard.sh`) sends what carries the mark to main
+(`tunnel-director.md`, "Chain Architecture").
 
 PREROUTING jump, one per LAN interface (`platform_lan_ifaces`; Merlin: `br0`):
 
@@ -240,27 +318,40 @@ The `--mark 0x0/0xff0000` condition ensures **first-match-wins**: once a packet 
 KeeneticOS binds an established **forwarded** flow to a NAT/route fast path that runs before
 `mangle` and never returns to it — the conntrack hook sits at priority -200, `mangle` at -150.
 Once a flow is bound, its packets never reach `TUN_DIR`, so the `MARK` is applied to the first
-few packets only and the rest miss `ip rule 16384` and leave through the WAN carrying the
-tunnel's source address. Measured on a KN-4521: conntrack counted 24 packets of one flow while
-`TUN_DIR` counted 6, and a 1 MB download stalled at exactly one TCP window (20610 bytes).
+few packets only: before the opt-out below, the rest missed `ip rule 16384` and left through the
+WAN carrying the tunnel's source address. Measured on a KN-4521: conntrack counted 24 packets of
+one flow while `TUN_DIR` counted 6, and a 1 MB download stalled at exactly one TCP window (20610
+bytes).
 
 `platform_tunnel_offload_target` names the mangle target that opts a flow out of it — `PPE` on
 Keenetic, which sets `ct->fast_ext` (a condition of both the `fastnat` and the `fastroute` entry
 test) and `FOE_ALG_SKIP`, closing the hardware path too. Merlin has no such path and prints
 nothing, so the rule does not exist there at all.
 
-Placement carries the meaning: the exclusion `RETURN`s run first, so an excluded destination
-keeps its acceleration, and the opt-out sits immediately before `MARK` with the identical match,
-where the `--mark 0x0/0xff0000` test still holds.
+The fast path routes a flow it took over by the ip rules alone, with the flow's source,
+destination and incoming interface - never by a mark. Measured on the KN-4521 (`keenetic.md`,
+"Fast path"): with a stand-in for the direct mark, its rule and the guards behind them but no
+`PPE`, a download from an excluded address timed out with 0 bytes - the six packets of its
+handshake went direct, then the fast path took the flow and the guard sent it into the tunnel;
+with `PPE` it ran at full rate. That is why the guards hold even the flows the fast path took
+while the chains were gone, and why every flow of a protected client is kept off the fast path.
 
-Xray needs none of this — TPROXY terminates the connection in a local socket, so no forwarded
-flow is left to accelerate. That is why Xray worked on KeeneticOS while Tunnel Director did not.
+Placement carries the meaning: the opt-out opens each client's block with the `MARK` rule's
+match, ahead of the exclusions, so no flow of a Tunnel Director client is accelerated - one to an
+excluded destination included: an accelerated connection to an excluded country would follow the
+client's guards into the tunnel, or be refused. Every other device keeps its acceleration.
+
+A flow TPROXY takes needs none of this — it terminates in a local socket, so no forwarded flow is
+left to accelerate. That is why Xray worked on KeeneticOS while Tunnel Director did not. What
+`XRAY_TPROXY` lets through is forwarded, though: the opt-out follows its direct mark, right after
+rule 1, so no flow of an Xray client is accelerated either.
 
 A flow already bound to the fast path stays bound until its conntrack entry expires; new flows
-are correct immediately. And because `tunnel_apply` hashes the *configuration*, a router that
-already has Tunnel Director applied with an unchanged config gets the rule on its next rebuild —
-seconds away on Keenetic, where any NDM firewall rebuild wipes our chains and the `netfilter.d`
-hook re-applies. `restart tunnel` forces it.
+are correct immediately. A firewall rebuild takes `PPE` away with the chains: a flow opened before
+they are back can be bound, and keeps the route its guard gave it ("Left open"). A router
+upgraded with its configuration unchanged gets the rules of a new placement on the first apply
+after the upgrade: the hash input carries the format of the rules (`_tunnel_format`).
+`restart tunnel` forces a rebuild at any time.
 
 ### Position Calculation
 
@@ -300,6 +391,16 @@ ip rule add pref {16384 + idx} fwmark {mark}/{mask} table {wgc1|ovpnc1|main|2000
 ip rule add pref {16384 + 255 + idx} fwmark {mark}/{mask} prohibit
 ```
 
+```bash
+# Right after the block range (lib/guard.sh): the direct rule, then the guards of each client of
+# every slot but main's, per LAN interface, at 16895 or 16896 (tunnel-director.md, "The kill
+# switch"); Xray's follow at 16897 or 16898 (xray-tproxy.md, "Fail-Safe"):
+ip rule add pref {16384 + 2 × 255} fwmark 0x200/0x200 lookup main
+ip rule add pref {16895|16896} from {client} to {address or CIDR exclusion} iif br0 lookup main
+ip rule add pref {16895|16896} from {client} iif br0 lookup {table}
+ip rule add pref {16895|16896} from {client} iif br0 prohibit
+```
+
 ## Traffic Flow Examples
 
 ### Example 1: Client in Xray only
@@ -321,7 +422,7 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 
 Packet from 192.168.50.10 to 203.0.113.1 (excluded country):
 1. XRAY_TPROXY: src in XRAY_CLIENTS? Yes
-2. dst in excluded country? Yes → **RETURN**
+2. dst in excluded country? Yes → **RETURN** with the direct mark 0x200
 3. TUN_DIR: no rules for this client
 4. **Goes to main table → WAN (direct)**
 
@@ -350,7 +451,7 @@ Packet from 192.168.1.5 to 8.8.8.8 (foreign):
 
 Packet from 192.168.1.5 to 203.0.113.1 (excluded country):
 1. XRAY_TPROXY: src in XRAY_CLIENTS? No → RETURN
-2. TUN_DIR: src=192.168.1.5 + dst in excluded country? Yes → **RETURN** (no mark)
+2. TUN_DIR: src=192.168.1.5 + dst in excluded country? Yes → **RETURN** with the direct mark 0x200
 3. **Goes to main table → WAN (direct)**
 
 ### Example 3: Client in both Xray and TD
@@ -394,7 +495,7 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | `iptables -t mangle -S XRAY_TPROXY` | Xray chain rules |
 | `iptables -t mangle -S TUN_DIR` | TD chain rules |
 | `iptables -t mangle -S PREROUTING` | Jump rules and positions |
-| `ip rule show` | Fwmark-based routing rules |
+| `ip rule show` | Fwmark rules, the direct rule and the guards |
 | `ip route show table {N\|name}` | Routes in specific table |
 
 ### Temporary state
@@ -403,6 +504,9 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 |------|---------|
 | `/tmp/tunnel_director/tun_dir_rules.sha256` | Hash of applied TD rules |
 | `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`); a tunnel keeps its idx while it has clients; during a rebuild, the union of both layouts |
+| `/tmp/tunnel_director/restored` | Marker: a firmware hook put the mangle rules back from the snapshot (`TUN_DIR_RESTORED`, `lib/fwsnap-restore.sh`); the next apply rebuilds, and no apply records the hash while it is there |
+| `/tmp/vpn-director/guards/{direct,tunnel,xray}` | The preferences the direct rule and each owner's guards last went in at (`GUARD_STATE_DIR`, `lib/guard.sh`) |
+| `/tmp/vpn-director/fwsnap/{mangle,nat}.rules` | The snapshot of our rules the last apply left, as `iptables-restore --noflush` input, for the firmware hooks to restore (`FWSNAP_DIR`, `lib/fwsnap.sh`); a full `stop` removes it, and a component's stop removes it before its teardown, then writes one of what keeps running |
 
 ## Key Code Locations
 
@@ -417,6 +521,9 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | `lib/tunnel.sh` | ip rule creation | Fwmark → `vpd_tunnel_table` |
 | `lib/tunnel.sh` | `_tunnel_ensure_routes()` | Re-install tunnel routes on an apply with no rebuild |
 | `lib/tunnel.sh` | `_tunnel_marks_present()` | Rebuild when a client's MARK rule is gone (Merlin's firewall start flushes every mangle chain) |
-| `lib/platform/keenetic.sh` | `platform_tunnel_offload_target()` | `PPE` — takes a marked flow out of the firmware fast path |
+| `lib/platform/keenetic.sh` | `platform_tunnel_offload_target()` | `PPE` — takes every flow of a protected client out of the firmware fast path |
 | `lib/tunnel.sh` | `_tunnel_block_ensure()` | The slot's `prohibit` rule after its lookup rule |
+| `lib/guard.sh` | `guard_direct_ensure()`, `guard_sync()` | The direct rule; an owner's guards, the new list in before the old one goes |
+| `lib/fwsnap.sh` | `fwsnap_save()` | The snapshot of our rules each apply leaves |
+| `lib/fwsnap-restore.sh` | `restore_mangle()`, `restore_nat()` | The firmware hooks put the snapshot back before they queue the apply |
 | `lib/iftunnel.sh` | `iftunnel_route_ensure()`, `vpd_*` | Interface tunnels; the layer the core calls for any tunnel |

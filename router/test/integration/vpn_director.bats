@@ -19,8 +19,17 @@ setup() {
     # /etc/iproute2/rt_tables, which the machine running the suite need not have.
     export RT_TABLES_FILE="$TEST_ROOT/fixtures/rt_tables"
     # And the ready marker: tproxy_apply would otherwise write the machine's own
-    # /tmp/xray_tproxy/ready.
+    # /tmp/xray_tproxy/ready. So would guard.sh its record of the preferences
+    # its rules went in at, under /tmp/vpn-director/guards, and every apply its
+    # snapshot of the rules, under /tmp/vpn-director/fwsnap.
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
+    export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
+    export FWSNAP_DIR="$BATS_TEST_TMPDIR/fwsnap"
+    # And the firmware's shared hooks (Asuswrt-Merlin): `hooks` and the full
+    # status would write and read the machine's /jffs/scripts, and the line
+    # would call the hooks of an install rather than the tree's.
+    export VPD_JFFS_SCRIPTS_DIR="$BATS_TEST_TMPDIR/jffs-scripts"
+    export VPD_HOOKS_DIR="$PROJECT_ROOT/opt/vpn-director/hooks"
     : > "$LOG_FILE"
 }
 
@@ -58,6 +67,19 @@ setup() {
     run "$SCRIPTS_DIR/vpn-director.sh" --badoption
     assert_failure
     assert_output --partial "Unknown option"
+}
+
+# A router a partially copied update left without lib/guard.sh died on bash's bare "No such file
+# or directory" in every command. The CLI names the missing library and the way out, and fails.
+@test "vpn-director: a router tree without lib/guard.sh names it and fails" {
+    local tree="$BATS_TEST_TMPDIR/vpn-director"
+    cp -R "$SCRIPTS_DIR" "$tree"
+    rm "$tree/lib/guard.sh"
+    run "$tree/vpn-director.sh" status
+    assert_failure
+    assert_output --partial "ERROR"
+    assert_output --partial "Guard library not found: $tree/lib/guard.sh - re-run install.sh to reinstall it"
+    refute_output --partial "No such file or directory"
 }
 
 # ============================================================================
@@ -106,6 +128,28 @@ setup() {
     run "$SCRIPTS_DIR/vpn-director.sh" status badcomp
     assert_failure
     assert_output --partial "Unknown component"
+}
+
+# The bot's /status keeps the tail of the full status, and the guards of a few Xray clients, every
+# one listed, pushed Tunnel Director's section out of it. The full status counts them per
+# preference (run_cli: the real modules on the stateful mocks, after an apply of the fixture);
+# the status of a component lists them.
+@test "vpn-director: the full status counts the guards per preference, status xray lists them" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+
+    run_cli status
+    assert_success
+    assert_output --partial $'--- Guards (ip rules by source) ---\n16894:\tfrom all fwmark 0x200/0x200 lookup main\nPref 16895: 2 guards\n"vpn-director.sh status tunnel" lists them\n'
+    assert_output --partial $'--- Guards (ip rules by source) ---\n16894:\tfrom all fwmark 0x200/0x200 lookup main\nPref 16897: 8 guards\n"vpn-director.sh status xray" lists them\n'
+    refute_output --partial $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+
+    run_cli status xray
+    assert_success
+    assert_output --partial $'16897:\tfrom 192.168.1.100 iif br0 prohibit'
+    refute_output --partial 'Pref 16897'
 }
 
 # ============================================================================
@@ -280,6 +324,54 @@ run_stubbed_cli() {
     assert_output "755"
 }
 
+# The hooks restore the snapshot of the rules after a firewall rebuild. A stop takes it away
+# first, whichever component it stops: a rebuild during the teardown would bring back what the stop
+# takes away. A full stop leaves none; a component's stop then writes one of what keeps running
+# ("a component's stop leaves the snapshot of what keeps running" below). A component it does not
+# know stops nothing, and the snapshot stays.
+@test "vpn-director: stop removes the snapshot before it tears anything down" {
+    export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
+    local args
+    for args in stop "stop tunnel" "stop xray" "stop badcomp"; do
+        mkdir -p "$FWSNAP_DIR"
+        printf '*mangle\n:TUN_DIR - [0:0]\nCOMMIT\n' > "$FWSNAP_DIR/mangle.rules"
+        printf -- '-o awg1 -j MASQUERADE\n' > "$FWSNAP_DIR/nat.rules"
+        rm -f "$BATS_TEST_TMPDIR/calls"
+        # shellcheck disable=SC2086
+        run bash -c '
+            script=$1 calls=$2
+            shift 2
+            source "$script" --source-only "$@"
+            _load_modules
+            acquire_lock() { :; }
+            seen() {
+                if [[ -e $FWSNAP_DIR/mangle.rules || -e $FWSNAP_DIR/nat.rules ]]; then
+                    echo "$1 with the snapshot"
+                else
+                    echo "$1"
+                fi
+            }
+            tproxy_stop() { seen tproxy_stop >> "$calls"; }
+            tunnel_stop() { seen tunnel_stop >> "$calls"; }
+            "cmd_$COMMAND"
+        ' -- "$SCRIPTS_DIR/vpn-director.sh" "$BATS_TEST_TMPDIR/calls" $args
+        if [[ $args == "stop badcomp" ]]; then
+            assert_failure
+            [ -f "$FWSNAP_DIR/mangle.rules" ]
+            [ -f "$FWSNAP_DIR/nat.rules" ]
+            continue
+        fi
+        assert_success
+        if [[ $args == stop ]]; then
+            [ ! -e "$FWSNAP_DIR/mangle.rules" ]
+            [ ! -e "$FWSNAP_DIR/nat.rules" ]
+        fi
+        run cat "$BATS_TEST_TMPDIR/calls"
+        assert_success
+        refute_output --partial "with the snapshot"
+    done
+}
+
 # The subscription watch writes config.json for each server it tries and needs
 # only the process to pick it up. "restart xray" would apply the TPROXY rules
 # again after each one for nothing.
@@ -348,6 +440,22 @@ run_stubbed_cli() {
     assert_failure
     run cat "$BATS_TEST_TMPDIR/calls"
     assert_output $'tproxy_apply\ntunnel_apply'
+}
+
+# An apply that ends part-way writes no snapshot of the rules it left half-changed: the one of an
+# earlier apply stays, and the apply the hooks queue after restoring it reconciles what is stale.
+# A snapshot written here would have gone instead: the stateless iptables lists no chain of ours.
+@test "vpn-director: an apply that fails part-way leaves the snapshot of an earlier one" {
+    mkdir -p "$FWSNAP_DIR"
+    printf '*mangle\n:TUN_DIR - [0:0]\nCOMMIT\n' > "$FWSNAP_DIR/mangle.rules"
+    export TUNNEL_APPLY_RC=1
+    local args
+    for args in apply update "restart tunnel"; do
+        # shellcheck disable=SC2086
+        run_stubbed_cli $args
+        assert_failure
+        assert_equal "$(cat "$FWSNAP_DIR/mangle.rules")" $'*mangle\n:TUN_DIR - [0:0]\nCOMMIT'
+    done
 }
 
 # C1: tunnel_apply soft-fails with 0 - a refused rule, a tunnel the platform
@@ -1016,6 +1124,232 @@ applied_then_moved_by_hand() {
     assert_success
 }
 
+# pref_base lowered by hand, then a server switch: apply xray alone would move the direct rule from
+# 16894 to 15510, ahead of Tunnel Director's lookup rules still at 16384, and send what Xray lets
+# through of a client on a tunnel too to main. It runs in full instead, with a WARN, and Tunnel
+# Director's rules move with the direct rule: nothing is left at the former preferences.
+@test "vpn-director: apply xray after the direct rule moved runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    assert_equal "$(cat "$GUARD_STATE_DIR/direct")" 16894
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    jq '.advanced.tunnel_director.pref_base = 15000' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply xray
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "pref_base, mark_mask or mark_shift moved the direct rule from preference 16894 to 15510 since the last apply; Tunnel Director's rules have to move with it, so this apply runs in full"
+    assert_output --regexp 'up-to-date|[Rr]ebuilding'
+    run ip rule show
+    assert_line $'15000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'15510:\tfrom all fwmark 0x200/0x200 lookup main'
+    refute_line --regexp '^16[0-9]{3}:'
+    assert_equal "$(cat "$GUARD_STATE_DIR/direct")" 15510
+}
+
+# With the direct rule where the configuration puts it, apply xray stays Xray's alone: no WARN, and
+# no tunnel_apply, which logs either way whether it rebuilds or finds its rules up to date.
+@test "vpn-director: apply xray with the direct rule in place stays Xray's alone" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    assert_equal "$(cat "$GUARD_STATE_DIR/direct")" 16894
+
+    run_cli apply xray
+    assert_success
+    refute_output --partial "moved the direct rule"
+    refute_output --regexp 'up-to-date|[Rr]ebuilding'
+}
+
+# direct_mark changed by hand, then a server switch: apply xray alone would put the direct rule's
+# new mark in place of the former one while TUN_DIR still sets the former bit on its exclusions,
+# which would then meet the guards and go into the tunnel. It runs in full instead, with a WARN,
+# and TUN_DIR is rebuilt with the new bit.
+@test "vpn-director: apply xray after the direct mark changed runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    jq '.advanced.tunnel_director.direct_mark = "0x400"' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply xray
+    assert_success
+    assert_output --partial "direct_mark or a mark mask changed the direct mark from 0x200 to 0x400 since the last apply; Tunnel Director's rules have to move with it, so this apply runs in full"
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x400/0x400 lookup main'
+    run iptables -t mangle -S TUN_DIR
+    assert_output --partial "MARK --set-xmark 0x400/0x400"
+    refute_output --partial "MARK --set-xmark 0x200/0x200"
+}
+
+# The other way: apply tunnel alone would rebuild TUN_DIR with the new bit and move the direct rule
+# to it, while XRAY_TPROXY still sets the former one on what it lets go direct, which Xray's guards
+# would then refuse.
+@test "vpn-director: apply tunnel after the direct mark changed runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    jq '.advanced.tunnel_director.direct_mark = "0x400"' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply tunnel
+    assert_success
+    assert_output --partial "direct_mark or a mark mask changed the direct mark from 0x200 to 0x400 since the last apply; Xray's rules have to move with it, so this apply runs in full"
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_output --partial "MARK --set-xmark 0x400/0x400"
+    refute_output --partial "MARK --set-xmark 0x200/0x200"
+}
+
+# pref_base raised by hand, then apply tunnel: Tunnel Director's rules and the direct rule would move
+# up, and Xray's guards left at the former preferences would come ahead of the direct rule and refuse
+# what XRAY_TPROXY lets go direct. It runs in full instead: nothing is left at the former ones.
+@test "vpn-director: apply tunnel after the direct rule moved runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    jq '.advanced.tunnel_director.pref_base = 17000' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply tunnel
+    assert_success
+    assert_output --partial "pref_base, mark_mask or mark_shift moved the direct rule from preference 16894 to 17510 since the last apply; Xray's rules have to move with it, so this apply runs in full"
+    run ip rule show
+    assert_line $'17510:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_line --regexp '^1751[34]:	from 192\.168\.1\.100 iif br0 prohibit$'
+    refute_line --regexp '^16[0-9]{3}:'
+}
+
+# With the direct rule as the configuration gives it, apply tunnel stays Tunnel Director's alone: no
+# WARN, and no tproxy_apply, which logs that it starts Xray's routing.
+@test "vpn-director: apply tunnel with the direct rule in place stays Tunnel Director's alone" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+
+    run_cli apply tunnel
+    assert_success
+    refute_output --partial "runs in full"
+    refute_output --partial "Xray TPROXY routing"
+}
+
+# ============================================================================
+# The snapshot of the rules, for the hooks to restore after a firewall rebuild
+# ============================================================================
+
+# Every apply that gets to its end leaves the snapshot of the rules it put in place: in full, of
+# one component, the update and the restart. The fixture's: Xray's client from br0 at 1, TUN_DIR
+# for wgc1 behind it.
+@test "vpn-director: every apply writes the snapshot of the rules it leaves" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    run cat "$FWSNAP_DIR/mangle.rules"
+    assert_success
+    assert_line --index 0 '*mangle'
+    assert_line --index 1 ':XRAY_TPROXY - [0:0]'
+    assert_line --index 2 ':TUN_DIR - [0:0]'
+    assert_line '-A XRAY_TPROXY -m set ! --match-set XRAY_CLIENTS src -j RETURN'
+    assert_line '-A TUN_DIR -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_line '-I PREROUTING 1 -i br0 -j XRAY_TPROXY'
+    assert_line '-I PREROUTING 2 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    assert_equal "${lines[-1]}" COMMIT
+
+    local args
+    for args in "apply tunnel" "apply xray" update restart "restart tunnel" "restart xray"; do
+        rm -f "$FWSNAP_DIR/mangle.rules"
+        # shellcheck disable=SC2086
+        run_cli $args
+        assert_success
+        [ -f "$FWSNAP_DIR/mangle.rules" ]
+    done
+}
+
+# What an apply leaves and a stop takes, through the CLI with the real modules on the stateful
+# mocks: the fixture's client of wgc1 and its Xray client. The apply puts in both chains, the
+# direct rule, both owners' guards, their records and the snapshot. An older release knows none of
+# them, so going back to one starts with this stop: afterwards nothing is at 16894-16898, neither
+# chain exists, and no snapshot or record is left.
+@test "vpn-director: stop takes away what an apply put in: chains, direct rule, guards, records, snapshot" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    iptables -t mangle -S XRAY_TPROXY >/dev/null
+    iptables -t mangle -S TUN_DIR >/dev/null
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_line --regexp '^16895:	from 192\.168\.50\.0/24 iif br0 '
+    assert_line --regexp '^16897:	from 192\.168\.1\.100 iif br0 prohibit$'
+    [ -f "$GUARD_STATE_DIR/direct" ]
+    [ -f "$GUARD_STATE_DIR/tunnel" ]
+    [ -f "$GUARD_STATE_DIR/xray" ]
+    [ -f "$FWSNAP_DIR/mangle.rules" ]
+
+    run_cli stop
+    assert_success
+    run ip rule show
+    refute_line --regexp '^1689[4-8]:'
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_failure
+    run iptables -t mangle -S TUN_DIR
+    assert_failure
+    [ -z "$(find "$FWSNAP_DIR" "$GUARD_STATE_DIR" -type f 2>/dev/null)" ]
+}
+
+# A stop of one component leaves the other running, and a firewall rebuild after it would leave
+# that one's clients on their guards until the hook's apply without a snapshot: Xray's refused, a
+# tunnel client's excluded countries through its tunnel. The stop removes the snapshot before its
+# teardown, then writes one of what keeps running; the stopped chain is gone by then. The full stop
+# leaves none.
+@test "vpn-director: a component's stop leaves the snapshot of what keeps running" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    run_cli stop xray
+    assert_success
+    run cat "$FWSNAP_DIR/mangle.rules"
+    assert_success
+    assert_line ':TUN_DIR - [0:0]'
+    assert_line '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    refute_output --partial 'XRAY_TPROXY'
+
+    run_cli apply
+    assert_success
+    run_cli stop tunnel
+    assert_success
+    run cat "$FWSNAP_DIR/mangle.rules"
+    assert_success
+    assert_line ':XRAY_TPROXY - [0:0]'
+    assert_line '-I PREROUTING 1 -i br0 -j XRAY_TPROXY'
+    refute_output --partial 'TUN_DIR'
+
+    run_cli apply
+    assert_success
+    run_cli stop
+    assert_success
+    [ ! -e "$FWSNAP_DIR/mangle.rules" ]
+    [ ! -e "$FWSNAP_DIR/nat.rules" ]
+}
+
 # Only path declarations are rehomed; init control flow remains production code.
 watchd_init_sandbox() {
     export WATCHD_TEST_BIN="$BATS_TEST_TMPDIR/watchd-bin"
@@ -1298,4 +1632,61 @@ EOF
         [[ ! -e "$BATS_TEST_TMPDIR/watchd-init.events" ]]
         assert_watchd_init_preserves_routing
     done
+}
+
+# ============================================================================
+# The firmware's shared hooks (Asuswrt-Merlin)
+# ============================================================================
+
+@test "vpn-director: hooks puts the line into each Merlin hook and says so" {
+    run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_success
+    assert_output --partial "$VPD_JFFS_SCRIPTS_DIR/firewall-start: created"
+    local h
+    for h in firewall-start wan-event nat-start; do
+        grep -qF ' # vpn-director' "$VPD_JFFS_SCRIPTS_DIR/$h"
+        [ -x "$VPD_JFFS_SCRIPTS_DIR/$h" ]
+    done
+}
+
+@test "vpn-director: hooks exits 1 when a hook is left without the line" {
+    mkdir -p "$VPD_JFFS_SCRIPTS_DIR"
+    echo 'echo hi' > "$VPD_JFFS_SCRIPTS_DIR/wan-event"
+    run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_failure
+    assert_output --partial "$VPD_JFFS_SCRIPTS_DIR/wan-event: left alone"
+}
+
+@test "vpn-director: the full status lists the firmware hooks" {
+    run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_success
+    run "$SCRIPTS_DIR/vpn-director.sh" status
+    assert_success
+    assert_line "=== Firmware Hooks ==="
+    assert_line "$VPD_JFFS_SCRIPTS_DIR/nat-start: vpn-director line in place"
+}
+
+# An apply runs on every firewall start and every event: the shared hooks are
+# install's and update's to write, and a line the owner took out stays out.
+@test "vpn-director: apply leaves the firmware hooks alone" {
+    run "$SCRIPTS_DIR/vpn-director.sh" apply --dry-run
+    assert_success
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    [ ! -e "$VPD_JFFS_SCRIPTS_DIR" ]
+}
+
+@test "vpn-director: on KeeneticOS hooks has nothing to put in and the status no hooks section" {
+    VPD_PLATFORM=keenetic PATH="$TEST_ROOT/mocks/keenetic:$PATH" \
+        run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_success
+    refute_output
+    [ ! -e "$VPD_JFFS_SCRIPTS_DIR" ]
+    VPD_PLATFORM=keenetic PATH="$TEST_ROOT/mocks/keenetic:$PATH" \
+        run "$SCRIPTS_DIR/vpn-director.sh" status
+    assert_success
+    assert_output --partial "Xray TPROXY Status"
+    refute_output --partial "Firmware Hooks"
 }

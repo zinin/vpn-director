@@ -274,12 +274,22 @@ _iftunnel_mss_in_ensure() {
     ensure_fw_rule -q mangle FORWARD -I 1 "${want[@]}" || true
 }
 
-# _iftunnel_rules_release <iface> - the three rules gone. Removing a rule that is not there is no
-# error: a release can come for a slot that was never ensured.
+# _iftunnel_rules_release <iface> - the three rules gone, every copy of each. The hooks' restore
+# takes no lock (lib/fwsnap-restore.sh): it and an apply's ensure_fw_rule can both find the
+# MASQUERADE or the outbound clamp missing and both put it in, and ensure_fw_rule -D takes one
+# copy. So each delete is repeated while iptables -C finds the rule, and a delete that fails (its
+# ERROR logged) ends it; purge_fw_rules takes every inbound clamp. Removing a rule that is not
+# there is no error: a release can come for a slot that was never ensured.
 _iftunnel_rules_release() {
-    ensure_fw_rule -q nat POSTROUTING -D -o "$1" -j MASQUERADE || true
-    ensure_fw_rule -q mangle FORWARD -D -o "$1" -p tcp -m tcp --tcp-flags SYN,RST SYN \
-        -j TCPMSS --clamp-mss-to-pmtu || true
+    local n
+    while n="$(ensure_fw_rule -q --count nat POSTROUTING -D -o "$1" -j MASQUERADE)" &&
+        [[ $n == 1 ]]; do
+        :
+    done
+    while n="$(ensure_fw_rule -q --count mangle FORWARD -D -o "$1" -p tcp -m tcp \
+        --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu)" && [[ $n == 1 ]]; do
+        :
+    done
     purge_fw_rules -q "mangle FORWARD" "$(_iftunnel_mss_pattern "$1")" || true
 }
 

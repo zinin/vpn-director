@@ -20,6 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 /opt/vpn-director/vpn-director.sh platform            # Platform facts as JSON (tunnels, WAN, password file)
 /opt/vpn-director/vpn-director.sh cron install        # Schedule the daily update (S99 does this)
 /opt/vpn-director/vpn-director.sh ensure-routes       # Put back a route an interface tunnel lost (its cron job runs it every minute)
+/opt/vpn-director/vpn-director.sh hooks               # Merlin: our line into each /jffs/scripts hook, the rest kept (install and update run it)
 /opt/vpn-director/vpn-director.sh --wait apply        # Queue for a running instance (120 s) instead of skipping
 /opt/vpn-director/vpn-director.sh --unless-stopped apply  # Skip once "stop" has run (watchd's subscription watch)
 
@@ -68,15 +69,18 @@ cd server && go run ./cmd/watchd --dev
 | `router/opt/vpn-director/lib/ipset.sh` | IPSet module: ensure, update, status |
 | `router/opt/vpn-director/lib/tunnel.sh` | Tunnel Director module: apply, stop, status |
 | `router/opt/vpn-director/lib/tproxy.sh` | Xray TPROXY module: apply, stop, status |
+| `router/opt/vpn-director/lib/guard.sh` | ip rule guards by source and LAN interface (16895-16898) and the direct rule (`fwmark 0x200/0x200 lookup main`, 16894): what keeps protected clients off the WAN while a firmware rebuild has taken our chains away |
+| `router/opt/vpn-director/lib/fwsnap.sh` | Snapshot of our mangle and nat rules after every apply (`/tmp/vpn-director/fwsnap/`), removed by a full `stop`; a component's stop leaves one of what keeps running |
+| `router/opt/vpn-director/lib/fwsnap-restore.sh` | POSIX sh the firmware hooks run before their apply: puts the snapshot back (`iptables-restore --noflush`) unless the table still holds our rules |
 | `router/opt/vpn-director/lib/xrayconf.sh` | Xray config.json from a server's stored outbound (legacy VLESS records built), `xray run -test` before it replaces the live one |
 | `router/opt/vpn-director/lib/subscription.sh` | Subscription decoder: share links (vless, vmess, trojan, ss, hysteria2), base64 or plain, and Xray JSON, into servers with a ready outbound |
 | `testdata/subscription/` | Cases both subscription decoders (shell and Go) must decode alike |
 | `router/opt/vpn-director/lib/substore.sh` | Subscription files (`<data_dir>/subscriptions/<id>.json`): order, ids, names, the write under the config lock; the twin of `vpnconfig/substore.go` |
 | `testdata/substore/` | Synthetic subscription files both stores (shell and Go) must list alike |
 | `router/opt/etc/init.d/S99vpn-director` | Entware init.d script for startup |
-| `router/jffs/scripts/firewall-start` | Asuswrt-Merlin hook for firewall reload |
-| `router/jffs/scripts/wan-event` | Asuswrt-Merlin hook for WAN events |
-| `router/jffs/scripts/nat-start` | Asuswrt-Merlin hook after a rebuild of nat |
+| `router/opt/vpn-director/hooks/firewall-start` | Asuswrt-Merlin hook for firewall reload, called from the shared `/jffs/scripts/firewall-start` by one line |
+| `router/opt/vpn-director/hooks/wan-event` | Asuswrt-Merlin hook for WAN events, called from the shared `/jffs/scripts/wan-event` by one line |
+| `router/opt/vpn-director/hooks/nat-start` | Asuswrt-Merlin hook after a rebuild of nat, called from the shared `/jffs/scripts/nat-start` by one line |
 | `router/test/` | Bats tests (unit/, integration/) |
 | `router/opt/vpn-director/vpn-director.json.template` | Unified config template |
 | `router/opt/etc/xray/config.json.template` | Xray server config template |
@@ -131,7 +135,9 @@ shutdown, durable notification and recovery contracts.
 - A tunnel whose table holds no route refuses its clients' traffic (a `prohibit` rule per slot
   after the lookup range); one the platform does not list keeps a slot whose block rule refuses
   its clients while its table has no route (KeeneticOS keeps routing `WireguardN` while RCI is
-  silent)
+  silent). While a firmware rebuild of the firewall has taken `TUN_DIR` away, each client's guards
+  (`lib/guard.sh`: ip rules by source and LAN interface) keep it in its tunnel or refused, its
+  address and CIDR exclusions direct
 - `exclude` takes IPv4 addresses and CIDRs beside country codes
 - Optional `gateway` is the OpenVPN next hop; ignored on WireGuard. On Merlin it
   is also what fills ovpncN when the server does not push redirect-gateway.
@@ -164,7 +170,8 @@ shutdown, durable notification and recovery contracts.
 - Shebang: sourced libraries keep `#!/usr/bin/env bash`; a script a router executes
   (`vpn-director.sh`, `configure.sh`, `import_server_list.sh`, `setup_telegram_bot.sh`,
   `lib/send-email.sh`, `install.sh`) starts `#!/bin/sh` and hands over to bash by absolute path — KeeneticOS
-  has no `/usr/bin/env`. Both forms then `set -euo pipefail`
+  has no `/usr/bin/env`. Both forms then `set -euo pipefail`. `lib/fwsnap-restore.sh`, which the
+  firmware hooks run, stays POSIX sh (no hand-over, no errexit) and always exits 0
 - Debug: `DEBUG=1 ./script.sh` enables tracing with informative PS4
 - Conditionals: Use `[[ ]]` instead of `[ ]`
 - Logging: `log -l ERROR|WARN|INFO|DEBUG|TRACE "message"`

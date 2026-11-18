@@ -38,6 +38,7 @@ router/test/
 ├── mocks/                   # Mock executables
 │   ├── nvram                # Mock nvram command
 │   ├── iptables             # Mock iptables
+│   ├── iptables-restore     # Mock iptables-restore: logs the call, reads nothing
 │   ├── ip6tables            # Mock ip6tables
 │   ├── ipset                # Mock ipset
 │   ├── nslookup             # Mock DNS resolution
@@ -50,6 +51,7 @@ router/test/
 │   ├── cru                  # Mock cru (Merlin cron)
 │   ├── xray                 # Mock "xray run -test" (XRAY_MOCK_EXIT, XRAY_MOCK_OUTPUT, XRAY_MOCK_LOG)
 │   ├── stateful/iptables    # Chains and rules kept per test (use_stateful_iptables)
+│   ├── stateful/iptables-restore # --noflush input into those chains, whole or nothing
 │   ├── stateful-ipset/ipset # XRAY_CLIENTS, TPROXY_BYPASS and their shadows kept per test (use_stateful_ipset)
 │   └── keenetic/
 │       └── curl             # RCI fixtures, per-test PATH
@@ -58,10 +60,12 @@ router/test/
 │   ├── tunnel.bats          # Tests for lib/tunnel.sh
 │   ├── iftunnel.bats        # Tests for lib/iftunnel.sh (interface tunnels, the vpd_* layer)
 │   ├── tproxy.bats          # Tests for lib/tproxy.sh
+│   ├── guard.bats           # Tests for lib/guard.sh (the guards, the direct rule)
+│   ├── fwsnap.bats          # lib/fwsnap.sh and lib/fwsnap-restore.sh (the snapshot, its restore)
 │   ├── platform.bats        # platform_detect and loader
 │   ├── platform_merlin.bats
 │   ├── platform_keenetic.bats
-│   ├── hooks.bats           # NDM hooks
+│   ├── hooks.bats           # NDM hooks; Merlin's firewall-start, nat-start and wan-event
 │   ├── install.bats
 │   ├── configure.bats
 │   ├── subscription.bats    # lib/subscription.sh on the shared cases in testdata/subscription
@@ -108,7 +112,7 @@ prefixes every path `platform_detect` looks at. Seams for Keenetic unit tests:
 | `load_ipset_module` | Source lib/ipset.sh module (uses `--source-only` flag) |
 | `load_tunnel_module` | Source lib/tunnel.sh module (uses `--source-only` flag) |
 | `load_tproxy_module` | Source lib/tproxy.sh module (uses `--source-only` flag) |
-| `use_stateful_iptables` | For the rest of the test, `mocks/stateful/iptables` ahead of the stateless mock: chains and rules kept under `$BATS_IPT_DIR`, a flush of a live chain appended to `$BATS_IPT_DIR/live_flushes`; call it after the `load_*` helper |
+| `use_stateful_iptables` | For the rest of the test, `mocks/stateful/iptables` ahead of the stateless mock: chains and rules kept under `$BATS_IPT_DIR`, a flush of a live chain appended to `$BATS_IPT_DIR/live_flushes`, and `mocks/stateful/iptables-restore` beside it to restore into them; call it after the `load_*` helper |
 | `use_stateful_ipset` | For the rest of the test, `mocks/stateful-ipset/ipset` ahead of the stateless mock: the members of `XRAY_CLIENTS`, `TPROXY_BYPASS` and their `_NEW` shadows kept under `$BATS_IPSET_DIR` (missing until created), so `ipset test` after an apply reads what the set holds; every other set stays with the stateless mock; call it after the `load_*` helper |
 | `ip_links "<iface> <flags> <mtu>"...` | For the rest of the test, the interfaces the `ip` mock's `link show` knows; any other name does not exist |
 
@@ -136,6 +140,12 @@ prefixes every path `platform_detect` looks at. Seams for Keenetic unit tests:
 | `VPD_CONFIG_FILE` | load_config | Test config fixture path |
 | `BATS_TEST_DIRNAME` | Bats | Directory containing test file |
 | `PROJECT_ROOT` | test_helper.bash | Project root directory |
+| `GUARD_STATE_DIR` | test_helper.bash `setup()` | Per test: where guard.sh records the preferences its rules went in at (`$BATS_TEST_TMPDIR/guards`) |
+| `FWSNAP_DIR` | test_helper.bash `setup()` | Per test: the snapshot fwsnap.sh writes and fwsnap-restore.sh reads (`$BATS_TEST_TMPDIR/fwsnap`) |
+| `VPD_JFFS_SCRIPTS_DIR` | test_helper.bash `setup()` | Per test: the firmware's shared hooks `platform_hooks_install` (Asuswrt-Merlin) writes (`$BATS_TEST_TMPDIR/jffs-scripts`, absent until a test or the function makes it) |
+| `VPD_HOOKS_DIR` | test_helper.bash `setup()` | The hooks the shared hook's line calls and the earlier releases' bodies it cuts out (`hooks/legacy/`): the tree's `router/opt/vpn-director/hooks` |
+| `VPD_RESTORE_PATH` | `restore` in fwsnap.bats | The PATH fwsnap-restore.sh runs with: the stateful mocks, the stateless ones, `/usr/bin:/bin`. Without it the script takes the router's directories, which on a workstation hold the real `iptables`; `restore` fails the test when `iptables` or `iptables-restore` resolves outside the mocks and the test's own fakes. `VPD_STOPPED_FILE`, `VPD_TUN_DIR_HASH` and `VPD_TUN_DIR_RESTORED` point it at the test's stop marker and Tunnel Director state |
+| `VPD_RESTORE` | `fake_restore` in hooks.bats | The restore the hooks run: a fake that notes its table in the log the apply is noted in, so one log shows the order |
 
 ## Mocks
 
@@ -144,11 +154,13 @@ Mocks are shell scripts in `router/test/mocks/` that simulate router commands:
 - **nvram**: Returns predefined values for router settings
 - **iptables/ip6tables**: Tracks rule operations
 - **stateful/iptables**: Remembers chains and rules per table under `$BATS_IPT_DIR` (`-S`, `-N`, `-F`, `-X`, `-E`, `-A`, `-I`, `-D`, `-C`); records a flush of a chain a rule still jumps to (a whole-table `-F` is not recorded). Turned on per test by `use_stateful_iptables`
+- **iptables-restore**: Logs the call to the iptables call log and returns success; what it is fed goes unread
+- **stateful/iptables-restore**: `iptables-restore --noflush`, the only form it takes, into the stateful iptables: `:<chain>` flushes a user chain that exists and creates one that does not, each `-A`/`-I` line goes to the stateful iptables, and a commit is whole or nothing - a line that fails, input that ends inside a table, or a last line without its newline (which iptables-restore 1.4.21 does not read as `COMMIT`) puts the table back and exits 1. The flush of a declared chain is no live flush: the kernel swaps the whole table in at the commit. On PATH with `use_stateful_iptables`
 - **ipset**: Simulates ipset management
 - **stateful-ipset/ipset**: Remembers `XRAY_CLIENTS`, `TPROXY_BYPASS` and their `_NEW` shadows under `$BATS_IPSET_DIR` (`list`, `create`, `add`, `del`, `test`, `flush`, `destroy`, `swap`). Members compare as in the kernel's `hash:net` sets: `x` and `x/32` are one element, kept as `x`; `add` and `del` take an element as written, so a host inside a network the set holds is added as an element of its own; `test` of a host (no prefix, or `/32`) finds it through any element that holds it, the address itself or a network around it, and `test` of a network finds only the identical element. Everything else goes to the stateless mock. Turned on per test by `use_stateful_ipset`; the processes a test starts inherit it
 - **nslookup**: Returns mock DNS responses
 - **logger**: Silent (no syslog in tests)
-- **ip**: Returns mock interface info; keeps ip rules (lookup and prohibit) and, per table, the routes add/replace put in and del/flush took out; `link show` answers from `ip_links`
+- **ip**: Returns mock interface info; keeps ip rules (lookup and prohibit) with their `from`, `to`, `fwmark` and `iif` selectors and renders each rule's selectors as iproute2 lists them: in iproute2's order, `from all` when no source was given, a `/32` without its length, `from x/0` as `from all` and `to x/0` not at all. It lists the rules after `0: from all lookup local` in the order they were added, not by preference, and prints no rule at 32766 or 32767 (main's and default's) but those a test adds. `add` refuses a rule identical to one it holds; `del` takes the first rule identical to the selectors given, or with a preference alone the first rule there. Per table it keeps the routes add/replace put in and del/flush took out; `link show` answers from `ip_links`
 - **insmod**: Records module loads (Keenetic)
 - **cru**: Merlin cron helper
 - **keenetic/curl**: Serves RCI fixtures; put on PATH per test

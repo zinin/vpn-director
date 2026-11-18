@@ -9,7 +9,11 @@ paths: "**/*.sh, jffs/**/*"
 - Shebang: `#!/usr/bin/env bash` for libraries, which are only ever sourced - except
   `lib/send-email.sh`, which `S99vpn-director` executes. A script a router executes starts
   `#!/bin/sh` and hands over to bash itself (see "No `/usr/bin/env`
-  on KeeneticOS" below). Both forms then `set -euo pipefail`
+  on KeeneticOS" below). Both forms then `set -euo pipefail`. The exception is
+  `lib/fwsnap-restore.sh`, which the firmware hooks run and wait for before they queue the apply:
+  it stays POSIX sh - no hand-over to bash, no errexit - and always exits 0. The hooks rely on
+  that: a few commands under the firmware's `/bin/sh`, inside NDM's 24-second timeout, and nothing
+  it fails at stops the apply that follows (`tunnel-director.md`, "State Tracking")
 - Debug mode: `DEBUG=1 ./script.sh` enables `set -x` with informative PS4
 - shellcheck annotations for intentional expansions/externals (SC2086, SC2155, SC2034)
 
@@ -33,6 +37,7 @@ paths: "**/*.sh, jffs/**/*"
 | `is_lan_ip [-6] <ip>` | Check if IP is in RFC1918/ULA range (prefix only) |
 | `is_ipv4_net <addr>` | IPv4 address or CIDR that iptables and ipset read as written (no leading zeros) |
 | `is_pos_int <value>` | Check if value is positive integer (>=1) |
+| `ensure_owned_dir <dir>` | watchd's `OwnedDir` policy for a directory of state root writes and trusts: a missing one made `0755` whatever the umask (its parent must exist; callers vet the parent first), a sticky one left as it is, any other `chmod go-w`; rc 1, nothing touched, for a symlink, no directory or another user's |
 | `rt_table_label <table>` | A routing table as `ip rule show` prints it: its rt_tables name, else as given |
 | `strip_comments [text]` | Remove blank lines and # comments |
 | `platform_wan_if` | Active WAN interface (platform contract; `get_active_wan_if` is a wrapper) |
@@ -248,7 +253,26 @@ starts `firewall-start` and `wan-event` without waiting for them
 (`run_custom_script` with no timeout), a WAN coming up does both, and a plain
 `apply` exits at once while another instance holds the lock - so the chains of
 a flush that landed during a running apply stayed empty until the next event.
-Both hooks pass `--wait`, as the KeeneticOS hooks do.
+Both hooks pass `--wait`, as the KeeneticOS hooks do, and run the apply
+detached, its descriptors closed: the firmware runs the shared
+`/jffs/scripts/<hook>`, whose one line of ours calls `/opt/vpn-director/hooks/<hook>`,
+and the owner's and other add-ons' commands after that line do not wait for the
+apply. It waits for them instead, a minute at most (`VPD_HOOK_SHELL`, the shell
+our line passes): iptables 1.4.15 on Merlin takes no lock, and two writers of one
+table at once can lose a rule of either.
+
+Ahead of that apply, `firewall-start` refills our chains from the snapshot the
+last apply left (`lib/fwsnap-restore.sh mangle`, `tunnel-director.md`, "State
+Tracking"): `iptables-restore --noflush` flushes each chain it declares that
+exists and fills it in the same commit, and puts the jumps back at the top of
+PREROUTING. One command, where the apply takes seconds; until it has run, the
+guards refuse the Xray clients and send a tunnel client's excluded countries
+through its tunnel. The restore leaves a mangle whose PREROUTING
+still jumps to our chains alone - a firewall start with QoS on keeps them - and
+one that went in takes Tunnel Director's hash away and leaves the restored
+marker, so the apply that follows rebuilds instead of reading the restored
+chain as applied. `nat-start` puts the interface tunnels' `MASQUERADE` back the
+same way, ahead of its apply.
 
 ### An apply never flushes a live chain or set
 
@@ -351,7 +375,8 @@ have_cmd() {
 
 Scripts that reach bash run under Entware's bash (`/opt/bin/bash`), where
 `command -v` works; the rule above is for what stays in `#!/bin/sh`: the
-generated update script, the init scripts and the NDM hooks. KeeneticOS's
+generated update script, the init scripts, the NDM hooks and
+`lib/fwsnap-restore.sh`, which the firmware hooks run. KeeneticOS's
 `/bin/sh` does have `command` (measured on 5.1.5), Asuswrt-Merlin's does not,
 so anything shipped to both platforms must assume it is missing.
 

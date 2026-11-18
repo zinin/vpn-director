@@ -31,6 +31,7 @@ fi
 #   vpn-director platform                    - Print platform facts as JSON (for the daemons)
 #   vpn-director cron install|remove         - Schedule or drop the daily ipset update
 #   vpn-director ensure-routes               - Put back a route an interface tunnel lost (cron runs it)
+#   vpn-director hooks                       - Put the call of our hooks into the firmware's shared hooks
 #
 # Options:
 #   -f, --force    Force operation (ignore hash checks)
@@ -123,6 +124,7 @@ Commands:
   platform                    Print platform facts as JSON
   cron install|remove         Schedule or drop the daily "update" job
   ensure-routes               Put back a route an interface tunnel lost (cron runs it every minute)
+  hooks                       Put the call of VPN Director's hooks into the firmware's shared hook scripts (Asuswrt-Merlin)
 
 Options:
   -f, --force       Force operation (ignore hash checks)
@@ -156,14 +158,28 @@ _load_common() {
     _COMMON_LOADED=1
 }
 
+# guard.sh and fwsnap.sh are newer than the rest: a router a partially copied update left without
+# one would otherwise die on the shell's bare "No such file or directory" in every command. Name
+# the missing library and the way out, as common.sh does for platform.sh, and fail: every caller
+# runs this as a plain command, so errexit ends the run.
 _load_modules() {
     [[ ${_MODULES_LOADED:-0} -eq 1 ]] && return 0
     _load_common
     . "$SCRIPT_DIR/lib/firewall.sh"
     . "$SCRIPT_DIR/lib/config.sh"
+    if [[ ! -f "$SCRIPT_DIR/lib/guard.sh" ]]; then
+        log -l ERROR "Guard library not found: $SCRIPT_DIR/lib/guard.sh - re-run install.sh to reinstall it"
+        return 1
+    fi
+    . "$SCRIPT_DIR/lib/guard.sh"
     . "$SCRIPT_DIR/lib/ipset.sh" --source-only
     . "$SCRIPT_DIR/lib/tunnel.sh" --source-only
     . "$SCRIPT_DIR/lib/tproxy.sh" --source-only
+    if [[ ! -f "$SCRIPT_DIR/lib/fwsnap.sh" ]]; then
+        log -l ERROR "Firewall snapshot library not found: $SCRIPT_DIR/lib/fwsnap.sh - re-run install.sh to reinstall it"
+        return 1
+    fi
+    . "$SCRIPT_DIR/lib/fwsnap.sh"
     _MODULES_LOADED=1
 }
 
@@ -216,11 +232,21 @@ cmd_status() {
     _load_modules
     case "$COMPONENT" in
         ""|all)
+            # The guards counted per preference, not listed (guard_status): the bot's /status
+            # keeps the tail of this, and the guards of a few Xray clients alone pushed Tunnel
+            # Director's section out of it. "status tunnel" and "status xray" list them.
             ipset_status
             echo ""
-            tunnel_status
+            GUARD_STATUS_BRIEF=1 tunnel_status
             echo ""
-            tproxy_status
+            GUARD_STATUS_BRIEF=1 tproxy_status
+            # The firmware's shared hooks and our line in each (Asuswrt-Merlin); a platform whose
+            # hooks are files of its own has nothing to show.
+            local hooks_status
+            if hooks_status="$(platform_hooks_status)"; then
+                echo ""
+                printf '%s\n' "=== Firmware Hooks ===" "$hooks_status"
+            fi
             ;;
         ipset)
             ipset_status
@@ -287,8 +313,35 @@ cmd_apply() {
     # Handle --force: pass to ipset module
     [[ $FORCE -eq 1 ]] && export IPSET_FORCE_UPDATE=1
 
+    # An apply of one component moves the direct rule (guard_direct_ensure) and rebuilds that
+    # component's rules alone, while the other component's chain may still be in mangle. After a
+    # change of pref_base, mark_mask or mark_shift the other's rules would stay at the former
+    # preferences (guard_layout_moved), and after a change of the direct mark - direct_mark, or a
+    # mask that moved the bit picked without it - its chain would keep setting the former bit,
+    # which no rule routes any more (guard_direct_mark_moved): Tunnel Director's exclusions would
+    # go into the tunnel, what Xray lets go direct would be refused. Such an apply runs in full, so
+    # both chains and the rule move together: restart xray, restart tunnel and ensure-routes,
+    # which end in a component's cmd_apply, too. Plain conditions: both return 1 for a layout that
+    # has not moved, and that must not end the run.
+    local other="" others_rules="" mark_in_place
+    case "$COMPONENT" in
+        xray|tproxy) other="${TUN_DIR_CHAIN:-TUN_DIR}" others_rules="Tunnel Director's rules" ;;
+        tunnel) other="${XRAY_CHAIN:-}" others_rules="Xray's rules" ;;
+    esac
+    if [[ -n $other ]] && guard_layout_moved "$other"; then
+        log -l WARN "pref_base, mark_mask or mark_shift moved the direct rule from preference $(_guard_record direct) to $(guard_direct_pref) since the last apply; $others_rules have to move with it, so this apply runs in full"
+        COMPONENT=all
+    elif [[ -n $other ]] && mark_in_place=$(guard_direct_mark_moved "$other"); then
+        log -l WARN "direct_mark or a mark mask changed the direct mark from $mark_in_place to $(guard_direct_mark_hex) since the last apply; $others_rules have to move with it, so this apply runs in full"
+        COMPONENT=all
+    fi
+
     local required_ipsets=""
 
+    # Every branch that applies ends with the snapshot of the rules it leaves (fwsnap_save),
+    # which the firmware hooks restore after a rebuild of the firewall, ahead of the apply they
+    # queue. A branch that fails part-way ends the run before it, and the snapshot of an earlier
+    # apply stays.
     case "$COMPONENT" in
         ""|all)
             required_ipsets="$(tunnel_get_required_ipsets) $(tproxy_get_required_ipsets)"
@@ -309,7 +362,9 @@ cmd_apply() {
             # Director in one step, a client moving to a tunnel was on neither for the length
             # of tunnel_apply and left through the WAN.
             #
-            # tproxy_apply soft-fails (a WARN and rc 0). tunnel_apply hard-fails under
+            # tproxy_apply soft-fails (a WARN and rc 0), but for a direct mark or guard
+            # preferences guard_layout_check refuses, which end the run with rc 1 before it
+            # touches anything, Tunnel Director included. tunnel_apply hard-fails under
             # errexit when it cannot apply at all - a malformed tunnels object, no LAN
             # interface - and the run ends before the prune: the clients that left Xray stay
             # proxied rather than leak. On a soft failure - a refused rule, a swap that did not
@@ -324,6 +379,7 @@ cmd_apply() {
             tunnel_apply
             _prune_keeping "$(tunnel_uncarried)"
             _routes_cron_sync
+            fwsnap_save
             ;;
         tunnel)
             required_ipsets=$(tunnel_get_required_ipsets)
@@ -333,6 +389,7 @@ cmd_apply() {
             fi
             tunnel_apply
             _routes_cron_sync
+            fwsnap_save
             ;;
         xray|tproxy)
             required_ipsets=$(tproxy_get_required_ipsets)
@@ -345,8 +402,12 @@ cmd_apply() {
             # Xray has it, and such a client stays proxied until a full apply moves it.
             # Only a client that left Xray for direct is let go, one moved to main among
             # them: main is no tunnel, and a client of it that no rule marks goes direct.
+            # An apply that finds the direct rule moved by pref_base, mark_mask or
+            # mark_shift, or its mark changed, since the last apply never gets here: it
+            # runs in full, with a WARN (above).
             tproxy_apply
             _prune_keeping "$(tunnel_clients)"
+            fwsnap_save
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2
@@ -372,16 +433,28 @@ cmd_stop() {
             printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
             ;;
     esac
+    # Then the snapshot of the rules goes, whichever component stops, before any teardown: the
+    # hooks restore it after a rebuild of the firewall, and a rebuild during the teardown would
+    # bring back what the stop takes away. A full stop leaves none. A component's stop then
+    # snapshots what keeps running - fwsnap_save declares only the chains that exist, and the
+    # stopped one is gone by then - so a rebuild after it brings the other component's chain back
+    # at once, where its clients would sit on their guards until the hook's apply. An unknown
+    # component stops nothing and keeps the snapshot.
     case "$COMPONENT" in
         ""|all)
+            fwsnap_remove
             tproxy_stop
             tunnel_stop
             ;;
         tunnel)
+            fwsnap_remove
             tunnel_stop
+            fwsnap_save
             ;;
         xray|tproxy)
+            fwsnap_remove
             tproxy_stop
+            fwsnap_save
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2
@@ -455,11 +528,13 @@ cmd_update() {
         _ensure_ipsets $required_ipsets
     fi
 
-    # Make before break, for the reason spelled out in cmd_apply.
+    # Make before break, for the reason spelled out in cmd_apply, and the
+    # snapshot of the rules last, as there.
     tproxy_apply
     tunnel_apply
     _prune_keeping "$(tunnel_uncarried)"
     _routes_cron_sync
+    fwsnap_save
 
     log "Update complete"
 }
@@ -634,6 +709,30 @@ cmd_cron() {
     esac
 }
 
+# -------------------------------------------------------------------------------------------------
+# cmd_hooks - put the call of our hooks into the firmware's shared hook scripts
+# -------------------------------------------------------------------------------------------------
+# Asuswrt-Merlin runs /jffs/scripts/<hook>, files shared with the owner and other add-ons: install
+# and update run this to put one line of ours into each and keep the rest of it, cutting out the
+# body an earlier release wrote (platform_hooks_install). Each line the platform prints is logged,
+# a "warn:" one as a WARN. No config and no lock: it touches no rule, and a hook is replaced by a
+# rename. Exits 1 when a hook is left without the line. An apply never runs it: a line the owner
+# took out stays out until install, an update or this command.
+# -------------------------------------------------------------------------------------------------
+cmd_hooks() {
+    _load_common
+    local out line rc=0
+    out="$(platform_hooks_install)" || rc=$?
+    while IFS= read -r line; do
+        case "$line" in
+            "ok: "*)   log "${line#ok: }" ;;
+            "warn: "*) log -l WARN "${line#warn: }" ;;
+            ?*)        log "$line" ;;
+        esac
+    done <<< "$out"
+    return "$rc"
+}
+
 ###################################################################################################
 # Main
 ###################################################################################################
@@ -668,6 +767,9 @@ case "$COMMAND" in
         ;;
     ensure-routes)
         cmd_ensure_routes
+        ;;
+    hooks)
+        cmd_hooks
         ;;
     *)
         echo "Unknown command: $COMMAND" >&2

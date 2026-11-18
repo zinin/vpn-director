@@ -564,3 +564,23 @@ EOF
     run platform_prerouting_base_pos
     assert_output "2"
 }
+
+# ---------------------------------------------------------------- Shared hooks
+#
+# The NDM hooks are files of our own (/opt/etc/ndm/*/50-vpn-director.sh), which
+# install and update replace whole: there is no shared hook to put a line into.
+
+@test "platform_hooks_install: nothing to do on KeeneticOS" {
+    load_platform
+    run platform_hooks_install
+    assert_success
+    refute_output
+    [ ! -e "$VPD_JFFS_SCRIPTS_DIR" ]
+}
+
+@test "platform_hooks_status: nothing to show on KeeneticOS" {
+    load_platform
+    run platform_hooks_status
+    assert_failure
+    refute_output
+}

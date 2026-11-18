@@ -1,0 +1,85 @@
+#!/bin/bash
+# The iptables-restore of the stateful iptables beside it: use_stateful_iptables
+# (test_helper.bash) puts both on PATH. It reads restore input from stdin as
+# "iptables-restore --noflush" does and hands each rule to that iptables, so
+# what it restores is what a listing shows, -C finds and -X refuses. Every call
+# is logged to /tmp/bats_iptables_calls.log, as the iptables mocks log theirs.
+#
+#   *<table>       starts a table, and its chains are copied aside
+#   :<chain> ...   flushes a user chain that exists, creates one that does not
+#                  (a builtin chain's policy is not kept)
+#   -A|-I ...      the stateful "iptables -t <table>" with the line's words
+#   COMMIT         ends the table
+#
+# Only --noflush: a restore that flushes every table it names is not one this
+# project makes. A commit is whole or nothing, as the kernel takes a table: a
+# line that fails - and input that ends inside a table, or whose last line has
+# no newline, which iptables-restore 1.4.21 does not read as COMMIT - puts the
+# copy back and exits 1. The flush of a declared chain is not a live flush: the
+# kernel swaps the whole table in at the commit.
+
+echo "iptables-restore $*" >> /tmp/bats_iptables_calls.log
+
+dir="${BATS_IPT_DIR:?use_stateful_iptables sets BATS_IPT_DIR}"
+iptables="${BASH_SOURCE[0]%/*}/iptables"
+
+if [[ $# -ne 1 || $1 != --noflush ]]; then
+    echo "iptables-restore: the mock takes --noflush alone" >&2
+    exit 2
+fi
+
+table=""
+n=0
+
+# fail <reason> - put the table the input is in back as it was, and exit 1.
+fail() {
+    if [[ -n $table ]]; then
+        rm -rf "${dir:?}/$table"
+        mv "$dir/.restore.$table" "$dir/$table"
+    fi
+    echo "iptables-restore: line $n failed: $1" >&2
+    exit 1
+}
+
+while IFS= read -r line; do
+    n=$((n + 1))
+    case "$line" in
+        ''|'#'*) ;;
+        '*'*)
+            [[ -z $table ]] || fail "COMMIT expected"
+            table="${line#\*}"
+            mkdir -p "$dir/$table"
+            rm -rf "${dir:?}/.restore.$table"
+            cp -a "$dir/$table" "$dir/.restore.$table"
+            ;;
+        :*)
+            [[ -n $table ]] || fail "no table"
+            chain="${line#:}"
+            chain="${chain%% *}"
+            case "$chain" in
+                PREROUTING|INPUT|FORWARD|OUTPUT|POSTROUTING) ;;
+                *) : > "$dir/$table/$chain" ;;
+            esac
+            ;;
+        COMMIT)
+            [[ -n $table ]] || fail "no table"
+            rm -rf "${dir:?}/.restore.$table"
+            table=""
+            ;;
+        '-A '*|'-I '*)
+            [[ -n $table ]] || fail "no table"
+            read -ra args <<< "$line"
+            "$iptables" -t "$table" "${args[@]}" || fail "$line"
+            ;;
+        *)
+            fail "$line"
+            ;;
+    esac
+done
+# read hands over a last line without its newline and fails, which ends the loop.
+if [[ -n $line ]]; then
+    n=$((n + 1))
+    fail "no newline after \"$line\""
+fi
+[[ -z $table ]] || fail "COMMIT expected"
+exit 0

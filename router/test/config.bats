@@ -81,6 +81,22 @@ load 'test_helper'
     [[ $TUN_DIR_PREF_BASE == "16384" ]]
 }
 
+# The template leaves the key out, and so does the fixture. It stays empty, and lib/guard.sh picks
+# the mark: 0x200, unless a mark mask holds that bit.
+@test "config.sh: TUN_DIR_DIRECT_MARK is empty without the key" {
+    load_config
+    [ "$(jq '.advanced.tunnel_director | has("direct_mark")' "$VPD_CONFIG_FILE")" = "false" ]
+    [ -z "$TUN_DIR_DIRECT_MARK" ]
+}
+
+@test "config.sh: loads advanced.tunnel_director.direct_mark" {
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-direct-mark.json"
+    jq '.advanced.tunnel_director.direct_mark = "0x400"' "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    [ "$TUN_DIR_DIRECT_MARK" = "0x400" ]
+}
+
 # ============================================================================
 # config.sh: error handling
 # ============================================================================

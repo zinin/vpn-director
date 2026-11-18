@@ -10,18 +10,26 @@
 # Dependencies:
 #   - common.sh (log, tmp_file, is_ipv4_net, rt_table_label) and, through it, the platform contract
 #     (platform_load_module, platform_vpn_endpoints, platform_tproxy_extra_rules,
-#      platform_lan_ifaces)
+#      platform_lan_ifaces, platform_tunnel_offload_target)
 #   - firewall.sh (delete_fw_chain, ensure_fw_rule, purge_fw_rules, swap_fw_chain, fw_chain_exists)
 #   - config.sh (XRAY_* variables)
+#   - guard.sh (guard_layout_check, guard_direct_mark_hex, guard_direct_ensure: the direct mark
+#               the chain sets on what it lets through, and the direct rule that routes it;
+#               guard_sync, guard_clear, guard_list, guard_status, guard_direct_release: the
+#               guards, which refuse an Xray client's packets while the firmware has deleted the
+#               chain)
 #   - ipset.sh (_is_valid_country_code, _ipset_exists)
 #
 # Public API:
-#   tproxy_status()              - show XRAY_TPROXY chain, routing, xray process
-#   tproxy_apply()               - the make half of an apply: routing, sets, chain swapped in;
-#                                  clients added, never removed; soft-fail if unavailable
+#   tproxy_status()              - show XRAY_TPROXY chain, routing, the guards, xray process
+#   tproxy_apply()               - the make half of an apply: routing, sets, the direct rule, chain
+#                                  swapped in, the guards; clients added, never removed; soft-fail
+#                                  if unavailable; rc 1, nothing touched, for a refused layout
 #   tproxy_prune [<addr>...]     - the break half: XRAY_CLIENTS becomes the effective clients, plus
-#                                  every <addr> it holds (the clients Tunnel Director does not carry)
-#   tproxy_stop()                - remove chain and routing
+#                                  every <addr> it holds (the clients Tunnel Director does not
+#                                  carry), and the guards follow it
+#   tproxy_stop()                - remove chain, routing and the guards; the direct rule once
+#                                  neither module needs it
 #   tproxy_restart_process()     - restart Xray process via Entware init script
 #   tproxy_get_required_ipsets() - return list of valid exclude ipsets (unknown codes dropped with a WARN)
 #
@@ -41,6 +49,11 @@
 #   _tproxy_build_chain()           - fill a fresh chain with the TPROXY rules (swap_fw_chain's build_fn)
 #   _tproxy_jump_pos()              - where the first XRAY_TPROXY jump goes: position 1
 #   _tproxy_setup_iptables()        - platform rules, then the chain swapped in with its jumps
+#   _tproxy_guards_wanted()         - does the live chain mark what it lets through direct?
+#   _tproxy_members()               - the members of the clients ipset, sorted
+#   _tproxy_guard_lines()           - the guards of what the clients ipset holds, in order
+#   _tproxy_guards_sync()           - make the guards those of the clients ipset (guard_sync)
+#   _tproxy_guards_prune()          - drop the guards of the clients the ipset let go, add none
 #   _tproxy_validate_ipv4_cidr()    - validate IPv4 address or CIDR notation
 #   _tproxy_teardown_iptables()     - remove iptables rules and ipsets
 #   _tproxy_init()                  - initialize module state
@@ -519,33 +532,62 @@ _tproxy_jump_pos() {
 # -------------------------------------------------------------------------------------------------
 # _tproxy_build_chain <chain> - fill a fresh chain with the TPROXY rules (swap_fw_chain's build_fn)
 # -------------------------------------------------------------------------------------------------
-# The rules ahead of the targets are of two kinds. Rule 1 and the private ranges of rule 4 bound
-# what the targets take - without rule 1 every LAN client, without rule 4 traffic to the router
-# and the rest of the LAN - so a failure there, or of a target itself, returns 2: the chain must
-# not go in, and the chain already in place keeps working. The others only decide what a client
-# reaches directly instead of through the proxy: a failure there is logged and returns 1, and the
-# chain goes in without the rule, the ready marker withheld. Keeping the chain out for those as
-# well left every Xray client on the WAN over one busy xtables lock.
+# The rules ahead of the targets are of two kinds. Rule 1 and the private ranges of rule 6 bound
+# what the targets take - without rule 1 every LAN client, without rule 6 traffic to the router
+# and the rest of the LAN - and the direct mark of rule 2 is what the direct rule sends to main:
+# without it, what the chain lets through meets the guards instead, and Xray's refuse it. A
+# failure there, or of a target itself, returns 2: the chain must not go in, and the chain
+# already in place keeps working. The others only decide what a client reaches directly instead
+# of through the proxy, or, the offload opt-out of rule 3, whether the platform may accelerate
+# it: a failure there is logged and returns 1, and the chain goes in without the rule, the ready
+# marker withheld. Keeping the chain out for those as well left every Xray client on the WAN over
+# one busy xtables lock.
 # -------------------------------------------------------------------------------------------------
 _tproxy_build_chain() {
-    local chain="$1" exclude_set resolved_set narrow_rc=0
+    local chain="$1" exclude_set resolved_set direct_mark offload_target narrow_rc=0 offload_ok=1
     local -a exclude_sets_array
 
     read -ra exclude_sets_array <<< "$(_tproxy_exclude_sets -q)"
+
+    # guard_layout_check, in tproxy_apply, has refused a direct mark that is none. A platform
+    # whose firmware accelerates forwarded flows past mangle names the target that opts a flow out
+    # of it (KeeneticOS: PPE); one that needs none prints nothing and returns 1.
+    direct_mark="$(guard_direct_mark_hex)" || return 2
+    offload_target="$(platform_tunnel_offload_target)" || offload_target=""
 
     # Rule 1: Skip if source is not in our clients ipset
     ensure_fw_rule -q mangle "$chain" \
         -m set ! --match-set "$XRAY_CLIENTS_IPSET" src -j RETURN || return 2
 
-    # Rule 2: Skip traffic to bypass destinations (Xray servers, user excludes, OpenVPN endpoints)
+    # Rule 2: The direct mark, on every packet of an Xray client. What the RETURNs below let go
+    # leaves the chain with it, and so does a protocol TPROXY does not take: the direct rule
+    # (lib/guard.sh) sends it to main ahead of the guards. A packet TPROXY takes gets Xray's mark
+    # beside it (--tproxy-mark leaves every bit outside fwmark_mask alone) and meets Xray's rule
+    # first. TUN_DIR tests its own field alone, so what Xray lets through of a client that is on a
+    # tunnel too is still marked for the tunnel, whose lookup rule comes before the direct rule.
+    # _tproxy_guards_wanted asks for this rule in this very form, no match ahead of the target:
+    # the two go together.
+    ensure_fw_rule -q mangle "$chain" \
+        -j MARK --set-xmark "$direct_mark/$direct_mark" || return 2
+
+    # Rule 3: The platform's offload opt-out, for what Xray lets through. The fast path routes a
+    # flow it took over by the ip rules alone, never by a mark, so an accelerated flow would meet
+    # the guards after its first packets. A flow TPROXY takes ends in a local socket, and no fast
+    # path takes it.
+    if [[ -n $offload_target ]] && ! ensure_fw_rule -q mangle "$chain" -j "$offload_target"; then
+        log -l WARN "The TPROXY offload opt-out did not go in; what Xray lets through can be accelerated past its direct mark until the next apply"
+        offload_ok=0
+    fi
+
+    # Rule 4: Skip traffic to bypass destinations (Xray servers, user excludes, OpenVPN endpoints)
     ensure_fw_rule -q mangle "$chain" \
         -m set --match-set "$XRAY_BYPASS_IPSET" dst -j RETURN || narrow_rc=1
 
-    # Rule 3: Skip local destinations (loopback)
+    # Rule 5: Skip local destinations (loopback)
     ensure_fw_rule -q mangle "$chain" \
         -d 127.0.0.0/8 -j RETURN || narrow_rc=1
 
-    # Rule 4: Skip private network destinations (RFC1918)
+    # Rule 6: Skip private network destinations (RFC1918)
     ensure_fw_rule -q mangle "$chain" \
         -d 10.0.0.0/8 -j RETURN || return 2
     ensure_fw_rule -q mangle "$chain" \
@@ -553,19 +595,19 @@ _tproxy_build_chain() {
     ensure_fw_rule -q mangle "$chain" \
         -d 192.168.0.0/16 -j RETURN || return 2
 
-    # Rule 5: Skip link-local
+    # Rule 7: Skip link-local
     ensure_fw_rule -q mangle "$chain" \
         -d 169.254.0.0/16 -j RETURN || narrow_rc=1
 
-    # Rule 6: Skip multicast
+    # Rule 8: Skip multicast
     ensure_fw_rule -q mangle "$chain" \
         -d 224.0.0.0/4 -j RETURN || narrow_rc=1
 
-    # Rule 7: Skip broadcast
+    # Rule 9: Skip broadcast
     ensure_fw_rule -q mangle "$chain" \
         -d 255.255.255.255/32 -j RETURN || narrow_rc=1
 
-    # Rule 8: Skip excluded country/custom ipsets
+    # Rule 10: Skip excluded country/custom ipsets
     for exclude_set in "${exclude_sets_array[@]}"; do
         [[ -n $exclude_set ]] || continue
         if ! resolved_set="$(_tproxy_resolve_exclude_set "$exclude_set")"; then
@@ -585,7 +627,7 @@ _tproxy_build_chain() {
         log -l WARN "A TPROXY exclusion did not go in; its destinations are proxied until the next apply"
     fi
 
-    # Rule 9: Apply TPROXY for remaining traffic.
+    # Rule 11: Apply TPROXY for remaining traffic.
     ensure_fw_rule -q mangle "$chain" \
         -p tcp -j TPROXY --on-port "$XRAY_TPROXY_PORT" \
         --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK" || return 2
@@ -593,6 +635,7 @@ _tproxy_build_chain() {
         -p udp -j TPROXY --on-port "$XRAY_TPROXY_PORT" \
         --tproxy-mark "$XRAY_FWMARK/$XRAY_FWMARK_MASK" || return 2
 
+    [[ $offload_ok -eq 1 ]] || return 1
     return "$narrow_rc"
 }
 
@@ -650,6 +693,154 @@ _tproxy_setup_iptables() {
 }
 
 # -------------------------------------------------------------------------------------------------
+# _tproxy_guards_wanted - does the live XRAY_TPROXY mark what it lets through direct?
+# -------------------------------------------------------------------------------------------------
+# Asks iptables for rule 2 as _tproxy_build_chain writes it - "-j MARK --set-xmark <D>/<D>", no
+# match, D from guard_direct_mark_hex: the two go together. Without that rule what goes direct
+# leaves unmarked and would meet the clients' guards, which refuse it, so they are not synced and
+# stay as they are: a chain an earlier version put in returns bare from every exclusion, and with
+# no chain at all - xt_TPROXY missing, the firmware's rebuild - every packet goes unmarked. Returns
+# 1 then.
+# -------------------------------------------------------------------------------------------------
+_tproxy_guards_wanted() {
+    local mark
+    mark="$(guard_direct_mark_hex)" || return 1
+    iptables -t mangle -C "$XRAY_CHAIN" -j MARK --set-xmark "$mark/$mark" 2>/dev/null
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tproxy_members - the members of XRAY_CLIENTS_IPSET, one per line, sorted
+# -------------------------------------------------------------------------------------------------
+# The first word of each line after "Members:" of "ipset list", "/32" dropped, as "ip rule show"
+# prints a host in a guard's from. Sorted: the kernel lists them in hash order, which a swap of
+# the set changes, and the same guards in another order would be written anew. Returns 1 with an
+# ERROR, printing nothing, when the set cannot be listed.
+# -------------------------------------------------------------------------------------------------
+_tproxy_members() {
+    local listing members
+    if ! listing="$(ipset list "$XRAY_CLIENTS_IPSET" 2>/dev/null)" ||
+        ! members="$(awk 'm && NF { sub(/\/32$/, "", $1); print $1 } /^Members:/ { m = 1 }' \
+            <<< "$listing" | LC_ALL=C sort)"; then
+        log -l ERROR "Xray: cannot list $XRAY_CLIENTS_IPSET; the guards stay as they are"
+        return 1
+    fi
+    [[ -z $members ]] || printf '%s\n' "$members"
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tproxy_guard_lines - Xray's guards, one ip rule's selectors per line, in the order they are to
+# match (guard_sync)
+# -------------------------------------------------------------------------------------------------
+# The firmware's firewall rebuilds take XRAY_TPROXY away - NDM deletes it, Merlin's firewall start
+# empties it - and until the apply puts it back an Xray client's packets are neither proxied nor
+# marked: they would reach main and leave through the WAN. ip rules survive the rebuilds. Xray
+# cannot be reached without the chain, so a client's guards refuse such a packet, but for what the
+# chain lets go direct. Per member X of XRAY_CLIENTS_IPSET and LAN interface L:
+#
+#   from <X> to <R> iif L lookup main    each private range R: 10.0.0.0/8, 172.16.0.0/12,
+#                                        192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4
+#   from <X> to <E> iif L lookup main    each address or CIDR E of xray.exclude_ips
+#   from <X> iif L prohibit              everything else
+#
+# A packet the chain marked - for Xray, or direct - meets Xray's rule or the direct rule first, so
+# in normal operation none reaches a guard. The members are what the set holds (_tproxy_members):
+# in tproxy_apply the clients it added and those an earlier apply left, after tproxy_prune the
+# effective clients and those it kept. They come sorted, and which comes first changes no route:
+# each gets the same guards.
+#
+# "iif" keeps the router's own traffic out - a client's CIDR may hold the router's LAN address -
+# and the local table, at preference 0, answers traffic to the router before any guard. An entry
+# of xray.exclude_ips gets its line only where the bypass set can hold it as written: an address
+# or a CIDR that ip and ipset read as such (is_ipv4_net), and no /0, which no hash:net set takes.
+# _tproxy_validate_ipv4_cidr lets a leading zero through, which ipset refuses and ip reads as
+# octal - 010 is 8: the guard would send another address direct, or be refused on every apply. A
+# country of xray.exclude_sets is no ip rule - no rule matches a set - and neither are the Xray
+# servers and the firmware's VPN endpoints the bypass set holds: while the chain is gone, their
+# traffic is refused as well. Returns 1 with an ERROR, printing nothing, when the platform names no
+# LAN interface or the set cannot be listed: the empty list would take every guard away.
+# -------------------------------------------------------------------------------------------------
+_tproxy_guard_lines() {
+    local lan_ifaces members member lan_if range excl
+    local -a ranges=(10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 224.0.0.0/4)
+    local -a excludes=()
+    lan_ifaces="$(platform_lan_ifaces)" || lan_ifaces=""
+    if [[ -z $lan_ifaces ]]; then
+        log -l ERROR "Xray: cannot determine the LAN interfaces; the guards stay as they are"
+        return 1
+    fi
+    members="$(_tproxy_members)" || return 1
+    [[ -z ${XRAY_EXCLUDE_IPS:-} ]] || read -ra excludes <<< "$XRAY_EXCLUDE_IPS"
+
+    while IFS= read -r member; do
+        [[ -n $member ]] || continue
+        while IFS= read -r lan_if; do
+            [[ -n $lan_if ]] || continue
+            for range in "${ranges[@]}"; do
+                printf 'from %s to %s iif %s lookup main\n' "$member" "$range" "$lan_if"
+            done
+            for excl in ${excludes[@]+"${excludes[@]}"}; do
+                is_ipv4_net "$excl" || continue
+                [[ $excl != */0 ]] || continue
+                printf 'from %s to %s iif %s lookup main\n' "$member" "${excl%/32}" "$lan_if"
+            done
+            printf 'from %s iif %s prohibit\n' "$member" "$lan_if"
+        done <<< "$lan_ifaces"
+    done <<< "$members"
+    return 0
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tproxy_guards_sync - make Xray's guards those of what XRAY_CLIENTS_IPSET holds
+# -------------------------------------------------------------------------------------------------
+# The new list goes in before the old one goes (guard_sync), and only while the live chain marks
+# what it lets through direct (_tproxy_guards_wanted): otherwise the guards stay as they are, and
+# it returns 2. Returns 1 when a guard did not go in - guard_sync logs an ERROR for each and keeps
+# the old guards of the clients the list still names - or when _tproxy_guard_lines cannot say what
+# they are (it logs the ERROR), the guards left as they are.
+# -------------------------------------------------------------------------------------------------
+_tproxy_guards_sync() {
+    local lines
+    _tproxy_guards_wanted || return 2
+    lines="$(_tproxy_guard_lines)" || return 1
+    guard_sync xray "$lines"
+}
+
+# -------------------------------------------------------------------------------------------------
+# _tproxy_guards_prune - drop the guards of the clients XRAY_CLIENTS_IPSET no longer holds, and
+# add none
+# -------------------------------------------------------------------------------------------------
+# For tproxy_prune while the live chain does not answer for its direct mark (_tproxy_guards_sync
+# returned 2). No guard may go in then, but a client the swap let go is returned by rule 1
+# unmarked, and in normal operation its refusal would meet it where it goes direct. guard_sync gets
+# the guards in place (guard_list, the preference stripped, in their order) of every member the
+# set still holds, its from compared with the members as _tproxy_guard_lines reads them
+# (_tproxy_members): it writes no line that is not in place already, and takes the rest. Nothing
+# changes when no guard is to go, nor when guard_list prints nothing: no guard, or a listing that
+# failed, which it does not tell apart, and the empty list would take every guard away. Returns 1
+# when the members cannot be read (the ERROR is logged) or guard_sync returns 1.
+# -------------------------------------------------------------------------------------------------
+_tproxy_guards_prune() {
+    local members listed line from kept="" dropped=0
+    local -a words=()
+    members="$(_tproxy_members)" || return 1
+    listed="$(guard_list xray)"
+    [[ -n $listed ]] || return 0
+    while IFS= read -r line; do
+        read -ra words <<< "${line#*:}"
+        [[ ${#words[@]} -gt 0 ]] || continue
+        from=""
+        [[ ${words[0]} != from ]] || from="${words[1]:-}"
+        if [[ -n $from && $'\n'$members$'\n' == *$'\n'"${from%/32}"$'\n'* ]]; then
+            kept+="${words[*]}"$'\n'
+        else
+            dropped=1
+        fi
+    done <<< "$listed"
+    [[ $dropped -eq 1 ]] || return 0
+    guard_sync xray "$kept"
+}
+
+# -------------------------------------------------------------------------------------------------
 # _tproxy_teardown_iptables - remove all iptables rules
 # -------------------------------------------------------------------------------------------------
 _tproxy_teardown_iptables() {
@@ -702,7 +893,7 @@ tproxy_restart_process() {
 # -------------------------------------------------------------------------------------------------
 # tproxy_status - show TPROXY status
 # -------------------------------------------------------------------------------------------------
-# Displays kernel module, routing, chains, ipsets, and xray process.
+# Displays kernel module, routing, the direct rule and the guards, ipsets, chains, and xray process.
 # -------------------------------------------------------------------------------------------------
 tproxy_status() {
     _tproxy_init
@@ -719,7 +910,17 @@ tproxy_status() {
     ip route show table "$XRAY_ROUTE_TABLE" 2>/dev/null || printf '%s\n' "  (empty)"
     printf '\n'
     printf '%s\n' "IP Rules:"
-    ip rule show | grep -E "$XRAY_ROUTE_TABLE|$XRAY_FWMARK" || printf '%s\n' "  (none)"
+    # Xray's own: its mark under any mask, or its table (_tproxy_rule_is_ours). The table number
+    # alone matched any rule holding its digits, the guards of 192.168.1.100 among them.
+    ip rule show | grep -E "fwmark $XRAY_FWMARK/|lookup $(rt_table_label "$XRAY_ROUTE_TABLE")( |\$)" ||
+        printf '%s\n' "  (none)"
+    printf '\n'
+
+    # The guards, which refuse an Xray client's packets while the firmware has deleted the chain,
+    # and the direct rule ahead of them, which sends what the chains mark direct to main: listed,
+    # or counted per preference in the full status (GUARD_STATUS_BRIEF=1, guard_status).
+    printf '%s\n' "--- Guards (ip rules by source) ---"
+    guard_status xray
     printf '\n'
 
     printf '%s\n' "--- Clients Ipset ---"
@@ -782,9 +983,10 @@ tproxy_get_required_ipsets() {
 }
 
 # -------------------------------------------------------------------------------------------------
-# tproxy_stop - remove chain and routing
+# tproxy_stop - remove chain, routing and the guards
 # -------------------------------------------------------------------------------------------------
-# Removes all TPROXY iptables rules and routing configuration.
+# Removes all TPROXY iptables rules and routing configuration, then Xray's guards, and the direct
+# rule once neither module needs it: the module that stops last removes it.
 # -------------------------------------------------------------------------------------------------
 tproxy_stop() {
     _tproxy_init
@@ -792,6 +994,13 @@ tproxy_stop() {
     log "Stopping Xray TPROXY routing..."
     _tproxy_teardown_iptables
     _tproxy_teardown_routing
+    # The guards, and with them the direct rule once neither module needs it:
+    # guard_direct_release leaves it while TUN_DIR is in mangle or Tunnel
+    # Director's guards are in place, and runs once the chain is gone, which
+    # could still mark a packet direct. Those a former pref_base left go too, at
+    # the preferences guard.sh recorded; nothing from main's rule at 32766 on.
+    guard_clear xray
+    guard_direct_release
     rm -f "$XRAY_TPROXY_READY"
     log "Xray TPROXY routing removed"
 
@@ -804,27 +1013,49 @@ tproxy_stop() {
 # Adds every effective client to XRAY_CLIENTS and removes none: tproxy_prune does that after
 # Tunnel Director has taken the clients that left Xray (vpn-director.sh cmd_apply). Soft-fails if
 # xt_TPROXY is unavailable or ipsets are missing, returning 0 so caller scripts can continue.
+#
+# The chain sets the direct mark on every packet of an Xray client, and the direct rule that
+# routes it (guard_direct_ensure) goes in before the chain; one that does not withholds the ready
+# marker. Once the chain is in, every client the set holds gets its guards, which refuse its
+# packets while the firmware has deleted the chain (_tproxy_guards_sync); a guard that does not go
+# in withholds the marker too, and so does a check that finds no direct mark in the chain just
+# swapped in. The soft-fails sync them as well, for the clients they add to a live set. A direct
+# mark or guard preferences that guard_layout_check refuses return 1 before anything is touched,
+# and the run ends there, as it would in tunnel_apply.
 # -------------------------------------------------------------------------------------------------
 tproxy_apply() {
     _tproxy_init
 
     log "Starting Xray TPROXY routing..."
 
+    # The direct mark is a bit of its own: in Xray's fwmark_mask it would read as
+    # Xray's mark, in Tunnel Director's field as a tunnel's. The direct rule and
+    # the guards stay ahead of main's rule as well. guard_layout_check logs the
+    # ERROR, and nothing is touched: not even the soft-fails below run, which
+    # add to the live client set.
+    guard_layout_check || return 1
+
     # Soft-fail: if xt_TPROXY module not available, return 0 without applying.
-    # A live XRAY_CLIENTS still gets every client, as on every apply (below).
+    # A live XRAY_CLIENTS still gets every client, as on every apply (below), and
+    # the clients get their guards while the live chain marks direct: it still
+    # intercepts with the set, and a client moving from a tunnel to Xray loses
+    # its tunnel guard in tunnel_apply.
     if ! _tproxy_check_module; then
         log -l WARN "xt_TPROXY module not available; skipping TPROXY setup"
         rm -f "$XRAY_TPROXY_READY"
         _tproxy_add_to_live_clients
+        _tproxy_guards_sync || true
         return 0
     fi
 
-    # Soft-fail: if required ipsets not ready, return 0 without applying
+    # Soft-fail: if required ipsets not ready, return 0 without applying; the live
+    # set and the guards as above.
     if ! _tproxy_check_required_ipsets; then
         log -l WARN "Required ipsets not ready; exiting without applying rules"
         log -l WARN "Run 'vpn-director.sh apply' first to build required ipsets"
         rm -f "$XRAY_TPROXY_READY"
         _tproxy_add_to_live_clients
+        _tproxy_guards_sync || true
         return 0
     fi
 
@@ -836,8 +1067,36 @@ tproxy_apply() {
     # A bypass set that could not be swapped keeps its entries and has said so.
     _tproxy_setup_bypass_ipset || true
 
-    # Soft-fail if iptables setup fails
+    # The direct rule before the chain: from the swap on, every packet of an Xray
+    # client carries the direct mark, and the rule sends what the chain lets
+    # through to main ahead of the guards. One in place is left alone. One that
+    # does not go in (guard_direct_ensure logs the ERROR) withholds the marker
+    # below; the chain and the guards go in all the same, the side that leaks
+    # nothing: until an apply puts the rule in, what the chain lets through
+    # meets the guards and is refused, but for the private ranges and
+    # xray.exclude_ips, which they send direct themselves.
+    local direct_ok=1
+    if ! guard_direct_ensure; then
+        direct_ok=0
+    fi
+
+    local iptables_ok=1
     if ! _tproxy_setup_iptables; then
+        iptables_ok=0
+    fi
+
+    # The guards, once the chain is in: from the swap on it marks what it lets
+    # through direct, which the guards would refuse otherwise. Where the new chain
+    # stayed out, the one in place decides (_tproxy_guards_wanted). They follow
+    # what XRAY_CLIENTS holds, which only grows here: a client that left Xray keeps
+    # its guards until the prune lets it go. One that does not go in (guard_sync
+    # logs the ERROR) withholds the marker below, and so does a check that finds
+    # no direct mark in the chain (rc 2).
+    local guards_rc=0
+    _tproxy_guards_sync || guards_rc=$?
+
+    # Soft-fail if iptables setup fails
+    if [[ $iptables_ok -eq 0 ]]; then
         log -l WARN "TPROXY rules are not complete; readiness withheld"
         rm -f "$XRAY_TPROXY_READY"
         return 0
@@ -849,6 +1108,30 @@ tproxy_apply() {
     # withholds the marker even though the chain itself is in place.
     if [[ $clients_ok -eq 0 ]]; then
         log -l WARN "Not every Xray client is in $XRAY_CLIENTS_IPSET; TPROXY readiness withheld"
+        rm -f "$XRAY_TPROXY_READY"
+        return 0
+    fi
+
+    # Without the direct rule, what the chain marks direct meets the guards
+    # instead of main.
+    if [[ $direct_ok -eq 0 ]]; then
+        log -l WARN "The direct rule is not in place; TPROXY readiness withheld"
+        rm -f "$XRAY_TPROXY_READY"
+        return 0
+    fi
+
+    # The watch takes Xray clients off the fallback tunnel on the marker, and one
+    # without its guards would leave through the WAN in the next rebuild of the
+    # firewall. The chain was just built with the direct-mark rule, so a check
+    # that does not find it is an error of the moment - a busy xtables lock - and
+    # no guard was synced; the next apply checks again.
+    if [[ $guards_rc -eq 2 ]]; then
+        log -l WARN "The direct mark was not found in $XRAY_CHAIN, or iptables could not check it (a busy xtables lock); the Xray guards were not synced, TPROXY readiness withheld"
+        rm -f "$XRAY_TPROXY_READY"
+        return 0
+    fi
+    if [[ $guards_rc -ne 0 ]]; then
+        log -l WARN "Not every Xray client has its guards; TPROXY readiness withheld"
         rm -f "$XRAY_TPROXY_READY"
         return 0
     fi
@@ -877,8 +1160,12 @@ tproxy_apply() {
 # effective x. One WARN names the addresses kept.
 #
 # A client the new set does not take would lose its interception with the swap, so the prune stops
-# there instead: the clients that left stay proxied until the next apply, which is no leak. Always
-# returns 0, and leaves the ready marker alone: every effective client is in the set either way.
+# there instead: the clients that left stay proxied until the next apply, which is no leak. Once
+# the set is swapped in, the guards follow it (_tproxy_guards_sync): a client it let go loses its
+# guards then, and not before. While the chain does not answer for its direct mark, no guard goes
+# in, and only those of the clients the set let go are taken away (_tproxy_guards_prune). Always
+# returns 0, and leaves the ready marker alone: every effective client is in the set either way,
+# and keeps its guards when a new one is refused.
 # -------------------------------------------------------------------------------------------------
 tproxy_prune() {
     _tproxy_init
@@ -930,6 +1217,19 @@ tproxy_prune() {
         log -l WARN "Kept in $XRAY_CLIENTS_IPSET: ${kept% } - they stay proxied until an apply in which Tunnel Director carries them"
     fi
     log "Pruned $XRAY_CLIENTS_IPSET to the $count effective Xray clients${kept:+ and the ones kept}"
+    # The guards follow the set, after the swap: a client it let go was proxied
+    # until then, and its guards kept it off the WAN in a rebuild of the firewall.
+    # A guard that does not go in (guard_sync logs the ERROR) leaves the old ones
+    # of the clients the set still holds. While the chain does not answer for its
+    # direct mark (rc 2), no guard may go in, but those of a client the set let
+    # go are taken away all the same: rule 1 returns its packets unmarked now,
+    # and its refusal would meet them in normal operation.
+    local guards_rc=0
+    _tproxy_guards_sync || guards_rc=$?
+    if [[ $guards_rc -eq 2 ]]; then
+        log -l WARN "The direct mark was not found in $XRAY_CHAIN, or iptables could not check it (a busy xtables lock); the Xray guards were not synced, only those of the clients that left the set removed"
+        _tproxy_guards_prune || true
+    fi
     return 0
 }
 

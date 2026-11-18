@@ -1,0 +1,20 @@
+#!/bin/sh
+
+###################################################################################################
+# wan-event - Asuswrt-Merlin hook invoked when WAN state changes
+# Arguments: $1 = WAN unit (0, 1, ...), $2 = event type
+###################################################################################################
+
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+SCRIPT_DIR="/jffs/scripts/vpn-director"
+
+# Skip if Entware not ready (during early boot)
+[ -x /opt/bin/bash ] || exit 0
+
+case "$2" in
+    connected)
+        # Restore routing rules after WAN reconnect
+        "$SCRIPT_DIR/tunnel_director.sh"
+        "$SCRIPT_DIR/xray_tproxy.sh" start
+        ;;
+esac

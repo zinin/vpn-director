@@ -78,6 +78,14 @@ interface: Tunnel Director would route them into the router's own server tunnel,
 traffic is dropped. Telling servers apart needs a router that has one to check the RCI fields
 against; that check is still open.
 
+On KeeneticOS no connection of a client on Xray or Tunnel Director is accelerated by the
+firmware, in software or in hardware - not even one to a destination the client excludes: an
+accelerated connection is routed by the router's routing rules alone, the rules that keep such a
+client off the WAN while the firmware rebuilds its firewall among them, and an accelerated
+connection to an excluded country would follow those rules into the tunnel, or be refused. Every
+other device keeps its acceleration. Traffic such a client sends to its excluded destinations no
+longer follows KeeneticOS's domain-based routes either.
+
 ### Optional
 
 - `opkg install wget-ssl` — faster and more reliable downloads for country zone files (recommended)
@@ -102,6 +110,7 @@ After installation, configs are located at:
 /opt/vpn-director/vpn-director.sh restart             # Restart Xray, rebuild all in place without a stop
 /opt/vpn-director/vpn-director.sh update              # Update ipsets + reapply
 /opt/vpn-director/vpn-director.sh ensure-routes       # Put back a route an interface tunnel lost (cron, every minute)
+/opt/vpn-director/vpn-director.sh hooks               # Merlin: put the VPN Director line back into the /jffs/scripts hooks (install and update do it)
 
 # Component-specific
 /opt/vpn-director/vpn-director.sh status tunnel       # Tunnel Director status only
@@ -180,6 +189,13 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 > Upgrading **to** the first release with the unified updater is still done by the old bot-only updater, which does not know about the Web UI. Re-run the [Quick Install](#quick-install) command once after that upgrade; every later update handles every daemon.
 
 > **Upgrading from v0.11.x or earlier.** The updater built into those releases downloads a fixed file list without `lib/platform.sh`, so pressing «Update» installs this release incompletely: the shell CLI, the firewall hooks and the daily update stop working (the Xray TPROXY and Tunnel Director rules are no longer re-applied after a firewall restart) until you re-run the [Quick Install](#quick-install) command once. The Web UI and the bot themselves keep running. Every later update reads the release manifest and needs no such step.
+
+> **Upgrading from v0.22.0 or earlier.** This release adds routing rules per client that keep clients on Xray or Tunnel Director off the WAN while the firmware rebuilds its firewall (ip rule preferences 16894-16898 with the default `pref_base`), and its firewall hooks put the chains back from a snapshot of the last apply.
+>
+> - Going back to v0.22.0 or earlier: run `vpn-director.sh stop` with this release first. It removes the rules at 16894-16898, the snapshot and the records of where the rules went in. An older release knows none of them, and they would send its tunnel clients' traffic to excluded countries into the tunnel, and refuse what its Xray clients send direct, except to private networks and the addresses of `xray.exclude_ips`. A reboot clears them too.
+> - A configuration whose Xray `fwmark_mask` or Tunnel Director `mark_mask` holds bit `0x200` takes another bit for its direct mark, the bit the chains set on what they let go direct; a WARN in the log names it, and `advanced.tunnel_director.direct_mark` pins it. Masks that leave no such bit free, such as an Xray `fwmark_mask` of `0xffffffff`, are refused: every apply ends with an error until you narrow them. `advanced.xray.rule_pref` must be a decimal number without a leading zero and stay below the direct rule's preference, 16894 with the default `pref_base` and `mark_mask`: an apply refuses a value at or above it, or written otherwise (such as `0x4200`).
+> - On KeeneticOS the first apply after the upgrade resets, once, the connections the firmware had already accelerated: those of a client on Xray or Tunnel Director to the destinations it reaches directly. New connections are not affected.
+> - On Asuswrt-Merlin the update no longer overwrites `/jffs/scripts/firewall-start`, `wan-event` and `nat-start`: it cuts out the hook an earlier release wrote, puts in one line of ours and keeps the rest, your own lines included ([Startup Scripts](#startup-scripts)).
 
 ## Telegram Bot
 
@@ -308,7 +324,7 @@ Pick another route for a client in the Web UI (the Route column) or in the bot (
 
 What remains:
 
-- The firmware's own firewall rebuilds (a firewall restart on Merlin, an NDM rebuild on KeeneticOS) empty the chains until the hook applies them again.
+- The firmware's own firewall rebuilds (a firewall restart on Merlin; an NDM rebuild on KeeneticOS, which on a KN-4521 with a DHCP WAN every renewal of the lease brought) take the chains away. The hook puts them back at once from a snapshot of the last apply, then applies again. Until the chains are back, routing rules per client, which the rebuild leaves alone, keep a tunnel client in its tunnel, where its connections carry on, and refuse an Xray client's new connections. Meanwhile a tunnel client's traffic to an excluded country goes through the tunnel (on KeeneticOS a connection opened then can stay there until it closes), and an Xray client's is refused; excluded addresses and CIDRs, and an Xray client's traffic to private networks and the addresses of `xray.exclude_ips`, still go direct. A client on both Xray and a tunnel is not kept in its tunnel for a moment, though: when no snapshot brought the chains back (none was there, or the hook could not restore it), the apply that follows puts Xray's chain back first, and until the same apply puts Tunnel Director's back, what Xray does not proxy for that client (ICMP such as ping, and the destinations Xray excludes or bypasses) goes out through the WAN.
 - A tunnel that is down refuses its clients' traffic until it is up (excluded destinations still go direct). The Web UI and the bot ask before they move a client to a tunnel that is down or that the router does not list.
 - On Asuswrt-Merlin, an OpenVPN client in "VPN Director (policy rules)" mode whose server pushes no redirect-gateway gets the WAN's default route copied into its table by the firmware each time the client starts, and vpn-director ships no hook for a VPN client's start: until the next apply puts the tunnel's default back, that tunnel's clients go out through the WAN. Run `vpn-director.sh apply` after restarting such a client.
 - A move changes the route of new connections. An open connection may break (reconnect it) or, on KeeneticOS, keep its old route until its conntrack entry expires. A UDP flow moved from Xray to a tunnel can stall until its conntrack entry expires.
@@ -331,16 +347,16 @@ This project uses Entware init.d for automatic startup:
 | Script | When Called | Purpose |
 |--------|-------------|---------|
 | `/opt/etc/init.d/S99vpn-director` | After Entware initialized | Runs `vpn-director.sh apply` to initialize all components |
-| `/jffs/scripts/firewall-start` | After firewall rules applied (Merlin) | Reapplies configuration after firewall reload |
-| `/jffs/scripts/wan-event` | On WAN connected (Merlin) | Runs `vpn-director.sh apply` on WAN connection |
-| `/jffs/scripts/nat-start` | After the nat table is rebuilt (Merlin) | Runs `vpn-director.sh --wait apply`, so interface tunnels get their `MASQUERADE` back |
-| `/opt/etc/ndm/netfilter.d`, `wan.d`, `iflayerchanged.d` (`50-vpn-director.sh`) | NDM firewall rebuild / WAN start / VPN client IPv4 layer (KeeneticOS) | Detached `vpn-director.sh --wait apply` |
+| `/jffs/scripts/firewall-start` | After firewall rules applied (Merlin) | One line of ours, marked `# vpn-director`, calls `/opt/vpn-director/hooks/firewall-start`: it puts the chains back from the last apply's snapshot, then reapplies the configuration in the background, once the commands after our line are done |
+| `/jffs/scripts/wan-event` | On WAN connected (Merlin) | One line of ours calls `/opt/vpn-director/hooks/wan-event`: `vpn-director.sh apply` in the background when the WAN connects, once the commands after our line are done |
+| `/jffs/scripts/nat-start` | After the nat table is rebuilt (Merlin) | One line of ours calls `/opt/vpn-director/hooks/nat-start`: it puts the interface tunnels' `MASQUERADE` back from the last apply's snapshot, then runs `vpn-director.sh --wait apply` in the background, once the commands after our line are done |
+| `/opt/etc/ndm/netfilter.d`, `wan.d`, `iflayerchanged.d` (`50-vpn-director.sh`) | NDM firewall rebuild / WAN start / VPN client IPv4 layer (KeeneticOS) | Detached `vpn-director.sh --wait apply`; `netfilter.d` first puts the rebuilt table's rules back from the last apply's snapshot |
 
 **Note:** The init.d script ensures Entware bash is available before running vpn-director scripts.
 
 On Merlin, to enable user scripts: Administration -> System -> Enable JFFS custom scripts and configs -> Yes
 
-The installer, and every update after it, writes these `/jffs/scripts` hooks in full, over the files that are there, so a router whose other add-ons use the same hooks has to merge them by hand, and a merge does not survive the next update: the updater copies the hooks over it again.
+These three `/jffs/scripts` files are shared with you and with other add-ons. The installer and every update put one line of ours into each, marked `# vpn-director`, right after the `#!` line, and leave the rest of the file as it is; the first update to this release also cuts out the whole hook an earlier release wrote there and keeps the lines you added. An earlier hook you edited stays, with a warning in the update log and in `vpn-director.sh status`: remove its call of `vpn-director.sh` by hand. A file without a `#!` line and a symlinked one are left alone, and a hook that is not executable but holds someone else's commands keeps its mode - the firmware skips it until you `chmod +x` it - each with a warning. `vpn-director.sh hooks` puts a lost line back, and `vpn-director.sh status` shows whether each line is in place. Deleting the line takes VPN Director out of that hook; an apply never puts it back.
 
 ## Process Monitoring
 

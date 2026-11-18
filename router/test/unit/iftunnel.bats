@@ -391,6 +391,28 @@ refuse_masquerade() {
     assert_output '-P FORWARD ACCEPT'
 }
 
+# The hooks' restore takes no lock and can race an apply's ensure_fw_rule: both find a rule
+# missing and both put it in. The release takes every copy, or one would outlive the tunnel.
+@test "iftunnel_table_release: every copy of the MASQUERADE and of the outbound clamp goes" {
+    load_iftunnel "awg1"
+    use_stateful_iptables
+    ip_links "$AWG1_UP"
+    iftunnel_route_ensure awg1 1
+    iptables -t nat -I POSTROUTING 1 -o awg1 -j MASQUERADE
+    iptables -t mangle -I FORWARD 1 -o awg1 -p tcp -m tcp --tcp-flags SYN,RST SYN \
+        -j TCPMSS --clamp-mss-to-pmtu
+    run iptables -t nat -S POSTROUTING
+    assert_equal "$(grep -c -e '-A POSTROUTING -o awg1 -j MASQUERADE' <<< "$output")" 2
+    run iptables -t mangle -S FORWARD
+    assert_equal "$(grep -c -e '-o awg1 .*-j TCPMSS --clamp-mss-to-pmtu' <<< "$output")" 2
+    run iftunnel_table_release awg1 1
+    assert_success
+    run iptables -t nat -S POSTROUTING
+    assert_output '-P POSTROUTING ACCEPT'
+    run iptables -t mangle -S FORWARD
+    assert_output '-P FORWARD ACCEPT'
+}
+
 # Review Focus 1: the inbound clamp is found by a pattern, and "awg1" must not
 # take "awg10"'s.
 @test "iftunnel_table_release: leaves another interface's rules alone, a longer name included" {

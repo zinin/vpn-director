@@ -7,7 +7,7 @@ bats_require_minimum_version 1.5.0
 load '../test_helper'
 
 # Note: load_tunnel_module is provided by test_helper.bash
-# It loads: common.sh, config.sh, ipset.sh, firewall.sh, tunnel.sh
+# It loads: common.sh, config.sh, guard.sh, ipset.sh, firewall.sh, tunnel.sh
 
 # ============================================================================
 # _tunnel_table_allowed - validate routing tables
@@ -62,6 +62,7 @@ load '../test_helper'
 @test "tunnel_get_required_ipsets: handles empty tunnels gracefully" {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export TUN_DIR_TUNNELS_JSON='{}'
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director.json"
     source "$LIB_DIR/ipset.sh" --source-only
@@ -234,6 +235,7 @@ marks_in_place() {
 @test "tunnel.sh: can be sourced with --source-only" {
     load_common
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     run source "$LIB_DIR/tunnel.sh" --source-only
     # Note: 'run source' doesn't work well, use direct sourcing
@@ -251,6 +253,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-invalid-string.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -268,6 +271,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-clients-string.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -287,6 +291,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-exclude-string.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -313,6 +318,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -341,6 +347,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -356,6 +363,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-overlapping.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -379,6 +387,7 @@ marks_in_place() {
     source "$LIB_DIR/firewall.sh"
     export VPD_CONFIG_FILE="$TEST_ROOT/fixtures/vpn-director-nonexistent-ipset.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
 
@@ -447,6 +456,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     run tunnel_apply
@@ -466,6 +476,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 1; }
@@ -492,6 +503,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() {
@@ -527,13 +539,15 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     # Route must succeed so the up-to-date path is not already failing on
-    # _tunnel_ensure_routes; this is only the missing ip rule.
+    # _tunnel_ensure_routes; this is only the missing ip rule - the slot's, not
+    # the client's guard, which looks the same table up.
     platform_tunnel_route_ensure() { return 0; }
     ip() {
-        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *fwmark*lookup\ ovpnc2* ]]; then
             echo "ip $*" >> /tmp/bats_ip_calls.log
             return 1
         fi
@@ -568,11 +582,12 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
     ip() {
-        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *fwmark*lookup\ ovpnc2* ]]; then
             return 1
         fi
         command ip "$@"
@@ -608,6 +623,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -638,11 +654,12 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
     ip() {
-        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *fwmark*lookup\ ovpnc2* ]]; then
             return 1
         fi
         command ip "$@"
@@ -677,11 +694,12 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
     ip() {
-        if [[ ${1:-} == rule && ${2:-} == add && $* == *lookup\ ovpnc2* ]]; then
+        if [[ ${1:-} == rule && ${2:-} == add && $* == *fwmark*lookup\ ovpnc2* ]]; then
             return 1
         fi
         command ip "$@"
@@ -710,6 +728,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -732,6 +751,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     run tunnel_apply
@@ -753,6 +773,7 @@ marks_in_place() {
         "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
     export VPD_CONFIG_FILE="$tmp_cfg"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/tunnel.sh" --source-only
     platform_tunnel_route_ensure() { return 0; }
@@ -802,6 +823,7 @@ marks_in_place() {
 load_tunnel_module_with() {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export TUN_DIR_CHAIN=TUN_DIR
     export TUN_DIR_PREF_BASE=16384
     export TUN_DIR_MARK_MASK=0x00ff0000
@@ -893,6 +915,7 @@ load_tunnel_module_with() {
 @test "tunnel_apply: empty tunnels tears down previously applied Tunnel Director" {
     load_common
     source "$LIB_DIR/firewall.sh"
+    source "$LIB_DIR/guard.sh"
     export TUN_DIR_CHAIN=TUN_DIR
     export TUN_DIR_PREF_BASE=16384
     export TUN_DIR_MARK_MASK=0x00ff0000
@@ -1047,6 +1070,7 @@ load_tunnel_module_with() {
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
@@ -1060,6 +1084,7 @@ load_tunnel_module_with() {
 
 @test "_tunnel_gateway: drops a value that is not an IPv4 address with a WARN" {
     load_common
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
     # Bypass config.sh: the load-time filter would strip this key before the
     # apply-time belt sees it. config.bats covers that path.
@@ -1074,6 +1099,7 @@ load_tunnel_module_with() {
 # is the only thing between "10.8.0.999" and ip route.
 @test "_tunnel_gateway: drops an address whose octet is above 255 with a WARN" {
     load_common
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
     TUN_DIR_TUNNELS_JSON='{"wgc1":{"gateway":"10.8.0.999"}}'
     run --separate-stderr _tunnel_gateway wgc1
@@ -1088,6 +1114,7 @@ load_tunnel_module_with() {
         > "$BATS_TEST_TMPDIR/vpn-director.json"
     export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
     source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
@@ -1108,35 +1135,39 @@ load_tunnel_module_with() {
 # The platform's fast-path opt-out
 # ============================================================================
 
-# The opt-out has to carry the same match as the MARK rule and sit immediately
-# before it. Above it, the exclusion RETURNs fire first, so an excluded
-# destination keeps its acceleration; below it, `--mark 0x0/0xff0000` would no
-# longer match a packet MARK had just marked, and the rule would never fire.
-@test "tunnel_apply: the platform's offload target goes immediately before MARK, same match" {
+# The opt-out carries the MARK rule's match and opens the client's block, ahead
+# of its exclusions: no flow of the client may be accelerated, one to an excluded
+# destination included. The fast path routes a flow it took by the ip rules
+# alone, and the client's guard would take such a flow into the tunnel, where it
+# dies. Below the MARK, `--mark 0x0/0xff0000` would no longer match a packet
+# MARK had just marked, and the rule would never fire.
+@test "tunnel_apply: the platform's offload target opens the client's block, ahead of its exclusions" {
     load_tunnel_module
     platform_tunnel_offload_target() { printf 'PPE\n'; }
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
     run grep -- '-A TUN_DIR_NEW' /tmp/bats_iptables_calls.log
-    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
-    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j PPE'
-    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j PPE'
+    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j MARK --set-xmark 0x200/0x200'
+    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
+    assert_line --index 3 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_equal "${#lines[@]}" 4
 }
 
 # Merlin names no target (platform_tunnel_offload_target returns 1), and the
-# chain must then look exactly as it did before this feature existed - a rule
-# naming a target the kernel does not have would fail the append and take the
-# whole apply down with it.
+# chain then holds no opt-out at all - a rule naming a target the kernel does
+# not have would be refused for every client.
 @test "tunnel_apply: no offload rule when the platform names no target" {
     load_tunnel_module
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
     run grep -- '-A TUN_DIR_NEW' /tmp/bats_iptables_calls.log
-    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
-    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
-    assert_equal "${#lines[@]}" 2
+    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j MARK --set-xmark 0x200/0x200'
+    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN'
+    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.50.0/24 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_equal "${#lines[@]}" 3
 }
 
 # ============================================================================
@@ -1515,6 +1546,8 @@ ip_rule_show_cut_short() {
     refute_line --partial '16384:'
 }
 
+# The guards change between the two: the new layout's go in once the new chain
+# carries every interface, and the old ones go before the slots they route into.
 @test "tunnel_apply: a new slot's ip rule goes in before the swap, a released one's goes after it" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
     run tunnel_apply
@@ -1539,8 +1572,13 @@ ip_rule_show_cut_short() {
     assert_line --index 2 'ip rule del pref 16385'
     assert_line --index 3 'ip rule add pref 16385 fwmark 0x20000/0xff0000 lookup ovpnc2'
     assert_line --index 4 'iptables -t mangle -E TUN_DIR_NEW TUN_DIR'
-    assert_line --index 5 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
-    assert_line --index 6 'ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit'
+    assert_line --index 5 'ip rule add pref 16896 from 192.168.1.6 iif br0 lookup ovpnc2'
+    assert_line --index 6 'ip rule add pref 16896 from 192.168.1.6 iif br0 prohibit'
+    assert_line --index 7 'ip rule del pref 16895 from 192.168.1.5 iif br0 lookup wgc1'
+    assert_line --index 8 'ip rule del pref 16895 from 192.168.1.5 iif br0 prohibit'
+    assert_line --index 9 'ip rule del pref 16384 fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line --index 10 'ip rule del pref 16639 fwmark 0x10000/0xff0000 prohibit'
+    assert_equal "${#lines[@]}" 11
 }
 
 # Review Focus 2: an NDM rebuild deletes our chain and jumps; the ip rules,
@@ -1623,6 +1661,68 @@ ip_rule_show_cut_short() {
     assert_success
     assert_output --partial "Rebuilding Tunnel Director in place"
     refute_output --partial "up-to-date"
+}
+
+# A firmware hook restores the chain from the snapshot of the last apply
+# (fwsnap-restore.sh), which can be older than the configuration, and leaves the
+# restored marker. With the chain, the record and every MARK rule in place the
+# apply would read up to date; the marker makes it a rebuild, which takes the
+# marker away.
+@test "tunnel_apply: the restored marker makes an otherwise up-to-date apply rebuild" {
+    load_tunnel_module
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+
+    : > "$TUN_DIR_RESTORED"
+    run tunnel_apply
+    assert_success
+    assert_output --partial "restored from the snapshot; rebuilding in place"
+    refute_output --partial "up-to-date"
+    [ -f "$TUN_DIR_HASH" ]
+    [ ! -e "$TUN_DIR_RESTORED" ]
+}
+
+# The restore takes no lock, and the hook's restore can land while an apply
+# that started before it rebuilds. Removing the hash alone loses then: that apply
+# would record its hash after the restore, and the apply the hook queued would
+# take the up-to-date path over the snapshot's chain. While the marker is there
+# no apply records the hash, and the next one rebuilds and records it.
+@test "tunnel_apply: a restore during a rebuild leaves no hash, and the next apply rebuilds and records it" {
+    load_tunnel_module
+    use_stateful_iptables
+    eval "real_$(declare -f guard_sync)"
+    guard_sync() {
+        : > "$TUN_DIR_RESTORED"
+        real_guard_sync "$@"
+    }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "restored from the snapshot during this rebuild"
+    refute_output --partial "WARN"
+    [ ! -e "$TUN_DIR_HASH" ]
+    [ -e "$TUN_DIR_RESTORED" ]
+
+    guard_sync() { real_guard_sync "$@"; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "rebuilding"
+    [ -f "$TUN_DIR_HASH" ]
+    [ ! -e "$TUN_DIR_RESTORED" ]
+}
+
+@test "tunnel_stop: removes the restored marker" {
+    load_tunnel_module
+    run tunnel_apply
+    assert_success
+    : > "$TUN_DIR_RESTORED"
+
+    run tunnel_stop
+    assert_success
+    [ ! -e "$TUN_DIR_RESTORED" ]
 }
 
 @test "tunnel_stop: removes a shadow chain an interrupted swap left" {
@@ -2024,6 +2124,22 @@ move_100_to_wgc1() {
     assert_failure
 }
 
+# While the chains are gone, a client on Xray and on a tunnel goes through the
+# tunnel, as a Tunnel Director client: Tunnel Director's guards take preferences
+# ahead of Xray's, and the kernel tries the rules in the order of their
+# preferences (the mock lists them in the order they went in).
+@test "full apply: a client on Xray and on a tunnel meets the tunnel's guard first" {
+    load_full_apply
+    XRAY_CLIENTS='192.168.1.100 192.168.1.101 100.64.0.8 192.168.1.5'
+
+    run full_apply
+    assert_success
+    run ip rule show
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1'
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 prohibit'
+    assert_line $'16897:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
 # ============================================================================
 # main is no tunnel: its clients are never reported, nor kept on Xray
 # ============================================================================
@@ -2355,7 +2471,7 @@ load_awg1() {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
     run tunnel_apply
     assert_success
-    assert_equal "$(cat "$TUN_DIR_HASH")" "$(printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash)"
+    assert_equal "$(cat "$TUN_DIR_HASH")" "$(printf '%s\n%s\n%s' "$TUN_DIR_TUNNELS_JSON" 'direct_mark: 0x200' 'format: 2' | compute_hash)"
 
     export TUN_DIR_INTERFACES=awg1
     run tunnel_apply
@@ -2495,6 +2611,8 @@ load_awg1() {
 
 @test "tunnel_apply: a new slot's block rule goes in before its lookup rule" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    # The direct rule is in already, so the log starts with the slot's rules.
+    guard_direct_ensure
     ip() {
         if [[ ${1:-} == rule && ( ${2:-} == add || ${2:-} == del ) ]]; then
             echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
@@ -2527,10 +2645,11 @@ load_awg1() {
 }
 
 # refuse_block_rules - for the rest of the test, the kernel refuses every block
-# rule: "ip rule add ... prohibit" fails, every other ip call goes to the mock.
+# rule: "ip rule add ... fwmark ... prohibit" fails, every other ip call - a
+# guard's prohibit among them - goes to the mock.
 refuse_block_rules() {
     ip() {
-        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" prohibit "* ]]; then
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" fwmark "*" prohibit "* ]]; then
             return 2
         fi
         command ip "$@"
@@ -2715,7 +2834,8 @@ refuse_block_rules() {
 }
 
 # With nothing refused the same move ends with every slot on its new
-# preferences and nothing of the old layout left.
+# preferences and nothing of the old layout left: the direct rule and the
+# guards move with pref_base too, from 16894 and 16895 to 16895 and 16896.
 @test "tunnel_apply: a pref_base moved by one ends with each slot on its new preferences alone" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]}}'
     run tunnel_apply
@@ -2730,7 +2850,13 @@ refuse_block_rules() {
     assert_line $'16640:\tfrom all fwmark 0x10000/0xff0000 prohibit'
     assert_line $'16386:\tfrom all fwmark 0x20000/0xff0000 lookup wgc2'
     assert_line $'16641:\tfrom all fwmark 0x20000/0xff0000 prohibit'
-    assert_equal "$(grep -c 'fwmark' <<< "$output")" 4
+    assert_equal "$(grep -c 'fwmark 0x[0-9a-f]*/0xff0000 ' <<< "$output")" 4
+    refute_line --partial '16894:'
+    assert_equal "$(grep -c '^16895:' <<< "$output")" 1
+    assert_line $'16895:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_equal "$(grep -c 'iif br0' <<< "$output")" 4
+    run guard_list tunnel
+    assert_output $'16896:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16896:\tfrom 192.168.1.5 iif br0 prohibit\n16896:\tfrom 192.168.1.6 iif br0 lookup wgc2\n16896:\tfrom 192.168.1.6 iif br0 prohibit'
 }
 
 # The rebuild's new slot makes way the same way: ovpnc1 takes the slot wgc1
@@ -3176,17 +3302,20 @@ firmware_masquerade() {
 # Addresses and CIDRs in a tunnel's exclude
 # ============================================================================
 
-@test "tunnel_apply: an address or CIDR in exclude returns ahead of the mark, beside the countries" {
+@test "tunnel_apply: an address or CIDR in exclude goes direct ahead of the mark, beside the countries" {
     load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.30"],"exclude":["ru","203.0.113.7","198.51.100.0/24"]}}'
     : > /tmp/bats_iptables_calls.log
     run tunnel_apply
     assert_success
     run grep -- '-A TUN_DIR_NEW' /tmp/bats_iptables_calls.log
-    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m set --match-set ru dst -j RETURN'
-    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 203.0.113.7 -j RETURN'
-    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 198.51.100.0/24 -j RETURN'
-    assert_line --index 3 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
-    assert_equal "${#lines[@]}" 4
+    assert_line --index 0 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m set --match-set ru dst -j MARK --set-xmark 0x200/0x200'
+    assert_line --index 1 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m set --match-set ru dst -j RETURN'
+    assert_line --index 2 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 203.0.113.7 -j MARK --set-xmark 0x200/0x200'
+    assert_line --index 3 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 203.0.113.7 -j RETURN'
+    assert_line --index 4 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 198.51.100.0/24 -j MARK --set-xmark 0x200/0x200'
+    assert_line --index 5 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -d 198.51.100.0/24 -j RETURN'
+    assert_line --index 6 'iptables -t mangle -A TUN_DIR_NEW -s 192.168.1.30 -m mark --mark 0x0/0xff0000 -j MARK --set-xmark 0x10000/0xff0000'
+    assert_equal "${#lines[@]}" 7
 }
 
 # Skipped, the entry costs the client nothing else: it is still marked.
@@ -3216,4 +3345,622 @@ firmware_masquerade() {
     run tunnel_get_required_ipsets
     assert_success
     assert_output "ru"
+}
+
+# ============================================================================
+# Exclusions go direct: the direct mark, the direct rule, the rules' format
+# ============================================================================
+
+# An exclusion whose direct mark was refused returns unmarked, and never meets
+# the direct rule. The up-to-date branch looks for the MARK rules alone, so only
+# a rebuild puts it back: the apply is not recorded. The refusal costs that rule
+# alone: the RETURN still goes in, and the client is still marked.
+@test "tunnel_apply: a refused direct mark on an exclusion records no hash" {
+    load_tunnel_module
+    iptables() {
+        if [[ $* == *"--set-xmark 0x200/0x200"* ]]; then
+            echo "iptables $*" >> /tmp/bats_iptables_calls.log
+            return 1
+        fi
+        command iptables "$@"
+    }
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "a client rule did not go in"
+    assert_output --partial "Added: client=192.168.50.0/24 tunnel=wgc1"
+    grep -q -- '-A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j RETURN' /tmp/bats_iptables_calls.log
+    [ ! -f "$TUN_DIR_HASH" ]
+}
+
+# The previous version returned bare from each exclusion, and its hash covered the
+# configuration alone. Unchanged, the configuration would take the first apply
+# after the upgrade down the up-to-date branch, which looks for the MARK rules
+# only: the bare RETURNs would stay, and the excluded traffic, unmarked, would
+# meet the guards. The lines the hash input gained - the direct mark and the
+# format of the rules - make that apply a rebuild.
+@test "tunnel_apply: the first apply after the upgrade rebuilds in place although the configuration is the same" {
+    load_tunnel_module
+    # What the previous version recorded for the fixture, which names no interface
+    # and no failover: the hash of the tunnels JSON alone, and wgc1 in slot 0.
+    mkdir -p "$(dirname "$TUN_DIR_HASH")"
+    printf '%s' "$TUN_DIR_TUNNELS_JSON" | compute_hash > "$TUN_DIR_HASH"
+    printf '0 wgc1\n' > "$TUN_DIR_TABLES"
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "rebuilding in place"
+    grep -q -- '-A TUN_DIR_NEW -s 192.168.50.0/24 -m set --match-set ru dst -j MARK --set-xmark 0x200/0x200' /tmp/bats_iptables_calls.log
+
+    # The control: the same state under the hash this version records is up to date.
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+}
+
+# The next change of the rules works the same way: a raised _tunnel_format
+# rebuilds a chain the configuration alone would leave as it is.
+@test "tunnel_apply: a raised format of the rules rebuilds the chain in place" {
+    load_tunnel_module
+    run tunnel_apply
+    assert_success
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+
+    _tunnel_format=3
+    run tunnel_apply
+    assert_success
+    assert_output --partial "rebuilding in place"
+}
+
+# From the swap on, the chain marks every excluded destination direct, and the
+# direct rule is what sends that to main ahead of the guards.
+@test "tunnel_apply: puts the direct rule in before the chain" {
+    load_tunnel_module
+    ip() {
+        [[ ${1:-} == rule && ${2:-} == add ]] && echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command ip "$@"
+    }
+    iptables() {
+        [[ $* == *" -N "* ]] && echo "iptables $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command iptables "$@"
+    }
+    run tunnel_apply
+    assert_success
+    local direct chain
+    direct=$(grep -nxF 'ip rule add pref 16894 fwmark 0x200/0x200 lookup main' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    chain=$(grep -nxF 'iptables -t mangle -N TUN_DIR_NEW' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    [[ -n $direct && -n $chain ]]
+    (( direct < chain ))
+}
+
+# Inside the mark field, a packet marked direct would read as one marked for a
+# tunnel.
+@test "tunnel_apply: refuses a direct mark inside its own field, before touching a rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"],"exclude":["ru"]}}'
+    export TUN_DIR_DIRECT_MARK=0x10000
+    : > /tmp/bats_ip_calls.log
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_failure
+    assert_output --partial "direct_mark 0x10000 lies in Tunnel Director's mark field"
+    refute grep -q 'ip rule' /tmp/bats_ip_calls.log
+    refute grep -q -- 'TUN_DIR' /tmp/bats_iptables_calls.log
+}
+
+# guard_direct_ensure takes the direct rule of a former direct_mark away, so the
+# chain has to set the new bit from the same apply on: the mark is in the hash.
+@test "tunnel_apply: a new direct mark rebuilds the chain in place" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"],"exclude":["ru"]}}'
+    run tunnel_apply
+    assert_success
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+
+    export TUN_DIR_DIRECT_MARK=0x400
+    : > /tmp/bats_iptables_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Configuration changed; rebuilding in place"
+    grep -q -- '-A TUN_DIR_NEW -s 192.168.1.5 -m set --match-set ru dst -j MARK --set-xmark 0x400/0x400' /tmp/bats_iptables_calls.log
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x400/0x400 lookup main'
+    refute_line --partial 'fwmark 0x200/0x200'
+}
+
+# refuse_direct_rule - for the rest of the test, the kernel refuses the direct
+# rule: "ip rule add pref 16894" fails, every other ip call goes to the mock.
+refuse_direct_rule() {
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && ${4:-} == 16894 ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+}
+
+# Without the direct rule, what the chain marks direct meets the guards instead
+# of main. A rebuild that went without it is not recorded, so the next apply
+# tries again, and the failover clients stay on Xray until it is in.
+@test "tunnel_apply: a refused direct rule records no hash, and the failover is not ready" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"],"exclude":["ru"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    refuse_direct_rule
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Guards: the direct rule did not go in"
+    assert_output --partial "the direct rule did not go in; this apply is not recorded as up-to-date"
+    [ ! -f "$TUN_DIR_HASH" ]
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+
+    unset -f ip
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+}
+
+# The up-to-date path starts with the direct rule: one that is gone is put back
+# there, and while the kernel refuses it the failover is not ready.
+@test "tunnel_apply: the up-to-date path puts a missing direct rule back, and withholds failover_ready while it is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"],"exclude":["ru"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+
+    ip rule del pref 16894 fwmark 0x200/0x200 lookup main
+    refuse_direct_rule
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    assert_output --partial "Failover tunnel 'wgc1' is not carrying traffic; Xray membership stays"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+
+    unset -f ip
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# ============================================================================
+# Guards: ip rules by source that outlive the firmware's firewall rebuilds
+# ============================================================================
+
+# The firmware's rebuilds take TUN_DIR away, and until the apply puts it back a
+# client's packets carry no mark: the fwmark rules never see them. ip rules
+# survive the rebuilds, and the client's guards, behind the fwmark rules and the
+# direct rule, send it into its tunnel instead, or nowhere.
+@test "tunnel_apply: a client of a tunnel gets its guard pair after the fwmark rules" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1'
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# An address or a CIDR in exclude is an ip rule too. A country is none - no rule
+# matches a set - and its traffic goes through the tunnel while the chain is gone.
+@test "tunnel_apply: an address exclusion goes direct ahead of the client's guard" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"],"exclude":["ru","192.168.100.0/24"]}}'
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.5 to 192.168.100.0/24 iif br0 lookup main\n16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# A client of main goes direct anyway, and a guard sending it to main would take
+# it past the guard of an Xray client entry that covers it.
+@test "tunnel_apply: a client of main gets no guard" {
+    load_tunnel_module_with '{"main":{"clients":["192.168.1.6"]},"wgc1":{"clients":["192.168.1.0/24"]}}'
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.0/24 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.0/24 iif br0 prohibit'
+}
+
+# The chain marks the failover clients first, so that an earlier entry that
+# covers them does not take them. In JSON order 192.168.1.7 would meet wgc2's
+# /24 first while the chain is gone.
+@test "tunnel_apply: guards follow the chain's order, the failover clients first" {
+    load_tunnel_module_with '{"wgc2":{"clients":["192.168.1.0/24"]},"wgc1":{"clients":["192.168.1.7"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.7
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.7 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.7 iif br0 prohibit\n16895:\tfrom 192.168.1.0/24 iif br0 lookup wgc2\n16895:\tfrom 192.168.1.0/24 iif br0 prohibit'
+}
+
+# The chain marks a failover client once, ahead of its tunnel's other clients,
+# and leaves it out on the tunnel's own row: so do the guards.
+@test "_tunnel_guard_lines: a failover client is listed once, ahead of its tunnel's other clients" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.0/24","192.168.1.7"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.7
+    _tunnel_init
+    printf '0 wgc1\n' > "$BATS_TEST_TMPDIR/slots"
+    # The slot's lookup rule, which its lookup guards follow.
+    ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1
+    run _tunnel_guard_lines "$BATS_TEST_TMPDIR/slots"
+    assert_success
+    assert_output $'from 192.168.1.7 iif br0 lookup wgc1\nfrom 192.168.1.7 iif br0 prohibit\nfrom 192.168.1.0/24 iif br0 lookup wgc1\nfrom 192.168.1.0/24 iif br0 prohibit'
+}
+
+# One listing serves the lookup rule of every slot: each "ip rule show" is a
+# process, and the up-to-date path lists the guards on every apply.
+@test "_tunnel_guard_lines: lists the ip rules once for every slot" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc2":{"clients":["192.168.1.6"]},"ovpnc1":{"clients":["192.168.1.7"]}}'
+    _tunnel_init
+    printf '0 wgc1\n1 wgc2\n2 ovpnc1\n' > "$BATS_TEST_TMPDIR/slots"
+    : > /tmp/bats_ip_calls.log
+    run _tunnel_guard_lines "$BATS_TEST_TMPDIR/slots"
+    assert_success
+    assert_equal "$(grep -c '^ip rule show$' /tmp/bats_ip_calls.log)" 1
+}
+
+# Without the listing no lookup rule could be found, and a list of refusals alone
+# would replace the guards of every working tunnel.
+@test "_tunnel_guard_lines: a listing that fails is an error, not a list without lookups" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    _tunnel_init
+    printf '0 wgc1\n' > "$BATS_TEST_TMPDIR/slots"
+    ip rule add pref 16384 fwmark 0x10000/0xff0000 lookup wgc1
+    ip() {
+        [[ ${1:-} == rule && ${2:-} == show ]] && return 1
+        command ip "$@"
+    }
+    run _tunnel_guard_lines "$BATS_TEST_TMPDIR/slots"
+    assert_failure
+    assert_output --partial "Tunnel Director: cannot list the ip rules; the guards stay as they are"
+    refute_output --partial "from 192.168.1.5"
+}
+
+# An empty list would take every guard away. A rebuild does not start without
+# the LAN interfaces; the up-to-date path leaves the guards as they are.
+@test "tunnel_apply: the up-to-date path keeps the guards when the platform names no LAN interface" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    platform_lan_ifaces() { return 1; }
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Tunnel Director: cannot determine the LAN interfaces; the guards stay as they are"
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# A key the platform names no table for has the block rule alone on its slot:
+# its clients get the refusing guard alone, and their exclusions still go
+# direct.
+@test "tunnel_apply: a tunnel with no table to route through gets the refusing guard alone" {
+    load_tunnel_module_with '{"foo1":{"clients":["192.168.1.6"],"exclude":["203.0.113.7"]}}'
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.6 to 203.0.113.7 iif br0 lookup main\n16895:\tfrom 192.168.1.6 iif br0 prohibit'
+}
+
+# The layer still names the table the last apply recorded for an interface taken
+# off the list, but the slot's lookup rule into it goes (_tunnel_unroute): the
+# slot keeps its block rule alone, and the clients their refusing guard alone.
+@test "tunnel_apply: an interface taken off the list keeps the refusing guard alone" {
+    load_awg1 '{"awg1":{"clients":["192.168.1.30"]}}'
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.30 iif br0 lookup 2000\n16895:\tfrom 192.168.1.30 iif br0 prohibit'
+
+    TUN_DIR_INTERFACES=""
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16896:\tfrom 192.168.1.30 iif br0 prohibit'
+}
+
+# refuse_lookup_wgc9 - for the rest of the test, ip refuses every rule that looks
+# wgc9 up, as iproute2 does on an Asuswrt-Merlin whose rt_tables names no wgc9
+# ("invalid table ID"); every other ip call goes to the mock. Merlin's naming
+# convention accepts wgc9 all the same, so its slot gets a lookup rule to try.
+refuse_lookup_wgc9() {
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" lookup wgc9 "* ]]; then
+            return 255
+        fi
+        command ip "$@"
+    }
+}
+
+# Such a key has its lookup rule refused on every apply, and its guard follows
+# that rule: the refusing guard alone, as its marks meet the block rule. A guard
+# line refused on every apply would keep each sync from completing, and the list
+# that guarded before would stay - with the guards of a client that has left
+# another tunnel since, which then go on routing it.
+@test "tunnel_apply: a slot whose lookup rule is refused gets the refusing guard alone, and the guards still sync" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]},"wgc9":{"clients":["192.168.1.20"]}}'
+    refuse_lookup_wgc9
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Failed to add ip rule: pref=16385 fwmark=0x20000 lookup=wgc9"
+    refute_output --partial "Guard of tunnel not installed"
+    assert_output --partial "a configured tunnel is not in the platform list"
+    [ ! -f "$TUN_DIR_HASH" ]
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit\n16895:\tfrom 192.168.1.6 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.6 iif br0 prohibit\n16895:\tfrom 192.168.1.20 iif br0 prohibit'
+
+    # 192.168.1.6 leaves Tunnel Director: TUN_DIR marks it no more, and its guards go.
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]},"wgc9":{"clients":["192.168.1.20"]}}'
+    run tunnel_apply
+    assert_success
+    refute_output --partial "Guard of tunnel not installed"
+    run guard_list tunnel
+    assert_output $'16896:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16896:\tfrom 192.168.1.5 iif br0 prohibit\n16896:\tfrom 192.168.1.20 iif br0 prohibit'
+}
+
+# The same key no longer keeps the failover of another tunnel from being ready.
+@test "tunnel_apply: a slot whose lookup rule is refused leaves another tunnel's failover ready" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]},"wgc9":{"clients":["192.168.1.20"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    refuse_lookup_wgc9
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    grep -qx wgc1 "$TUN_DIR_FAILOVER_READY"
+}
+
+# The chain skips such a client, and so do the guards.
+@test "tunnel_apply: a client outside RFC1918 gets no guard" {
+    load_tunnel_module_with '{"wgc1":{"clients":["100.64.0.8","192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# Review Focus: what is no address to iptables - IPv6, or 010 that it would read
+# as 8 - is no address to a guard either, and costs the apply nothing.
+@test "tunnel_apply: an IPv6 or misread exclusion gets no guard, and the apply succeeds" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"],"exclude":["2001:db8::1","203.0.113.010"]}}'
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# Review Focus: config.sh takes a paused client out of every client list, so it
+# gets no guard; the other client of its tunnel keeps its own.
+@test "tunnel_apply: a paused client gets no guard" {
+    load_common
+    source "$LIB_DIR/firewall.sh"
+    local tmp_cfg="$BATS_TEST_TMPDIR/vpn-director-paused-guard.json"
+    jq '.tunnel_director.tunnels.wgc1.clients += ["192.168.50.7"] | .paused_clients = ["192.168.50.0/24"]' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$tmp_cfg"
+    export VPD_CONFIG_FILE="$tmp_cfg"
+    source "$LIB_DIR/config.sh"
+    source "$LIB_DIR/guard.sh"
+    source "$LIB_DIR/ipset.sh" --source-only
+    source "$LIB_DIR/tunnel.sh" --source-only
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.50.7 iif br0 lookup wgc1\n16895:\tfrom 192.168.50.7 iif br0 prohibit'
+}
+
+# Review Focus: a client CIDR may hold the router's own LAN address (br0 is
+# 192.168.1.1/24 here). The router's own packets match "iif lo", never a LAN
+# interface, and the local table at preference 0 answers traffic to the router
+# before any guard. A guard without "iif" would take the router's own traffic
+# into the tunnel.
+@test "tunnel_apply: every guard names a LAN interface" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.0/24"],"exclude":["203.0.113.7"]},"wgc2":{"clients":["10.0.0.5"]}}'
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_equal "${#lines[@]}" 5
+    assert_equal "$(grep -c ' iif br0 ' <<< "$output")" 5
+}
+
+# "iif" takes one name, so each LAN interface has guards of its own.
+@test "tunnel_apply: a guard per LAN interface" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    platform_lan_ifaces() { printf 'br0\nbr1\n'; }
+    run tunnel_apply
+    assert_success
+    run guard_list tunnel
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1'
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 prohibit'
+    assert_line $'16895:\tfrom 192.168.1.5 iif br1 lookup wgc1'
+    assert_line $'16895:\tfrom 192.168.1.5 iif br1 prohibit'
+    assert_equal "${#lines[@]}" 4
+}
+
+# Make before break: the old guards route the old layout's clients until the
+# new chain carries every interface.
+@test "tunnel_apply: a client the layout dropped loses its guard after the swap" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5","192.168.1.6"]}}'
+    run tunnel_apply
+    assert_success
+    ip() {
+        if [[ ${1:-} == rule && ( ${2:-} == add || ${2:-} == del ) ]]; then
+            echo "ip $*" >> "$BATS_TEST_TMPDIR/order.log"
+        fi
+        command ip "$@"
+    }
+    iptables() {
+        [[ $* == *" -E "* ]] && echo "iptables $*" >> "$BATS_TEST_TMPDIR/order.log"
+        command iptables "$@"
+    }
+    TUN_DIR_TUNNELS_JSON='{"wgc1":{"clients":["192.168.1.5"]}}'
+
+    run tunnel_apply
+    assert_success
+    local swap del
+    swap=$(grep -nxF 'iptables -t mangle -E TUN_DIR_NEW TUN_DIR' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    del=$(grep -nxF 'ip rule del pref 16895 from 192.168.1.6 iif br0 lookup wgc1' "$BATS_TEST_TMPDIR/order.log" | cut -d: -f1)
+    [[ -n $swap && -n $del ]]
+    (( swap < del ))
+    run guard_list tunnel
+    assert_output $'16896:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16896:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# The rebuild that put a guard in recorded the hash, and every later apply takes
+# the up-to-date path: a guard that is gone goes back in there, and the one in
+# place is left alone.
+@test "tunnel_apply: the up-to-date path puts a missing guard back" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    ip rule del pref 16895 from 192.168.1.5 iif br0 prohibit
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    : > /tmp/bats_ip_calls.log
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    run ip rule show
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 prohibit'
+    run grep -E 'ip rule (add|del) pref 1689[56] ' /tmp/bats_ip_calls.log
+    assert_output 'ip rule add pref 16895 from 192.168.1.5 iif br0 prohibit'
+}
+
+# The watch takes the failover clients off Xray on failover_ready, and a client
+# moved without its guard would leave through the WAN in the next rebuild of the
+# firewall. A refused guard is retried by the next apply, a rebuild. While the
+# chain is in place the client is carried all the same, and not reported.
+@test "tunnel_apply: a refused guard records no hash and withholds failover_ready" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" iif br0 "* ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    : > "$LOG_FILE"
+    # Not through `run`: TUNNEL_UNCARRIED has to outlive the call.
+    tunnel_apply
+    grep -qF "Guard of tunnel not installed at pref 16895: from 192.168.1.5 iif br0 lookup wgc1" "$LOG_FILE"
+    grep -qF "Tunnel Director: a guard did not go in; this apply is not recorded as up-to-date" "$LOG_FILE"
+    [ ! -f "$TUN_DIR_HASH" ]
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+    assert_equal "${#TUNNEL_UNCARRIED[@]}" 0
+
+    unset -f ip
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_HASH" ]
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+    run guard_list tunnel
+    assert_output $'16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit'
+}
+
+# The same on the up-to-date path, which tries the guard again on every apply.
+@test "tunnel_apply: the up-to-date path withholds failover_ready while a missing guard is refused" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    export XRAY_FAILOVER_TUNNEL=wgc1 XRAY_FAILOVER_CLIENTS=192.168.1.5
+    platform_tunnel_route_ensure() { return 0; }
+    run tunnel_apply
+    assert_success
+    [ -f "$TUN_DIR_FAILOVER_READY" ]
+
+    ip rule del pref 16895 from 192.168.1.5 iif br0 prohibit
+    ip() {
+        if [[ ${1:-} == rule && ${2:-} == add && " $* " == *" iif br0 "* ]]; then
+            return 2
+        fi
+        command ip "$@"
+    }
+    fw_chain_exists() { return 0; }
+    marks_in_place
+    run tunnel_apply
+    assert_success
+    assert_output --partial "Rules are applied and up-to-date"
+    assert_output --partial "Guard of tunnel not installed at pref 16895: from 192.168.1.5 iif br0 prohibit"
+    assert_output --partial "Failover tunnel 'wgc1' is not carrying traffic; Xray membership stays"
+    [ ! -e "$TUN_DIR_FAILOVER_READY" ]
+}
+
+# With TUN_DIR gone and no XRAY_TPROXY, nothing marks a packet direct any more:
+# the direct rule goes with the guards.
+@test "tunnel_stop: removes the guards and, with no chain left, the direct rule" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"],"exclude":["203.0.113.7"]}}'
+    use_stateful_iptables
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 prohibit'
+
+    run tunnel_stop
+    assert_success
+    run ip rule show
+    refute_line --regexp '^1689[4-6]:'
+}
+
+# "stop tunnel" with Xray still running: XRAY_TPROXY marks what Xray lets
+# through direct, and the direct rule stays for it.
+@test "tunnel_stop: leaves the direct rule while XRAY_TPROXY is in place" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    export XRAY_CHAIN=XRAY_TPROXY
+    iptables -t mangle -N XRAY_TPROXY
+    run tunnel_apply
+    assert_success
+    run ip rule show
+    assert_line $'16895:\tfrom 192.168.1.5 iif br0 prohibit'
+
+    run tunnel_stop
+    assert_success
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+    refute_line --regexp '^1689[56]:'
+}
+
+# The guards and the direct rule follow the block range: with this pref_base
+# the direct rule would sit on main's rule at 32766 and the guards on the
+# default's at 32767. tunnel_apply refuses such a layout (guard_layout_check),
+# and stop, which runs with whatever pref_base the config holds, leaves both
+# alone.
+@test "tunnel_stop: leaves main's rules alone where the guards' preferences would reach them" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    use_stateful_iptables
+    printf '32766:\tfrom all lookup main\n32767:\tfrom all lookup default\n' >> "${BATS_IP_RULES_FILE:-/tmp/bats_test_ip_rules}"
+    export TUN_DIR_PREF_BASE=32256
+    run tunnel_stop
+    assert_success
+    run ip rule show
+    assert_line $'32766:\tfrom all lookup main'
+    assert_line $'32767:\tfrom all lookup default'
+}
+
+@test "tunnel_status: lists the guards" {
+    load_tunnel_module_with '{"wgc1":{"clients":["192.168.1.5"]}}'
+    run tunnel_apply
+    assert_success
+    run tunnel_status
+    assert_success
+    local section
+    section=$(sed -n '/^--- Guards (ip rules by source) ---$/,/^$/p' <<< "$output")
+    assert_equal "$section" $'--- Guards (ip rules by source) ---\n16894:\tfrom all fwmark 0x200/0x200 lookup main\n16895:\tfrom 192.168.1.5 iif br0 lookup wgc1\n16895:\tfrom 192.168.1.5 iif br0 prohibit'
 }

@@ -40,6 +40,19 @@ setup() {
     # otherwise - the file the bot on the machine running the suite would read.
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
 
+    # guard.sh records where its rules went in, under /tmp/vpn-director/guards
+    # unless told otherwise: each test keeps a record of its own. So does
+    # fwsnap.sh its snapshot of the rules, under /tmp/vpn-director/fwsnap.
+    export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
+    export FWSNAP_DIR="$BATS_TEST_TMPDIR/fwsnap"
+
+    # platform_hooks_install (Asuswrt-Merlin) writes the firmware's shared
+    # hooks under /jffs/scripts unless told otherwise, and the line it puts in
+    # calls an install's hooks under /opt/vpn-director/hooks: each test gets a
+    # /jffs/scripts of its own, and the line calls the tree's hooks.
+    export VPD_JFFS_SCRIPTS_DIR="$BATS_TEST_TMPDIR/jffs-scripts"
+    export VPD_HOOKS_DIR="$PROJECT_ROOT/opt/vpn-director/hooks"
+
     # Clean log file
     : > "$LOG_FILE"
 
@@ -137,6 +150,7 @@ load_ipset_module() {
 load_tunnel_module() {
     load_common
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tunnel.sh" --source-only
@@ -146,6 +160,7 @@ load_tunnel_module() {
 load_tproxy_module() {
     load_common
     load_config
+    source "$LIB_DIR/guard.sh"
     source "$LIB_DIR/ipset.sh" --source-only
     source "$LIB_DIR/firewall.sh"
     source "$LIB_DIR/tproxy.sh" --source-only

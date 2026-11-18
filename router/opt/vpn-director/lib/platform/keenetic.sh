@@ -263,8 +263,9 @@ platform_tunnel_table_release() {
 # fastroute entry test, and the same target sets FOE_ALG_SKIP, which closes the
 # hardware path too. The flag lives as long as the conntrack entry.
 #
-# Xray needs none of this: TPROXY terminates the connection in a local socket,
-# so there is no forwarded flow left to accelerate.
+# A flow TPROXY takes needs none of this: it terminates in a local socket, so
+# there is no forwarded flow left to accelerate. What XRAY_TPROXY lets through
+# is forwarded, and tproxy.sh opts it out as well.
 platform_tunnel_offload_target() {
     printf 'PPE\n'
 }
@@ -347,6 +348,17 @@ platform_cron_requirements() {
     [[ -x $init ]] && return 1
     printf "Entware's cron is not installed (%s is missing): opkg install cron - the job file in %s is already written and starts running once the package is there\n" \
         "$init" "$dir"
+}
+
+# The NDM hooks (/opt/etc/ndm/*/50-vpn-director.sh) are files of our own, which
+# install and update replace whole: no shared hook to put a line into, and
+# nothing to show for one.
+platform_hooks_install() {
+    return 0
+}
+
+platform_hooks_status() {
+    return 1
 }
 
 # mangle INPUT jumps port 443 to _NDM_HTTP_INPUT_TLS_, which drops every TLS
