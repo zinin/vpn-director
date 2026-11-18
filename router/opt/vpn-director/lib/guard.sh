@@ -45,7 +45,7 @@
 #   live there, and go with their former owner, on stop as on an apply (_guard_release_former).
 #
 # Dependencies:
-#   - common.sh (log, rt_table_label)
+#   - common.sh (log, rt_table_label, ensure_owned_dir)
 #   - firewall.sh (fw_chain_exists)
 #   - config.sh (TUN_DIR_PREF_BASE, TUN_DIR_MARK_MASK, TUN_DIR_MARK_SHIFT, TUN_DIR_DIRECT_MARK,
 #                TUN_DIR_CHAIN; XRAY_CHAIN, XRAY_FWMARK_MASK and XRAY_RULE_PREF). Read when a
@@ -54,7 +54,8 @@
 #                mark masks - so a test that skips config.sh can call everything; an XRAY_* one
 #                that is unset or empty is no Xray to look at.
 #   - GUARD_STATE_DIR: the directory of the records, /tmp/vpn-director/guards unless set. /tmp
-#     goes at a reboot, as the ip rules do.
+#     goes at a reboot, as the ip rules do. It and its parent are held to watchd's OwnedDir policy
+#     (ensure_owned_dir), and a record is read only when it is this user's own (_guard_record).
 #
 # Public API:
 #   guard_direct_pref          - the preference of the direct rule
@@ -262,12 +263,14 @@ _guard_pref_clear() {
 }
 
 # _guard_record <kind> - print the preferences the record of <kind> (direct, tunnel, xray) names,
-# on one line: where its rules last went in. Nothing when there is no record; a word that is no
+# on one line: where its rules last went in. Nothing when there is no record, and nothing for one
+# that is no regular file, a symlink, or another user's: the record decides at which preferences
+# root deletes rules of the guard shapes, and only one of this user's own may. A word that is no
 # preference is left out.
 _guard_record() {
     local file="${GUARD_STATE_DIR:-/tmp/vpn-director/guards}/$1" line="" w out=""
     local -a words=()
-    [[ -f $file ]] || return 0
+    [[ -f $file && ! -L $file && -O $file ]] || return 0
     { IFS= read -r line < "$file"; } 2>/dev/null || true
     read -ra words <<< "$line"
     for w in ${words[@]+"${words[@]}"}; do
@@ -277,17 +280,21 @@ _guard_record() {
 }
 
 # _guard_record_set <kind> <prefs> - record that the rules of <kind> went in at <prefs>: through a
-# file beside the record and a rename, and only when that changes it. The directory is made 0755
-# whatever the umask, and so is its parent: /tmp/vpn-director is also watchd's runtime directory.
-# A write that fails is a WARN and nothing else: the next change of pref_base then finds no former
-# preferences to release.
+# file beside the record, written under umask 077, and a rename, and only when that changes it.
+# The directory and its parent have to be this user's alone (ensure_owned_dir): a missing one is
+# made 0755 whatever the umask, one that group or others can write to loses that write -
+# /tmp/vpn-director is also watchd's runtime directory - and a symlink, no directory or another
+# user's records nothing. A refusal or a write that fails is a WARN and nothing else: the next
+# change of pref_base then finds no former preferences to release.
 _guard_record_set() {
     local dir="${GUARD_STATE_DIR:-/tmp/vpn-director/guards}" file
     file="$dir/$1"
     [[ $(_guard_record "$1") != "$2" ]] || return 0
-    # shellcheck disable=SC2174  # each directory named is the deepest of its own path: both get -m
-    if ! { { [[ -d $dir ]] || mkdir -p -m 755 "${dir%/*}" "$dir"; } &&
-        printf '%s\n' "$2" > "$file.new" && mv -f "$file.new" "$file"; } 2>/dev/null; then
+    if ! { ensure_owned_dir "${dir%/*}" && ensure_owned_dir "$dir"; }; then
+        log -l WARN "Guards: cannot record preferences $2 in $file; after a change of pref_base their rules stay"
+        return 0
+    fi
+    if ! { ( umask 077; printf '%s\n' "$2" > "$file.new" ) && mv -f "$file.new" "$file"; } 2>/dev/null; then
         rm -f "$file.new" 2>/dev/null || true
         log -l WARN "Guards: cannot record preferences $2 in $file; after a change of pref_base their rules stay"
     fi

@@ -74,6 +74,12 @@
 #   is_pos_int <value>
 #       Returns success (0) if <value> is a positive integer (>=1); else returns 1.
 #
+#   ensure_owned_dir <dir>
+#       Makes <dir> a directory of the effective user's alone, for state root writes and trusts: a
+#       missing one is created 0755 whatever the umask (its parent must exist), one with the
+#       sticky bit is left as it is, any other loses group and other write. Returns 1, touching
+#       nothing, for a symlink, no directory, or another user's.
+#
 # Notes
 # -----
 #   * Use -6 in functions to select IPv6 (where applicable).
@@ -868,6 +874,34 @@ is_pos_int() {
     esac
 
     [ "$v" -ge 1 ] 2>/dev/null
+}
+
+###################################################################################################
+# ensure_owned_dir - a directory of the effective user's alone, for state root writes and trusts
+# -------------------------------------------------------------------------------------------------
+# Usage:
+#   ensure_owned_dir <dir>
+#
+# Behavior:
+#   * A missing <dir> is created with mode 0755 whatever the umask. Its parent must exist: a caller
+#     vets the parent first, with a call of its own.
+#   * A <dir> that is a symlink, no directory, or not owned by the effective user (root on the
+#     router) returns 1 and is not touched: whoever owns it could plant a file there that root
+#     then reads, or a symlink root then writes through.
+#   * A directory with the sticky bit, such as /tmp, is left as it is and returns 0.
+#   * Any other loses group and other write (chmod go-w) and returns 0, or 1 when that chmod
+#     fails: the stop of an older release left /tmp/vpn-director 0777 under Asuswrt-Merlin's
+#     umask 0.
+#
+# The policy of watchd's OwnedDir (server/internal/watchdapi/server.go) for its own directory.
+###################################################################################################
+ensure_owned_dir() {
+    local dir="${1:-}"
+    [[ -n $dir ]] || return 1
+    [[ -e $dir || -L $dir ]] || mkdir -m 755 "$dir" 2>/dev/null || true
+    [[ ! -L $dir && -d $dir && -O $dir ]] || return 1
+    [[ ! -k $dir ]] || return 0
+    chmod go-w "$dir" 2>/dev/null
 }
 
 ###################################################################################################

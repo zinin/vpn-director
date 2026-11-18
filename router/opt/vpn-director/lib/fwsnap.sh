@@ -31,12 +31,14 @@
 #   removes the snapshot, whichever component it stops.
 #
 # Dependencies:
-#   - common.sh (log) and, through it, iftunnel.sh (IFTUNNEL_STATE_FILE)
+#   - common.sh (log, ensure_owned_dir) and, through it, iftunnel.sh (IFTUNNEL_STATE_FILE)
 #   - config.sh (XRAY_CHAIN, XRAY_FWMARK, XRAY_FWMARK_MASK, TUN_DIR_CHAIN). Read when a function
 #     runs, never when this file is sourced. An XRAY_* one that is unset or empty is no Xray to
 #     snapshot; TUN_DIR_CHAIN defaults to TUN_DIR, as in guard.sh.
 #   - FWSNAP_DIR: the directory of the snapshot, /tmp/vpn-director/fwsnap unless set. /tmp goes at
-#     a reboot, as the rules do.
+#     a reboot, as the rules do. It and its parent are held to watchd's OwnedDir policy
+#     (ensure_owned_dir): root's alone, as fwsnap-restore.sh checks before it restores anything -
+#     another user able to write there could hand root rules of their own.
 #
 # Public API:
 #   fwsnap_save    - snapshot the rules in place; rc 0 always
@@ -160,19 +162,26 @@ _fwsnap_nat() {
 }
 
 # _fwsnap_put <name> <content> - make $FWSNAP_DIR/<name> hold <content>, through a file beside it
-# and a rename; no content removes it. The directory is made 0755 whatever the umask, and so is its
-# parent: /tmp/vpn-director is also watchd's runtime directory. The file is made 0644: the hooks
-# hand it to iptables-restore as root. A write that fails is a WARN, and the file an earlier apply
-# wrote stays.
+# and a rename; no content removes it. The hooks hand the file to iptables-restore as root, so the
+# directory and its parent have to be root's alone (ensure_owned_dir): a missing one is made 0755
+# whatever the umask, one that group or others can write to loses that write - /tmp/vpn-director
+# is also watchd's runtime directory, which an older release's stop left 0777 under Merlin's umask
+# 0 - and a symlink, no directory or another user's is refused with a WARN naming it, nothing
+# written. The file is written under umask 077, then made 0644 and renamed into place. A refusal
+# or a write that fails is a WARN, and the file an earlier apply wrote stays.
 _fwsnap_put() {
-    local file="$FWSNAP_DIR/$1"
+    local file="$FWSNAP_DIR/$1" dir
     if [[ -z $2 ]]; then
         [[ ! -e $file ]] || rm -f "$file" 2>/dev/null || true
         return 0
     fi
-    # shellcheck disable=SC2174  # each directory named is the deepest of its own path: both get -m
-    if ! { { [[ -d $FWSNAP_DIR ]] || mkdir -p -m 755 "${FWSNAP_DIR%/*}" "$FWSNAP_DIR"; } &&
-        printf '%s\n' "$2" > "$file.new" && chmod 644 "$file.new" &&
+    for dir in "${FWSNAP_DIR%/*}" "$FWSNAP_DIR"; do
+        if ! ensure_owned_dir "$dir"; then
+            log -l WARN "Firewall snapshot: cannot write $file: $dir is a symlink, no directory or not this user's alone; a firewall rebuild restores the snapshot of an earlier apply, if there is one"
+            return 0
+        fi
+    done
+    if ! { ( umask 077; printf '%s\n' "$2" > "$file.new" ) && chmod 644 "$file.new" &&
         mv -f "$file.new" "$file"; } 2>/dev/null; then
         rm -f "$file.new" 2>/dev/null || true
         log -l WARN "Firewall snapshot: cannot write $file; a firewall rebuild restores the snapshot of an earlier apply, if there is one"

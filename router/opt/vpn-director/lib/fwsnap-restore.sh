@@ -31,6 +31,16 @@
 #   Nothing for any other table, without the table's snapshot, or once stop has left its marker;
 #   stop removes the snapshot as well.
 #
+# Root's alone: whoever can write the snapshot hands root the rules it restores. A snapshot file is
+# read only when it is a regular file, no symlink, and it, its directory and that directory's
+# parent are root's own, the two directories no symlinks, and none of the three is writable by
+# group or others unless it has the sticky bit (trusted) - watchd's OwnedDir policy, which
+# fwsnap.sh holds the directories to (ensure_owned_dir). Otherwise nothing is restored, with a line
+# in syslog. What this writes is root's alone too (umask 077): the copy iptables-restore reads, in
+# that checked directory, and the restored marker, removed first and created anew, never written
+# through a path that is there - a symlink planted in /tmp/tunnel_director would have its target
+# truncated as root.
+#
 # No lock: the restore is made to race an apply. A rebuild that runs meanwhile records no hash
 # while the restored marker is there, and its swap deletes every jump to the chain it replaces
 # (swap_fw_chain, firewall.sh), one the restore put in beside its own included. The hooks keep
@@ -49,6 +59,8 @@
 ###################################################################################################
 
 PATH="${VPD_RESTORE_PATH:-/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+# The copy and the marker are root's alone: the hooks bring the firmware's umask, 0 on Merlin.
+umask 077
 FWSNAP_DIR="${FWSNAP_DIR:-/tmp/vpn-director/fwsnap}"
 VPD_STOPPED_FILE="${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
 VPD_TUN_DIR_HASH="${VPD_TUN_DIR_HASH:-/tmp/tunnel_director/tun_dir_rules.sha256}"
@@ -57,11 +69,45 @@ VPD_TUN_DIR_RESTORED="${VPD_TUN_DIR_RESTORED:-/tmp/tunnel_director/restored}"
 # A rule is split into words for iptables and never expanded as a file name.
 set -f
 
+# trusted <file> - may root restore from <file>? A regular file and no symlink; the file, its
+# directory and that directory's parent each owned by the effective user (root on the router), the
+# two directories no symlinks either; and none of the three writable by group or others unless it
+# has the sticky bit. The modes come from one "ls -ldn" of the three, whose lines ls sorts by name,
+# so each line is judged alone: in the mode field the 6th character "w" is group write, the 9th
+# "w" other write, and a 10th "t" or "T" the sticky bit, the one [ -k ] tests. Any doubt - ls
+# failing, a line missing - is "not trusted".
+# shellcheck disable=SC3067  # -O is a builtin test of BusyBox ash and dash, the shells it runs under
+trusted() {
+    t_dir="${1%/*}"
+    t_parent="${t_dir%/*}"
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -O "$1" ] &&
+        [ ! -L "$t_dir" ] && [ -O "$t_dir" ] &&
+        [ ! -L "$t_parent" ] && [ -O "$t_parent" ] || return 1
+    t_modes="$(ls -ldn "$1" "$t_dir" "$t_parent" 2>/dev/null)" || return 1
+    t_lines=0
+    while read -r t_mode _; do
+        t_lines=$((t_lines + 1))
+        case "$t_mode" in
+            ?????????[tT]*) ;;
+            ?????w*|????????w*) return 1 ;;
+        esac
+    done <<EOF
+$t_modes
+EOF
+    [ "$t_lines" -eq 3 ]
+}
+
+# untrusted <file> - the syslog line for a snapshot trusted refused.
+untrusted() {
+    logger -t vpn-director "Snapshot $1 not restored: the file or its directory is not root's alone"
+}
+
 # restore_mangle - the snapshot's mangle rules, unless PREROUTING still jumps to a chain of it.
 # shellcheck disable=SC2086  # a rule's $spec is split into its words on purpose
 restore_mangle() {
     snap="$FWSNAP_DIR/mangle.rules"
     [ -f "$snap" ] || return 0
+    trusted "$snap" || { untrusted "$snap"; return 0; }
     type iptables-restore >/dev/null 2>&1 || return 0
 
     # Read whole, never piped into grep -q (shell-conventions.md). A listing that failed says
@@ -117,7 +163,10 @@ restore_mangle() {
     # builtin.
     copy="$snap.$$"
     if { printf '%s' "$out" > "$copy"; } 2>/dev/null && iptables-restore --noflush < "$copy"; then
-        { printf '' > "$VPD_TUN_DIR_RESTORED"; } 2>/dev/null
+        # The marker anew, with noclobber: whatever stands at its path goes first, and a path that
+        # is there again - a symlink planted meanwhile - is never written through.
+        rm -f "$VPD_TUN_DIR_RESTORED"
+        ( set -C; printf '' > "$VPD_TUN_DIR_RESTORED" ) 2>/dev/null
         rm -f "$copy" "$VPD_TUN_DIR_HASH"
         logger -t vpn-director "Restored the mangle rules from the snapshot"
     else
@@ -132,6 +181,7 @@ restore_mangle() {
 restore_nat() {
     snap="$FWSNAP_DIR/nat.rules"
     [ -f "$snap" ] || return 0
+    trusted "$snap" || { untrusted "$snap"; return 0; }
     while IFS= read -r spec; do
         [ -n "$spec" ] || continue
         iptables -t nat -C POSTROUTING $spec 2>/dev/null

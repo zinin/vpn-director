@@ -248,6 +248,81 @@ load 'test_helper'
 }
 
 # ============================================================================
+# ensure_owned_dir
+# ============================================================================
+
+# The firmware hooks bring its umask, 0 on Asuswrt-Merlin: a directory made under it without a mode
+# of its own would be 0777. A parent that is missing makes nothing.
+@test "ensure_owned_dir: a missing directory comes out 0755 under umask 000" {
+    load_common
+    local dir="$BATS_TEST_TMPDIR/owned" mask
+    mask="$(umask)"
+    umask 000
+    run ensure_owned_dir "$dir"
+    umask "$mask"
+    assert_success
+    [ -d "$dir" ]
+    assert_equal "$(stat -c %a "$dir")" 755
+
+    run ensure_owned_dir "$BATS_TEST_TMPDIR/missing/owned"
+    assert_failure
+    [ ! -e "$BATS_TEST_TMPDIR/missing" ]
+}
+
+# The stop of an older release left /tmp/vpn-director 0777 under Merlin's umask 0. A directory of
+# this user's loses group and other write, and keeps the rest of its mode.
+@test "ensure_owned_dir: a directory of its own that group or others can write to is tightened" {
+    load_common
+    local dir="$BATS_TEST_TMPDIR/owned"
+    mkdir "$dir"
+    chmod 777 "$dir"
+    run ensure_owned_dir "$dir"
+    assert_success
+    assert_equal "$(stat -c %a "$dir")" 755
+    chmod 730 "$dir"
+    run ensure_owned_dir "$dir"
+    assert_success
+    assert_equal "$(stat -c %a "$dir")" 710
+}
+
+# A directory with the sticky bit, such as /tmp, is shared by design: it stays as it is.
+@test "ensure_owned_dir: a sticky directory is left as it is" {
+    load_common
+    local dir="$BATS_TEST_TMPDIR/sticky"
+    mkdir "$dir"
+    chmod 1777 "$dir"
+    run ensure_owned_dir "$dir"
+    assert_success
+    assert_equal "$(stat -c %a "$dir")" 1777
+}
+
+# Root would write through a symlink another user planted. A symlink, a dangling one or one to a
+# directory, and a path that is no directory return 1, and nothing is created or changed. A
+# directory of another user's cannot be set up by a test user that is not root.
+@test "ensure_owned_dir: a symlink or no directory returns 1 and is not touched" {
+    load_common
+    local target="$BATS_TEST_TMPDIR/target" link="$BATS_TEST_TMPDIR/link"
+    mkdir "$target"
+    chmod 777 "$target"
+    ln -s "$target" "$link"
+    run ensure_owned_dir "$link"
+    assert_failure
+    [ -L "$link" ]
+    assert_equal "$(stat -c %a "$target")" 777
+
+    ln -s "$BATS_TEST_TMPDIR/nowhere" "$BATS_TEST_TMPDIR/dangling"
+    run ensure_owned_dir "$BATS_TEST_TMPDIR/dangling"
+    assert_failure
+    [ ! -e "$BATS_TEST_TMPDIR/nowhere" ]
+
+    : > "$BATS_TEST_TMPDIR/file"
+    chmod 666 "$BATS_TEST_TMPDIR/file"
+    run ensure_owned_dir "$BATS_TEST_TMPDIR/file"
+    assert_failure
+    assert_equal "$(stat -c %a "$BATS_TEST_TMPDIR/file")" 666
+}
+
+# ============================================================================
 # download_file
 # ============================================================================
 

@@ -409,8 +409,13 @@ guard at its preferences as its own. A guard left on the direct rule's preferenc
 left on a guard's, are never live there and go with their former owner, on `stop` as on an apply;
 `guard_direct_ensure` also deletes every guard at its preference. Without a record nothing says
 where the rules were, and none at another preference goes; a write that fails is a WARN, and the
-next change of `pref_base` leaves the rules where they were. The directory is made `0755` whatever
-the umask, its parent too: `/tmp/vpn-director` is watchd's runtime directory as well.
+next change of `pref_base` leaves the rules where they were. A record decides at which preferences
+root deletes rules, so the directory and its parent are held to watchd's `OwnedDir` policy
+(`ensure_owned_dir`, `lib/common.sh`): a missing one is made `0755` whatever the umask, one of
+root's own that group or others can write to loses that write - `/tmp/vpn-director` is watchd's
+runtime directory as well - and a symlink, no directory or another user's records nothing, with
+the same WARN. A record is written under umask 077, and read only while it is a regular file of
+root's own, no symlink; any other reads as none.
 
 `vpn-director.sh` ends every apply that gets there - in full, of one component, `update`,
 `restart` - with `fwsnap_save`, which snapshots the rules that apply left, a file per table.
@@ -422,13 +427,22 @@ the head of INPUT and the interface tunnels' MSS rules at the head of FORWARD. `
 hold goes: `mangle.rules` while neither chain exists, `nat.rules` without such a rule. An apply that
 fails part-way ends before the snapshot, and the one of an earlier apply stays; `stop` removes it
 before it tears anything down, whichever component it stops. A listing or a write that fails is a
-WARN, the earlier snapshot stays, and the apply goes on. The directory is made `0755` whatever the
-umask, its parent too, and the files `0644`: the hooks hand them to `iptables-restore` as root.
+WARN, the earlier snapshot stays, and the apply goes on. The hooks hand the files to
+`iptables-restore` as root, so the directory and its parent are held to watchd's `OwnedDir` policy
+(`ensure_owned_dir`): a missing one is made `0755` whatever the umask, one of root's own that group
+or others can write to loses that write, and a symlink, no directory or another user's gets
+nothing written, with a WARN naming it. A file is written under umask 077, then made `0644` and
+renamed into place.
 
 The firmware hooks restore the snapshot, and wait for that, before they queue the apply
 (`lib/fwsnap-restore.sh`, POSIX sh, no common.sh and no lock): KeeneticOS's `netfilter.d` hook the
 table it was called for, Merlin's `firewall-start` mangle and `nat-start` nat. Nothing is restored
-once `stop` has left its marker. Mangle goes back in one `iptables-restore --noflush`, and only
+once `stop` has left its marker, nor from a snapshot file root cannot trust: it has to be a regular
+file and no symlink, it, its directory and that directory's parent root's own, the two directories
+no symlinks, and none of the three writable by group or others unless it has the sticky bit;
+otherwise a syslog line says the snapshot was not restored. The restore runs under umask 077, and
+creates the restored marker anew - removed first, then made with noclobber - so a symlink planted
+at its path is never written through. Mangle goes back in one `iptables-restore --noflush`, and only
 while PREROUTING jumps to no chain the snapshot declares: NDM calls the hook for mangle several
 times in one rebuild, and a hook for a table the rebuild left whole must not add a second jump. Its
 INPUT and FORWARD rules go in only where `iptables -C` does not find them (status 1), renumbered

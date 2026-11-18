@@ -37,6 +37,7 @@ paths: "**/*.sh, jffs/**/*"
 | `is_lan_ip [-6] <ip>` | Check if IP is in RFC1918/ULA range (prefix only) |
 | `is_ipv4_net <addr>` | IPv4 address or CIDR that iptables and ipset read as written (no leading zeros) |
 | `is_pos_int <value>` | Check if value is positive integer (>=1) |
+| `ensure_owned_dir <dir>` | watchd's `OwnedDir` policy for a directory of state root writes and trusts: a missing one made `0755` whatever the umask (its parent must exist; callers vet the parent first), a sticky one left as it is, any other `chmod go-w`; rc 1, nothing touched, for a symlink, no directory or another user's |
 | `rt_table_label <table>` | A routing table as `ip rule show` prints it: its rt_tables name, else as given |
 | `strip_comments [text]` | Remove blank lines and # comments |
 | `platform_wan_if` | Active WAN interface (platform contract; `get_active_wan_if` is a wrapper) |

@@ -230,6 +230,32 @@ EOF
     assert_output --partial "Firewall snapshot: cannot write $FWSNAP_DIR/mangle.rules"
 }
 
+# The hooks hand the snapshot to iptables-restore as root. A directory of its own that others can
+# write to - an older release's stop left /tmp/vpn-director 0777 under Merlin's umask 0 - loses
+# that write, and the file goes in 0644. A symlink in its place is refused with a WARN naming it,
+# and nothing is written behind it.
+@test "fwsnap_save: tightens a snapshot directory of its own, and refuses a symlink in its place" {
+    load_fwsnap
+    tun_dir_applied
+    mkdir -p "$FWSNAP_DIR"
+    chmod 777 "$FWSNAP_DIR"
+    run fwsnap_save
+    assert_success
+    refute_output
+    run stat -c %a "$FWSNAP_DIR" "$FWSNAP_DIR/mangle.rules"
+    assert_output $'755\n644'
+
+    rm -rf "$FWSNAP_DIR"
+    mkdir "$BATS_TEST_TMPDIR/elsewhere"
+    ln -s "$BATS_TEST_TMPDIR/elsewhere" "$FWSNAP_DIR"
+    run fwsnap_save
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "Firewall snapshot: cannot write $FWSNAP_DIR/mangle.rules: $FWSNAP_DIR is a symlink, no directory or not this user's alone"
+    run ls -A "$BATS_TEST_TMPDIR/elsewhere"
+    refute_output
+}
+
 # A listing that fails says nothing of the rules in place: the snapshot of an earlier apply stays,
 # and the apply the hooks queue after restoring it reconciles what it holds that is stale.
 @test "fwsnap_save: a listing that fails leaves the snapshot as it was" {
@@ -470,6 +496,115 @@ LIST
     refute_output
     [ ! -s /tmp/bats_iptables_calls.log ]
     [ ! -e "$TUN_DIR_RESTORED" ]
+}
+
+# both_snapshots - the fixture applied with an interface tunnel, the snapshot of both tables, and
+# a rebuild of both after it: a restore that goes in has something to put back.
+both_snapshots() {
+    applied
+    export IFTUNNEL_STATE_FILE="$BATS_TEST_TMPDIR/iftunnels"
+    printf 'awg1 2000\n' > "$IFTUNNEL_STATE_FILE"
+    iptables -t nat -A POSTROUTING -o awg1 -j MASQUERADE
+    fwsnap_save
+    [ -f "$FWSNAP_DIR/nat.rules" ]
+    ndm_rebuild
+    iptables -t nat -D POSTROUTING -o awg1 -j MASQUERADE
+}
+
+# not_restored - the restore of mangle and of nat touched nothing: not one iptables call, the hash
+# kept, no marker, and a syslog line for each saying why.
+not_restored() {
+    : > /tmp/bats_iptables_calls.log
+    : > /tmp/bats_logger_calls.log
+    restore mangle
+    assert_success
+    refute_output
+    restore nat
+    assert_success
+    refute_output
+    [ ! -s /tmp/bats_iptables_calls.log ]
+    [ -f "$TUN_DIR_HASH" ]
+    [ ! -e "$TUN_DIR_RESTORED" ]
+    run grep -c "not restored: the file or its directory is not root's alone" /tmp/bats_logger_calls.log
+    assert_output 2
+}
+
+# Whoever can write the snapshot hands root the rules it restores. A snapshot file, its directory or
+# that directory's parent that group or others can write to restores nothing. Back to the owner's
+# alone - or with a parent that has the sticky bit, as /tmp has - the same snapshot goes in.
+@test "fwsnap-restore: a snapshot that group or others can write to is not restored" {
+    both_snapshots
+    local path mode
+    for path in "$FWSNAP_DIR" "$BATS_TEST_TMPDIR"; do
+        for mode in g+w o+w; do
+            chmod "$mode" "$path"
+            not_restored
+            chmod go-w "$path"
+        done
+    done
+    for mode in g+w o+w; do
+        chmod "$mode" "$FWSNAP_DIR/mangle.rules" "$FWSNAP_DIR/nat.rules"
+        not_restored
+        chmod go-w "$FWSNAP_DIR/mangle.rules" "$FWSNAP_DIR/nat.rules"
+    done
+
+    chmod 1777 "$BATS_TEST_TMPDIR"
+    restore mangle
+    assert_success
+    restore nat
+    assert_success
+    run iptables -t mangle -S PREROUTING
+    assert_output $'-P PREROUTING ACCEPT\n-A PREROUTING -i br0 -j XRAY_TPROXY\n-A PREROUTING -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    run iptables -t nat -S POSTROUTING
+    assert_output $'-P POSTROUTING ACCEPT\n-A POSTROUTING -o awg1 -j MASQUERADE'
+    [ -e "$TUN_DIR_RESTORED" ]
+}
+
+# A symlink in place of a snapshot file, of its directory or of that directory's parent restores
+# nothing either: whoever planted it chose what root reads.
+@test "fwsnap-restore: a snapshot reached through a symlink is not restored" {
+    both_snapshots
+    local name
+    mkdir "$BATS_TEST_TMPDIR/real"
+    for name in mangle.rules nat.rules; do
+        mv "$FWSNAP_DIR/$name" "$BATS_TEST_TMPDIR/real/$name"
+        ln -s "$BATS_TEST_TMPDIR/real/$name" "$FWSNAP_DIR/$name"
+    done
+    not_restored
+    for name in mangle.rules nat.rules; do
+        rm "$FWSNAP_DIR/$name"
+        mv "$BATS_TEST_TMPDIR/real/$name" "$FWSNAP_DIR/$name"
+    done
+
+    mv "$FWSNAP_DIR" "$BATS_TEST_TMPDIR/realdir"
+    ln -s "$BATS_TEST_TMPDIR/realdir" "$FWSNAP_DIR"
+    not_restored
+    rm "$FWSNAP_DIR"
+    mv "$BATS_TEST_TMPDIR/realdir" "$FWSNAP_DIR"
+
+    mkdir "$BATS_TEST_TMPDIR/realparent"
+    mv "$FWSNAP_DIR" "$BATS_TEST_TMPDIR/realparent/fwsnap"
+    ln -s "$BATS_TEST_TMPDIR/realparent" "$BATS_TEST_TMPDIR/parent"
+    export FWSNAP_DIR="$BATS_TEST_TMPDIR/parent/fwsnap"
+    not_restored
+}
+
+# The restored marker sits in /tmp/tunnel_director, where a symlink planted at its path had its
+# target truncated as root. What stands there goes, and the marker is made anew: a regular empty
+# file, the target as it was.
+@test "fwsnap-restore: a symlink planted at the marker's path goes, its target untouched" {
+    applied
+    ndm_rebuild
+    printf 'keep\n' > "$BATS_TEST_TMPDIR/target"
+    rm -f "$TUN_DIR_RESTORED"
+    ln -s "$BATS_TEST_TMPDIR/target" "$TUN_DIR_RESTORED"
+
+    restore mangle
+    assert_success
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/target")" keep
+    [ -f "$TUN_DIR_RESTORED" ]
+    [ ! -L "$TUN_DIR_RESTORED" ]
+    [ ! -s "$TUN_DIR_RESTORED" ]
 }
 
 # The hooks restore the table the firmware rebuilt, and only mangle and nat hold rules of ours.

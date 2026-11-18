@@ -891,6 +891,44 @@ log_rule_changes() {
     grep -q "WARN.*cannot record preferences 16895 16896 in $GUARD_STATE_DIR/tunnel" "$LOG_FILE"
 }
 
+# A record decides at which preferences root deletes rules of the guard shapes. One planted as a
+# symlink - to a file that names the preference of a rule someone else wants gone - is no record:
+# the rule there stays, and the record goes in anew, a file of its own, the symlink's target as it
+# was.
+@test "_guard_record: a record that is a symlink is no record" {
+    load_guard
+    mkdir -p "$GUARD_STATE_DIR"
+    printf '20510\n' > "$BATS_TEST_TMPDIR/planted"
+    ln -s "$BATS_TEST_TMPDIR/planted" "$GUARD_STATE_DIR/direct"
+    run _guard_record direct
+    assert_success
+    refute_output
+
+    ip rule add pref 20510 fwmark 0x200/0x200 lookup main
+    run guard_direct_ensure
+    assert_success
+    run ip rule show
+    assert_line $'20510:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_line $'16894:\tfrom all fwmark 0x200/0x200 lookup main'
+    [ ! -L "$GUARD_STATE_DIR/direct" ]
+    assert_equal "$(cat "$GUARD_STATE_DIR/direct")" 16894
+    assert_equal "$(cat "$BATS_TEST_TMPDIR/planted")" 20510
+}
+
+# A GUARD_STATE_DIR that is a symlink is refused: nothing is written behind it, and the WARN of a
+# record that cannot be written says so.
+@test "_guard_record_set: a GUARD_STATE_DIR that is a symlink records nothing" {
+    load_guard
+    mkdir "$BATS_TEST_TMPDIR/elsewhere"
+    ln -s "$BATS_TEST_TMPDIR/elsewhere" "$GUARD_STATE_DIR"
+    run _guard_record_set direct 16894
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "cannot record preferences 16894 in $GUARD_STATE_DIR/direct"
+    run ls -A "$BATS_TEST_TMPDIR/elsewhere"
+    refute_output
+}
+
 # A listing that fails shows no rule to release: the record goes on naming the former preference,
 # whose rule the next apply takes.
 @test "guard_direct_ensure: a listing that fails releases nothing, and the record stays" {
