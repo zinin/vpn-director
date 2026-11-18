@@ -188,6 +188,13 @@ Left open:
   packet that carries a tunnel's mark beside the direct bit to main.
   `apply tunnel` and `restart tunnel` move a client between tunnels in place, but add nothing to
   `XRAY_CLIENTS`: one moved from a tunnel to Xray leaves through the WAN until the next full apply.
+  They apply in full too, with a WARN, once the direct rule moved while `XRAY_TPROXY` is in mangle:
+  Xray's guards left at the former preferences could come ahead of it.
+  Either component's apply also runs in full when the direct mark changed - `direct_mark`, or a
+  mask that moved the bit picked without it - while the other chain is in mangle
+  (`guard_direct_mark_moved`): the rule of the new bit takes the place of the former one, and the
+  chain left alone would keep setting the former bit, which no rule routes any more - Tunnel
+  Director's exclusions into the tunnel, what Xray lets go direct refused by its guards.
   The daemons move clients with full applies; a server switch, which changes no client's route,
   runs `restart xray`.
 - `S99vpn-director restart` is `stop`, then `start` (`vpn-director.sh stop`, then `apply`), with no

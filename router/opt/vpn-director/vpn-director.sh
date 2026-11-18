@@ -313,15 +313,26 @@ cmd_apply() {
     # Handle --force: pass to ipset module
     [[ $FORCE -eq 1 ]] && export IPSET_FORCE_UPDATE=1
 
-    # An apply of Xray alone moves the direct rule (guard_direct_ensure) and runs no tunnel_apply.
-    # After a change of pref_base, mark_mask or mark_shift, Tunnel Director's lookup and block
-    # rules would stay at the former base, and the direct rule moved ahead of them would send what
-    # Xray lets through of a client on a tunnel too - the tunnel's mark beside the direct bit - to
-    # main. Such an apply runs in full, so both move together: restart xray, which ends in
-    # COMPONENT=xray cmd_apply, too. A plain condition: guard_layout_moved returns 1 for a layout
-    # that has not moved, and that must not end the run.
-    if [[ $COMPONENT == xray || $COMPONENT == tproxy ]] && guard_layout_moved; then
-        log -l WARN "pref_base, mark_mask or mark_shift moved the direct rule from preference $(_guard_record direct) to $(guard_direct_pref) since the last apply; Tunnel Director's rules have to move with it, so this apply runs in full"
+    # An apply of one component moves the direct rule (guard_direct_ensure) and rebuilds that
+    # component's rules alone, while the other component's chain may still be in mangle. After a
+    # change of pref_base, mark_mask or mark_shift the other's rules would stay at the former
+    # preferences (guard_layout_moved), and after a change of the direct mark - direct_mark, or a
+    # mask that moved the bit picked without it - its chain would keep setting the former bit,
+    # which no rule routes any more (guard_direct_mark_moved): Tunnel Director's exclusions would
+    # go into the tunnel, what Xray lets go direct would be refused. Such an apply runs in full, so
+    # both chains and the rule move together: restart xray, restart tunnel and ensure-routes,
+    # which end in a component's cmd_apply, too. Plain conditions: both return 1 for a layout that
+    # has not moved, and that must not end the run.
+    local other="" others_rules="" mark_in_place
+    case "$COMPONENT" in
+        xray|tproxy) other="${TUN_DIR_CHAIN:-TUN_DIR}" others_rules="Tunnel Director's rules" ;;
+        tunnel) other="${XRAY_CHAIN:-}" others_rules="Xray's rules" ;;
+    esac
+    if [[ -n $other ]] && guard_layout_moved "$other"; then
+        log -l WARN "pref_base, mark_mask or mark_shift moved the direct rule from preference $(_guard_record direct) to $(guard_direct_pref) since the last apply; $others_rules have to move with it, so this apply runs in full"
+        COMPONENT=all
+    elif [[ -n $other ]] && mark_in_place=$(guard_direct_mark_moved "$other"); then
+        log -l WARN "direct_mark or a mark mask changed the direct mark from $mark_in_place to $(guard_direct_mark_hex) since the last apply; $others_rules have to move with it, so this apply runs in full"
         COMPONENT=all
     fi
 
@@ -392,8 +403,8 @@ cmd_apply() {
             # Only a client that left Xray for direct is let go, one moved to main among
             # them: main is no tunnel, and a client of it that no rule marks goes direct.
             # An apply that finds the direct rule moved by pref_base, mark_mask or
-            # mark_shift since the last apply never gets here: it runs in full, with a
-            # WARN (above).
+            # mark_shift, or its mark changed, since the last apply never gets here: it
+            # runs in full, with a WARN (above).
             tproxy_apply
             _prune_keeping "$(tunnel_clients)"
             fwsnap_save

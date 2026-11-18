@@ -232,32 +232,70 @@ load_guard() {
     refute_output
 }
 
-# An apply of Xray alone moves the direct rule and runs no tunnel_apply: after a change of pref_base
-# it would leave Tunnel Director's rules at the former base. Moved: the record names another
-# preference than the configuration gives, while TUN_DIR is in mangle.
-@test "guard_layout_moved: a recorded preference that is not the current one, with TUN_DIR in mangle" {
+# An apply of one component moves the direct rule and rebuilds its own chain alone: after a change
+# of pref_base it would leave the other component's rules at the former base. Moved: the record
+# names another preference than the configuration gives, while the chain named is in mangle.
+@test "guard_layout_moved: a recorded preference that is not the current one, with the chain named in mangle" {
     load_guard
     use_stateful_iptables
     iptables -t mangle -N TUN_DIR
-    run guard_layout_moved
+    run guard_layout_moved TUN_DIR
     assert_failure
     refute_output
 
     mkdir -p "$GUARD_STATE_DIR"
     echo 16894 > "$GUARD_STATE_DIR/direct"
-    run guard_layout_moved
+    run guard_layout_moved TUN_DIR
     assert_failure
     refute_output
 
     TUN_DIR_PREF_BASE=15000
-    run guard_layout_moved
+    run guard_layout_moved TUN_DIR
     assert_success
     refute_output
 
-    iptables -t mangle -X TUN_DIR
-    run guard_layout_moved
+    run guard_layout_moved XRAY_TPROXY
     assert_failure
     refute_output
+
+    iptables -t mangle -X TUN_DIR
+    run guard_layout_moved TUN_DIR
+    assert_failure
+    refute_output
+}
+
+# A change of direct_mark - or of a mask that moves the bit picked without it - leaves the
+# preference where it is: the direct rule in place carries the former mark, which the chain that an
+# apply of the other component does not rebuild still sets. The mark in place is printed.
+@test "guard_direct_mark_moved: the direct rule in place carries another mark, with the chain named in mangle" {
+    load_guard
+    use_stateful_iptables
+    iptables -t mangle -N XRAY_TPROXY
+    run guard_direct_mark_moved XRAY_TPROXY
+    assert_failure
+    refute_output
+
+    ip rule add pref 16894 fwmark 0x200/0x200 lookup main
+    run guard_direct_mark_moved XRAY_TPROXY
+    assert_failure
+    refute_output
+
+    TUN_DIR_DIRECT_MARK=0x400
+    run guard_direct_mark_moved XRAY_TPROXY
+    assert_success
+    assert_output "0x200"
+
+    run guard_direct_mark_moved TUN_DIR
+    assert_failure
+    refute_output
+
+    # With a record, the rule in place is looked for where it names: 16894, not 15510.
+    mkdir -p "$GUARD_STATE_DIR"
+    echo 16894 > "$GUARD_STATE_DIR/direct"
+    TUN_DIR_PREF_BASE=15000
+    run guard_direct_mark_moved XRAY_TPROXY
+    assert_success
+    assert_output "0x200"
 }
 
 # ============================================================================

@@ -1168,6 +1168,87 @@ applied_then_moved_by_hand() {
     refute_output --regexp 'up-to-date|[Rr]ebuilding'
 }
 
+# direct_mark changed by hand, then a server switch: apply xray alone would put the direct rule's
+# new mark in place of the former one while TUN_DIR still sets the former bit on its exclusions,
+# which would then meet the guards and go into the tunnel. It runs in full instead, with a WARN,
+# and TUN_DIR is rebuilt with the new bit.
+@test "vpn-director: apply xray after the direct mark changed runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    jq '.advanced.tunnel_director.direct_mark = "0x400"' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply xray
+    assert_success
+    assert_output --partial "direct_mark or a mark mask changed the direct mark from 0x200 to 0x400 since the last apply; Tunnel Director's rules have to move with it, so this apply runs in full"
+    run ip rule show
+    assert_line $'16894:\tfrom all fwmark 0x400/0x400 lookup main'
+    run iptables -t mangle -S TUN_DIR
+    assert_output --partial "MARK --set-xmark 0x400/0x400"
+    refute_output --partial "MARK --set-xmark 0x200/0x200"
+}
+
+# The other way: apply tunnel alone would rebuild TUN_DIR with the new bit and move the direct rule
+# to it, while XRAY_TPROXY still sets the former one on what it lets go direct, which Xray's guards
+# would then refuse.
+@test "vpn-director: apply tunnel after the direct mark changed runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    jq '.advanced.tunnel_director.direct_mark = "0x400"' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply tunnel
+    assert_success
+    assert_output --partial "direct_mark or a mark mask changed the direct mark from 0x200 to 0x400 since the last apply; Xray's rules have to move with it, so this apply runs in full"
+    run iptables -t mangle -S XRAY_TPROXY
+    assert_output --partial "MARK --set-xmark 0x400/0x400"
+    refute_output --partial "MARK --set-xmark 0x200/0x200"
+}
+
+# pref_base raised by hand, then apply tunnel: Tunnel Director's rules and the direct rule would move
+# up, and Xray's guards left at the former preferences would come ahead of the direct rule and refuse
+# what XRAY_TPROXY lets go direct. It runs in full instead: nothing is left at the former ones.
+@test "vpn-director: apply tunnel after the direct rule moved runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    jq '.advanced.tunnel_director.pref_base = 17000' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply tunnel
+    assert_success
+    assert_output --partial "pref_base, mark_mask or mark_shift moved the direct rule from preference 16894 to 17510 since the last apply; Xray's rules have to move with it, so this apply runs in full"
+    run ip rule show
+    assert_line $'17510:\tfrom all fwmark 0x200/0x200 lookup main'
+    assert_line --regexp '^1751[34]:	from 192\.168\.1\.100 iif br0 prohibit$'
+    refute_line --regexp '^16[0-9]{3}:'
+}
+
+# With the direct rule as the configuration gives it, apply tunnel stays Tunnel Director's alone: no
+# WARN, and no tproxy_apply, which logs that it starts Xray's routing.
+@test "vpn-director: apply tunnel with the direct rule in place stays Tunnel Director's alone" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+
+    run_cli apply tunnel
+    assert_success
+    refute_output --partial "runs in full"
+    refute_output --partial "Xray TPROXY routing"
+}
+
 # ============================================================================
 # The snapshot of the rules, for the hooks to restore after a firewall rebuild
 # ============================================================================

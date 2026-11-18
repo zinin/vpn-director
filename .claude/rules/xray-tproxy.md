@@ -24,7 +24,10 @@ in `TPROXY_BYPASS`, whose `xray.servers` a switch may have recomputed. Once `pre
 `mark_mask` or `mark_shift` has moved the direct rule since the last apply, the apply of
 `restart xray`, as `apply xray`, runs in full, with a WARN (`guard_layout_moved`, `lib/guard.sh`):
 alone it would move the direct rule ahead of Tunnel Director's lookup rules, still at the former
-base, and send what Xray lets through of a client on a tunnel too to main. `restart xray-process`
+base, and send what Xray lets through of a client on a tunnel too to main. So it does once the
+direct mark changed - `direct_mark`, or a mask that moved the bit picked without it - while
+`TUN_DIR` is in mangle (`guard_direct_mark_moved`): alone it would put the rule of the new bit in
+place of the former one, which `TUN_DIR` still sets on its exclusions. `restart xray-process`
 restarts the process alone, for a caller whose only change is `config.json` — the subscription
 watch trying one server after another.
 

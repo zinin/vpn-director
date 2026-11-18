@@ -63,8 +63,11 @@
 #   guard_direct_mark_hex      - the direct mark as ip prints it
 #   guard_layout_check         - refuse a direct mark, guard preferences or an Xray rule_pref that
 #                                cannot work
-#   guard_layout_moved         - has the direct rule's preference moved since the last apply, with
-#                                Tunnel Director's chain in mangle?
+#   guard_layout_moved <chain> - has the direct rule's preference moved since the last apply, with
+#                                <chain> (the other component's) in mangle?
+#   guard_direct_mark_moved <chain>
+#                              - does the direct rule in place route another mark than the
+#                                configuration gives, with <chain> in mangle? Prints that mark
 #   guard_direct_ensure        - the direct rule, alone at its preference; a former one goes
 #   guard_direct_release       - remove the direct rule once neither module needs it
 #   guard_sync <owner> <lines> - make an owner's guards exactly <lines>, make before break
@@ -473,24 +476,63 @@ guard_layout_check() {
 }
 
 # -------------------------------------------------------------------------------------------------
-# guard_layout_moved - has the direct rule's preference moved since the last apply, with Tunnel
-# Director's chain in mangle?
+# guard_layout_moved <chain> - has the direct rule's preference moved since the last apply, with
+# <chain> in mangle?
 # -------------------------------------------------------------------------------------------------
 # rc 0 when the direct rule's record names a preference other than guard_direct_pref - pref_base,
-# mark_mask or mark_shift changed since the last apply - while TUN_DIR_CHAIN is in mangle. Tunnel
-# Director's lookup and block rules then sit at the former base until a tunnel_apply moves them,
-# and an apply of Xray alone, which runs none, would move the direct rule without them: after a
-# lower base it lands ahead of the former lookup range, and sends a packet that carries a tunnel's
-# mark beside the direct bit - what Xray lets through of a client that is on a tunnel too - to
-# main. vpn-director.sh makes such an apply a full one. rc 1 without a record, with the same
-# preference, or without Tunnel Director's chain: nothing of Tunnel Director's to move then. Prints
-# nothing.
+# mark_mask or mark_shift changed since the last apply - while <chain>, the chain of the component
+# an apply leaves alone, is in mangle. An apply of one component moves the direct rule
+# (guard_direct_ensure) and that component's rules alone. Of Xray alone, it leaves Tunnel
+# Director's lookup and block rules at the former base: after a lower base the direct rule lands
+# ahead of the former lookup range, and sends a packet that carries a tunnel's mark beside the
+# direct bit - what Xray lets through of a client that is on a tunnel too - to main. Of Tunnel
+# Director alone, it leaves Xray's guards at the former preferences: after a higher base they come
+# ahead of the direct rule and refuse what XRAY_TPROXY lets go direct. vpn-director.sh makes such
+# an apply a full one. rc 1 without a record, with the same preference, or without <chain>:
+# nothing of the other component's to move then. Prints nothing.
 # -------------------------------------------------------------------------------------------------
 guard_layout_moved() {
-    local recorded
+    local chain="${1:-}" recorded
+    [[ -n $chain ]] || return 1
     recorded=$(_guard_record direct)
     [[ -n $recorded && $recorded != "$(guard_direct_pref)" ]] || return 1
-    fw_chain_exists mangle "${TUN_DIR_CHAIN:-TUN_DIR}"
+    fw_chain_exists mangle "$chain"
+}
+
+# -------------------------------------------------------------------------------------------------
+# guard_direct_mark_moved <chain> - does the direct rule in place route another mark than the
+# configuration gives, with <chain> in mangle?
+# -------------------------------------------------------------------------------------------------
+# rc 0, printing the mark in place, when the rule of the direct shape at the recorded direct
+# preference (the current one without a record) carries another mark than guard_direct_mark_hex -
+# direct_mark changed since the last apply, or a mask that moved the bit picked without it - while
+# <chain>, the chain of the component an apply leaves alone, is in mangle. Both chains set the
+# direct mark, and the one rule routes it: an apply of one component puts the rule of the new mark
+# in place of the former one (guard_direct_ensure) and rebuilds its own chain alone, and <chain>
+# keeps setting the former bit, which no rule routes any more - what it lets go direct meets the
+# guards: Tunnel Director's exclusions go into the tunnel, what Xray lets through is refused.
+# vpn-director.sh makes such an apply a full one. rc 1 with no direct rule in place, with the
+# configured mark, or without <chain>.
+# -------------------------------------------------------------------------------------------------
+guard_direct_mark_moved() {
+    local chain="${1:-}" pref rules line selectors mark="" want
+    [[ -n $chain ]] || return 1
+    pref=$(_guard_record direct)
+    [[ -n $pref ]] || pref=$(guard_direct_pref)
+    # Read whole, never piped into grep -q (shell-conventions.md).
+    rules=$(ip rule show 2>/dev/null) || return 1
+    while IFS= read -r line; do
+        [[ ${line%%:*} == "$pref" ]] || continue
+        selectors=${line#*:}
+        if _guard_is direct "$selectors" && [[ $selectors =~ fwmark\ (0x[0-9a-f]+)/ ]]; then
+            mark=${BASH_REMATCH[1]}
+            break
+        fi
+    done <<< "$rules"
+    want=$(guard_direct_mark_hex 2>/dev/null) || want=""
+    [[ -n $mark && $mark != "$want" ]] || return 1
+    fw_chain_exists mangle "$chain" || return 1
+    printf '%s\n' "$mark"
 }
 
 # -------------------------------------------------------------------------------------------------
