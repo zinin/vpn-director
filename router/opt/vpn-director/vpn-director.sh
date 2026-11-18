@@ -31,6 +31,7 @@ fi
 #   vpn-director platform                    - Print platform facts as JSON (for the daemons)
 #   vpn-director cron install|remove         - Schedule or drop the daily ipset update
 #   vpn-director ensure-routes               - Put back a route an interface tunnel lost (cron runs it)
+#   vpn-director hooks                       - Put the call of our hooks into the firmware's shared hooks
 #
 # Options:
 #   -f, --force    Force operation (ignore hash checks)
@@ -123,6 +124,7 @@ Commands:
   platform                    Print platform facts as JSON
   cron install|remove         Schedule or drop the daily "update" job
   ensure-routes               Put back a route an interface tunnel lost (cron runs it every minute)
+  hooks                       Put the call of VPN Director's hooks into the firmware's shared hook scripts (Asuswrt-Merlin)
 
 Options:
   -f, --force       Force operation (ignore hash checks)
@@ -238,6 +240,13 @@ cmd_status() {
             GUARD_STATUS_BRIEF=1 tunnel_status
             echo ""
             GUARD_STATUS_BRIEF=1 tproxy_status
+            # The firmware's shared hooks and our line in each (Asuswrt-Merlin); a platform whose
+            # hooks are files of its own has nothing to show.
+            local hooks_status
+            if hooks_status="$(platform_hooks_status)"; then
+                echo ""
+                printf '%s\n' "=== Firmware Hooks ===" "$hooks_status"
+            fi
             ;;
         ipset)
             ipset_status
@@ -689,6 +698,30 @@ cmd_cron() {
     esac
 }
 
+# -------------------------------------------------------------------------------------------------
+# cmd_hooks - put the call of our hooks into the firmware's shared hook scripts
+# -------------------------------------------------------------------------------------------------
+# Asuswrt-Merlin runs /jffs/scripts/<hook>, files shared with the owner and other add-ons: install
+# and update run this to put one line of ours into each and keep the rest of it, cutting out the
+# body an earlier release wrote (platform_hooks_install). Each line the platform prints is logged,
+# a "warn:" one as a WARN. No config and no lock: it touches no rule, and a hook is replaced by a
+# rename. Exits 1 when a hook is left without the line. An apply never runs it: a line the owner
+# took out stays out until install, an update or this command.
+# -------------------------------------------------------------------------------------------------
+cmd_hooks() {
+    _load_common
+    local out line rc=0
+    out="$(platform_hooks_install)" || rc=$?
+    while IFS= read -r line; do
+        case "$line" in
+            "ok: "*)   log "${line#ok: }" ;;
+            "warn: "*) log -l WARN "${line#warn: }" ;;
+            ?*)        log "$line" ;;
+        esac
+    done <<< "$out"
+    return "$rc"
+}
+
 ###################################################################################################
 # Main
 ###################################################################################################
@@ -723,6 +756,9 @@ case "$COMMAND" in
         ;;
     ensure-routes)
         cmd_ensure_routes
+        ;;
+    hooks)
+        cmd_hooks
         ;;
     *)
         echo "Unknown command: $COMMAND" >&2

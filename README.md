@@ -110,6 +110,7 @@ After installation, configs are located at:
 /opt/vpn-director/vpn-director.sh restart             # Restart Xray, rebuild all in place without a stop
 /opt/vpn-director/vpn-director.sh update              # Update ipsets + reapply
 /opt/vpn-director/vpn-director.sh ensure-routes       # Put back a route an interface tunnel lost (cron, every minute)
+/opt/vpn-director/vpn-director.sh hooks               # Merlin: put the VPN Director line back into the /jffs/scripts hooks (install and update do it)
 
 # Component-specific
 /opt/vpn-director/vpn-director.sh status tunnel       # Tunnel Director status only

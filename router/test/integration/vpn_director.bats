@@ -25,6 +25,11 @@ setup() {
     export XRAY_TPROXY_READY="$BATS_TEST_TMPDIR/xray_tproxy_ready"
     export GUARD_STATE_DIR="$BATS_TEST_TMPDIR/guards"
     export FWSNAP_DIR="$BATS_TEST_TMPDIR/fwsnap"
+    # And the firmware's shared hooks (Asuswrt-Merlin): `hooks` and the full
+    # status would write and read the machine's /jffs/scripts, and the line
+    # would call the hooks of an install rather than the tree's.
+    export VPD_JFFS_SCRIPTS_DIR="$BATS_TEST_TMPDIR/jffs-scripts"
+    export VPD_HOOKS_DIR="$PROJECT_ROOT/opt/vpn-director/hooks"
     : > "$LOG_FILE"
 }
 
@@ -1546,4 +1551,61 @@ EOF
         [[ ! -e "$BATS_TEST_TMPDIR/watchd-init.events" ]]
         assert_watchd_init_preserves_routing
     done
+}
+
+# ============================================================================
+# The firmware's shared hooks (Asuswrt-Merlin)
+# ============================================================================
+
+@test "vpn-director: hooks puts the line into each Merlin hook and says so" {
+    run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_success
+    assert_output --partial "$VPD_JFFS_SCRIPTS_DIR/firewall-start: created"
+    local h
+    for h in firewall-start wan-event nat-start; do
+        grep -qF ' # vpn-director' "$VPD_JFFS_SCRIPTS_DIR/$h"
+        [ -x "$VPD_JFFS_SCRIPTS_DIR/$h" ]
+    done
+}
+
+@test "vpn-director: hooks exits 1 when a hook is left without the line" {
+    mkdir -p "$VPD_JFFS_SCRIPTS_DIR"
+    echo 'echo hi' > "$VPD_JFFS_SCRIPTS_DIR/wan-event"
+    run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_failure
+    assert_output --partial "$VPD_JFFS_SCRIPTS_DIR/wan-event: left alone"
+}
+
+@test "vpn-director: the full status lists the firmware hooks" {
+    run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_success
+    run "$SCRIPTS_DIR/vpn-director.sh" status
+    assert_success
+    assert_line "=== Firmware Hooks ==="
+    assert_line "$VPD_JFFS_SCRIPTS_DIR/nat-start: vpn-director line in place"
+}
+
+# An apply runs on every firewall start and every event: the shared hooks are
+# install's and update's to write, and a line the owner took out stays out.
+@test "vpn-director: apply leaves the firmware hooks alone" {
+    run "$SCRIPTS_DIR/vpn-director.sh" apply --dry-run
+    assert_success
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    [ ! -e "$VPD_JFFS_SCRIPTS_DIR" ]
+}
+
+@test "vpn-director: on KeeneticOS hooks has nothing to put in and the status no hooks section" {
+    VPD_PLATFORM=keenetic PATH="$TEST_ROOT/mocks/keenetic:$PATH" \
+        run "$SCRIPTS_DIR/vpn-director.sh" hooks
+    assert_success
+    refute_output
+    [ ! -e "$VPD_JFFS_SCRIPTS_DIR" ]
+    VPD_PLATFORM=keenetic PATH="$TEST_ROOT/mocks/keenetic:$PATH" \
+        run "$SCRIPTS_DIR/vpn-director.sh" status
+    assert_success
+    assert_output --partial "Xray TPROXY Status"
+    refute_output --partial "Firmware Hooks"
 }

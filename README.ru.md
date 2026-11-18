@@ -110,6 +110,7 @@ curl -fsSL \
 /opt/vpn-director/vpn-director.sh restart             # Перезапустить Xray и пересобрать всё на месте, без остановки
 /opt/vpn-director/vpn-director.sh update              # Обновить ipsets + применить
 /opt/vpn-director/vpn-director.sh ensure-routes       # Вернуть маршрут, потерянный туннелем-интерфейсом (cron, раз в минуту)
+/opt/vpn-director/vpn-director.sh hooks               # Merlin: вернуть строку VPN Director в хуки /jffs/scripts (это делают установка и обновление)
 
 # Отдельные компоненты
 /opt/vpn-director/vpn-director.sh status tunnel       # Только статус Tunnel Director

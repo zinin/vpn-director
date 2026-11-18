@@ -20,6 +20,7 @@ curl -fsSL https://raw.githubusercontent.com/zinin/vpn-director/master/install.s
 /opt/vpn-director/vpn-director.sh platform            # Platform facts as JSON (tunnels, WAN, password file)
 /opt/vpn-director/vpn-director.sh cron install        # Schedule the daily update (S99 does this)
 /opt/vpn-director/vpn-director.sh ensure-routes       # Put back a route an interface tunnel lost (its cron job runs it every minute)
+/opt/vpn-director/vpn-director.sh hooks               # Merlin: our line into each /jffs/scripts hook, the rest kept (install and update run it)
 /opt/vpn-director/vpn-director.sh --wait apply        # Queue for a running instance (120 s) instead of skipping
 /opt/vpn-director/vpn-director.sh --unless-stopped apply  # Skip once "stop" has run (watchd's subscription watch)
 
