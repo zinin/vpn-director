@@ -615,10 +615,10 @@ shared_hook() {
     assert_line --partial "warn: $VPD_JFFS_SCRIPTS_DIR/wan-event: left alone"
 }
 
-@test "_merlin_hook_line: calls our hook with the firmware's arguments, marked" {
+@test "_merlin_hook_line: calls our hook with the firmware's arguments and its shell, marked" {
     load_platform
     run _merlin_hook_line nat-start
-    assert_output "[ -x $VPD_HOOKS_DIR/nat-start ] && $VPD_HOOKS_DIR/nat-start \"\$@\" # vpn-director"
+    assert_output "[ -x $VPD_HOOKS_DIR/nat-start ] && VPD_HOOK_SHELL=\$\$ $VPD_HOOKS_DIR/nat-start \"\$@\" # vpn-director"
 }
 
 @test "_merlin_hook_ensure: every earlier body of every hook is recognized" {
@@ -710,6 +710,31 @@ shared_hook() {
     [ -x "$f" ]
 }
 
+# Merlin runs no hook that is not executable: one that holds someone else's
+# commands is off, and turning it on is not ours to do.
+@test "_merlin_hook_ensure: a non-executable hook with someone else's commands is not made executable" {
+    load_platform
+    local f="$VPD_JFFS_SCRIPTS_DIR/firewall-start"
+    printf '#!/bin/sh\n/jffs/scripts/disabled-thing start\n' | shared_hook firewall-start
+    chmod 644 "$f"
+    run _merlin_hook_ensure firewall-start
+    assert_failure
+    assert_line --index 0 "ok: $f: updated (line added)"
+    assert_line --index 1 "warn: $f: not executable, so the firmware runs nothing in it; chmod +x it if its commands should run, then run vpn-director.sh hooks"
+    [ "$(stat -c %a "$f")" = 644 ]
+    assert_hook firewall-start "$(printf '#!/bin/sh\n%s\n/jffs/scripts/disabled-thing start' "$(_merlin_hook_line firewall-start)")"
+}
+
+@test "_merlin_hook_ensure: a rewrite keeps the hook's own mode" {
+    load_platform
+    local f="$VPD_JFFS_SCRIPTS_DIR/firewall-start"
+    { cat "$VPD_HOOKS_DIR/legacy/firewall-start.v0.14.0"; echo '/jffs/scripts/guest-lan-port &'; } | shared_hook firewall-start
+    chmod 700 "$f"
+    run _merlin_hook_ensure firewall-start
+    assert_success
+    [ "$(stat -c %a "$f")" = 700 ]
+}
+
 @test "_merlin_hook_ensure: leaves a file without #! alone" {
     load_platform
     local f="$VPD_JFFS_SCRIPTS_DIR/firewall-start"
@@ -763,6 +788,26 @@ shared_hook() {
         [ "$(md5sum < "$VPD_HOOKS_DIR/legacy/${entry% *}" | cut -d' ' -f1)" = "${entry#* }" ]
     done
     [ "$(ls "$VPD_HOOKS_DIR/legacy" | wc -l)" -eq 9 ]
+}
+
+# An update's log goes with the update: the status is where an earlier body
+# the update could not cut out stays visible.
+@test "platform_hooks_status: a vpn-director.sh call left beside the line is reported" {
+    load_platform
+    { echo '#!/bin/sh'; _merlin_hook_line firewall-start
+      tail -n +2 "$VPD_HOOKS_DIR/legacy/firewall-start.v0.14.0" | sed 's/--wait apply/apply/'; } | shared_hook firewall-start
+    run platform_hooks_status
+    assert_success
+    assert_line "$VPD_JFFS_SCRIPTS_DIR/firewall-start: vpn-director line in place; still calls vpn-director.sh outside it - remove that call by hand"
+}
+
+@test "platform_hooks_status: a non-executable hook with someone else's commands asks for chmod" {
+    load_platform
+    printf '#!/bin/sh\n%s\necho mine\n' "$(_merlin_hook_line nat-start)" | shared_hook nat-start
+    chmod 644 "$VPD_JFFS_SCRIPTS_DIR/nat-start"
+    run platform_hooks_status
+    assert_success
+    assert_line "$VPD_JFFS_SCRIPTS_DIR/nat-start: not executable, so the firmware runs nothing in it; chmod +x it if its commands should run"
 }
 
 @test "platform_hooks_status: in place, not executable, no line" {

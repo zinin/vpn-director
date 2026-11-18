@@ -335,11 +335,31 @@ install_shared_hook() {
     assert_success
     run cat "$BATS_TEST_TMPDIR/order.log"
     assert_output "owner"
+    wait_for_order_apply
+    run cat "$BATS_TEST_TMPDIR/order.log"
+    assert_output $'owner\napply'
+}
+
+# wait_for_order_apply - until order.log holds the apply's line, 5 s at most.
+wait_for_order_apply() {
     local i
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
-        grep -q '^apply$' "$BATS_TEST_TMPDIR/order.log" && break
+    for i in $(seq 1 25); do
+        grep -q '^apply$' "$BATS_TEST_TMPDIR/order.log" 2>/dev/null && return 0
         sleep 0.2
     done
+    return 1
+}
+
+# The apply waits for the shell running the shared hook: iptables 1.4.15 on
+# Merlin takes no lock, and two writers of one table at once can lose a rule
+# of either. The commands after our line still do not wait for the apply.
+@test "shared firewall-start: our apply waits for the commands after our line" {
+    setup_merlin_hook_env
+    printf '#!/bin/sh\necho apply >> "%s/order.log"\n' "$BATS_TEST_TMPDIR" > "$VPD_SCRIPT"
+    install_shared_hook firewall-start "sleep 1; echo owner >> \"$BATS_TEST_TMPDIR/order.log\""
+    run sh "$VPD_JFFS_SCRIPTS_DIR/firewall-start" eth0 3>&-
+    assert_success
+    wait_for_order_apply
     run cat "$BATS_TEST_TMPDIR/order.log"
     assert_output $'owner\napply'
 }

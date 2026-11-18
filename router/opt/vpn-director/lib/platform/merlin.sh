@@ -335,10 +335,39 @@ _MERLIN_HOOKS="firewall-start wan-event nat-start"
 _MERLIN_HOOK_MARK=" # vpn-director"
 
 # _merlin_hook_line <hook> - our line for the shared <hook>: our hook with the
-# firmware's arguments, skipped while Entware is not mounted.
+# firmware's arguments, skipped while Entware is not mounted. It names the shell
+# running the shared hook (VPD_HOOK_SHELL), whose other commands our detached
+# apply waits for (hooks/<hook>).
 _merlin_hook_line() {
     local dir="${VPD_HOOKS_DIR:-/opt/vpn-director/hooks}"
-    printf '[ -x %s/%s ] && %s/%s "$@"%s\n' "$dir" "$1" "$dir" "$1" "$_MERLIN_HOOK_MARK"
+    printf '[ -x %s/%s ] && VPD_HOOK_SHELL=$$ %s/%s "$@"%s\n' "$dir" "$1" "$dir" "$1" "$_MERLIN_HOOK_MARK"
+}
+
+# _merlin_hook_foreign <line> <lines...> - does any of <lines>, ours aside, run
+# something: a line that is neither blank nor a comment.
+_merlin_hook_foreign() {
+    local line="$1" l text
+    shift
+    for l in "$@"; do
+        [[ $l != "$line" ]] || continue
+        text=${l#"${l%%[![:space:]]*}"}
+        [[ -n $text && $text != '#'* ]] && return 0
+    done
+    return 1
+}
+
+# _merlin_hook_stray_call <line> <lines...> - does any of <lines>, ours aside,
+# call vpn-director.sh: an earlier body someone edited, so it was not cut out,
+# applying a second time on every event.
+_merlin_hook_stray_call() {
+    local line="$1" l text
+    shift
+    for l in "$@"; do
+        [[ $l != "$line" ]] || continue
+        text=${l#"${l%%[![:space:]]*}"}
+        [[ $text != '#'* && $text == *vpn-director.sh* ]] && return 0
+    done
+    return 1
 }
 
 # _merlin_hook_ensure <hook> - our line in the shared <hook>, everything else in
@@ -348,7 +377,7 @@ _merlin_hook_line() {
 # the owner's link, so a symlinked hook is rewritten by hand.
 _merlin_hook_ensure() {
     local hook="$1" dir="${VPD_JFFS_SCRIPTS_DIR:-/jffs/scripts}"
-    local file tmp line body version text i j n found first=-1 replaced=0 dups=0 joined
+    local file tmp line body version i j n found first=-1 replaced=0 dups=0 joined make_x=0 off=0
     local -a lines=() old=() kept=() changes=()
     file="$dir/$hook"
     tmp="$dir/.$hook.vpd-new"
@@ -428,14 +457,24 @@ _merlin_hook_ensure() {
     if (( dups )); then
         changes+=("duplicate lines removed")
     fi
+    # The firmware runs no hook that is not executable. One that holds nothing
+    # but ours is made so; one that also runs someone else's commands is off,
+    # and switching it on is not ours to do: it gets the line and keeps its mode.
     if [[ ! -x $file ]]; then
-        changes+=("made executable")
+        if _merlin_hook_foreign "$line" "${kept[@]:1}"; then
+            off=1
+        else
+            make_x=1
+            changes+=("made executable")
+        fi
     fi
 
     if (( ${#changes[@]} == 0 )); then
-        printf 'ok: %s: unchanged\n' "$file"
+        if (( ! off )); then
+            printf 'ok: %s: unchanged\n' "$file"
+        fi
     elif [[ ${changes[*]} == "made executable" ]]; then
-        if ! chmod 755 "$file" 2>/dev/null; then
+        if ! chmod +x "$file" 2>/dev/null; then
             printf 'warn: %s: cannot write it; the hook is as it was\n' "$file"
             return 1
         fi
@@ -444,7 +483,10 @@ _merlin_hook_ensure() {
         printf 'warn: %s: left alone: it is a symlink, which a rewrite would replace with a file; put this line after the #! line of the file it points to: %s\n' "$file" "$line"
         return 1
     else
-        if ! { printf '%s\n' "${kept[@]}" > "$tmp" && chmod 755 "$tmp" && mv -f "$tmp" "$file"; } 2>/dev/null; then
+        # The new text goes into a copy of the hook, which keeps the hook's own
+        # mode; only one made executable above gains the execute bits.
+        if ! { cp -p "$file" "$tmp" && printf '%s\n' "${kept[@]}" > "$tmp" &&
+            { (( ! make_x )) || chmod +x "$tmp"; } && mv -f "$tmp" "$file"; } 2>/dev/null; then
             rm -f "$tmp" 2>/dev/null || true
             printf 'warn: %s: cannot write it; the hook is as it was\n' "$file"
             return 1
@@ -453,18 +495,13 @@ _merlin_hook_ensure() {
         printf 'ok: %s: updated (%s)\n' "$file" "${joined%, }"
     fi
 
-    # A call of the CLI left outside our line - an earlier body someone edited,
-    # so it was not recognized - would apply a second time on every event.
-    for i in "${!kept[@]}"; do
-        [[ ${kept[i]} != "$line" ]] || continue
-        text=${kept[i]#"${kept[i]%%[![:space:]]*}"}
-        [[ $text != '#'* ]] || continue
-        if [[ $text == *vpn-director.sh* ]]; then
-            printf 'warn: %s: still calls vpn-director.sh outside the vpn-director line; remove that call by hand\n' "$file"
-            break
-        fi
-    done
-    return 0
+    if (( off )); then
+        printf 'warn: %s: not executable, so the firmware runs nothing in it; chmod +x it if its commands should run, then run vpn-director.sh hooks\n' "$file"
+    fi
+    if _merlin_hook_stray_call "$line" "${kept[@]:1}"; then
+        printf 'warn: %s: still calls vpn-director.sh outside the vpn-director line; remove that call by hand\n' "$file"
+    fi
+    return "$off"
 }
 
 # One line per shared hook, "ok: <file>: <what was done>" or "warn: <file>:
@@ -478,16 +515,25 @@ platform_hooks_install() {
     return "$rc"
 }
 
+# What the owner can act on, per hook: the line missing, a hook the firmware
+# does not run, or a call of vpn-director.sh outside our line - which an
+# update reports in its own log only, and a successful update deletes that.
 platform_hooks_status() {
     local hook file line
+    local -a lines=()
     for hook in $_MERLIN_HOOKS; do
         file="${VPD_JFFS_SCRIPTS_DIR:-/jffs/scripts}/$hook"
         line=$(_merlin_hook_line "$hook")
         if [[ -f $file ]] && grep -qxF -- "$line" "$file"; then
-            if [[ -x $file ]]; then
-                printf '%s: vpn-director line in place\n' "$file"
-            else
+            mapfile -t lines < "$file"
+            if [[ ! -x $file ]] && _merlin_hook_foreign "$line" "${lines[@]:1}"; then
+                printf '%s: not executable, so the firmware runs nothing in it; chmod +x it if its commands should run\n' "$file"
+            elif [[ ! -x $file ]]; then
                 printf '%s: not executable; run vpn-director.sh hooks\n' "$file"
+            elif _merlin_hook_stray_call "$line" "${lines[@]:1}"; then
+                printf '%s: vpn-director line in place; still calls vpn-director.sh outside it - remove that call by hand\n' "$file"
+            else
+                printf '%s: vpn-director line in place\n' "$file"
             fi
         else
             printf '%s: no vpn-director line; run vpn-director.sh hooks\n' "$file"

@@ -8,7 +8,7 @@
 # A WAN coming up restarts the firewall too, and both hooks apply: --wait
 # queues this apply behind a running one rather than exiting at once, so
 # neither is lost. The apply is detached, its descriptors closed, so the
-# commands after our line in the shared file run at once.
+# commands after our line in the shared file run at once; it waits for them.
 
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 VPD_SCRIPT="${VPD_SCRIPT:-/opt/vpn-director/vpn-director.sh}"
@@ -16,7 +16,19 @@ VPD_SCRIPT="${VPD_SCRIPT:-/opt/vpn-director/vpn-director.sh}"
 [ "$2" = "connected" ] || exit 0
 
 if [ -x "$VPD_SCRIPT" ]; then
-    "$VPD_SCRIPT" --wait apply </dev/null >/dev/null 2>&1 &
+    # The apply waits for the shell running the shared hook - VPD_HOOK_SHELL,
+    # which our line there passes - to finish the commands after our line, a
+    # minute at most: iptables 1.4.15 on Merlin takes no lock, and two writers
+    # of one table at once can lose a rule of either. Run any other way, the
+    # hook applies at once.
+    (
+        n=0
+        while [ -n "${VPD_HOOK_SHELL:-}" ] && [ "$n" -lt 60 ] && kill -0 "$VPD_HOOK_SHELL" 2>/dev/null; do
+            sleep 1
+            n=$((n + 1))
+        done
+        exec "$VPD_SCRIPT" --wait apply
+    ) </dev/null >/dev/null 2>&1 &
 else
     logger -t "wan-event" "vpn-director not found at $VPD_SCRIPT"
 fi

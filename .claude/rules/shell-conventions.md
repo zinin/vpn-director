@@ -257,7 +257,9 @@ Both hooks pass `--wait`, as the KeeneticOS hooks do, and run the apply
 detached, its descriptors closed: the firmware runs the shared
 `/jffs/scripts/<hook>`, whose one line of ours calls `/opt/vpn-director/hooks/<hook>`,
 and the owner's and other add-ons' commands after that line do not wait for the
-apply.
+apply. It waits for them instead, a minute at most (`VPD_HOOK_SHELL`, the shell
+our line passes): iptables 1.4.15 on Merlin takes no lock, and two writers of one
+table at once can lose a rule of either.
 
 Ahead of that apply, `firewall-start` refills our chains from the snapshot the
 last apply left (`lib/fwsnap-restore.sh mangle`, `tunnel-director.md`, "State
