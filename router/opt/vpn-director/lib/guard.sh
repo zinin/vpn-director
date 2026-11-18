@@ -63,6 +63,8 @@
 #   guard_direct_mark_hex      - the direct mark as ip prints it
 #   guard_layout_check         - refuse a direct mark, guard preferences or an Xray rule_pref that
 #                                cannot work
+#   guard_layout_moved         - has the direct rule's preference moved since the last apply, with
+#                                Tunnel Director's chain in mangle?
 #   guard_direct_ensure        - the direct rule, alone at its preference; a former one goes
 #   guard_direct_release       - remove the direct rule once neither module needs it
 #   guard_sync <owner> <lines> - make an owner's guards exactly <lines>, make before break
@@ -449,6 +451,27 @@ guard_layout_check() {
         return 1
     fi
     return 0
+}
+
+# -------------------------------------------------------------------------------------------------
+# guard_layout_moved - has the direct rule's preference moved since the last apply, with Tunnel
+# Director's chain in mangle?
+# -------------------------------------------------------------------------------------------------
+# rc 0 when the direct rule's record names a preference other than guard_direct_pref - pref_base,
+# mark_mask or mark_shift changed since the last apply - while TUN_DIR_CHAIN is in mangle. Tunnel
+# Director's lookup and block rules then sit at the former base until a tunnel_apply moves them,
+# and an apply of Xray alone, which runs none, would move the direct rule without them: after a
+# lower base it lands ahead of the former lookup range, and sends a packet that carries a tunnel's
+# mark beside the direct bit - what Xray lets through of a client that is on a tunnel too - to
+# main. vpn-director.sh makes such an apply a full one. rc 1 without a record, with the same
+# preference, or without Tunnel Director's chain: nothing of Tunnel Director's to move then. Prints
+# nothing.
+# -------------------------------------------------------------------------------------------------
+guard_layout_moved() {
+    local recorded
+    recorded=$(_guard_record direct)
+    [[ -n $recorded && $recorded != "$(guard_direct_pref)" ]] || return 1
+    fw_chain_exists mangle "${TUN_DIR_CHAIN:-TUN_DIR}"
 }
 
 # -------------------------------------------------------------------------------------------------

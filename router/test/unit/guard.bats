@@ -209,6 +209,34 @@ load_guard() {
     refute_output
 }
 
+# An apply of Xray alone moves the direct rule and runs no tunnel_apply: after a change of pref_base
+# it would leave Tunnel Director's rules at the former base. Moved: the record names another
+# preference than the configuration gives, while TUN_DIR is in mangle.
+@test "guard_layout_moved: a recorded preference that is not the current one, with TUN_DIR in mangle" {
+    load_guard
+    use_stateful_iptables
+    iptables -t mangle -N TUN_DIR
+    run guard_layout_moved
+    assert_failure
+    refute_output
+
+    mkdir -p "$GUARD_STATE_DIR"
+    echo 16894 > "$GUARD_STATE_DIR/direct"
+    run guard_layout_moved
+    assert_failure
+    refute_output
+
+    TUN_DIR_PREF_BASE=15000
+    run guard_layout_moved
+    assert_success
+    refute_output
+
+    iptables -t mangle -X TUN_DIR
+    run guard_layout_moved
+    assert_failure
+    refute_output
+}
+
 # ============================================================================
 # guard_direct_ensure / guard_direct_release
 # ============================================================================

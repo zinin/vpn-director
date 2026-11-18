@@ -1093,6 +1093,50 @@ applied_then_moved_by_hand() {
     assert_success
 }
 
+# pref_base lowered by hand, then a server switch: apply xray alone would move the direct rule from
+# 16894 to 15510, ahead of Tunnel Director's lookup rules still at 16384, and send what Xray lets
+# through of a client on a tunnel too to main. It runs in full instead, with a WARN, and Tunnel
+# Director's rules move with the direct rule: nothing is left at the former preferences.
+@test "vpn-director: apply xray after the direct rule moved runs in full, with a WARN" {
+    use_stateful_iptables
+    use_stateful_ipset
+    export VPD_CONFIG_FILE="$BATS_TEST_TMPDIR/vpn-director.json"
+    cp "$TEST_ROOT/fixtures/vpn-director.json" "$VPD_CONFIG_FILE"
+    run_cli apply
+    assert_success
+    assert_equal "$(cat "$GUARD_STATE_DIR/direct")" 16894
+    run ip rule show
+    assert_line $'16384:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    jq '.advanced.tunnel_director.pref_base = 15000' \
+        "$TEST_ROOT/fixtures/vpn-director.json" > "$VPD_CONFIG_FILE"
+
+    run_cli apply xray
+    assert_success
+    assert_output --partial "WARN"
+    assert_output --partial "pref_base, mark_mask or mark_shift moved the direct rule from preference 16894 to 15510 since the last apply; Tunnel Director's rules have to move with it, so this apply runs in full"
+    assert_output --regexp 'up-to-date|[Rr]ebuilding'
+    run ip rule show
+    assert_line $'15000:\tfrom all fwmark 0x10000/0xff0000 lookup wgc1'
+    assert_line $'15510:\tfrom all fwmark 0x200/0x200 lookup main'
+    refute_line --regexp '^16[0-9]{3}:'
+    assert_equal "$(cat "$GUARD_STATE_DIR/direct")" 15510
+}
+
+# With the direct rule where the configuration puts it, apply xray stays Xray's alone: no WARN, and
+# no tunnel_apply, which logs either way whether it rebuilds or finds its rules up to date.
+@test "vpn-director: apply xray with the direct rule in place stays Xray's alone" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    assert_equal "$(cat "$GUARD_STATE_DIR/direct")" 16894
+
+    run_cli apply xray
+    assert_success
+    refute_output --partial "moved the direct rule"
+    refute_output --regexp 'up-to-date|[Rr]ebuilding'
+}
+
 # ============================================================================
 # The snapshot of the rules, for the hooks to restore after a firewall rebuild
 # ============================================================================

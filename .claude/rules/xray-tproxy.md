@@ -20,7 +20,11 @@ vpn-director.sh apply             # Apply all (including TPROXY)
 `restart xray` restarts the process, then applies the TPROXY rules in place (`tproxy_apply`,
 `tproxy_prune`): nothing is stopped, so a client meets a restarting Xray and waits — TPROXY drops
 what no socket takes. The Web UI server switch, `/xray` and the wizard use it; its apply also swaps
-in `TPROXY_BYPASS`, whose `xray.servers` a switch may have recomputed. `restart xray-process`
+in `TPROXY_BYPASS`, whose `xray.servers` a switch may have recomputed. Once `pref_base`,
+`mark_mask` or `mark_shift` has moved the direct rule since the last apply, the apply of
+`restart xray`, as `apply xray`, runs in full, with a WARN (`guard_layout_moved`, `lib/guard.sh`):
+alone it would move the direct rule ahead of Tunnel Director's lookup rules, still at the former
+base, and send what Xray lets through of a client on a tunnel too to main. `restart xray-process`
 restarts the process alone, for a caller whose only change is `config.json` — the subscription
 watch trying one server after another.
 
@@ -46,7 +50,8 @@ watch trying one server after another.
   CIDR skipped - plus every client the caller names that the live set holds: after `tunnel_apply`
   (a full apply) the clients it reported as not carried, for `apply xray` and `restart xray` every
   client the config puts on a tunnel, `main`'s left out (`tunnel-director.md`, "What tunnel_apply
-  reports as not carried"). A client moving to a tunnel stays proxied that way until an apply in
+  reports as not carried") - unless the direct rule moved since the last apply, when they apply in
+  full, with a WARN (above). A client moving to a tunnel stays proxied that way until an apply in
   which Tunnel Director carries it (`packet-flow.md`, "The apply: make before break"); one that left
   Xray for direct - moved to `main` as well - is let go. A named client the new set already matches
   gets no element of its own: `ipset test` finds a host through any network the set holds, so a host

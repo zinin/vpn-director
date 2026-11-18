@@ -182,7 +182,10 @@ Left open:
   `restart xray` run no Tunnel Director, so their prune keeps every client the config puts on a
   tunnel - `main`'s left out - that `XRAY_CLIENTS` still holds: a client moved from Xray to a tunnel
   by hand stays proxied until a full apply moves it, and only a client that left Xray for direct is
-  let go.
+  let go. Once `pref_base`, `mark_mask` or `mark_shift` has moved the direct rule since the last
+  apply (`guard_layout_moved`), they apply in full instead, with a WARN: Tunnel Director's lookup
+  and block rules have to move with it, or the direct rule would come ahead of them and send a
+  packet that carries a tunnel's mark beside the direct bit to main.
   `apply tunnel` and `restart tunnel` move a client between tunnels in place, but add nothing to
   `XRAY_CLIENTS`: one moved from a tunnel to Xray leaves through the WAN until the next full apply.
   The daemons move clients with full applies; a server switch, which changes no client's route,
