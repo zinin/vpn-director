@@ -69,7 +69,7 @@ cd server && go run ./cmd/watchd --dev
 | `router/opt/vpn-director/lib/tunnel.sh` | Tunnel Director module: apply, stop, status |
 | `router/opt/vpn-director/lib/tproxy.sh` | Xray TPROXY module: apply, stop, status |
 | `router/opt/vpn-director/lib/guard.sh` | ip rule guards by source and LAN interface (16895-16898) and the direct rule (`fwmark 0x200/0x200 lookup main`, 16894): what keeps protected clients off the WAN while a firmware rebuild has taken our chains away |
-| `router/opt/vpn-director/lib/fwsnap.sh` | Snapshot of our mangle and nat rules after every apply (`/tmp/vpn-director/fwsnap/`), removed by `stop` |
+| `router/opt/vpn-director/lib/fwsnap.sh` | Snapshot of our mangle and nat rules after every apply (`/tmp/vpn-director/fwsnap/`), removed by a full `stop`; a component's stop leaves one of what keeps running |
 | `router/opt/vpn-director/lib/fwsnap-restore.sh` | POSIX sh the firmware hooks run before their apply: puts the snapshot back (`iptables-restore --noflush`) unless the table still holds our rules |
 | `router/opt/vpn-director/lib/xrayconf.sh` | Xray config.json from a server's stored outbound (legacy VLESS records built), `xray run -test` before it replaces the live one |
 | `router/opt/vpn-director/lib/subscription.sh` | Subscription decoder: share links (vless, vmess, trojan, ss, hysteria2), base64 or plain, and Xray JSON, into servers with a ready outbound |

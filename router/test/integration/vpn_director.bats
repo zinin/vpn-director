@@ -298,8 +298,10 @@ run_stubbed_cli() {
 }
 
 # The hooks restore the snapshot of the rules after a firewall rebuild. A stop takes it away
-# first, whichever component it stops: a rebuild during the teardown or after it would bring back
-# what the stop took away. A component it does not know stops nothing, and the snapshot stays.
+# first, whichever component it stops: a rebuild during the teardown would bring back what the stop
+# takes away. A full stop leaves none; a component's stop then writes one of what keeps running
+# ("a component's stop leaves the snapshot of what keeps running" below). A component it does not
+# know stops nothing, and the snapshot stays.
 @test "vpn-director: stop removes the snapshot before it tears anything down" {
     export VPD_STOPPED_FILE="$BATS_TEST_TMPDIR/stopped"
     local args
@@ -333,8 +335,10 @@ run_stubbed_cli() {
             continue
         fi
         assert_success
-        [ ! -e "$FWSNAP_DIR/mangle.rules" ]
-        [ ! -e "$FWSNAP_DIR/nat.rules" ]
+        if [[ $args == stop ]]; then
+            [ ! -e "$FWSNAP_DIR/mangle.rules" ]
+            [ ! -e "$FWSNAP_DIR/nat.rules" ]
+        fi
         run cat "$BATS_TEST_TMPDIR/calls"
         assert_success
         refute_output --partial "with the snapshot"
@@ -1200,6 +1204,42 @@ applied_then_moved_by_hand() {
     run iptables -t mangle -S TUN_DIR
     assert_failure
     [ -z "$(find "$FWSNAP_DIR" "$GUARD_STATE_DIR" -type f 2>/dev/null)" ]
+}
+
+# A stop of one component leaves the other running, and a firewall rebuild after it would leave
+# that one's clients on their guards until the hook's apply without a snapshot: Xray's refused, a
+# tunnel client's excluded countries through its tunnel. The stop removes the snapshot before its
+# teardown, then writes one of what keeps running; the stopped chain is gone by then. The full stop
+# leaves none.
+@test "vpn-director: a component's stop leaves the snapshot of what keeps running" {
+    use_stateful_iptables
+    use_stateful_ipset
+    run_cli apply
+    assert_success
+    run_cli stop xray
+    assert_success
+    run cat "$FWSNAP_DIR/mangle.rules"
+    assert_success
+    assert_line ':TUN_DIR - [0:0]'
+    assert_line '-I PREROUTING 1 -i br0 -m mark --mark 0x0/0xff0000 -j TUN_DIR'
+    refute_output --partial 'XRAY_TPROXY'
+
+    run_cli apply
+    assert_success
+    run_cli stop tunnel
+    assert_success
+    run cat "$FWSNAP_DIR/mangle.rules"
+    assert_success
+    assert_line ':XRAY_TPROXY - [0:0]'
+    assert_line '-I PREROUTING 1 -i br0 -j XRAY_TPROXY'
+    refute_output --partial 'TUN_DIR'
+
+    run_cli apply
+    assert_success
+    run_cli stop
+    assert_success
+    [ ! -e "$FWSNAP_DIR/mangle.rules" ]
+    [ ! -e "$FWSNAP_DIR/nat.rules" ]
 }
 
 # Only path declarations are rehomed; init control flow remains production code.

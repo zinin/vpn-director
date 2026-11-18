@@ -28,8 +28,9 @@
 #           tproxy_apply rebuilds its chain on every apply anyway.
 #   nat     each "-o <iface> -j MASQUERADE" of $FWSNAP_DIR/nat.rules that "iptables -C" does not
 #           find in nat POSTROUTING, inserted at its head.
-#   Nothing for any other table, without the table's snapshot, or once stop has left its marker;
-#   stop removes the snapshot as well.
+#   Nothing for any other table, without the table's snapshot, or once a full stop has left its
+#   marker; a full stop removes the snapshot as well. A component's stop leaves no marker, and
+#   leaves the snapshot of what keeps running.
 #
 # Root's alone: whoever can write the snapshot hands root the rules it restores. A snapshot file is
 # read only when it is a regular file, no symlink, and it, its directory and that directory's

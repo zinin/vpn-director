@@ -499,7 +499,7 @@ Packet from 192.168.50.10 to 8.8.8.8 (foreign):
 | `/tmp/tunnel_director/tun_dir_tables` | Applied tunnels, `<idx> <id>` per line (`TUN_DIR_TABLES`); a tunnel keeps its idx while it has clients; during a rebuild, the union of both layouts |
 | `/tmp/tunnel_director/restored` | Marker: a firmware hook put the mangle rules back from the snapshot (`TUN_DIR_RESTORED`, `lib/fwsnap-restore.sh`); the next apply rebuilds, and no apply records the hash while it is there |
 | `/tmp/vpn-director/guards/{direct,tunnel,xray}` | The preferences the direct rule and each owner's guards last went in at (`GUARD_STATE_DIR`, `lib/guard.sh`) |
-| `/tmp/vpn-director/fwsnap/{mangle,nat}.rules` | The snapshot of our rules the last apply left, as `iptables-restore --noflush` input, for the firmware hooks to restore (`FWSNAP_DIR`, `lib/fwsnap.sh`); `stop` removes it |
+| `/tmp/vpn-director/fwsnap/{mangle,nat}.rules` | The snapshot of our rules the last apply left, as `iptables-restore --noflush` input, for the firmware hooks to restore (`FWSNAP_DIR`, `lib/fwsnap.sh`); a full `stop` removes it, and a component's stop removes it before its teardown, then writes one of what keeps running |
 
 ## Key Code Locations
 

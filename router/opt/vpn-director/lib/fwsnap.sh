@@ -27,8 +27,9 @@
 #   swap or deletes the chain (swap_fw_chain).
 #
 #   An apply that fails part-way ends before the snapshot, and the one of an earlier apply stays:
-#   the apply the hooks queue after restoring it reconciles whatever it holds that is stale. stop
-#   removes the snapshot, whichever component it stops.
+#   the apply the hooks queue after restoring it reconciles whatever it holds that is stale. A
+#   full stop removes the snapshot. A component's stop removes it before its teardown too, then
+#   writes one of what keeps running: the stopped component's chain is gone by then.
 #
 # Dependencies:
 #   - common.sh (log, ensure_owned_dir) and, through it, iftunnel.sh (IFTUNNEL_STATE_FILE)
@@ -238,7 +239,9 @@ fwsnap_save() {
 # fwsnap_remove - remove the snapshot
 # -------------------------------------------------------------------------------------------------
 # stop runs it, whichever component it stops, before it tears anything down: a firewall rebuild
-# during the teardown or after it has nothing to bring back. The next apply writes a new one.
+# during the teardown has nothing to bring back. After a full stop none is left until the next
+# apply writes one; a component's stop writes one of what keeps running once its teardown is done
+# (fwsnap_save).
 # -------------------------------------------------------------------------------------------------
 fwsnap_remove() {
     rm -f "$FWSNAP_DIR/mangle.rules" "$FWSNAP_DIR/nat.rules" 2>/dev/null || true

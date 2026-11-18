@@ -410,9 +410,13 @@ cmd_stop() {
             printf '1\n' > "${VPD_STOPPED_FILE:-/tmp/vpn-director/stopped}"
             ;;
     esac
-    # Then the snapshot of the rules goes, whichever component stops: the hooks restore it after
-    # a rebuild of the firewall, and a rebuild during the teardown or after it would bring back
-    # what the stop takes away. An unknown component stops nothing and keeps it.
+    # Then the snapshot of the rules goes, whichever component stops, before any teardown: the
+    # hooks restore it after a rebuild of the firewall, and a rebuild during the teardown would
+    # bring back what the stop takes away. A full stop leaves none. A component's stop then
+    # snapshots what keeps running - fwsnap_save declares only the chains that exist, and the
+    # stopped one is gone by then - so a rebuild after it brings the other component's chain back
+    # at once, where its clients would sit on their guards until the hook's apply. An unknown
+    # component stops nothing and keeps the snapshot.
     case "$COMPONENT" in
         ""|all)
             fwsnap_remove
@@ -422,10 +426,12 @@ cmd_stop() {
         tunnel)
             fwsnap_remove
             tunnel_stop
+            fwsnap_save
             ;;
         xray|tproxy)
             fwsnap_remove
             tproxy_stop
+            fwsnap_save
             ;;
         *)
             echo "Unknown component: $COMPONENT" >&2

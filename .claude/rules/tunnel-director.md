@@ -427,8 +427,11 @@ PREROUTING jumps from the top, Xray's first, the mangle INPUT accept of Xray's m
 the head of INPUT and the interface tunnels' MSS rules at the head of FORWARD. `nat.rules` holds
 `-o <iface> -j MASQUERADE` for each interface tunnel whose rule is in place. A file with nothing to
 hold goes: `mangle.rules` while neither chain exists, `nat.rules` without such a rule. An apply that
-fails part-way ends before the snapshot, and the one of an earlier apply stays; `stop` removes it
-before it tears anything down, whichever component it stops. A listing or a write that fails is a
+fails part-way ends before the snapshot, and the one of an earlier apply stays. `stop` removes it
+before it tears anything down, whichever component it stops, and a full stop leaves none; a
+component's stop then writes one of what keeps running (`fwsnap_save` declares only the chains that
+exist, and the stopped one is gone by then), so a rebuild after `stop xray` brings `TUN_DIR` back
+at once, and one after `stop tunnel` `XRAY_TPROXY`. A listing or a write that fails is a
 WARN, and the apply goes on without the part of an earlier apply's snapshot it cannot bring up to
 date: a failed listing of mangle removes both files, one of nat POSTROUTING `nat.rules` alone (the
 `mangle.rules` that run wrote is current), a failed write its own file. Left in place, a stale file
