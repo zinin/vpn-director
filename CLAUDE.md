@@ -77,9 +77,9 @@ cd server && go run ./cmd/watchd --dev
 | `router/opt/vpn-director/lib/substore.sh` | Subscription files (`<data_dir>/subscriptions/<id>.json`): order, ids, names, the write under the config lock; the twin of `vpnconfig/substore.go` |
 | `testdata/substore/` | Synthetic subscription files both stores (shell and Go) must list alike |
 | `router/opt/etc/init.d/S99vpn-director` | Entware init.d script for startup |
-| `router/jffs/scripts/firewall-start` | Asuswrt-Merlin hook for firewall reload |
-| `router/jffs/scripts/wan-event` | Asuswrt-Merlin hook for WAN events |
-| `router/jffs/scripts/nat-start` | Asuswrt-Merlin hook after a rebuild of nat |
+| `router/opt/vpn-director/hooks/firewall-start` | Asuswrt-Merlin hook for firewall reload, called from the shared `/jffs/scripts/firewall-start` by one line |
+| `router/opt/vpn-director/hooks/wan-event` | Asuswrt-Merlin hook for WAN events, called from the shared `/jffs/scripts/wan-event` by one line |
+| `router/opt/vpn-director/hooks/nat-start` | Asuswrt-Merlin hook after a rebuild of nat, called from the shared `/jffs/scripts/nat-start` by one line |
 | `router/test/` | Bats tests (unit/, integration/) |
 | `router/opt/vpn-director/vpn-director.json.template` | Unified config template |
 | `router/opt/etc/xray/config.json.template` | Xray server config template |

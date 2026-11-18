@@ -1,5 +1,9 @@
 #!/bin/sh
-# Asuswrt-Merlin runs this after every firewall start, without waiting for it.
+# Asuswrt-Merlin runs /jffs/scripts/firewall-start after every firewall start,
+# without waiting for it. That file is shared with the owner and other add-ons:
+# VPN Director puts one line into it (vpn-director.sh hooks), which calls this
+# script with the same arguments.
+#
 # The firewall start empties every mangle chain and deletes none - TUN_DIR and
 # XRAY_TPROXY included - so the apply after the last one has to run. A plain
 # apply exits at once while another instance holds the lock, and one still
@@ -8,6 +12,8 @@
 #
 # The chains are refilled first, from the snapshot of the last apply
 # (fwsnap-restore.sh): one iptables-restore, where the apply takes seconds.
+# The apply is detached, its descriptors closed, so the commands after our line
+# in the shared file run at once instead of waiting for it.
 
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 VPD_SCRIPT="${VPD_SCRIPT:-/opt/vpn-director/vpn-director.sh}"
@@ -17,7 +23,7 @@ if [ -x "$VPD_SCRIPT" ]; then
     if [ -x "$VPD_RESTORE" ]; then
         "$VPD_RESTORE" mangle >/dev/null 2>&1
     fi
-    "$VPD_SCRIPT" --wait apply
+    "$VPD_SCRIPT" --wait apply </dev/null >/dev/null 2>&1 &
 else
     logger -t "firewall-start" "vpn-director not found at $VPD_SCRIPT"
 fi

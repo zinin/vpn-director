@@ -253,7 +253,11 @@ starts `firewall-start` and `wan-event` without waiting for them
 (`run_custom_script` with no timeout), a WAN coming up does both, and a plain
 `apply` exits at once while another instance holds the lock - so the chains of
 a flush that landed during a running apply stayed empty until the next event.
-Both hooks pass `--wait`, as the KeeneticOS hooks do.
+Both hooks pass `--wait`, as the KeeneticOS hooks do, and run the apply
+detached, its descriptors closed: the firmware runs the shared
+`/jffs/scripts/<hook>`, whose one line of ours calls `/opt/vpn-director/hooks/<hook>`,
+and the owner's and other add-ons' commands after that line do not wait for the
+apply.
 
 Ahead of that apply, `firewall-start` refills our chains from the snapshot the
 last apply left (`lib/fwsnap-restore.sh mangle`, `tunnel-director.md`, "State

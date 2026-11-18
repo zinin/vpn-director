@@ -130,8 +130,16 @@ func TestRepoManifest_ShipsUpdateCriticalFiles(t *testing.T) {
 			t.Errorf("manifest must ship %s with tag common, got %q", want, have[want])
 		}
 	}
-	if have["router/jffs/scripts/firewall-start"] != "merlin" {
-		t.Errorf("firewall-start must be tagged merlin, got %q", have["router/jffs/scripts/firewall-start"])
+	if have["router/opt/vpn-director/hooks/firewall-start"] != "merlin" {
+		t.Errorf("hooks/firewall-start must be tagged merlin, got %q", have["router/opt/vpn-director/hooks/firewall-start"])
+	}
+	// Merlin's /jffs/scripts hooks are shared with the owner and other add-ons:
+	// they get one line of ours (vpn-director.sh hooks), and nothing copies a
+	// file over them.
+	for path := range have {
+		if strings.HasPrefix(path, "router/jffs/") {
+			t.Errorf("%s would be copied into /jffs over a shared hook", path)
+		}
 	}
 	if have["router/opt/vpn-director/lib/platform/merlin.sh"] != "merlin" {
 		t.Errorf("platform/merlin.sh must be tagged merlin, got %q", have["router/opt/vpn-director/lib/platform/merlin.sh"])

@@ -3,11 +3,12 @@
 load '../test_helper'
 
 # The router hooks: KeeneticOS's under router/opt/etc/ndm, Asuswrt-Merlin's
-# under router/jffs/scripts. NDM runs its hooks serially under a 24-second
-# timeout, so each one starts the CLI detached through nohup and exits; a fake
-# nohup records what it was asked to run and runs nothing.
+# under router/opt/vpn-director/hooks, which the firmware's shared
+# /jffs/scripts/<hook> calls through one line. NDM runs its hooks serially
+# under a 24-second timeout, so each one starts the CLI detached through nohup
+# and exits; a fake nohup records what it was asked to run and runs nothing.
 HOOKS="$PROJECT_ROOT/opt/etc/ndm"
-MERLIN_HOOKS="$PROJECT_ROOT/jffs/scripts"
+MERLIN_HOOKS="$PROJECT_ROOT/opt/vpn-director/hooks"
 
 setup_hook_env() {
     # The hooks name the router's own directories in PATH, the way the Merlin
@@ -180,11 +181,15 @@ $VPD_SCRIPT --wait apply"
 # ------------------------------------------------------------ Asuswrt-Merlin
 #
 # The firmware starts firewall-start and wan-event without waiting for them
-# (run_custom_script with no timeout), so they call the CLI directly. Every
-# firewall start empties every mangle chain - TUN_DIR and XRAY_TPROXY included -
-# and a plain apply exits at once while another one holds the lock: when that
-# was the apply of the last firewall start, the chains stayed empty until the
-# next event. --wait queues it behind the running one instead.
+# (run_custom_script with no timeout). Every firewall start empties every
+# mangle chain - TUN_DIR and XRAY_TPROXY included - and a plain apply exits at
+# once while another one holds the lock: when that was the apply of the last
+# firewall start, the chains stayed empty until the next event. --wait queues
+# it behind the running one instead. The firmware runs the shared
+# /jffs/scripts/<hook>, whose one line of ours calls these, so the apply is
+# detached: the commands after ours in that file do not wait for it. The tests
+# run these hooks with fd 3 closed, so a detached apply never holds bats'
+# output, and wait for the apply's line.
 
 # setup_merlin_hook_env - the fakes, and a CLI that notes what it was asked, in
 # the log the restore notes its table in.
@@ -194,10 +199,27 @@ setup_merlin_hook_env() {
     fake_restore "$BATS_TEST_TMPDIR/apply.log"
 }
 
+# wait_for_merlin_applies <n> - until apply.log holds <n> detached applies, 3 s at most.
+wait_for_merlin_applies() {
+    local i n
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+        n=$(grep -c -- '^--wait apply$' "$BATS_TEST_TMPDIR/apply.log" 2>/dev/null) || n=0
+        [ "$n" -ge "$1" ] && return 0
+        sleep 0.2
+    done
+    return 1
+}
+
+assert_no_merlin_apply() {
+    sleep 0.5
+    ! grep -q -- '--wait apply' "$BATS_TEST_TMPDIR/apply.log" 2>/dev/null
+}
+
 @test "firewall-start: re-applies, queued behind a running apply" {
     setup_merlin_hook_env
-    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0 3>&-
     assert_success
+    wait_for_merlin_applies 1
     run cat "$BATS_TEST_TMPDIR/apply.log"
     assert_line "--wait apply"
 }
@@ -206,24 +228,27 @@ setup_merlin_hook_env() {
 # from the last apply's snapshot first: the apply after it takes seconds.
 @test "firewall-start: restores mangle, then queues the apply" {
     setup_merlin_hook_env
-    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0 3>&-
     assert_success
+    wait_for_merlin_applies 1
     run cat "$BATS_TEST_TMPDIR/apply.log"
     assert_output $'restore mangle\n--wait apply'
 }
 
 @test "wan-event: re-applies when a WAN connection comes up, queued behind a running apply" {
     setup_merlin_hook_env
-    run_hook "$MERLIN_HOOKS/wan-event" 0 connected
+    run_hook "$MERLIN_HOOKS/wan-event" 0 connected 3>&-
     assert_success
+    wait_for_merlin_applies 1
     run cat "$BATS_TEST_TMPDIR/apply.log"
     assert_output "--wait apply"
 }
 
 @test "wan-event: leaves the other WAN events alone" {
     setup_merlin_hook_env
-    run_hook "$MERLIN_HOOKS/wan-event" 0 disconnected
+    run_hook "$MERLIN_HOOKS/wan-event" 0 disconnected 3>&-
     assert_success
+    assert_no_merlin_apply
     [ ! -e "$BATS_TEST_TMPDIR/apply.log" ]
 }
 
@@ -231,30 +256,46 @@ setup_merlin_hook_env() {
 # changed - and the rebuild takes the MASQUERADE of every interface tunnel.
 @test "nat-start: re-applies, queued behind a running apply" {
     setup_merlin_hook_env
-    run_hook "$MERLIN_HOOKS/nat-start"
+    run_hook "$MERLIN_HOOKS/nat-start" 3>&-
     assert_success
+    wait_for_merlin_applies 1
     run cat "$BATS_TEST_TMPDIR/apply.log"
     assert_line "--wait apply"
 }
 
 @test "nat-start: restores nat, then queues the apply" {
     setup_merlin_hook_env
-    run_hook "$MERLIN_HOOKS/nat-start"
+    run_hook "$MERLIN_HOOKS/nat-start" 3>&-
     assert_success
+    wait_for_merlin_applies 1
     run cat "$BATS_TEST_TMPDIR/apply.log"
     assert_output $'restore nat\n--wait apply'
 }
 
-@test "nat-start: is POSIX sh and executable in the tree" {
-    [ -x "$MERLIN_HOOKS/nat-start" ]
-    head -n1 "$MERLIN_HOOKS/nat-start" | grep -qx '#!/bin/sh'
-    sh -n "$MERLIN_HOOKS/nat-start"
+# The apply is detached: the hook returns once the restore is done, so a
+# command after ours in the shared /jffs/scripts file runs at once.
+@test "Merlin hooks: return before the apply ends" {
+    setup_merlin_hook_env
+    printf '#!/bin/sh\nsleep 1\necho "$*" >> "%s/apply.log"\n' "$BATS_TEST_TMPDIR" > "$VPD_SCRIPT"
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0 3>&-
+    assert_success
+    run cat "$BATS_TEST_TMPDIR/apply.log"
+    assert_output "restore mangle"
+    wait_for_merlin_applies 1
+}
+
+@test "Merlin hooks: are POSIX sh and executable in the tree" {
+    for hook in firewall-start wan-event nat-start; do
+        [ -x "$MERLIN_HOOKS/$hook" ]
+        head -n1 "$MERLIN_HOOKS/$hook" | grep -qx '#!/bin/sh'
+        sh -n "$MERLIN_HOOKS/$hook"
+    done
 }
 
 # install.sh and the updater ship what files.manifest lists, by tag. KeeneticOS
 # runs no nat-start: its netfilter.d hook already applies after a rebuild of nat.
 @test "nat-start: ships to Asuswrt-Merlin only" {
-    run awk '$2 == "router/jffs/scripts/nat-start" { print $1 }' "$PROJECT_ROOT/files.manifest"
+    run awk '$2 == "router/opt/vpn-director/hooks/nat-start" { print $1 }' "$PROJECT_ROOT/files.manifest"
     assert_success
     assert_output "merlin"
 }
@@ -312,10 +353,11 @@ EOF
 
     setup_merlin_hook_env
     export VPD_RESTORE="$BATS_TEST_TMPDIR/absent.sh"
-    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0 3>&-
     assert_success
-    run_hook "$MERLIN_HOOKS/nat-start"
+    run_hook "$MERLIN_HOOKS/nat-start" 3>&-
     assert_success
+    wait_for_merlin_applies 2
     run cat "$BATS_TEST_TMPDIR/apply.log"
     assert_output $'--wait apply\n--wait apply'
 }
@@ -333,12 +375,13 @@ EOF
 
     setup_merlin_hook_env
     printf '#!/bin/sh\necho restoring\necho "cannot restore" >&2\nexit 1\n' > "$VPD_RESTORE"
-    run_hook "$MERLIN_HOOKS/firewall-start" eth0
+    run_hook "$MERLIN_HOOKS/firewall-start" eth0 3>&-
     assert_success
     refute_output
-    run_hook "$MERLIN_HOOKS/nat-start"
+    run_hook "$MERLIN_HOOKS/nat-start" 3>&-
     assert_success
     refute_output
+    wait_for_merlin_applies 2
     run cat "$BATS_TEST_TMPDIR/apply.log"
     assert_output $'--wait apply\n--wait apply'
 }
