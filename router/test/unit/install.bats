@@ -1210,7 +1210,7 @@ watchd_start_alive_case() {
     load_installer
     local step
     for step in print_header detect_platform check_environment resolve_release_tag create_directories \
-        download_scripts load_platform_lib download_telegram_bot download_webui download_watchd \
+        download_scripts load_platform_lib install_hooks download_telegram_bot download_webui download_watchd \
         generate_tls_cert start_webui print_next_steps; do
         eval "$step() { printf '%s\\n' '$step' >> \"\$BATS_TEST_TMPDIR/main.calls\"; }"
     done
@@ -1227,5 +1227,29 @@ watchd_start_alive_case() {
 
     assert_success
     run cat "$BATS_TEST_TMPDIR/main.calls"
-    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\ndownload_scripts\nload_platform_lib\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
+    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\ndownload_scripts\nload_platform_lib\ninstall_hooks\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
+}
+
+# Asuswrt-Merlin's /jffs/scripts hooks are shared with the owner and other
+# add-ons: the installer has vpn-director.sh put one line of ours into each,
+# keeping the rest, rather than copying a file over them.
+@test "install_hooks: runs vpn-director.sh hooks for the detected platform" {
+    load_installer
+    printf '#!/bin/sh\necho "$VPD_PLATFORM $*" >> "%s/hooks.calls"\n' "$BATS_TEST_TMPDIR" > "$VPD_DIR/vpn-director.sh"
+    chmod +x "$VPD_DIR/vpn-director.sh"
+    PLATFORM=keenetic
+    run install_hooks
+    assert_success
+    assert_output --partial "Firmware hooks set"
+    run cat "$BATS_TEST_TMPDIR/hooks.calls"
+    assert_output "keenetic hooks"
+}
+
+@test "install_hooks: a failure is a warning, not the end of the install" {
+    load_installer
+    printf '#!/bin/sh\nexit 1\n' > "$VPD_DIR/vpn-director.sh"
+    chmod +x "$VPD_DIR/vpn-director.sh"
+    run install_hooks
+    assert_success
+    assert_output --partial "run $VPD_DIR/vpn-director.sh hooks"
 }

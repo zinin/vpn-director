@@ -2153,3 +2153,35 @@ func TestGenerateScript_CleanupMatchesAndKillsOnlyOwnedArgvZero(t *testing.T) {
 		})
 	}
 }
+
+// TestGenerateScript_SetsTheHooksOnceTheFilesAreInPlace: Asuswrt-Merlin's
+// /jffs/scripts hooks are shared, so the update puts our line into them with the
+// release's own vpn-director.sh - once the payload is copied and the apply lock
+// released - and a failure there ends no update: the files are in place already.
+func TestGenerateScript_SetsTheHooksOnceTheFilesAreInPlace(t *testing.T) {
+	s := &Service{updateDir: t.TempDir()}
+	writeTestManifest(t, s)
+	script, err := s.generateScript(validOpts())
+	if err != nil {
+		t.Fatalf("generateScript() error = %v", err)
+	}
+
+	body := afterOnExit(t, script)
+	call := strings.Index(body, "/opt/vpn-director/vpn-director.sh hooks")
+	copied := strings.Index(body, "# 4. Copy files")
+	released := strings.Index(body, "\nrelease_apply_lock\n")
+	started := strings.Index(body, "# 6. Start everyone")
+	switch {
+	case call < 0:
+		t.Fatal("the update never runs vpn-director.sh hooks")
+	case copied < 0 || call < copied:
+		t.Error("the hooks are set before the payload is copied")
+	case released < 0 || call < released:
+		t.Error("the hooks are set before the apply lock is released")
+	case started < 0 || call > started:
+		t.Error("the hooks are set after the daemons start")
+	}
+	if !strings.Contains(body, "if ! /opt/vpn-director/vpn-director.sh hooks") {
+		t.Error("a failure of vpn-director.sh hooks must not end the update")
+	}
+}

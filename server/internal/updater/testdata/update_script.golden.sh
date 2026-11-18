@@ -433,6 +433,15 @@ rm -rf "$FILES_DIR"
 # here, before step 6 starts a daemon that would inherit the descriptor.
 release_apply_lock
 
+# 5b. Asuswrt-Merlin's /jffs/scripts hooks are shared with the owner and other
+#     add-ons: the release's own vpn-director.sh puts our line into each and
+#     keeps the rest of it (nothing on KeeneticOS). The files are in place
+#     already, so a failure here is a warning, not a failed update.
+log "Setting the firmware hooks"
+if ! /opt/vpn-director/vpn-director.sh hooks >> "$LOG_FILE" 2>&1; then
+    log "WARN: a firmware hook does not call VPN Director; see the lines above, then run /opt/vpn-director/vpn-director.sh hooks"
+fi
+
 # Init script of the daemon that reads notify.json. Looked up from the table
 # so the script never names an init file outside DAEMONS.
 NOTIFY_INIT=""

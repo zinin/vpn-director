@@ -195,6 +195,7 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 > - Going back to v0.22.0 or earlier: run `vpn-director.sh stop` with this release first. It removes the rules at 16894-16898, the snapshot and the records of where the rules went in. An older release knows none of them, and they would send its tunnel clients' traffic to excluded countries into the tunnel, and refuse what its Xray clients send direct, except to private networks and the addresses of `xray.exclude_ips`. A reboot clears them too.
 > - A configuration whose Xray `fwmark_mask` or Tunnel Director `mark_mask` holds bit `0x200` takes another bit for its direct mark, the bit the chains set on what they let go direct; a WARN in the log names it, and `advanced.tunnel_director.direct_mark` pins it. Masks that leave no such bit free, such as an Xray `fwmark_mask` of `0xffffffff`, are refused: every apply ends with an error until you narrow them. `advanced.xray.rule_pref` must be a decimal number without a leading zero and stay below the direct rule's preference, 16894 with the default `pref_base` and `mark_mask`: an apply refuses a value at or above it, or written otherwise (such as `0x4200`).
 > - On KeeneticOS the first apply after the upgrade resets, once, the connections the firmware had already accelerated: those of a client on Xray or Tunnel Director to the destinations it reaches directly. New connections are not affected.
+> - On Asuswrt-Merlin the update no longer overwrites `/jffs/scripts/firewall-start`, `wan-event` and `nat-start`: it cuts out the hook an earlier release wrote, puts in one line of ours and keeps the rest, your own lines included ([Startup Scripts](#startup-scripts)).
 
 ## Telegram Bot
 
@@ -346,16 +347,16 @@ This project uses Entware init.d for automatic startup:
 | Script | When Called | Purpose |
 |--------|-------------|---------|
 | `/opt/etc/init.d/S99vpn-director` | After Entware initialized | Runs `vpn-director.sh apply` to initialize all components |
-| `/jffs/scripts/firewall-start` | After firewall rules applied (Merlin) | Puts the chains back from the last apply's snapshot, then reapplies configuration after firewall reload |
-| `/jffs/scripts/wan-event` | On WAN connected (Merlin) | Runs `vpn-director.sh apply` on WAN connection |
-| `/jffs/scripts/nat-start` | After the nat table is rebuilt (Merlin) | Puts the interface tunnels' `MASQUERADE` back from the last apply's snapshot, then runs `vpn-director.sh --wait apply` |
+| `/jffs/scripts/firewall-start` | After firewall rules applied (Merlin) | One line of ours, marked `# vpn-director`, calls `/opt/vpn-director/hooks/firewall-start`: it puts the chains back from the last apply's snapshot, then reapplies the configuration in the background |
+| `/jffs/scripts/wan-event` | On WAN connected (Merlin) | One line of ours calls `/opt/vpn-director/hooks/wan-event`: `vpn-director.sh apply` in the background when the WAN connects |
+| `/jffs/scripts/nat-start` | After the nat table is rebuilt (Merlin) | One line of ours calls `/opt/vpn-director/hooks/nat-start`: it puts the interface tunnels' `MASQUERADE` back from the last apply's snapshot, then runs `vpn-director.sh --wait apply` in the background |
 | `/opt/etc/ndm/netfilter.d`, `wan.d`, `iflayerchanged.d` (`50-vpn-director.sh`) | NDM firewall rebuild / WAN start / VPN client IPv4 layer (KeeneticOS) | Detached `vpn-director.sh --wait apply`; `netfilter.d` first puts the rebuilt table's rules back from the last apply's snapshot |
 
 **Note:** The init.d script ensures Entware bash is available before running vpn-director scripts.
 
 On Merlin, to enable user scripts: Administration -> System -> Enable JFFS custom scripts and configs -> Yes
 
-The installer, and every update after it, writes these `/jffs/scripts` hooks in full, over the files that are there, so a router whose other add-ons use the same hooks has to merge them by hand, and a merge does not survive the next update: the updater copies the hooks over it again.
+These three `/jffs/scripts` files are shared with you and with other add-ons. The installer and every update put one line of ours into each, marked `# vpn-director`, right after the `#!` line, and leave the rest of the file as it is; the first update to this release also cuts out the whole hook an earlier release wrote there and keeps the lines you added. An earlier hook you edited stays, with a warning in the update log: remove its call of `vpn-director.sh` by hand. A file without a `#!` line, and a symlinked one, are left alone with a warning too. `vpn-director.sh hooks` puts a lost line back, and `vpn-director.sh status` shows whether each line is in place. Deleting the line takes VPN Director out of that hook; an apply never puts it back.
 
 ## Process Monitoring
 

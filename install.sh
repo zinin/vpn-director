@@ -376,6 +376,24 @@ download_scripts() {
 }
 
 ###############################################################################
+# Firmware hooks
+###############################################################################
+
+# install_hooks - Asuswrt-Merlin's /jffs/scripts hooks are shared with the
+#   owner and other add-ons: vpn-director.sh puts one line of ours into each and
+#   keeps the rest of it, rather than having a file copied over them (nothing
+#   to do on KeeneticOS, whose hooks are files of ours). A failure is a warning:
+#   nothing else the installer does depends on it.
+install_hooks() {
+    print_info "Setting the firmware hooks..."
+    if VPD_PLATFORM="$PLATFORM" "$VPD_DIR/vpn-director.sh" hooks; then
+        print_success "Firmware hooks set"
+    else
+        print_info "Warning: a firmware hook does not call VPN Director (see above); fix it, then run $VPD_DIR/vpn-director.sh hooks"
+    fi
+}
+
+###############################################################################
 # Download telegram bot binary (optional)
 ###############################################################################
 
@@ -711,6 +729,7 @@ main() {
     create_directories
     download_scripts
     load_platform_lib || print_info "Platform library not installed; using default LAN facts"
+    install_hooks
     download_telegram_bot
     download_webui
     download_watchd
