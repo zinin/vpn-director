@@ -14,6 +14,10 @@ paths: "**/*.sh, jffs/**/*"
   it stays POSIX sh - no hand-over to bash, no errexit - and always exits 0. The hooks rely on
   that: a few commands under the firmware's `/bin/sh`, inside NDM's 24-second timeout, and nothing
   it fails at stops the apply that follows (`tunnel-director.md`, "State Tracking")
+- Umask: every script a router executes makes `umask 022` its first command. That covers the entry
+  scripts, the init scripts and the Merlin and NDM hooks. In an entry script the line comes ahead
+  of the hand-over block. `lib/fwsnap-restore.sh` runs under `umask 077`. See "Asuswrt-Merlin runs
+  everything under umask 0" below
 - Debug mode: `DEBUG=1 ./script.sh` enables `set -x` with informative PS4
 - shellcheck annotations for intentional expansions/externals (SC2086, SC2155, SC2034)
 
@@ -598,3 +602,36 @@ list as a function argument and pipes it in: `substore_name_taken`,
 name, a time. `xray.servers`, the union of every address, still goes as
 `--argjson` (`substore_sync_config`, the last write of `configure.sh`): at 18
 bytes an address, it reaches the limit at about 7,300 addresses.
+
+### Asuswrt-Merlin runs everything under umask 0
+
+**Problem**: the firmware starts its services, cron, the hooks and an ssh session under umask 0
+(`umask` prints `0000`). Whatever a script creates without a mode is then writable by everyone:
+directories 0777, files 0666. Measured on an RT-AX86U on v0.23.0:
+
+- every directory of `/opt/vpn-director` was 0777;
+- 0666 were `telegram-bot.json` (the bot token and `allowed_users`), `certs/server.crt`, the
+  ipset dumps in `data/ipsets`, `/tmp/vpn-director.log`, the files of `/tmp/tunnel_director` and
+  `/tmp/xray_tproxy`, and `/var/lock/vpn-director.lock`.
+
+Root runs the scripts, the hooks and the daemon binaries in those directories. In a 0777
+directory any process can replace a root-owned 0755 file, and the router runs processes as
+`nobody`: `dnsmasq`, nginx workers, `lldpd`. Every apply restores the country sets from the dumps,
+so a rewritten dump decides what a tunnel client reaches directly. KeeneticOS starts its sessions
+under umask 0022.
+
+**Solution**: every script a router executes makes `umask 022` its first command:
+
+- the entry scripts;
+- the init scripts - the daemons, and everything they start, inherit the umask;
+- the Merlin and NDM hooks.
+
+`router/test/unit/entrypoints.bats` pins it in each one. In an entry script the line comes ahead of
+the hand-over block, which `bash script` and `curl … | bash` skip.
+
+A secret needs more than that, because umask 022 still lets everyone read it. Write it with
+`mktemp` in its own directory, then `chmod 600`, then `mv -f` it into place. The `mv` gives it a new
+inode, so an old 0666 file does not keep its mode. `lib/fwsnap-restore.sh` runs under `umask 077`.
+
+Install and the update take group and other write away from what an earlier release left
+(`repair_modes`).

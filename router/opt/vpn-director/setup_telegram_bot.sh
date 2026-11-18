@@ -6,6 +6,8 @@
 # after it. PATH is no help here: Asuswrt-Merlin's /bin/sh has no "command"
 # builtin (see .claude/rules/shell-conventions.md) and its /bin/bash is a
 # symlink to busybox rather than bash.
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 if [ -z "${BASH_VERSION:-}" ]; then
     for _vpd_bash in /opt/bin/bash /usr/bin/bash /bin/bash; do
         # Asuswrt-Merlin's /bin/bash is busybox: a POSIX shell that never sets

@@ -15,6 +15,8 @@
 # The apply is detached, its descriptors closed, so the commands after our line
 # in the shared file run at once instead of waiting for it; it waits for them.
 
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 VPD_SCRIPT="${VPD_SCRIPT:-/opt/vpn-director/vpn-director.sh}"
 VPD_RESTORE="${VPD_RESTORE:-/opt/vpn-director/lib/fwsnap-restore.sh}"

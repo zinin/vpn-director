@@ -1,5 +1,7 @@
 #!/bin/sh
 
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # Note: We don't source rc.func because VPN Director manages multiple
