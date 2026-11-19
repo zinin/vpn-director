@@ -25,7 +25,7 @@ paths: "**/*.sh, jffs/**/*"
 
 - Logging: `log -l ERROR|WARN|INFO|DEBUG|TRACE "message"` (default: INFO)
 - Locking: `acquire_lock [name]` prevents concurrent script execution; with `VPD_LOCK_WAIT=<sec>` (set by `vpn-director.sh --wait[=SEC]`) it waits for the lock instead of exiting 0
-- Temp files: `tmp_file` / `tmp_dir` with auto-cleanup on exit
+- Temp files: `tmp_file` / `tmp_dir` with auto-cleanup on exit, created 0600 / 0700 whatever the umask
 
 ## Key Utilities (common.sh and the platform contract)
 
