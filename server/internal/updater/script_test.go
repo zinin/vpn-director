@@ -2211,9 +2211,10 @@ func TestGenerateScript_SetsUmask022BeforeAnything(t *testing.T) {
 }
 
 // Earlier releases left /opt/vpn-director and our runtime files writable by every process. The
-// update takes that write away once the new files are in place - the twin of install.sh's
-// repair_modes - and a failure there must not end an update whose files are copied already.
-func TestGenerateScript_RepairsModesOnceTheFilesAreInPlace(t *testing.T) {
+// update takes that write away before it copies anything into them or runs anything it copied -
+// the twin of install.sh's repair_modes - once it holds the apply lock, and a failure there must
+// not end the update.
+func TestGenerateScript_RepairsModesBeforeTheCopy(t *testing.T) {
 	s := &Service{updateDir: t.TempDir()}
 	writeTestManifest(t, s)
 	script, err := s.generateScript(validOpts())
@@ -2223,13 +2224,21 @@ func TestGenerateScript_RepairsModesOnceTheFilesAreInPlace(t *testing.T) {
 
 	body := afterOnExit(t, script)
 	call := strings.Index(body, "if ! repair_modes")
+	lock := strings.Index(body, "flock -n 9")
+	copied := strings.Index(body, "# 4. Copy files")
 	hooks := strings.Index(body, "/opt/vpn-director/vpn-director.sh hooks")
 	started := strings.Index(body, "# 6. Start everyone")
 	switch {
 	case call < 0:
 		t.Fatal("the update never repairs the modes, or a failure there would end it")
-	case hooks < 0 || call < hooks:
-		t.Error("the modes are repaired before the hooks step")
+	case strings.Count(body, "if ! repair_modes") != 1:
+		t.Error("the update repairs the modes more than once")
+	case lock < 0 || call < lock:
+		t.Error("the modes are repaired before the update holds the apply lock")
+	case copied < 0 || call > copied:
+		t.Error("the modes are repaired after the copy")
+	case hooks < 0 || call > hooks:
+		t.Error("the modes are repaired after the hooks step")
 	case started < 0 || call > started:
 		t.Error("the modes are repaired after the daemons start")
 	}

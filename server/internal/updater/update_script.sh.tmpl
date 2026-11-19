@@ -451,6 +451,17 @@ until flock -n 9; do
     waited=$((waited + 1))
 done
 
+# 3c. Earlier releases left /opt/vpn-director and our files writable by every
+#     process under Asuswrt-Merlin's umask 0 (repair_modes). That write goes
+#     before the update copies anything into them or runs anything it copied -
+#     cp -f keeps a repaired mode, the hooks' cp -p in 5b too, and new files
+#     are created under umask 022 - and a failure here is a warning, not a
+#     failed update.
+log "Removing write access for others"
+if ! repair_modes >> "$LOG_FILE" 2>&1; then
+    log "WARN: the paths named above keep write access for others; check each one (the warnings are in the system log too)"
+fi
+
 # 4. Copy files - NO || true, fail on error
 log "Copying files"
 for entry in $FILES; do
@@ -503,14 +514,6 @@ release_apply_lock
 log "Setting the firmware hooks"
 if ! /opt/vpn-director/vpn-director.sh hooks >> "$LOG_FILE" 2>&1; then
     log "WARN: a firmware hook does not call VPN Director; see the lines above, then run /opt/vpn-director/vpn-director.sh hooks"
-fi
-
-# 5c. Earlier releases left /opt/vpn-director and our runtime files writable by
-#     every process under Asuswrt-Merlin's umask 0 (repair_modes). The files are
-#     in place already, so a failure here is a warning, not a failed update.
-log "Removing write access for others"
-if ! repair_modes >> "$LOG_FILE" 2>&1; then
-    log "WARN: the paths named above keep write access for others; check each one (the warnings are in the system log too)"
 fi
 
 # Init script of the daemon that reads notify.json. Looked up from the table

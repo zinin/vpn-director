@@ -645,6 +645,9 @@ Install and the update take group and other write away from what an earlier rele
 - `/jffs/scripts` and Asuswrt-Merlin's shared hooks in it, whose rewrite (`cp -p`) keeps their mode;
 - our runtime files in `/tmp` and `/var/lock`.
 
+Both run `repair_modes` before they write anything or run anything they install: `install.sh`
+right after `create_directories`, the update in its step 3c, once it holds the apply lock.
+
 A path that is a symlink is left alone, with a warning: `chmod` follows a symlink named on its
 command line, `-R` included. The update also sends that warning to syslog, since the bot deletes
 `update.log` after a successful update.

@@ -784,10 +784,13 @@ main() {
     check_environment
     resolve_release_tag
     create_directories
+    # Earlier releases left these paths writable by every process. That write goes before anything
+    # is written into them or run from them: curl -o and the hooks' cp -p keep a repaired mode, and
+    # new files are created under umask 022.
+    repair_modes || print_info "Warning: the paths named above keep write access for others; check each one"
     download_scripts
     load_platform_lib || print_info "Platform library not installed; using default LAN facts"
     install_hooks
-    repair_modes || print_info "Warning: the paths named above keep write access for others; check each one"
     download_telegram_bot
     download_webui
     download_watchd

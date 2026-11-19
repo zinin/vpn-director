@@ -1227,7 +1227,7 @@ watchd_start_alive_case() {
 
     assert_success
     run cat "$BATS_TEST_TMPDIR/main.calls"
-    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\ndownload_scripts\nload_platform_lib\ninstall_hooks\nrepair_modes\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
+    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\nrepair_modes\ndownload_scripts\nload_platform_lib\ninstall_hooks\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
 }
 
 # Asuswrt-Merlin's /jffs/scripts hooks are shared with the owner and other
