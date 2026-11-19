@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -1076,10 +1077,10 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 
 			// Rehome every router path and replace process tools before executing.
 			script = regexp.MustCompile(`(?m)^PATH=.*$`).ReplaceAllString(script, "PATH="+tools+":/usr/bin:/bin")
-			for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock"} {
+			for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock", "/tmp/tunnel_director", "/tmp/xray_tproxy", "/tmp/vpn-director.log"} {
 				script = strings.ReplaceAll(script, prefix, root+prefix)
 			}
-			if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock)(/|\b)`).MatchString(script) {
+			if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock|tmp/tunnel_director|tmp/xray_tproxy|tmp/vpn-director\.log)(/|\b)`).MatchString(script) {
 				t.Fatal("unrehomed router path in sandbox script")
 			}
 			scriptPath := filepath.Join(root, "update.sh")
@@ -1654,10 +1655,10 @@ func (s *firstInstallSandbox) run(failure, mode string) firstInstallResult {
 	s.mode = mode
 	s.write(s.calls, "", 0644)
 	script = regexp.MustCompile(`(?m)^PATH=.*$`).ReplaceAllString(script, "PATH="+s.tools+":/usr/bin:/bin")
-	for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock"} {
+	for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock", "/tmp/tunnel_director", "/tmp/xray_tproxy", "/tmp/vpn-director.log"} {
 		script = strings.ReplaceAll(script, prefix, s.root+prefix)
 	}
-	if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock)(/|\b)`).MatchString(script) {
+	if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock|tmp/tunnel_director|tmp/xray_tproxy|tmp/vpn-director\.log)(/|\b)`).MatchString(script) {
 		s.t.Fatal("unrehomed router path in same-tree sandbox script")
 	}
 	path := filepath.Join(s.root, "update.sh")
@@ -2183,5 +2184,588 @@ func TestGenerateScript_SetsTheHooksOnceTheFilesAreInPlace(t *testing.T) {
 	}
 	if !strings.Contains(body, "if ! /opt/vpn-director/vpn-director.sh hooks") {
 		t.Error("a failure of vpn-director.sh hooks must not end the update")
+	}
+}
+
+// Asuswrt-Merlin runs everything under umask 0, the daemon that runs this script included:
+// whatever the script creates before a umask of its own - a directory a release adds - would be
+// writable by every process on the router.
+func TestGenerateScript_SetsUmask022BeforeAnything(t *testing.T) {
+	s := &Service{updateDir: t.TempDir()}
+	writeTestManifest(t, s)
+	script, err := s.generateScript(validOpts())
+	if err != nil {
+		t.Fatalf("generateScript() error = %v", err)
+	}
+
+	for _, line := range strings.Split(script, "\n")[1:] {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		if line != "umask 022" {
+			t.Fatalf("the first command is %q, want \"umask 022\"", line)
+		}
+		return
+	}
+	t.Fatal("the script has no command")
+}
+
+// Earlier releases left /opt/vpn-director and our runtime files writable by every process. The
+// update takes that write away before it copies anything into them or runs anything it copied -
+// the twin of install.sh's repair_modes - once it holds the apply lock, and a failure there must
+// not end the update.
+func TestGenerateScript_RepairsModesBeforeTheCopy(t *testing.T) {
+	s := &Service{updateDir: t.TempDir()}
+	writeTestManifest(t, s)
+	script, err := s.generateScript(validOpts())
+	if err != nil {
+		t.Fatalf("generateScript() error = %v", err)
+	}
+
+	body := afterOnExit(t, script)
+	call := strings.Index(body, "if ! repair_modes")
+	lock := strings.Index(body, "flock -n 9")
+	copied := strings.Index(body, "# 4. Copy files")
+	hooks := strings.Index(body, "/opt/vpn-director/vpn-director.sh hooks")
+	started := strings.Index(body, "# 6. Start everyone")
+	switch {
+	case call < 0:
+		t.Fatal("the update never repairs the modes, or a failure there would end it")
+	case strings.Count(body, "if ! repair_modes") != 1:
+		t.Error("the update repairs the modes more than once")
+	case lock < 0 || call < lock:
+		t.Error("the modes are repaired before the update holds the apply lock")
+	case copied < 0 || call > copied:
+		t.Error("the modes are repaired after the copy")
+	case hooks < 0 || call > hooks:
+		t.Error("the modes are repaired after the hooks step")
+	case started < 0 || call > started:
+		t.Error("the modes are repaired after the daemons start")
+	}
+
+	start := strings.Index(script, "\nrepair_modes() {\n")
+	if start < 0 {
+		t.Fatal("the script defines no repair_modes")
+	}
+	fn := script[start:]
+	if end := strings.Index(fn, "\n}\n"); end >= 0 {
+		fn = fn[:end]
+	}
+	for _, want := range []string{
+		"chmod -R go-w /opt/vpn-director",
+		"/tmp/tunnel_director",
+		"/tmp/xray_tproxy",
+		"/tmp/vpn-director.log",
+		"/var/lock/vpn-director.lock",
+		"/opt/vpn-director/telegram-bot.json 600",
+	} {
+		if !strings.Contains(fn, want) {
+			t.Errorf("repair_modes misses %q", want)
+		}
+	}
+	// /jffs/scripts itself, not only the hooks in it: in a 0777 directory any process can replace
+	// a hook root runs.
+	if !regexp.MustCompile(`\s/jffs/scripts\s`).MatchString(fn) {
+		t.Error(`repair_modes misses "/jffs/scripts"`)
+	}
+	// chmod follows a symlink named on its command line, -R included.
+	if !strings.Contains(script, "is a symlink; left as it is") {
+		t.Error("the repair would follow a symlink at one of our paths")
+	}
+}
+
+// repairFunctions defines the template's repair functions for /bin/sh, every router path in them
+// moved into a scratch root by move. A router path move leaves where it is fails the test: run as
+// it is, the repair would chmod the machine's own /opt/vpn-director, /jffs/scripts or /var/lock.
+func repairFunctions(t *testing.T, script string, move *strings.Replacer) string {
+	t.Helper()
+	var b strings.Builder
+	for _, name := range []string{"repair_warn", "repair_path", "repair_flat_dir", "has_go_write", "repair_modes"} {
+		b.WriteString(name + "() {\n" + move.Replace(functionBody(t, script, name)) + "\n}\n")
+	}
+	if m := unmovedRouterPath.FindString(b.String()); m != "" {
+		t.Fatalf("the repair functions keep a router path move does not cover: %q", m)
+	}
+	return b.String()
+}
+
+// unmovedRouterPath is a router path the repair touches with no scratch root in front of it.
+var unmovedRouterPath = regexp.MustCompile(`(?m)(^|[^A-Za-z0-9_.-])/(opt|jffs|var/lock|tmp/tunnel_director|tmp/xray_tproxy|tmp/vpn-director\.log)\b`)
+
+// The template's repair_path, repair_flat_dir and repair_modes, run under /bin/sh with their paths
+// moved into a scratch root - the twin of install.sh's, which install.bats runs. Beside
+// /opt/vpn-director and the runtime files, the repair has to reach every file the update installs
+// outside the tree (the init scripts, the Xray template: cp -f keeps the mode of a destination
+// that is there), /jffs/scripts and Asuswrt-Merlin's shared hooks in it, which root runs on every
+// firewall start. Our directories in /tmp are never walked: a subdirectory planted in one, and
+// what it holds, keep their modes.
+func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
+	script := cleanupScript(t)
+	root := t.TempDir()
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts", root+"/jffs/scripts",
+	)
+	place := func(rel string, mode os.FileMode, dir bool) string {
+		t.Helper()
+		path := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if dir {
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		} else if err := os.WriteFile(path, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	want := map[string]os.FileMode{
+		place("opt/vpn-director/lib", 0o777, true):                0o755,
+		place("opt/vpn-director/telegram-bot.json", 0o666, false): 0o600,
+		place("tmp/tunnel_director", 0o777, true):                 0o755,
+		place("tmp/tunnel_director/tun_dir_tables", 0o666, false): 0o644,
+		place("tmp/tunnel_director/planted", 0o777, true):         0o777,
+		place("tmp/tunnel_director/planted/file", 0o666, false):   0o666,
+		place("tmp/xray_tproxy/ready", 0o666, false):              0o644,
+		place("tmp/vpn-director.log", 0o666, false):               0o644,
+		place("var/lock/vpn-director.lock", 0o666, false):         0o644,
+		place("opt/etc/init.d/S99vpn-director", 0o777, false):     0o755,
+		place("opt/etc/xray/config.json.template", 0o666, false):  0o644,
+		place("jffs/scripts", 0o777, true):                        0o755,
+		place("jffs/scripts/firewall-start", 0o777, false):        0o755,
+		place("jffs/scripts/nat-start", 0o666, false):             0o644,
+	}
+	outside := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(outside, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(outside, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "jffs/scripts/wan-event")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The bot deletes update.log after a successful update: a warning has to reach syslog too.
+	bin := t.TempDir()
+	logged := filepath.Join(t.TempDir(), "logger.calls")
+	if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+logged+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	files := "a|" + root + "/opt/etc/init.d/S99vpn-director|x b|" + root + "/opt/etc/xray/config.json.template|-"
+	prog := "set -e\nPATH='" + bin + "':$PATH\nFILES='" + files + "'\n" + repairFunctions(t, script, move) +
+		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+	if err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "rc=1") || !strings.Contains(string(out), "wan-event is a symlink; left as it is") {
+		t.Errorf("a symlinked hook must be left alone with a warning and status 1; got:\n%s", out)
+	}
+	if strings.Contains(string(out), "another user's") {
+		t.Errorf("every path here is the test user's own, yet one is named as another user's; got:\n%s", out)
+	}
+	if calls, _ := os.ReadFile(logged); !strings.Contains(string(calls), "wan-event is a symlink; left as it is") {
+		t.Errorf("the warning never reached syslog; logger got %q", calls)
+	}
+	for path, mode := range want {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != mode {
+			t.Errorf("%s is %o, want %o", strings.TrimPrefix(path, root), got, mode)
+		}
+	}
+	info, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o666 {
+		t.Errorf("the symlink's target must keep 0666, got %o", info.Mode().Perm())
+	}
+}
+
+// data_dir comes from vpn-director.json, which earlier releases left writable by every process:
+// outside /opt/vpn-director the template's repair only reads the path and warns - into update.log
+// and syslog, with status 1 - and every mode there stays as it is. One nobody else can write to is
+// no warning; one under the tree is the tree's, even while the tree's chmod fails; no config is
+// nothing at all. The functions run under /bin/sh with their paths moved into a scratch root.
+func TestGenerateScript_RepairModesWarnsAboutAWritableDataDirOutsideTheTree(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+	script := cleanupScript(t)
+	run := func(t *testing.T, root, dataDir string, failTree bool) (out, logged string) {
+		t.Helper()
+		move := strings.NewReplacer(
+			"/opt/vpn-director", root+"/opt/vpn-director",
+			"/tmp/", root+"/tmp/",
+			"/var/lock/", root+"/var/lock/",
+			"/jffs/scripts", root+"/jffs/scripts",
+		)
+		if err := os.MkdirAll(filepath.Join(root, "opt/vpn-director"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if dataDir != "" {
+			config, err := json.Marshal(map[string]string{"data_dir": dataDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "opt/vpn-director/vpn-director.json"), config, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		bin := t.TempDir()
+		calls := filepath.Join(t.TempDir(), "logger.calls")
+		if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+calls+"'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if failTree {
+			chmod := "#!/bin/sh\n[ \"$*\" = '-R go-w " + root + "/opt/vpn-director/' ] && exit 1\nexec /bin/chmod \"$@\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "chmod"), []byte(chmod), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		prog := "PATH='" + bin + "':$PATH\nFILES=''\n" + repairFunctions(t, script, move) +
+			"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		b, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+		if err != nil {
+			t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, b)
+		}
+		c, _ := os.ReadFile(calls)
+		return string(b), string(c)
+	}
+	plant := func(t *testing.T, dir string, mode os.FileMode) string {
+		t.Helper()
+		dump := filepath.Join(dir, "ipsets", "ru.dump")
+		if err := os.MkdirAll(filepath.Dir(dump), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range []string{dir, filepath.Dir(dump)} {
+			if err := os.Chmod(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(dump, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dump, mode); err != nil {
+			t.Fatal(err)
+		}
+		return dump
+	}
+
+	t.Run("outside the tree, writable by others", func(t *testing.T) {
+		root := t.TempDir()
+		dataDir := filepath.Join(root, "elsewhere")
+		dump := plant(t, dataDir, 0o666)
+		out, logged := run(t, root, dataDir, false)
+		want := "WARN: data_dir " + dataDir + " lies outside " + root + "/opt/vpn-director, which the repair does not touch, " +
+			"and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w " + dataDir
+		if !strings.Contains(out, want) || !strings.Contains(out, "rc=1") {
+			t.Errorf("want %q and status 1; got:\n%s", want, out)
+		}
+		if !strings.Contains(logged, want) {
+			t.Errorf("the warning never reached syslog; logger got %q", logged)
+		}
+		info, err := os.Stat(dump)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o666 {
+			t.Errorf("the dump is %o, want 666: the repair changes no mode in data_dir", info.Mode().Perm())
+		}
+	})
+	t.Run("outside the tree, nobody else can write", func(t *testing.T) {
+		root := t.TempDir()
+		dataDir := filepath.Join(root, "elsewhere")
+		plant(t, dataDir, 0o644)
+		if out, _ := run(t, root, dataDir, false); strings.Contains(out, "data_dir") || !strings.Contains(out, "rc=0") {
+			t.Errorf("want no warning and status 0; got:\n%s", out)
+		}
+	})
+	t.Run("under the tree, its chmod failing", func(t *testing.T) {
+		root := t.TempDir()
+		dataDir := filepath.Join(root, "opt/vpn-director/data")
+		plant(t, dataDir, 0o666)
+		out, _ := run(t, root, dataDir, true)
+		if !strings.Contains(out, "could not remove write access for others from "+root+"/opt/vpn-director") {
+			t.Fatalf("the tree's chmod did not fail as set up; got:\n%s", out)
+		}
+		if strings.Contains(out, "data_dir") {
+			t.Errorf("a data_dir under the tree is the tree's, yet it is named; got:\n%s", out)
+		}
+	})
+	t.Run("no config", func(t *testing.T) {
+		root := t.TempDir()
+		plant(t, filepath.Join(root, "elsewhere"), 0o666)
+		if out, _ := run(t, root, "", false); strings.Contains(out, "data_dir") || !strings.Contains(out, "rc=0") {
+			t.Errorf("want no warning and status 0; got:\n%s", out)
+		}
+	})
+}
+
+// While the tree was 0777 any process could put a file of its own in place of one of ours, and
+// chmod never changes an owner. The template's repair takes the write away all the same, never
+// chowns, and names each path another user owns - under /opt/vpn-director the first ten, then a
+// count - into update.log and syslog, with status 1. Only root can make a file of another user's.
+func TestGenerateScript_RepairNamesWhatAnotherUserOwns(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("only root can make a file of another user's")
+	}
+	nobody, err := user.Lookup("nobody")
+	if err != nil {
+		t.Skipf("no user nobody: %v", err)
+	}
+	uid, err := strconv.Atoi(nobody.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := cleanupScript(t)
+	root := t.TempDir()
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts", root+"/jffs/scripts",
+	)
+	var foreign []string
+	for i := 1; i <= 12; i++ {
+		foreign = append(foreign, filepath.Join(root, "opt/vpn-director/data", fmt.Sprintf("f%d", i)))
+	}
+	foreign = append(foreign, filepath.Join(root, "tmp/vpn-director.log"))
+	for _, path := range foreign {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o666); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Lchown(path, uid, -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bin := t.TempDir()
+	logged := filepath.Join(t.TempDir(), "logger.calls")
+	if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+logged+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" + repairFunctions(t, script, move) +
+		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+	if err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "rc=1") {
+		t.Errorf("a path another user owns must make the repair report failure; got:\n%s", out)
+	}
+	named := strings.Count(string(out), "is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy")
+	if named != 10 {
+		t.Errorf("the tree's entries are named %d times, want 10; got:\n%s", named, out)
+	}
+	if want := "... and 2 more entries under " + root + "/opt/vpn-director are another user's"; !strings.Contains(string(out), want) {
+		t.Errorf("no count line %q; got:\n%s", want, out)
+	}
+	if want := root + "/tmp/vpn-director.log is another user's: its owner can still write to it whatever its mode"; !strings.Contains(string(out), want) {
+		t.Errorf("repair_path does not name %q; got:\n%s", want, out)
+	}
+	if calls, _ := os.ReadFile(logged); !strings.Contains(string(calls), "is another user's") {
+		t.Errorf("the warnings never reached syslog; logger got %q", calls)
+	}
+	for _, path := range foreign {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o644 {
+			t.Errorf("%s is %o, want 644: the chmod is never skipped", strings.TrimPrefix(path, root), got)
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != uid {
+			t.Errorf("%s changed its owner to %d: the repair never chowns", strings.TrimPrefix(path, root), st.Uid)
+		}
+	}
+}
+
+// BusyBox's chmod -R, given a symlink to a directory, changes that directory alone and exits 0: an
+// owner who moved /opt/vpn-director elsewhere and linked it back would keep every file in it
+// writable by everyone. Run with the machine's busybox as chmod, where there is one.
+func TestGenerateScript_RepairModesRecursesIntoALinkedTreeUnderBusyBox(t *testing.T) {
+	busybox, err := exec.LookPath("busybox")
+	if err != nil {
+		t.Skip("busybox not installed")
+	}
+	script := cleanupScript(t)
+	root := t.TempDir()
+	elsewhere := filepath.Join(root, "elsewhere")
+	lib := filepath.Join(elsewhere, "lib")
+	file := filepath.Join(lib, "common.sh")
+	if err := os.MkdirAll(lib, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(file, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(lib, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "opt"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(elsewhere, filepath.Join(root, "opt", "vpn-director")); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.Symlink(busybox, filepath.Join(bin, "chmod")); err != nil {
+		t.Fatal(err)
+	}
+
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts", root+"/jffs/scripts",
+	)
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" + repairFunctions(t, script, move) +
+		"repair_modes || true\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if out, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput(); err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, out)
+	}
+	for path, want := range map[string]os.FileMode{lib: 0o755, file: 0o644} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != want {
+			t.Errorf("%s is %o, want %o", strings.TrimPrefix(path, root), got, want)
+		}
+	}
+}
+
+// merlinFind is find as Asuswrt-Merlin 388 has it: BusyBox v1.25.1, whose find --help on an
+// RT-AX86U lists -L, -H, -follow, !, -a, -o, -name, -iname, -mtime, -print, -print0 and -exec, the
+// last ended by ";" alone, and nothing else - no -type, no -perm. A shell function to define ahead
+// of the repair functions: it refuses everything else the way that find does, and notes each
+// refused call in the file $MERLIN_FIND_REFUSED names.
+const merlinFind = `find() {
+    mf_skip=0
+    mf_exec=0
+    for mf_a in "$@"; do
+        if [ "$mf_exec" = 1 ]; then
+            [ "$mf_a" != ';' ] || mf_exec=0
+            continue
+        fi
+        if [ "$mf_skip" = 1 ]; then
+            mf_skip=0
+            continue
+        fi
+        case $mf_a in
+            -L | -H | -follow | '!' | -a | -o | -print | -print0) ;;
+            -name | -iname | -mtime) mf_skip=1 ;;
+            -exec) mf_exec=1 ;;
+            -* | '(' | ')')
+                echo "find: unrecognized: $mf_a" >&2
+                echo "$*" >> "$MERLIN_FIND_REFUSED"
+                return 1
+                ;;
+        esac
+    done
+    command find "$@"
+}
+`
+
+// Asuswrt-Merlin's BusyBox find knows no -type and no -perm, and the update script runs it wherever
+// Entware's findutils is not installed: the repair has to make do with what that find knows. Under
+// it every find the repair runs is one it knows, and a data_dir others can write to is still named.
+// A symlink in the tree to a file of another user's - /etc/passwd, root's, for a test that does not
+// run as root - is no entry of another user's: chmod -R does not follow it, and it is not ours to
+// replace.
+func TestGenerateScript_RepairModesUnderAsuswrtMerlinsFind(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+	script := cleanupScript(t)
+	root := t.TempDir()
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts", root+"/jffs/scripts",
+	)
+	tree := filepath.Join(root, "opt/vpn-director")
+	if err := os.MkdirAll(filepath.Join(tree, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(tree, "lib", "passwd")); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(root, "elsewhere")
+	dump := filepath.Join(dataDir, "ipsets", "ru.dump")
+	if err := os.MkdirAll(filepath.Dir(dump), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dump, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dump, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	config, err := json.Marshal(map[string]string{"data_dir": dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, "vpn-director.json"), config, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	refused := filepath.Join(t.TempDir(), "find.refused")
+
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\nMERLIN_FIND_REFUSED='" + refused + "'\n" + merlinFind +
+		repairFunctions(t, script, move) +
+		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+	if err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, b)
+	}
+	out := string(b)
+	if calls, err := os.ReadFile(refused); err == nil {
+		t.Errorf("the repair ran a find Asuswrt-Merlin's BusyBox refuses:\n%s\noutput:\n%s", calls, out)
+	}
+	want := "WARN: data_dir " + dataDir + " lies outside " + root + "/opt/vpn-director, which the repair does not touch, " +
+		"and group or others can write to something in it"
+	if !strings.Contains(out, want) || !strings.Contains(out, "rc=1") {
+		t.Errorf("want %q and status 1; got:\n%s", want, out)
+	}
+	if os.Geteuid() != 0 && strings.Contains(out, "another user's") {
+		t.Errorf("a symlink in the tree is named as another user's entry; got:\n%s", out)
 	}
 }

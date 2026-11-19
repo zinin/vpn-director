@@ -323,6 +323,27 @@ load 'test_helper'
 }
 
 # ============================================================================
+# tmp_file / tmp_dir
+# ============================================================================
+
+# A temp file can hold a secret - import_server_list.sh resolves the servers, with their
+# credentials, into one - so it is its owner's alone whatever the caller's umask, Asuswrt-Merlin's
+# 0 included.
+@test "tmp_file and tmp_dir: a file comes out 0600 and a directory 0700 under umask 000" {
+    load_common
+    local mask file dir
+    mask="$(umask)"
+    umask 000
+    file="$(tmp_file)"
+    dir="$(tmp_dir)"
+    umask "$mask"
+    [ -f "$file" ]
+    [ -d "$dir" ]
+    assert_equal "$(stat -c %a "$file")" 600
+    assert_equal "$(stat -c %a "$dir")" 700
+}
+
+# ============================================================================
 # download_file
 # ============================================================================
 

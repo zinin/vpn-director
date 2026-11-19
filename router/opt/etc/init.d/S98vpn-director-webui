@@ -6,6 +6,8 @@
 # the process started successfully. We also use `nohup` to detach the daemon
 # from the controlling terminal so it survives an SSH logout when the script
 # is invoked manually. (`setsid` is not provided by BusyBox 1.25 on Merlin.)
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENABLED=yes
 DESC="VPN Director Web UI"

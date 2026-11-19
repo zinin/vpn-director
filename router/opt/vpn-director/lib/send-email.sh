@@ -16,6 +16,8 @@
 # These stay above the hand-over block: shellcheck reads a directive as
 # file-wide only while no command has run yet.
 
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 if [ -z "${BASH_VERSION:-}" ]; then
     for _vpd_bash in /opt/bin/bash /usr/bin/bash /bin/bash; do
         # Asuswrt-Merlin's /bin/bash is busybox: a POSIX shell that never sets

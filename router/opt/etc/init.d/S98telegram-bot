@@ -2,6 +2,8 @@
 
 # Note: We don't source rc.func because we need to start the bot via absolute path
 # so that pgrep -f "/opt/vpn-director/telegram-bot" works reliably in update scripts.
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 PATH=/opt/sbin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENABLED=yes
 DESC="Telegram Bot for VPN Director"

@@ -67,6 +67,7 @@ router/test/
 │   ├── platform_keenetic.bats
 │   ├── hooks.bats           # NDM hooks; Merlin's firewall-start, nat-start and wan-event
 │   ├── install.bats
+│   ├── setup_telegram_bot.bats # setup_telegram_bot.sh: telegram-bot.json written 0600
 │   ├── configure.bats
 │   ├── subscription.bats    # lib/subscription.sh on the shared cases in testdata/subscription
 │   ├── substore.bats        # lib/substore.sh on the shared files in testdata/substore

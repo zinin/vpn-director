@@ -4,6 +4,8 @@
 # bypass ipset resolves the VPN endpoints and the ipset update downloads, so
 # apply on start only. Detached for the reason netfilter.d gives.
 
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 VPD_SCRIPT="${VPD_SCRIPT:-/opt/vpn-director/vpn-director.sh}"
 

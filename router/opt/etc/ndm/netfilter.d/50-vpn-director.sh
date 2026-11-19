@@ -17,6 +17,8 @@
 
 # $type and $table are NDM's, out of the hook environment; nothing here assigns them.
 # shellcheck disable=SC2154
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
 VPD_SCRIPT="${VPD_SCRIPT:-/opt/vpn-director/vpn-director.sh}"
 VPD_RESTORE="${VPD_RESTORE:-/opt/vpn-director/lib/fwsnap-restore.sh}"

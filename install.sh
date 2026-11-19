@@ -6,6 +6,8 @@
 # after it. PATH is no help here: Asuswrt-Merlin's /bin/sh has no "command"
 # builtin (see .claude/rules/shell-conventions.md) and its /bin/bash is a
 # symlink to busybox rather than bash.
+# Asuswrt-Merlin runs everything under umask 0; nothing this creates may be writable by others.
+umask 022
 if [ -z "${BASH_VERSION:-}" ]; then
     for _vpd_bash in /opt/bin/bash /usr/bin/bash /bin/bash; do
         # Asuswrt-Merlin's /bin/bash is busybox: a POSIX shell that never sets
@@ -368,6 +370,13 @@ download_scripts() {
             print_error "Failed to download $file"
             return 1
         fi
+        # curl writes into a file that is there and keeps its mode: an install under
+        # Asuswrt-Merlin's umask 0 left the init scripts 0777, and root runs them.
+        chmod go-w "$target" || print_info "Warning: could not remove write access for others from $target"
+        # It keeps its owner too, and chmod never changes one: a file another user put there while
+        # its directory was 0777 stays writable by that user.
+        [[ -O $target ]] ||
+            print_info "Warning: $target is another user's: its owner can still write to it whatever its mode"
         if manifest_is_executable "$file"; then
             chmod +x "$target"
         fi
@@ -391,6 +400,139 @@ install_hooks() {
     else
         print_info "Warning: a firmware hook does not call VPN Director (see above); fix it, then run $VPD_DIR/vpn-director.sh hooks"
     fi
+}
+
+###############################################################################
+# Take write away from group and others where an earlier install left it
+###############################################################################
+
+# _repair_path <path> <chmod mode args...>
+#   chmod one path of ours: nothing for a missing one; a warning and rc 1 for one that is a
+#   symlink - chmod would follow it, -R included, and a link any process planted in /tmp would
+#   take the write from whatever it points to - and for a chmod that fails. One another user owns
+#   is chmod-ed all the same, then named with a warning and rc 1: chmod never changes an owner,
+#   who can still write to it whatever its mode.
+_repair_path() {
+    local path="$1"
+    shift
+    if [[ -L $path ]]; then
+        print_info "Warning: $path is a symlink; left as it is"
+        return 1
+    fi
+    [[ -e $path ]] || return 0
+    if ! chmod "$@" "$path"; then
+        print_info "Warning: could not remove write access for others from $path"
+        return 1
+    fi
+    [[ -O $path ]] && return 0
+    print_info "Warning: $path is another user's: its owner can still write to it whatever its mode"
+    return 1
+}
+
+# _repair_flat_dir <dir>
+#   One of our runtime directories in /tmp, which hold plain files only: takes write for others
+#   from the directory, then from each regular file directly in it, and never walks further -
+#   chmod -R goes by name, and a subdirectory another process swaps for a symlink mid-walk would
+#   take root's chmod anywhere. Nothing for a missing path; a warning and rc 1, nothing touched,
+#   for a symlink, no directory or a directory another user owns: any process can create these
+#   paths in /tmp before we do, and ensure_owned_dir leaves such a directory alone too. A chmod of
+#   the directory that fails is a warning and rc 1, and stops there; one of a file is a warning and
+#   rc 1, the other files still done.
+_repair_flat_dir() {
+    local dir="$1" f rc=0
+    [[ -e $dir || -L $dir ]] || return 0
+    if [[ -L $dir || ! -d $dir || ! -O $dir ]]; then
+        print_info "Warning: $dir is a symlink, no directory or another user's; left as it is"
+        return 1
+    fi
+    if ! chmod go-w "$dir"; then
+        print_info "Warning: could not remove write access for others from $dir"
+        return 1
+    fi
+    for f in "$dir"/*; do
+        [[ -f $f && ! -L $f ]] || continue
+        if ! chmod go-w "$f"; then
+            print_info "Warning: could not remove write access for others from $f"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
+# _has_go_write <dir>
+#   Status 0 when <dir>, or anything under it that is no symlink, is writable by group or others.
+#   A plain find, and ls -ld for the mode: Asuswrt-Merlin's BusyBox find knows no -type and no
+#   -perm, and an ssh session there finds it ahead of Entware's.
+_has_go_write() {
+    local p mode
+    while IFS= read -r p; do
+        [[ -L $p ]] && continue
+        mode=$(ls -ld "$p" 2>/dev/null) || continue
+        if [[ ${mode:5:1} == w || ${mode:8:1} == w ]]; then
+            return 0
+        fi
+    done < <(find "$1/" 2>/dev/null)
+    return 1
+}
+
+# repair_modes
+#   Asuswrt-Merlin runs everything under umask 0, and earlier releases created their directories
+#   and files without a mode: every process on the router could write to them, and root runs the
+#   scripts and binaries there. Takes that write away from the whole of $VPD_DIR (the owner's own
+#   files in it included), from our runtime files in /tmp and /var/lock and from /jffs/scripts and
+#   Asuswrt-Merlin's shared hooks in it, which root runs on every firewall start and whose rewrite
+#   keeps their mode, and makes telegram-bot.json, which holds the bot token, 0600. The files
+#   download_scripts installs outside $VPD_DIR lose it there. Each path on its own, a missing one
+#   skipped; $VPD_DIR is taken as given. rc 1, after every path, when one was not repaired or is
+#   another user's, or when a data_dir outside $VPD_DIR holds something others can write to.
+repair_modes() {
+    local rc=0 path p foreign=0
+
+    print_info "Removing write access for others..."
+    # The trailing slash: BusyBox's chmod -R, given a symlink to a directory, changes that
+    # directory alone and exits 0; an install moved elsewhere and linked back is repaired too.
+    if [[ -e $VPD_DIR ]]; then
+        if ! chmod -R go-w "$VPD_DIR/"; then
+            print_info "Warning: could not remove write access for others from $VPD_DIR"
+            rc=1
+        fi
+        # chmod never changes an owner. While the tree was 0777 any process could put a file of its
+        # own in place of one of ours, and curl -o and cp -f write into the file that is there: its
+        # owner can still write to it, whatever its mode. Name each such entry (the first ten, then
+        # a count); never chown it. A plain find, the symlink left out here: Asuswrt-Merlin's
+        # BusyBox find knows no -type, and -O would follow the link.
+        while IFS= read -r p; do
+            [[ -L $p || -O $p ]] && continue
+            foreign=$((foreign + 1))
+            if (( foreign <= 10 )); then
+                print_info "Warning: $p is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy (reinstall, or run setup_telegram_bot.sh for telegram-bot.json)"
+            fi
+        done < <(find "$VPD_DIR/")
+        if (( foreign > 10 )); then
+            print_info "Warning: ... and $((foreign - 10)) more entries under $VPD_DIR are another user's"
+        fi
+        (( foreign == 0 )) || rc=1
+    fi
+    for path in "${INSTALL_ROOT}/tmp/tunnel_director" "${INSTALL_ROOT}/tmp/xray_tproxy"; do
+        _repair_flat_dir "$path" || rc=1
+    done
+    for path in "${INSTALL_ROOT}/tmp/vpn-director.log" "${INSTALL_ROOT}/var/lock/vpn-director.lock" \
+        "${INSTALL_ROOT}/jffs/scripts" "${INSTALL_ROOT}/jffs/scripts/firewall-start" \
+        "${INSTALL_ROOT}/jffs/scripts/wan-event" "${INSTALL_ROOT}/jffs/scripts/nat-start"; do
+        _repair_path "$path" go-w || rc=1
+    done
+    _repair_path "$VPD_DIR/telegram-bot.json" 600 || rc=1
+
+    # data_dir comes from vpn-director.json, which earlier releases left writable by every process:
+    # root reads that path and warns, and changes no mode there. Under $VPD_DIR the tree's repair
+    # covers it. The trailing slash follows a data_dir that is a symlink, as the tree's repair does.
+    local dd
+    dd=$(jq -r '.data_dir // empty' "$VPD_DIR/vpn-director.json" 2>/dev/null) || dd=""
+    if [[ $dd == /* && $dd != "$VPD_DIR" && $dd != "$VPD_DIR"/* ]] && _has_go_write "$dd"; then
+        print_info "Warning: data_dir $dd lies outside $VPD_DIR, which the repair does not touch, and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w $dd"
+        rc=1
+    fi
+    return "$rc"
 }
 
 ###############################################################################
@@ -727,6 +869,10 @@ main() {
     check_environment
     resolve_release_tag
     create_directories
+    # Earlier releases left these paths writable by every process. That write goes before anything
+    # is written into them or run from them: curl -o and the hooks' cp -p keep a repaired mode, and
+    # new files are created under umask 022.
+    repair_modes || print_info "Warning: the paths named above keep write access for others; check each one"
     download_scripts
     load_platform_lib || print_info "Platform library not installed; using default LAN facts"
     install_hooks

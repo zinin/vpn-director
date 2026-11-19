@@ -19,6 +19,16 @@ entry_scripts() {
         "$PROJECT_ROOT/../install.sh"
 }
 
+# Every script a router executes: the entry scripts, the init scripts that start the daemons,
+# and the firmware hooks - every file of their directories, so a new init script or hook joins
+# the check on its own. hooks/legacy/ holds the earlier releases' hook bodies, which the hook
+# migration matches byte for byte and nothing executes.
+executed_scripts() {
+    entry_scripts
+    printf '%s\n' "$PROJECT_ROOT"/opt/etc/init.d/* "$PROJECT_ROOT"/opt/etc/ndm/*/*
+    find "$SCRIPTS_DIR/hooks" -maxdepth 1 -type f | sort
+}
+
 @test "executed scripts do not depend on /usr/bin/env" {
     local script hit
     while IFS= read -r script; do
@@ -109,4 +119,31 @@ make_probe_with_candidates() {
     run sh "$SCRIPTS_DIR/vpn-director.sh" --help
     assert_success
     assert_output --partial "Usage:"
+}
+
+# Asuswrt-Merlin runs everything under umask 0 - the firmware's services, cron, the hooks, an
+# ssh session - and what a script creates without a mode takes its caller's umask: directories
+# 0777, files 0666, which every process on the router can write.
+@test "every executed script sets umask 022 before anything else" {
+    local script first
+    while IFS= read -r script; do
+        first=$(awk 'NR > 1 && !/^[[:space:]]*(#|$)/ { print; exit }' "$script")
+        [[ $first == 'umask 022' ]] || fail "$script starts with '$first', not 'umask 022'"
+    done < <(executed_scripts)
+}
+
+# Ahead of the hand-over block, not inside it: "bash script" and "curl ... | bash" skip the block.
+@test "an entry script runs under umask 022 whatever its caller's umask, from sh or from bash" {
+    local script probe="$BATS_TEST_TMPDIR/probe"
+    while IFS= read -r script; do
+        sed -n '1,/^fi$/p' "$script" > "$probe"
+        printf 'umask\n' >> "$probe"
+        chmod +x "$probe"
+        run sh -c 'umask 0; exec "$1"' _ "$probe"
+        assert_success
+        assert_output "0022"
+        run bash -c 'umask 0; bash "$1"' _ "$probe"
+        assert_success
+        assert_output "0022"
+    done < <(entry_scripts)
 }

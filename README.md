@@ -190,6 +190,16 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 
 > **Upgrading from v0.11.x or earlier.** The updater built into those releases downloads a fixed file list without `lib/platform.sh`, so pressing «Update» installs this release incompletely: the shell CLI, the firewall hooks and the daily update stop working (the Xray TPROXY and Tunnel Director rules are no longer re-applied after a firewall restart) until you re-run the [Quick Install](#quick-install) command once. The Web UI and the bot themselves keep running. Every later update reads the release manifest and needs no such step.
 
+> **Upgrading from v0.23.0 or earlier on Asuswrt-Merlin.** The firmware runs everything under umask 0, and earlier releases left `/opt/vpn-director` writable by every process on the router, `telegram-bot.json` with the bot token included. The update:
+>
+> - takes that write away from the whole `/opt/vpn-director` tree, your own files there included;
+> - does the same for the files it installs elsewhere (the init scripts, the Xray config template), for `/jffs/scripts` and its shared `firewall-start`, `wan-event` and `nat-start`, and for `/tmp/tunnel_director`, `/tmp/xray_tproxy`, `/tmp/vpn-director.log` and `/var/lock/vpn-director.lock`;
+> - makes `telegram-bot.json` readable by root alone (0600).
+>
+> A symlink at one of those paths, or a directory of ours in `/tmp` that another user owns, is left as it is, with a warning in the system log. A file another user owns is named with a warning too: its owner keeps write access whatever its mode, so replace it from a trusted copy. `/opt/vpn-director` itself is repaired wherever it points. A `data_dir` moved outside `/opt/vpn-director` is not repaired: the update names it in a warning while group or others can write to something there.
+>
+> The 0600 mode does not take back a token read while the file was 0666: if a process you do not trust could have run on the router, revoke the token with @BotFather (`/revoke`) and run `setup_telegram_bot.sh` with the new one.
+
 > **Upgrading from v0.22.0 or earlier.** This release adds routing rules per client that keep clients on Xray or Tunnel Director off the WAN while the firmware rebuilds its firewall (ip rule preferences 16894-16898 with the default `pref_base`), and its firewall hooks put the chains back from a snapshot of the last apply.
 >
 > - Going back to v0.22.0 or earlier: run `vpn-director.sh stop` with this release first. It removes the rules at 16894-16898, the snapshot and the records of where the rules went in. An older release knows none of them, and they would send its tunnel clients' traffic to excluded countries into the tunnel, and refuse what its Xray clients send direct, except to private networks and the addresses of `xray.exclude_ips`. A reboot clears them too.

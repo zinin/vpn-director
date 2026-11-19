@@ -1210,8 +1210,8 @@ watchd_start_alive_case() {
     load_installer
     local step
     for step in print_header detect_platform check_environment resolve_release_tag create_directories \
-        download_scripts load_platform_lib install_hooks download_telegram_bot download_webui download_watchd \
-        generate_tls_cert start_webui print_next_steps; do
+        download_scripts load_platform_lib install_hooks repair_modes download_telegram_bot download_webui \
+        download_watchd generate_tls_cert start_webui print_next_steps; do
         eval "$step() { printf '%s\\n' '$step' >> \"\$BATS_TEST_TMPDIR/main.calls\"; }"
     done
     setup_webui_config() {
@@ -1227,7 +1227,7 @@ watchd_start_alive_case() {
 
     assert_success
     run cat "$BATS_TEST_TMPDIR/main.calls"
-    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\ndownload_scripts\nload_platform_lib\ninstall_hooks\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
+    assert_output $'print_header\ndetect_platform\ncheck_environment\nresolve_release_tag\ncreate_directories\nrepair_modes\ndownload_scripts\nload_platform_lib\ninstall_hooks\ndownload_telegram_bot\ndownload_webui\ndownload_watchd\ngenerate_tls_cert\nsetup_webui_config\nstart_webui\nstart_watchd\nprint_next_steps'
 }
 
 # Asuswrt-Merlin's /jffs/scripts hooks are shared with the owner and other
@@ -1252,4 +1252,459 @@ watchd_start_alive_case() {
     run install_hooks
     assert_success
     assert_output --partial "run $VPD_DIR/vpn-director.sh hooks"
+}
+
+# Asuswrt-Merlin runs everything under umask 0, and an earlier install left what it created
+# writable by every process: the directories of /opt/vpn-director 0777, its files and our runtime
+# files in /tmp and /var/lock 0666, telegram-bot.json - the bot token - among them.
+make_world_writable_install() {
+    mkdir -p "$VPD_DIR/lib" "$VPD_DIR/data/ipsets" "$VPD_DIR/backup-v0.10.0" \
+        "$INSTALL_ROOT/tmp/tunnel_director" "$INSTALL_ROOT/tmp/xray_tproxy" "$INSTALL_ROOT/var/lock"
+    printf 'x\n' > "$VPD_DIR/data/ipsets/ru.dump"
+    printf 'x\n' > "$VPD_DIR/backup-v0.10.0/vpn-director.sh"
+    printf '1 ovpnc4\n' > "$INSTALL_ROOT/tmp/tunnel_director/tun_dir_tables"
+    printf 'ok\n' > "$INSTALL_ROOT/tmp/xray_tproxy/ready"
+    printf 'log\n' > "$INSTALL_ROOT/tmp/vpn-director.log"
+    : > "$INSTALL_ROOT/var/lock/vpn-director.lock"
+    printf '{}\n' > "$VPD_DIR/telegram-bot.json"
+    chmod 777 "$VPD_DIR" "$VPD_DIR/lib" "$VPD_DIR/data" "$VPD_DIR/data/ipsets" "$VPD_DIR/backup-v0.10.0" \
+        "$VPD_DIR/backup-v0.10.0/vpn-director.sh" \
+        "$INSTALL_ROOT/tmp/tunnel_director" "$INSTALL_ROOT/tmp/xray_tproxy"
+    chmod 666 "$VPD_DIR/data/ipsets/ru.dump" "$INSTALL_ROOT/tmp/tunnel_director/tun_dir_tables" \
+        "$INSTALL_ROOT/tmp/xray_tproxy/ready" "$INSTALL_ROOT/tmp/vpn-director.log" \
+        "$INSTALL_ROOT/var/lock/vpn-director.lock" "$VPD_DIR/telegram-bot.json"
+}
+
+@test "repair_modes: takes group and other write away from what an earlier install left" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    make_world_writable_install
+
+    run repair_modes
+
+    assert_success
+    run find "$VPD_DIR" "$INSTALL_ROOT/tmp/tunnel_director" "$INSTALL_ROOT/tmp/xray_tproxy" \
+        "$INSTALL_ROOT/tmp/vpn-director.log" "$INSTALL_ROOT/var/lock/vpn-director.lock" ! -type l -perm /022
+    assert_output ""
+    assert_equal "$(stat -c %a "$VPD_DIR/telegram-bot.json")" 600
+    assert_equal "$(stat -c %a "$VPD_DIR/lib")" 755
+    assert_equal "$(stat -c %a "$VPD_DIR/data/ipsets/ru.dump")" 644
+    assert_equal "$(stat -c %a "$VPD_DIR/backup-v0.10.0/vpn-director.sh")" 755
+}
+
+@test "repair_modes: a symlink in the tree leaves its target's mode alone" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    printf 'x\n' > "$BATS_TEST_TMPDIR/outside"
+    chmod 666 "$BATS_TEST_TMPDIR/outside"
+    ln -s "$BATS_TEST_TMPDIR/outside" "$VPD_DIR/link"
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$BATS_TEST_TMPDIR/outside")" 666
+}
+
+# chmod follows a symlink named on its command line, -R included: a /tmp/xray_tproxy any process
+# planted as a link to / would have the write taken from everything under it.
+@test "repair_modes: a symlink at one of our paths is left alone, whatever it points to" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local elsewhere="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$elsewhere" "$INSTALL_ROOT/tmp"
+    printf 'x\n' > "$elsewhere/file"
+    chmod 777 "$elsewhere"
+    chmod 666 "$elsewhere/file"
+    ln -s "$elsewhere" "$INSTALL_ROOT/tmp/tunnel_director"
+    ln -s "$elsewhere/file" "$INSTALL_ROOT/tmp/vpn-director.log"
+    ln -s "$elsewhere/file" "$VPD_DIR/telegram-bot.json"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "$INSTALL_ROOT/tmp/tunnel_director is a symlink"
+    assert_equal "$(stat -c %a "$elsewhere")" 777
+    assert_equal "$(stat -c %a "$elsewhere/file")" 666
+}
+
+# Our directories in /tmp hold plain files only, and the repair never walks them: chmod -R goes
+# by name, and a subdirectory another process swaps for a symlink mid-walk would take root's chmod
+# anywhere. A subdirectory planted in one, and what it holds, keep their modes.
+@test "repair_modes: a subdirectory in one of our /tmp directories is not descended into" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dir="$INSTALL_ROOT/tmp/tunnel_director"
+    mkdir -p "$dir/planted"
+    printf '1 ovpnc4\n' > "$dir/tun_dir_tables"
+    printf 'x\n' > "$dir/planted/file"
+    chmod 777 "$dir" "$dir/planted"
+    chmod 666 "$dir/tun_dir_tables" "$dir/planted/file"
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$dir")" 755
+    assert_equal "$(stat -c %a "$dir/tun_dir_tables")" 644
+    assert_equal "$(stat -c %a "$dir/planted")" 777
+    assert_equal "$(stat -c %a "$dir/planted/file")" 666
+}
+
+@test "repair_modes: a file where one of our /tmp directories belongs is left as it is, with a warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$INSTALL_ROOT/tmp"
+    printf 'x\n' > "$INSTALL_ROOT/tmp/xray_tproxy"
+    chmod 666 "$INSTALL_ROOT/tmp/xray_tproxy"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: $INSTALL_ROOT/tmp/xray_tproxy is a symlink, no directory or another user's; left as it is"
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/tmp/xray_tproxy")" 666
+}
+
+# Any process can create /tmp/xray_tproxy before we do: root leaves a directory another user owns
+# as it is, as ensure_owned_dir does. Only root can make a directory of another user's here.
+@test "repair_modes: one of our /tmp directories that another user owns is left as it is, with a warning" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a directory of another user's"
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dir="$INSTALL_ROOT/tmp/xray_tproxy"
+    mkdir -p "$dir"
+    printf 'ok\n' > "$dir/ready"
+    chmod 777 "$dir"
+    chmod 666 "$dir/ready"
+    chown -R nobody "$dir"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: $dir is a symlink, no directory or another user's; left as it is"
+    assert_equal "$(stat -c %a "$dir")" 777
+    assert_equal "$(stat -c %a "$dir/ready")" 666
+}
+
+# While the tree was 0777 any process could put a file of its own in place of one of ours, and
+# chmod never changes an owner: the repair takes the write away all the same, never chowns, and
+# names each entry another user owns - the first ten, then a count. Only root can make one.
+@test "repair_modes: entries under VPD_DIR another user owns are named, ten at most, then a count" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a file of another user's"
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local i
+    mkdir -p "$VPD_DIR/data"
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        printf 'x\n' > "$VPD_DIR/data/f$i"
+    done
+    chmod 666 "$VPD_DIR"/data/f*
+    chown nobody "$VPD_DIR"/data/f*
+
+    run repair_modes
+
+    assert_failure
+    assert_equal "$(grep -c "is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy" <<< "$output")" 10
+    assert_output --partial "Warning: ... and 2 more entries under $VPD_DIR are another user's"
+    assert_equal "$(stat -c %a "$VPD_DIR/data/f1")" 644
+    assert_equal "$(stat -c %U "$VPD_DIR/data/f1")" nobody
+}
+
+@test "_repair_path: a path another user owns loses write for others, and is named" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a file of another user's"
+    load_installer
+    local file="$BATS_TEST_TMPDIR/vpn-director.log"
+    printf 'log\n' > "$file"
+    chmod 666 "$file"
+    chown nobody "$file"
+
+    run _repair_path "$file" go-w
+
+    assert_failure
+    assert_output --partial "Warning: $file is another user's: its owner can still write to it whatever its mode"
+    assert_equal "$(stat -c %a "$file")" 644
+    assert_equal "$(stat -c %U "$file")" nobody
+}
+
+@test "download_scripts: a file another user owns is named, and the download goes on" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a file of another user's"
+    load_installer
+    fake_curl
+    local repo="$BATS_TEST_TMPDIR/repo/router"
+    mkdir -p "$repo/opt/etc/init.d" "$repo/opt/etc/xray"
+    cat > "$repo/files.manifest" <<'MANIFEST'
+common   router/opt/etc/init.d/S99vpn-director
+common   router/opt/etc/xray/config.json.template
+MANIFEST
+    echo "init" > "$repo/opt/etc/init.d/S99vpn-director"
+    echo "{}" > "$repo/opt/etc/xray/config.json.template"
+    REPO_URL="https://raw.example/zinin/vpn-director/refs/tags/v1.0.0"
+    PLATFORM="merlin"
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local init="$INSTALL_ROOT/opt/etc/init.d/S99vpn-director"
+    mkdir -p "$INSTALL_ROOT/opt/etc/init.d"
+    echo "old" > "$init"
+    chmod 777 "$init"
+    chown nobody "$init"
+
+    run download_scripts
+
+    assert_success
+    assert_output --partial "Warning: $init is another user's: its owner can still write to it whatever its mode"
+    assert_equal "$(cat "$init")" "init"
+    assert_equal "$(stat -c %a "$init")" 755
+    assert_equal "$(cat "$INSTALL_ROOT/opt/etc/xray/config.json.template")" "{}"
+}
+
+# data_dir comes from vpn-director.json, which earlier releases left writable by every process:
+# outside VPD_DIR root only reads the path and warns, and every mode there stays as it is.
+@test "repair_modes: a data_dir outside VPD_DIR that others can write to is named, and left as it is" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dd="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$dd/ipsets"
+    printf 'x\n' > "$dd/ipsets/ru.dump"
+    chmod 755 "$dd" "$dd/ipsets"
+    chmod 666 "$dd/ipsets/ru.dump"
+    jq -n --arg dd "$dd" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: data_dir $dd lies outside $VPD_DIR, which the repair does not touch, and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w $dd"
+    assert_equal "$(stat -c %a "$dd/ipsets/ru.dump")" 666
+}
+
+@test "repair_modes: a data_dir outside VPD_DIR that nobody else can write to, or no config, is no warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dd="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$dd/ipsets"
+    printf 'x\n' > "$dd/ipsets/ru.dump"
+    chmod 755 "$dd" "$dd/ipsets"
+    chmod 644 "$dd/ipsets/ru.dump"
+    jq -n --arg dd "$dd" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+
+    run repair_modes
+
+    assert_success
+    refute_output --partial "Warning"
+
+    rm "$VPD_DIR/vpn-director.json"
+    chmod 666 "$dd/ipsets/ru.dump"
+
+    run repair_modes
+
+    assert_success
+    refute_output --partial "Warning"
+}
+
+# The tree's repair covers a data_dir under VPD_DIR; its chmod failing here keeps a file there
+# writable, and still no data_dir warning comes.
+@test "repair_modes: a data_dir under VPD_DIR is the tree's, with no data_dir warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$VPD_DIR/data/ipsets"
+    printf 'x\n' > "$VPD_DIR/data/ipsets/ru.dump"
+    chmod 666 "$VPD_DIR/data/ipsets/ru.dump"
+    jq -n --arg dd "$VPD_DIR/data" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+    chmod() {
+        [[ "$*" == "-R go-w $VPD_DIR/" ]] && return 1
+        command chmod "$@"
+    }
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: could not remove write access for others from $VPD_DIR"
+    refute_output --partial "data_dir"
+}
+
+@test "repair_modes: a fresh install has nothing to repair and no warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+
+    run repair_modes
+
+    assert_success
+    refute_output --partial "Warning"
+}
+
+@test "repair_modes: a chmod that fails is a warning, and every other path is still repaired" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    printf '{}\n' > "$VPD_DIR/telegram-bot.json"
+    chmod 666 "$VPD_DIR/telegram-bot.json"
+    chmod() {
+        [[ "$*" == "-R go-w $VPD_DIR/" ]] && return 1
+        command chmod "$@"
+    }
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: could not remove write access for others from $VPD_DIR"
+    assert_equal "$(stat -c %a "$VPD_DIR/telegram-bot.json")" 600
+}
+
+# curl -o writes into a file that is there and keeps its mode: an earlier install under Merlin's
+# umask 0 left the init scripts 0777 and the Xray template 0666 outside /opt/vpn-director, which
+# root runs or reads, and a reinstall must not keep them so.
+@test "download_scripts: a file an earlier install left writable by others loses that write" {
+    load_installer
+    fake_curl
+    local repo="$BATS_TEST_TMPDIR/repo/router"
+    mkdir -p "$repo/opt/etc/init.d" "$repo/opt/etc/xray"
+    cat > "$repo/files.manifest" <<'MANIFEST'
+common   router/opt/etc/init.d/S99vpn-director
+common   router/opt/etc/xray/config.json.template
+MANIFEST
+    echo "init" > "$repo/opt/etc/init.d/S99vpn-director"
+    echo "{}" > "$repo/opt/etc/xray/config.json.template"
+    REPO_URL="https://raw.example/zinin/vpn-director/refs/tags/v1.0.0"
+    PLATFORM="merlin"
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$INSTALL_ROOT/opt/etc/init.d" "$INSTALL_ROOT/opt/etc/xray"
+    echo "old" > "$INSTALL_ROOT/opt/etc/init.d/S99vpn-director"
+    echo "old" > "$INSTALL_ROOT/opt/etc/xray/config.json.template"
+    chmod 777 "$INSTALL_ROOT/opt/etc/init.d/S99vpn-director"
+    chmod 666 "$INSTALL_ROOT/opt/etc/xray/config.json.template"
+
+    run download_scripts
+
+    assert_success
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/opt/etc/init.d/S99vpn-director")" 755
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/opt/etc/xray/config.json.template")" 644
+}
+
+# A repair that fails is a warning, never a failed install: under set -e a chmod that fails would
+# end the installer right after the download.
+@test "download_scripts: a chmod that fails is a warning, and every file is still installed" {
+    load_installer
+    fake_curl
+    local repo="$BATS_TEST_TMPDIR/repo/router"
+    mkdir -p "$repo/opt/etc/init.d" "$repo/opt/etc/xray"
+    cat > "$repo/files.manifest" <<'MANIFEST'
+common   router/opt/etc/init.d/S99vpn-director
+common   router/opt/etc/xray/config.json.template
+MANIFEST
+    echo "init" > "$repo/opt/etc/init.d/S99vpn-director"
+    echo "{}" > "$repo/opt/etc/xray/config.json.template"
+    REPO_URL="https://raw.example/zinin/vpn-director/refs/tags/v1.0.0"
+    PLATFORM="merlin"
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    chmod() {
+        [[ "$*" == "go-w $INSTALL_ROOT/opt/etc/init.d/S99vpn-director" ]] && return 1
+        command chmod "$@"
+    }
+
+    run download_scripts
+
+    assert_success
+    assert_output --partial "Warning: could not remove write access for others from $INSTALL_ROOT/opt/etc/init.d/S99vpn-director"
+    assert_equal "$(cat "$INSTALL_ROOT/opt/etc/init.d/S99vpn-director")" "init"
+    assert_equal "$(cat "$INSTALL_ROOT/opt/etc/xray/config.json.template")" "{}"
+}
+
+# Asuswrt-Merlin runs /jffs/scripts/<hook> as root on every firewall start, and the hook line's
+# rewrite keeps the file's mode (cp -p): one an earlier release left 0777 stays so. In a 0777
+# /jffs/scripts any process can replace a hook, whatever its mode.
+@test "repair_modes: /jffs/scripts and the shared hooks in it lose write for others, an owner's +x kept" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$INSTALL_ROOT/jffs/scripts"
+    printf '#!/bin/sh\n' > "$INSTALL_ROOT/jffs/scripts/firewall-start"
+    printf '#!/bin/sh\n' > "$INSTALL_ROOT/jffs/scripts/nat-start"
+    chmod 777 "$INSTALL_ROOT/jffs/scripts" "$INSTALL_ROOT/jffs/scripts/firewall-start"
+    chmod 666 "$INSTALL_ROOT/jffs/scripts/nat-start"
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/jffs/scripts")" 755
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/jffs/scripts/firewall-start")" 755
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/jffs/scripts/nat-start")" 644
+}
+
+# BusyBox's chmod -R, given a symlink to a directory, changes that directory alone and exits 0: an
+# owner who moved /opt/vpn-director elsewhere and linked it back would keep every file in it
+# writable by everyone.
+@test "repair_modes: a VPD_DIR that is a symlink is repaired all the way down, by BusyBox's chmod too" {
+    command -v busybox >/dev/null || skip "busybox not installed"
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local elsewhere="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$elsewhere/lib"
+    printf 'x\n' > "$elsewhere/lib/common.sh"
+    chmod 777 "$elsewhere/lib"
+    chmod 666 "$elsewhere/lib/common.sh"
+    rm -rf "$VPD_DIR"
+    ln -s "$elsewhere" "$VPD_DIR"
+    chmod() { busybox chmod "$@"; }
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$elsewhere/lib")" 755
+    assert_equal "$(stat -c %a "$elsewhere/lib/common.sh")" 644
+}
+
+# merlin_find is find as Asuswrt-Merlin 388 has it: BusyBox v1.25.1, whose find --help on an
+# RT-AX86U lists -L, -H, -follow, !, -a, -o, -name, -iname, -mtime, -print, -print0 and -exec, the
+# last ended by ";" alone, and nothing else - no -type, no -perm - and which an ssh session there
+# finds ahead of Entware's. It refuses everything else the way that find does, and notes each
+# refused call in $BATS_TEST_TMPDIR/find.refused.
+merlin_find() {
+    local a skip=0 in_exec=0
+    for a in "$@"; do
+        if (( in_exec )); then
+            if [[ $a == ';' ]]; then
+                in_exec=0
+            fi
+            continue
+        fi
+        if (( skip )); then
+            skip=0
+            continue
+        fi
+        case $a in
+            -L | -H | -follow | '!' | -a | -o | -print | -print0) ;;
+            -name | -iname | -mtime) skip=1 ;;
+            -exec) in_exec=1 ;;
+            -* | '(' | ')')
+                echo "find: unrecognized: $a" >&2
+                echo "$*" >> "$BATS_TEST_TMPDIR/find.refused"
+                return 1
+                ;;
+        esac
+    done
+    command find "$@"
+}
+
+# The installer runs with the PATH of an ssh session, and on Asuswrt-Merlin that finds BusyBox's
+# find, which knows no -type and no -perm, ahead of Entware's: the repair has to make do with what
+# it knows. A symlink in the tree to a file of another user's - /etc/passwd, root's, for a test that
+# does not run as root - is no entry of another user's: chmod -R does not follow it, and it is not
+# ours to replace.
+@test "repair_modes: under Asuswrt-Merlin's BusyBox find, no find it runs is refused and a data_dir others can write to is still named" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dd="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$dd/ipsets"
+    printf 'x\n' > "$dd/ipsets/ru.dump"
+    chmod 755 "$dd" "$dd/ipsets"
+    chmod 666 "$dd/ipsets/ru.dump"
+    jq -n --arg dd "$dd" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+    ln -s /etc/passwd "$VPD_DIR/lib/passwd"
+    find() { merlin_find "$@"; }
+
+    run repair_modes
+    unset -f find
+
+    if [[ -e $BATS_TEST_TMPDIR/find.refused ]]; then
+        fail "the repair ran a find Asuswrt-Merlin's BusyBox refuses: $(cat "$BATS_TEST_TMPDIR/find.refused")"
+    fi
+    assert_failure
+    assert_output --partial "Warning: data_dir $dd lies outside $VPD_DIR, which the repair does not touch, and group or others can write to something in it"
+    if (( EUID != 0 )); then
+        refute_output --partial "another user's"
+    fi
 }

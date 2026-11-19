@@ -14,6 +14,10 @@ paths: "**/*.sh, jffs/**/*"
   it stays POSIX sh - no hand-over to bash, no errexit - and always exits 0. The hooks rely on
   that: a few commands under the firmware's `/bin/sh`, inside NDM's 24-second timeout, and nothing
   it fails at stops the apply that follows (`tunnel-director.md`, "State Tracking")
+- Umask: every script a router executes makes `umask 022` its first command. That covers the entry
+  scripts, the init scripts, the Merlin and NDM hooks and the update script the updater generates.
+  In an entry script the line comes ahead of the hand-over block. `lib/fwsnap-restore.sh` runs under `umask 077`. See "Asuswrt-Merlin runs
+  everything under umask 0" below
 - Debug mode: `DEBUG=1 ./script.sh` enables `set -x` with informative PS4
 - shellcheck annotations for intentional expansions/externals (SC2086, SC2155, SC2034)
 
@@ -21,7 +25,7 @@ paths: "**/*.sh, jffs/**/*"
 
 - Logging: `log -l ERROR|WARN|INFO|DEBUG|TRACE "message"` (default: INFO)
 - Locking: `acquire_lock [name]` prevents concurrent script execution; with `VPD_LOCK_WAIT=<sec>` (set by `vpn-director.sh --wait[=SEC]`) it waits for the lock instead of exiting 0
-- Temp files: `tmp_file` / `tmp_dir` with auto-cleanup on exit
+- Temp files: `tmp_file` / `tmp_dir` with auto-cleanup on exit, created 0600 / 0700 whatever the umask
 
 ## Key Utilities (common.sh and the platform contract)
 
@@ -502,6 +506,25 @@ its version banner before it loads the config, so `xrayconf_validate` reads
 that exit code — not the output — to tell a timeout
 (`xray config test timed out after 15s`) from a rejection.
 
+### Asuswrt-Merlin's BusyBox `find` knows no `-type` and no `-perm`
+
+**Problem**: the `find` applet of BusyBox 1.25.1 on an RT-AX86U (Merlin 388) knows `-L`, `-H`,
+`-follow`, `!`, `-a`, `-o`, `-name`, `-iname`, `-mtime`, `-print`, `-print0` and `-exec … ;`, and
+nothing else. `-type`, `-perm`, `-user`, `-prune`, `-maxdepth`, `-path`, `-newer` and the rest end
+with `find: unrecognized: -type`, the applet's usage and exit 1. An ssh session there has
+`PATH=/bin:/sbin:/usr/bin:/usr/sbin:/opt/bin:…`, so `/usr/bin/find`, the applet, comes ahead of
+Entware's GNU `find` in `/opt/bin` even where findutils is installed, and `install.sh` runs with
+that PATH. The update script puts `/opt/bin` first, but findutils is no dependency of ours. In a
+command or process substitution the failure is silent: the loop over its output reads nothing, and
+a check built on it finds nothing. A workstation runs GNU `find`, where the tests pass.
+
+**Solution**: a plain `find <dir>/`, which every `find` walks, and the tests in the shell on each
+path it prints: `[ -L ]` for a symlink, `[ -O ]` for the owner (BusyBox ash and dash have it), the
+mode from `ls -ld` (`?????w*` or `????????w*` in a `case` is write for group or others). The
+repair's scans in `install.sh` and the update template are written that way, and `install.bats`
+(`merlin_find`) and `script_test.go` (`merlinFind`) run them under a `find` that refuses what the
+router's refuses.
+
 ### jq reads number literals that are not JSON
 
 **Problem**: jq 1.8.1 takes number literals Go's `encoding/json` refuses:
@@ -598,3 +621,67 @@ list as a function argument and pipes it in: `substore_name_taken`,
 name, a time. `xray.servers`, the union of every address, still goes as
 `--argjson` (`substore_sync_config`, the last write of `configure.sh`): at 18
 bytes an address, it reaches the limit at about 7,300 addresses.
+
+### Asuswrt-Merlin runs everything under umask 0
+
+**Problem**: the firmware starts its services, cron, the hooks and an ssh session under umask 0
+(`umask` prints `0000`). Whatever a script creates without a mode is then writable by everyone:
+directories 0777, files 0666. Measured on an RT-AX86U on v0.23.0:
+
+- every directory of `/opt/vpn-director` was 0777;
+- 0666 were `telegram-bot.json` (the bot token and `allowed_users`), `certs/server.crt`, the
+  ipset dumps in `data/ipsets`, `/tmp/vpn-director.log`, the files of `/tmp/tunnel_director` and
+  `/tmp/xray_tproxy`, and `/var/lock/vpn-director.lock`.
+
+Root runs the scripts, the hooks and the daemon binaries in those directories. In a 0777
+directory any process can replace a root-owned 0755 file, and the router runs processes as
+`nobody`: `dnsmasq`, nginx workers, `lldpd`. Every apply restores the country sets from the dumps,
+so a rewritten dump decides what a tunnel client reaches directly. KeeneticOS starts its sessions
+under umask 0022.
+
+**Solution**: every script a router executes makes `umask 022` its first command:
+
+- the entry scripts;
+- the init scripts - the daemons, and everything they start, inherit the umask;
+- the Merlin and NDM hooks;
+- the update script the updater generates (`update_script.sh.tmpl`).
+
+`router/test/unit/entrypoints.bats` pins it in each one but the update script, which
+`server/internal/updater/script_test.go` pins. In an entry script the line comes ahead of the
+hand-over block, which `bash script` and `curl … | bash` skip.
+
+A secret needs more than that, because umask 022 still lets everyone read it. Write it with
+`mktemp` in its own directory, then `chmod 600`, then `mv -f` it into place. The `mv` gives it a new
+inode, so an old 0666 file does not keep its mode. `lib/fwsnap-restore.sh` runs under `umask 077`.
+
+Install and the update take group and other write away from what an earlier release left
+(`repair_modes`):
+
+- the whole `/opt/vpn-director` tree;
+- every file they install outside it - the init scripts, the Xray template, the NDM hooks:
+  `install.sh` as it downloads each one (`download_scripts`), the update in `repair_modes`. `curl -o`
+  and `cp -f` keep the mode of a file that is there;
+- `/jffs/scripts` and Asuswrt-Merlin's shared hooks in it, whose rewrite (`cp -p`) keeps their mode;
+- our runtime files in `/tmp` and `/var/lock`.
+
+Our state directories in `/tmp` hold plain files, so the repair takes write from each directory
+and the files directly in it and never walks it, and leaves one root does not own as it is, with a
+warning.
+
+Both run `repair_modes` before they write anything or run anything they install: `install.sh`
+right after `create_directories`, the update in its step 3c, once it holds the apply lock.
+
+A path that is a symlink is left alone, with a warning: `chmod` follows a symlink named on its
+command line, `-R` included. The update also sends that warning to syslog, since the bot deletes
+`update.log` after a successful update. A path another user owns loses the write all the same and
+is named with a warning too: `chmod` never changes an owner, who keeps write access whatever the
+mode, so such a file is to be replaced from a trusted copy. A `data_dir` outside `/opt/vpn-director`
+is not repaired, only named with a warning while group or others can write to something in it: the
+path comes from `vpn-director.json`, which earlier releases left writable by every process, so root
+reads it and changes no mode there. Both scans, the tree's for another user's entries and
+`data_dir`'s for write by group or others, walk with a plain `find` and test each path in the
+shell ("Asuswrt-Merlin's BusyBox `find` knows no `-type` and no `-perm`" above).
+
+`/opt/vpn-director` itself is taken as given, and handed to `chmod -R` with a trailing slash.
+BusyBox's `chmod -R`, given a symlink to a directory, changes only that directory and exits 0; the
+slash makes it recurse.

@@ -541,7 +541,9 @@ _tmp_list="/tmp/$(get_script_name -n).$$.tmp_files"
 #
 # Behavior:
 #   * Prints the new path.
-#   * Creates an empty file or directory.
+#   * Creates an empty file or directory that is root's alone - 0600 or 0700 - whatever the
+#     caller's umask: a temp file can hold a secret, and import_server_list.sh resolves the
+#     servers, with their credentials, into one.
 #   * Appends the path to $_tmp_list for later cleanup.
 # -------------------------------------------------------------------------------------------------
 _tmp_path() {
@@ -557,9 +559,9 @@ _tmp_path() {
 
     # Create the file or directory
     if [ "$as_dir" -eq 0 ]; then
-        : > "$path"
+        ( umask 077; : > "$path" )
     else
-        mkdir -p "$path"
+        ( umask 077; mkdir -p "$path" )
     fi
 
     # Record it for cleanup
