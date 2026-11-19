@@ -98,8 +98,8 @@ repair_path() {
 # files in it included), from every file this update installs outside it - the
 # init scripts, the Xray template: cp -f keeps the mode of a destination that
 # is there -, from our runtime files in /tmp and /var/lock and from
-# Asuswrt-Merlin's shared hooks in /jffs/scripts, which root runs on every
-# firewall start and whose rewrite keeps their mode, and makes
+# /jffs/scripts and Asuswrt-Merlin's shared hooks in it, which root runs on
+# every firewall start and whose rewrite keeps their mode, and makes
 # telegram-bot.json, which holds the bot token, 0600. The twin of install.sh's.
 # Each path on its own, a missing one skipped; status 1, after every path, when
 # one was not repaired.
@@ -119,7 +119,7 @@ repair_modes() {
         rm_rest="${rm_entry#*|}"
         repair_path "${rm_rest%%|*}" go-w || rm_rc=1
     done
-    for rm_path in /tmp/vpn-director.log /var/lock/vpn-director.lock \
+    for rm_path in /tmp/vpn-director.log /var/lock/vpn-director.lock /jffs/scripts \
         /jffs/scripts/firewall-start /jffs/scripts/wan-event /jffs/scripts/nat-start; do
         repair_path "$rm_path" go-w || rm_rc=1
     done
@@ -510,7 +510,7 @@ fi
 #     in place already, so a failure here is a warning, not a failed update.
 log "Removing write access for others"
 if ! repair_modes >> "$LOG_FILE" 2>&1; then
-    log "WARN: something above keeps write access for others; run chmod -R go-w /opt/vpn-director"
+    log "WARN: the paths named above keep write access for others; check each one (the warnings are in the system log too)"
 fi
 
 # Init script of the daemon that reads notify.json. Looked up from the table

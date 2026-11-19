@@ -639,9 +639,10 @@ Install and the update take group and other write away from what an earlier rele
 (`repair_modes`):
 
 - the whole `/opt/vpn-director` tree;
-- every file they install outside it - the init scripts, the Xray template, the NDM hooks. `curl -o`
+- every file they install outside it - the init scripts, the Xray template, the NDM hooks:
+  `install.sh` as it downloads each one (`download_scripts`), the update in `repair_modes`. `curl -o`
   and `cp -f` keep the mode of a file that is there;
-- Asuswrt-Merlin's shared hooks in `/jffs/scripts`, whose rewrite (`cp -p`) keeps their mode;
+- `/jffs/scripts` and Asuswrt-Merlin's shared hooks in it, whose rewrite (`cp -p`) keeps their mode;
 - our runtime files in `/tmp` and `/var/lock`.
 
 A path that is a symlink is left alone, with a warning: `chmod` follows a symlink named on its

@@ -372,7 +372,7 @@ download_scripts() {
         fi
         # curl writes into a file that is there and keeps its mode: an install under
         # Asuswrt-Merlin's umask 0 left the init scripts 0777, and root runs them.
-        chmod go-w "$target"
+        chmod go-w "$target" || print_info "Warning: could not remove write access for others from $target"
         if manifest_is_executable "$file"; then
             chmod +x "$target"
         fi
@@ -423,9 +423,9 @@ _repair_path() {
 #   Asuswrt-Merlin runs everything under umask 0, and earlier releases created their directories
 #   and files without a mode: every process on the router could write to them, and root runs the
 #   scripts and binaries there. Takes that write away from the whole of $VPD_DIR (the owner's own
-#   files in it included), from our runtime files in /tmp and /var/lock and from Asuswrt-Merlin's
-#   shared hooks in /jffs/scripts, which root runs on every firewall start and whose rewrite keeps
-#   their mode, and makes telegram-bot.json, which holds the bot token, 0600. The files
+#   files in it included), from our runtime files in /tmp and /var/lock and from /jffs/scripts and
+#   Asuswrt-Merlin's shared hooks in it, which root runs on every firewall start and whose rewrite
+#   keeps their mode, and makes telegram-bot.json, which holds the bot token, 0600. The files
 #   download_scripts installs outside $VPD_DIR lose it there. Each path on its own, a missing one
 #   skipped; $VPD_DIR is taken as given. rc 1, after every path, when one was not repaired.
 repair_modes() {
@@ -442,8 +442,8 @@ repair_modes() {
         _repair_path "$path" -R go-w || rc=1
     done
     for path in "${INSTALL_ROOT}/tmp/vpn-director.log" "${INSTALL_ROOT}/var/lock/vpn-director.lock" \
-        "${INSTALL_ROOT}/jffs/scripts/firewall-start" "${INSTALL_ROOT}/jffs/scripts/wan-event" \
-        "${INSTALL_ROOT}/jffs/scripts/nat-start"; do
+        "${INSTALL_ROOT}/jffs/scripts" "${INSTALL_ROOT}/jffs/scripts/firewall-start" \
+        "${INSTALL_ROOT}/jffs/scripts/wan-event" "${INSTALL_ROOT}/jffs/scripts/nat-start"; do
         _repair_path "$path" go-w || rc=1
     done
     _repair_path "$VPD_DIR/telegram-bot.json" 600 || rc=1
@@ -787,7 +787,7 @@ main() {
     download_scripts
     load_platform_lib || print_info "Platform library not installed; using default LAN facts"
     install_hooks
-    repair_modes || print_info "Warning: something above keeps write access for others; run chmod -R go-w $VPD_DIR"
+    repair_modes || print_info "Warning: the paths named above keep write access for others; check each one"
     download_telegram_bot
     download_webui
     download_watchd

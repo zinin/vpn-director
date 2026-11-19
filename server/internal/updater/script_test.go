@@ -1076,10 +1076,10 @@ func TestGenerateScript_NewDaemonRecoverySandbox(t *testing.T) {
 
 			// Rehome every router path and replace process tools before executing.
 			script = regexp.MustCompile(`(?m)^PATH=.*$`).ReplaceAllString(script, "PATH="+tools+":/usr/bin:/bin")
-			for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock"} {
+			for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock", "/tmp/tunnel_director", "/tmp/xray_tproxy", "/tmp/vpn-director.log"} {
 				script = strings.ReplaceAll(script, prefix, root+prefix)
 			}
-			if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock)(/|\b)`).MatchString(script) {
+			if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock|tmp/tunnel_director|tmp/xray_tproxy|tmp/vpn-director\.log)(/|\b)`).MatchString(script) {
 				t.Fatal("unrehomed router path in sandbox script")
 			}
 			scriptPath := filepath.Join(root, "update.sh")
@@ -1654,10 +1654,10 @@ func (s *firstInstallSandbox) run(failure, mode string) firstInstallResult {
 	s.mode = mode
 	s.write(s.calls, "", 0644)
 	script = regexp.MustCompile(`(?m)^PATH=.*$`).ReplaceAllString(script, "PATH="+s.tools+":/usr/bin:/bin")
-	for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock"} {
+	for _, prefix := range []string{"/opt/", "/jffs/", "/var/lock", "/tmp/tunnel_director", "/tmp/xray_tproxy", "/tmp/vpn-director.log"} {
 		script = strings.ReplaceAll(script, prefix, s.root+prefix)
 	}
-	if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock)(/|\b)`).MatchString(script) {
+	if regexp.MustCompile(`(^|[" =|])/(opt|jffs|var/lock|tmp/tunnel_director|tmp/xray_tproxy|tmp/vpn-director\.log)(/|\b)`).MatchString(script) {
 		s.t.Fatal("unrehomed router path in same-tree sandbox script")
 	}
 	path := filepath.Join(s.root, "update.sh")
@@ -2254,6 +2254,11 @@ func TestGenerateScript_RepairsModesOnceTheFilesAreInPlace(t *testing.T) {
 			t.Errorf("repair_modes misses %q", want)
 		}
 	}
+	// /jffs/scripts itself, not only the hooks in it: in a 0777 directory any process can replace
+	// a hook root runs.
+	if !regexp.MustCompile(`\s/jffs/scripts\s`).MatchString(fn) {
+		t.Error(`repair_modes misses "/jffs/scripts"`)
+	}
 	// chmod follows a symlink named on its command line, -R included.
 	if !strings.Contains(script, "is a symlink; left as it is") {
 		t.Error("the repair would follow a symlink at one of our paths")
@@ -2263,8 +2268,8 @@ func TestGenerateScript_RepairsModesOnceTheFilesAreInPlace(t *testing.T) {
 // The template's repair_path and repair_modes, run under /bin/sh with their paths moved into a
 // scratch root - the twin of install.sh's, which install.bats runs. Beside /opt/vpn-director and
 // the runtime files, the repair has to reach every file the update installs outside the tree (the
-// init scripts, the Xray template: cp -f keeps the mode of a destination that is there) and
-// Asuswrt-Merlin's shared hooks, which root runs on every firewall start.
+// init scripts, the Xray template: cp -f keeps the mode of a destination that is there),
+// /jffs/scripts and Asuswrt-Merlin's shared hooks in it, which root runs on every firewall start.
 func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	script := cleanupScript(t)
 	root := t.TempDir()
@@ -2272,7 +2277,7 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 		"/opt/vpn-director", root+"/opt/vpn-director",
 		"/tmp/", root+"/tmp/",
 		"/var/lock/", root+"/var/lock/",
-		"/jffs/scripts/", root+"/jffs/scripts/",
+		"/jffs/scripts", root+"/jffs/scripts",
 	)
 	place := func(rel string, mode os.FileMode, dir bool) string {
 		t.Helper()
@@ -2302,6 +2307,7 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 		place("var/lock/vpn-director.lock", 0o666, false):         0o644,
 		place("opt/etc/init.d/S99vpn-director", 0o777, false):     0o755,
 		place("opt/etc/xray/config.json.template", 0o666, false):  0o644,
+		place("jffs/scripts", 0o777, true):                        0o755,
 		place("jffs/scripts/firewall-start", 0o777, false):        0o755,
 		place("jffs/scripts/nat-start", 0o666, false):             0o644,
 	}

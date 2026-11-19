@@ -35,6 +35,18 @@ setup() {
     assert_failure
 }
 
+# mv -f into a directory moves the file inside it: a directory at the config path would take the
+# config, and the wizard would report it created and restart the bot without one.
+@test "bot_config_write: a directory at the config path is a failure, and nothing is written in or beside it" {
+    mkdir "$CONFIG"
+    run bot_config_write "$CONFIG" "123:abc" '["alice"]'
+    assert_failure
+    run compgen -G "$CONFIG/*"
+    assert_failure
+    run compgen -G "$CONFIG.*"
+    assert_failure
+}
+
 # /proc/<pid>/cmdline is readable by every process on the router, the `nobody` ones among them: a
 # token on jq's command line would be theirs for as long as jq runs. /proc/<pid>/environ is root's.
 @test "bot_config_write: the token never reaches jq's command line" {

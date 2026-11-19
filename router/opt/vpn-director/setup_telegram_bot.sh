@@ -33,6 +33,7 @@ CONFIG_FILE="$VPD_DIR/telegram-bot.json"
 #   rc 1 - the temp file removed, <file> left as it was - when a step fails.
 bot_config_write() {
     local file="$1" token="$2" users="$3" tmp
+    [[ ! -d $file ]] || return 1
     tmp=$(mktemp "$file.XXXXXX") || return 1
     if ! VPD_BOT_TOKEN="$token" jq -n --argjson users "$users" \
             '{bot_token: env.VPD_BOT_TOKEN, allowed_users: $users, log_level: "info", update_check_interval: "24h"}' \
