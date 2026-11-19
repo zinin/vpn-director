@@ -2383,6 +2383,132 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	}
 }
 
+// data_dir comes from vpn-director.json, which earlier releases left writable by every process:
+// outside /opt/vpn-director the template's repair only reads the path and warns - into update.log
+// and syslog, with status 1 - and every mode there stays as it is. One nobody else can write to is
+// no warning; one under the tree is the tree's, even while the tree's chmod fails; no config is
+// nothing at all. The functions run under /bin/sh with their paths moved into a scratch root.
+func TestGenerateScript_RepairModesWarnsAboutAWritableDataDirOutsideTheTree(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+	script := cleanupScript(t)
+	run := func(t *testing.T, root, dataDir string, failTree bool) (out, logged string) {
+		t.Helper()
+		move := strings.NewReplacer(
+			"/opt/vpn-director", root+"/opt/vpn-director",
+			"/tmp/", root+"/tmp/",
+			"/var/lock/", root+"/var/lock/",
+			"/jffs/scripts", root+"/jffs/scripts",
+		)
+		if err := os.MkdirAll(filepath.Join(root, "opt/vpn-director"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if dataDir != "" {
+			config, err := json.Marshal(map[string]string{"data_dir": dataDir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, "opt/vpn-director/vpn-director.json"), config, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		bin := t.TempDir()
+		calls := filepath.Join(t.TempDir(), "logger.calls")
+		if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+calls+"'\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if failTree {
+			chmod := "#!/bin/sh\n[ \"$*\" = '-R go-w " + root + "/opt/vpn-director/' ] && exit 1\nexec /bin/chmod \"$@\"\n"
+			if err := os.WriteFile(filepath.Join(bin, "chmod"), []byte(chmod), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		prog := "PATH='" + bin + "':$PATH\nFILES=''\n" +
+			"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
+			"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
+			"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
+			"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+			"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		b, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+		if err != nil {
+			t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, b)
+		}
+		c, _ := os.ReadFile(calls)
+		return string(b), string(c)
+	}
+	plant := func(t *testing.T, dir string, mode os.FileMode) string {
+		t.Helper()
+		dump := filepath.Join(dir, "ipsets", "ru.dump")
+		if err := os.MkdirAll(filepath.Dir(dump), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range []string{dir, filepath.Dir(dump)} {
+			if err := os.Chmod(d, 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(dump, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(dump, mode); err != nil {
+			t.Fatal(err)
+		}
+		return dump
+	}
+
+	t.Run("outside the tree, writable by others", func(t *testing.T) {
+		root := t.TempDir()
+		dataDir := filepath.Join(root, "elsewhere")
+		dump := plant(t, dataDir, 0o666)
+		out, logged := run(t, root, dataDir, false)
+		want := "WARN: data_dir " + dataDir + " lies outside " + root + "/opt/vpn-director, which the repair does not touch, " +
+			"and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w " + dataDir
+		if !strings.Contains(out, want) || !strings.Contains(out, "rc=1") {
+			t.Errorf("want %q and status 1; got:\n%s", want, out)
+		}
+		if !strings.Contains(logged, want) {
+			t.Errorf("the warning never reached syslog; logger got %q", logged)
+		}
+		info, err := os.Stat(dump)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o666 {
+			t.Errorf("the dump is %o, want 666: the repair changes no mode in data_dir", info.Mode().Perm())
+		}
+	})
+	t.Run("outside the tree, nobody else can write", func(t *testing.T) {
+		root := t.TempDir()
+		dataDir := filepath.Join(root, "elsewhere")
+		plant(t, dataDir, 0o644)
+		if out, _ := run(t, root, dataDir, false); strings.Contains(out, "data_dir") || !strings.Contains(out, "rc=0") {
+			t.Errorf("want no warning and status 0; got:\n%s", out)
+		}
+	})
+	t.Run("under the tree, its chmod failing", func(t *testing.T) {
+		root := t.TempDir()
+		dataDir := filepath.Join(root, "opt/vpn-director/data")
+		plant(t, dataDir, 0o666)
+		out, _ := run(t, root, dataDir, true)
+		if !strings.Contains(out, "could not remove write access for others from "+root+"/opt/vpn-director") {
+			t.Fatalf("the tree's chmod did not fail as set up; got:\n%s", out)
+		}
+		if strings.Contains(out, "data_dir") {
+			t.Errorf("a data_dir under the tree is the tree's, yet it is named; got:\n%s", out)
+		}
+	})
+	t.Run("no config", func(t *testing.T) {
+		root := t.TempDir()
+		plant(t, filepath.Join(root, "elsewhere"), 0o666)
+		if out, _ := run(t, root, "", false); strings.Contains(out, "data_dir") || !strings.Contains(out, "rc=0") {
+			t.Errorf("want no warning and status 0; got:\n%s", out)
+		}
+	})
+}
+
 // While the tree was 0777 any process could put a file of its own in place of one of ours, and
 // chmod never changes an owner. The template's repair takes the write away all the same, never
 // chowns, and names each path another user owns - under /opt/vpn-director the first ten, then a

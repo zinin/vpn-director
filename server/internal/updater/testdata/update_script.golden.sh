@@ -143,7 +143,8 @@ repair_flat_dir() {
 # every firewall start and whose rewrite keeps their mode, and makes
 # telegram-bot.json, which holds the bot token, 0600. The twin of install.sh's.
 # Each path on its own, a missing one skipped; status 1, after every path, when
-# one was not repaired or is another user's.
+# one was not repaired or is another user's, or when a data_dir outside
+# /opt/vpn-director holds something others can write to.
 # shellcheck disable=SC3067  # -O is a builtin test of BusyBox ash and dash, the shells it runs under
 repair_modes() {
     rm_rc=0
@@ -188,6 +189,23 @@ EOF
         repair_path "$rm_path" go-w || rm_rc=1
     done
     repair_path /opt/vpn-director/telegram-bot.json 600 || rm_rc=1
+
+    # data_dir comes from vpn-director.json, which earlier releases left
+    # writable by every process: root reads that path and warns, and changes no
+    # mode there. Under /opt/vpn-director the tree's repair covers it. The
+    # trailing slash follows a data_dir that is a symlink, as the tree's repair
+    # does.
+    rm_dd=$(jq -r '.data_dir // empty' /opt/vpn-director/vpn-director.json 2>/dev/null) || rm_dd=""
+    case "$rm_dd" in
+        /opt/vpn-director | /opt/vpn-director/*) ;;
+        /*)
+            if [ -n "$(find "$rm_dd/" ! -type l -perm -002 2>/dev/null | head -n 1)" ] ||
+                [ -n "$(find "$rm_dd/" ! -type l -perm -020 2>/dev/null | head -n 1)" ]; then
+                repair_warn "data_dir $rm_dd lies outside /opt/vpn-director, which the repair does not touch, and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w $rm_dd"
+                rm_rc=1
+            fi
+            ;;
+    esac
     return $rm_rc
 }
 

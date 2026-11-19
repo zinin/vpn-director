@@ -468,7 +468,7 @@ _repair_flat_dir() {
 #   keeps their mode, and makes telegram-bot.json, which holds the bot token, 0600. The files
 #   download_scripts installs outside $VPD_DIR lose it there. Each path on its own, a missing one
 #   skipped; $VPD_DIR is taken as given. rc 1, after every path, when one was not repaired or is
-#   another user's.
+#   another user's, or when a data_dir outside $VPD_DIR holds something others can write to.
 repair_modes() {
     local rc=0 path p foreign=0
 
@@ -505,6 +505,18 @@ repair_modes() {
         _repair_path "$path" go-w || rc=1
     done
     _repair_path "$VPD_DIR/telegram-bot.json" 600 || rc=1
+
+    # data_dir comes from vpn-director.json, which earlier releases left writable by every process:
+    # root reads that path and warns, and changes no mode there. Under $VPD_DIR the tree's repair
+    # covers it. The trailing slash follows a data_dir that is a symlink, as the tree's repair does.
+    local dd
+    dd=$(jq -r '.data_dir // empty' "$VPD_DIR/vpn-director.json" 2>/dev/null) || dd=""
+    if [[ $dd == /* && $dd != "$VPD_DIR" && $dd != "$VPD_DIR"/* ]] &&
+        [[ -n $(find "$dd/" ! -type l -perm -002 2>/dev/null | head -n 1) ||
+            -n $(find "$dd/" ! -type l -perm -020 2>/dev/null | head -n 1) ]]; then
+        print_info "Warning: data_dir $dd lies outside $VPD_DIR, which the repair does not touch, and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w $dd"
+        rc=1
+    fi
     return "$rc"
 }
 

@@ -1454,6 +1454,70 @@ MANIFEST
     assert_equal "$(cat "$INSTALL_ROOT/opt/etc/xray/config.json.template")" "{}"
 }
 
+# data_dir comes from vpn-director.json, which earlier releases left writable by every process:
+# outside VPD_DIR root only reads the path and warns, and every mode there stays as it is.
+@test "repair_modes: a data_dir outside VPD_DIR that others can write to is named, and left as it is" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dd="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$dd/ipsets"
+    printf 'x\n' > "$dd/ipsets/ru.dump"
+    chmod 755 "$dd" "$dd/ipsets"
+    chmod 666 "$dd/ipsets/ru.dump"
+    jq -n --arg dd "$dd" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: data_dir $dd lies outside $VPD_DIR, which the repair does not touch, and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w $dd"
+    assert_equal "$(stat -c %a "$dd/ipsets/ru.dump")" 666
+}
+
+@test "repair_modes: a data_dir outside VPD_DIR that nobody else can write to, or no config, is no warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dd="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$dd/ipsets"
+    printf 'x\n' > "$dd/ipsets/ru.dump"
+    chmod 755 "$dd" "$dd/ipsets"
+    chmod 644 "$dd/ipsets/ru.dump"
+    jq -n --arg dd "$dd" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+
+    run repair_modes
+
+    assert_success
+    refute_output --partial "Warning"
+
+    rm "$VPD_DIR/vpn-director.json"
+    chmod 666 "$dd/ipsets/ru.dump"
+
+    run repair_modes
+
+    assert_success
+    refute_output --partial "Warning"
+}
+
+# The tree's repair covers a data_dir under VPD_DIR; its chmod failing here keeps a file there
+# writable, and still no data_dir warning comes.
+@test "repair_modes: a data_dir under VPD_DIR is the tree's, with no data_dir warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$VPD_DIR/data/ipsets"
+    printf 'x\n' > "$VPD_DIR/data/ipsets/ru.dump"
+    chmod 666 "$VPD_DIR/data/ipsets/ru.dump"
+    jq -n --arg dd "$VPD_DIR/data" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+    chmod() {
+        [[ "$*" == "-R go-w $VPD_DIR/" ]] && return 1
+        command chmod "$@"
+    }
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: could not remove write access for others from $VPD_DIR"
+    refute_output --partial "data_dir"
+}
+
 @test "repair_modes: a fresh install has nothing to repair and no warning" {
     load_installer
     INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
