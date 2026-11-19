@@ -77,7 +77,10 @@ repair_warn() {
 # repair_path $1=path, then chmod's mode arguments - one path of ours: nothing for
 # a missing one; a warning and status 1 for one that is a symlink - chmod would
 # follow it, -R included, and a link any process planted in /tmp would take the
-# write from whatever it points to - and for a chmod that fails.
+# write from whatever it points to - and for a chmod that fails. One another
+# user owns is chmod-ed all the same, then named with a warning and status 1:
+# chmod never changes an owner, who can still write to it whatever its mode.
+# shellcheck disable=SC3067  # -O is a builtin test of BusyBox ash and dash, the shells it runs under
 repair_path() {
     rp_path=$1
     shift
@@ -86,8 +89,12 @@ repair_path() {
         return 1
     fi
     [ -e "$rp_path" ] || return 0
-    chmod "$@" "$rp_path" && return 0
-    repair_warn "could not remove write access for others from $rp_path"
+    if ! chmod "$@" "$rp_path"; then
+        repair_warn "could not remove write access for others from $rp_path"
+        return 1
+    fi
+    [ -O "$rp_path" ] && return 0
+    repair_warn "$rp_path is another user's: its owner can still write to it whatever its mode"
     return 1
 }
 
@@ -136,15 +143,38 @@ repair_flat_dir() {
 # every firewall start and whose rewrite keeps their mode, and makes
 # telegram-bot.json, which holds the bot token, 0600. The twin of install.sh's.
 # Each path on its own, a missing one skipped; status 1, after every path, when
-# one was not repaired.
+# one was not repaired or is another user's.
+# shellcheck disable=SC3067  # -O is a builtin test of BusyBox ash and dash, the shells it runs under
 repair_modes() {
     rm_rc=0
     # The trailing slash: BusyBox's chmod -R, given a symlink to a directory,
     # changes that directory alone and exits 0; an install moved elsewhere and
     # linked back is repaired too.
-    if [ -e /opt/vpn-director ] && ! chmod -R go-w /opt/vpn-director/; then
-        repair_warn "could not remove write access for others from /opt/vpn-director"
-        rm_rc=1
+    if [ -e /opt/vpn-director ]; then
+        if ! chmod -R go-w /opt/vpn-director/; then
+            repair_warn "could not remove write access for others from /opt/vpn-director"
+            rm_rc=1
+        fi
+        # chmod never changes an owner. While the tree was 0777 any process
+        # could put a file of its own in place of one of ours, and cp -f writes
+        # into the file that is there: its owner can still write to it, whatever
+        # its mode. Name each such entry (the first ten, then a count); never
+        # chown it. A here-document keeps the loop, and its count, in this shell.
+        rm_foreign=0
+        while IFS= read -r rm_p; do
+            [ -n "$rm_p" ] || continue
+            [ -O "$rm_p" ] && continue
+            rm_foreign=$((rm_foreign + 1))
+            if [ "$rm_foreign" -le 10 ]; then
+                repair_warn "$rm_p is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy (reinstall, or run setup_telegram_bot.sh for telegram-bot.json)"
+            fi
+        done <<EOF
+$(find /opt/vpn-director/ ! -type l)
+EOF
+        if [ "$rm_foreign" -gt 10 ]; then
+            repair_warn "... and $((rm_foreign - 10)) more entries under /opt/vpn-director are another user's"
+        fi
+        [ "$rm_foreign" -eq 0 ] || rm_rc=1
     fi
     for rm_path in /tmp/tunnel_director /tmp/xray_tproxy; do
         repair_flat_dir "$rm_path" || rm_rc=1

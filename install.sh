@@ -373,6 +373,10 @@ download_scripts() {
         # curl writes into a file that is there and keeps its mode: an install under
         # Asuswrt-Merlin's umask 0 left the init scripts 0777, and root runs them.
         chmod go-w "$target" || print_info "Warning: could not remove write access for others from $target"
+        # It keeps its owner too, and chmod never changes one: a file another user put there while
+        # its directory was 0777 stays writable by that user.
+        [[ -O $target ]] ||
+            print_info "Warning: $target is another user's: its owner can still write to it whatever its mode"
         if manifest_is_executable "$file"; then
             chmod +x "$target"
         fi
@@ -405,7 +409,9 @@ install_hooks() {
 # _repair_path <path> <chmod mode args...>
 #   chmod one path of ours: nothing for a missing one; a warning and rc 1 for one that is a
 #   symlink - chmod would follow it, -R included, and a link any process planted in /tmp would
-#   take the write from whatever it points to - and for a chmod that fails.
+#   take the write from whatever it points to - and for a chmod that fails. One another user owns
+#   is chmod-ed all the same, then named with a warning and rc 1: chmod never changes an owner,
+#   who can still write to it whatever its mode.
 _repair_path() {
     local path="$1"
     shift
@@ -414,8 +420,12 @@ _repair_path() {
         return 1
     fi
     [[ -e $path ]] || return 0
-    chmod "$@" "$path" && return 0
-    print_info "Warning: could not remove write access for others from $path"
+    if ! chmod "$@" "$path"; then
+        print_info "Warning: could not remove write access for others from $path"
+        return 1
+    fi
+    [[ -O $path ]] && return 0
+    print_info "Warning: $path is another user's: its owner can still write to it whatever its mode"
     return 1
 }
 
@@ -457,16 +467,34 @@ _repair_flat_dir() {
 #   Asuswrt-Merlin's shared hooks in it, which root runs on every firewall start and whose rewrite
 #   keeps their mode, and makes telegram-bot.json, which holds the bot token, 0600. The files
 #   download_scripts installs outside $VPD_DIR lose it there. Each path on its own, a missing one
-#   skipped; $VPD_DIR is taken as given. rc 1, after every path, when one was not repaired.
+#   skipped; $VPD_DIR is taken as given. rc 1, after every path, when one was not repaired or is
+#   another user's.
 repair_modes() {
-    local rc=0 path
+    local rc=0 path p foreign=0
 
     print_info "Removing write access for others..."
     # The trailing slash: BusyBox's chmod -R, given a symlink to a directory, changes that
     # directory alone and exits 0; an install moved elsewhere and linked back is repaired too.
-    if [[ -e $VPD_DIR ]] && ! chmod -R go-w "$VPD_DIR/"; then
-        print_info "Warning: could not remove write access for others from $VPD_DIR"
-        rc=1
+    if [[ -e $VPD_DIR ]]; then
+        if ! chmod -R go-w "$VPD_DIR/"; then
+            print_info "Warning: could not remove write access for others from $VPD_DIR"
+            rc=1
+        fi
+        # chmod never changes an owner. While the tree was 0777 any process could put a file of its
+        # own in place of one of ours, and curl -o and cp -f write into the file that is there: its
+        # owner can still write to it, whatever its mode. Name each such entry (the first ten, then
+        # a count); never chown it.
+        while IFS= read -r p; do
+            [[ -O $p ]] && continue
+            foreign=$((foreign + 1))
+            if (( foreign <= 10 )); then
+                print_info "Warning: $p is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy (reinstall, or run setup_telegram_bot.sh for telegram-bot.json)"
+            fi
+        done < <(find "$VPD_DIR/" ! -type l)
+        if (( foreign > 10 )); then
+            print_info "Warning: ... and $((foreign - 10)) more entries under $VPD_DIR are another user's"
+        fi
+        (( foreign == 0 )) || rc=1
     fi
     for path in "${INSTALL_ROOT}/tmp/tunnel_director" "${INSTALL_ROOT}/tmp/xray_tproxy"; do
         _repair_flat_dir "$path" || rc=1

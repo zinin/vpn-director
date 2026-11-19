@@ -1384,6 +1384,76 @@ make_world_writable_install() {
     assert_equal "$(stat -c %a "$dir/ready")" 666
 }
 
+# While the tree was 0777 any process could put a file of its own in place of one of ours, and
+# chmod never changes an owner: the repair takes the write away all the same, never chowns, and
+# names each entry another user owns - the first ten, then a count. Only root can make one.
+@test "repair_modes: entries under VPD_DIR another user owns are named, ten at most, then a count" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a file of another user's"
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local i
+    mkdir -p "$VPD_DIR/data"
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+        printf 'x\n' > "$VPD_DIR/data/f$i"
+    done
+    chmod 666 "$VPD_DIR"/data/f*
+    chown nobody "$VPD_DIR"/data/f*
+
+    run repair_modes
+
+    assert_failure
+    assert_equal "$(grep -c "is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy" <<< "$output")" 10
+    assert_output --partial "Warning: ... and 2 more entries under $VPD_DIR are another user's"
+    assert_equal "$(stat -c %a "$VPD_DIR/data/f1")" 644
+    assert_equal "$(stat -c %U "$VPD_DIR/data/f1")" nobody
+}
+
+@test "_repair_path: a path another user owns loses write for others, and is named" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a file of another user's"
+    load_installer
+    local file="$BATS_TEST_TMPDIR/vpn-director.log"
+    printf 'log\n' > "$file"
+    chmod 666 "$file"
+    chown nobody "$file"
+
+    run _repair_path "$file" go-w
+
+    assert_failure
+    assert_output --partial "Warning: $file is another user's: its owner can still write to it whatever its mode"
+    assert_equal "$(stat -c %a "$file")" 644
+    assert_equal "$(stat -c %U "$file")" nobody
+}
+
+@test "download_scripts: a file another user owns is named, and the download goes on" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a file of another user's"
+    load_installer
+    fake_curl
+    local repo="$BATS_TEST_TMPDIR/repo/router"
+    mkdir -p "$repo/opt/etc/init.d" "$repo/opt/etc/xray"
+    cat > "$repo/files.manifest" <<'MANIFEST'
+common   router/opt/etc/init.d/S99vpn-director
+common   router/opt/etc/xray/config.json.template
+MANIFEST
+    echo "init" > "$repo/opt/etc/init.d/S99vpn-director"
+    echo "{}" > "$repo/opt/etc/xray/config.json.template"
+    REPO_URL="https://raw.example/zinin/vpn-director/refs/tags/v1.0.0"
+    PLATFORM="merlin"
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local init="$INSTALL_ROOT/opt/etc/init.d/S99vpn-director"
+    mkdir -p "$INSTALL_ROOT/opt/etc/init.d"
+    echo "old" > "$init"
+    chmod 777 "$init"
+    chown nobody "$init"
+
+    run download_scripts
+
+    assert_success
+    assert_output --partial "Warning: $init is another user's: its owner can still write to it whatever its mode"
+    assert_equal "$(cat "$init")" "init"
+    assert_equal "$(stat -c %a "$init")" 755
+    assert_equal "$(cat "$INSTALL_ROOT/opt/etc/xray/config.json.template")" "{}"
+}
+
 @test "repair_modes: a fresh install has nothing to repair and no warning" {
     load_installer
     INSTALL_ROOT="$BATS_TEST_TMPDIR/root"

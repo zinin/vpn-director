@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -2358,6 +2359,9 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	if !strings.Contains(string(out), "rc=1") || !strings.Contains(string(out), "wan-event is a symlink; left as it is") {
 		t.Errorf("a symlinked hook must be left alone with a warning and status 1; got:\n%s", out)
 	}
+	if strings.Contains(string(out), "another user's") {
+		t.Errorf("every path here is the test user's own, yet one is named as another user's; got:\n%s", out)
+	}
 	if calls, _ := os.ReadFile(logged); !strings.Contains(string(calls), "wan-event is a symlink; left as it is") {
 		t.Errorf("the warning never reached syslog; logger got %q", calls)
 	}
@@ -2376,6 +2380,97 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o666 {
 		t.Errorf("the symlink's target must keep 0666, got %o", info.Mode().Perm())
+	}
+}
+
+// While the tree was 0777 any process could put a file of its own in place of one of ours, and
+// chmod never changes an owner. The template's repair takes the write away all the same, never
+// chowns, and names each path another user owns - under /opt/vpn-director the first ten, then a
+// count - into update.log and syslog, with status 1. Only root can make a file of another user's.
+func TestGenerateScript_RepairNamesWhatAnotherUserOwns(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("only root can make a file of another user's")
+	}
+	nobody, err := user.Lookup("nobody")
+	if err != nil {
+		t.Skipf("no user nobody: %v", err)
+	}
+	uid, err := strconv.Atoi(nobody.Uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := cleanupScript(t)
+	root := t.TempDir()
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts", root+"/jffs/scripts",
+	)
+	var foreign []string
+	for i := 1; i <= 12; i++ {
+		foreign = append(foreign, filepath.Join(root, "opt/vpn-director/data", fmt.Sprintf("f%d", i)))
+	}
+	foreign = append(foreign, filepath.Join(root, "tmp/vpn-director.log"))
+	for _, path := range foreign {
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o666); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Lchown(path, uid, -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	bin := t.TempDir()
+	logged := filepath.Join(t.TempDir(), "logger.calls")
+	if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+logged+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" +
+		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
+		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
+		"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
+		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+	if err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, out)
+	}
+	if !strings.Contains(string(out), "rc=1") {
+		t.Errorf("a path another user owns must make the repair report failure; got:\n%s", out)
+	}
+	named := strings.Count(string(out), "is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy")
+	if named != 10 {
+		t.Errorf("the tree's entries are named %d times, want 10; got:\n%s", named, out)
+	}
+	if want := "... and 2 more entries under " + root + "/opt/vpn-director are another user's"; !strings.Contains(string(out), want) {
+		t.Errorf("no count line %q; got:\n%s", want, out)
+	}
+	if want := root + "/tmp/vpn-director.log is another user's: its owner can still write to it whatever its mode"; !strings.Contains(string(out), want) {
+		t.Errorf("repair_path does not name %q; got:\n%s", want, out)
+	}
+	if calls, _ := os.ReadFile(logged); !strings.Contains(string(calls), "is another user's") {
+		t.Errorf("the warnings never reached syslog; logger got %q", calls)
+	}
+	for _, path := range foreign {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o644 {
+			t.Errorf("%s is %o, want 644: the chmod is never skipped", strings.TrimPrefix(path, root), got)
+		}
+		if st, ok := info.Sys().(*syscall.Stat_t); ok && int(st.Uid) != uid {
+			t.Errorf("%s changed its owner to %d: the repair never chowns", strings.TrimPrefix(path, root), st.Uid)
+		}
 	}
 }
 

@@ -654,7 +654,9 @@ right after `create_directories`, the update in its step 3c, once it holds the a
 
 A path that is a symlink is left alone, with a warning: `chmod` follows a symlink named on its
 command line, `-R` included. The update also sends that warning to syslog, since the bot deletes
-`update.log` after a successful update.
+`update.log` after a successful update. A path another user owns loses the write all the same and
+is named with a warning too: `chmod` never changes an owner, who keeps write access whatever the
+mode, so such a file is to be replaced from a trusted copy.
 
 `/opt/vpn-director` itself is taken as given, and handed to `chmod -R` with a trailing slash.
 BusyBox's `chmod -R`, given a symlink to a directory, changes only that directory and exits 0; the

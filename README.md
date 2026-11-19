@@ -196,7 +196,7 @@ Updates are authenticated by TLS to github.com and nothing else — there is no 
 > - does the same for the files it installs elsewhere (the init scripts, the Xray config template), for `/jffs/scripts` and its shared `firewall-start`, `wan-event` and `nat-start`, and for `/tmp/tunnel_director`, `/tmp/xray_tproxy`, `/tmp/vpn-director.log` and `/var/lock/vpn-director.lock`;
 > - makes `telegram-bot.json` readable by root alone (0600).
 >
-> A symlink at one of those paths, or a directory of ours in `/tmp` that another user owns, is left as it is, with a warning in the system log. `/opt/vpn-director` itself is repaired wherever it points.
+> A symlink at one of those paths, or a directory of ours in `/tmp` that another user owns, is left as it is, with a warning in the system log. A file another user owns is named with a warning too: its owner keeps write access whatever its mode, so replace it from a trusted copy. `/opt/vpn-director` itself is repaired wherever it points.
 >
 > The 0600 mode does not take back a token read while the file was 0666: if a process you do not trust could have run on the router, revoke the token with @BotFather (`/revoke`) and run `setup_telegram_bot.sh` with the new one.
 
