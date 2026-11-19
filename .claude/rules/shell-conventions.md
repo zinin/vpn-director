@@ -645,6 +645,10 @@ Install and the update take group and other write away from what an earlier rele
 - `/jffs/scripts` and Asuswrt-Merlin's shared hooks in it, whose rewrite (`cp -p`) keeps their mode;
 - our runtime files in `/tmp` and `/var/lock`.
 
+Our state directories in `/tmp` hold plain files, so the repair takes write from each directory
+and the files directly in it and never walks it, and leaves one root does not own as it is, with a
+warning.
+
 Both run `repair_modes` before they write anything or run anything they install: `install.sh`
 right after `create_directories`, the update in its step 3c, once it holds the apply lock.
 

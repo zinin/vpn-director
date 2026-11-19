@@ -419,6 +419,36 @@ _repair_path() {
     return 1
 }
 
+# _repair_flat_dir <dir>
+#   One of our runtime directories in /tmp, which hold plain files only: takes write for others
+#   from the directory, then from each regular file directly in it, and never walks further -
+#   chmod -R goes by name, and a subdirectory another process swaps for a symlink mid-walk would
+#   take root's chmod anywhere. Nothing for a missing path; a warning and rc 1, nothing touched,
+#   for a symlink, no directory or a directory another user owns: any process can create these
+#   paths in /tmp before we do, and ensure_owned_dir leaves such a directory alone too. A chmod of
+#   the directory that fails is a warning and rc 1, and stops there; one of a file is a warning and
+#   rc 1, the other files still done.
+_repair_flat_dir() {
+    local dir="$1" f rc=0
+    [[ -e $dir || -L $dir ]] || return 0
+    if [[ -L $dir || ! -d $dir || ! -O $dir ]]; then
+        print_info "Warning: $dir is a symlink, no directory or another user's; left as it is"
+        return 1
+    fi
+    if ! chmod go-w "$dir"; then
+        print_info "Warning: could not remove write access for others from $dir"
+        return 1
+    fi
+    for f in "$dir"/*; do
+        [[ -f $f && ! -L $f ]] || continue
+        if ! chmod go-w "$f"; then
+            print_info "Warning: could not remove write access for others from $f"
+            rc=1
+        fi
+    done
+    return "$rc"
+}
+
 # repair_modes
 #   Asuswrt-Merlin runs everything under umask 0, and earlier releases created their directories
 #   and files without a mode: every process on the router could write to them, and root runs the
@@ -439,7 +469,7 @@ repair_modes() {
         rc=1
     fi
     for path in "${INSTALL_ROOT}/tmp/tunnel_director" "${INSTALL_ROOT}/tmp/xray_tproxy"; do
-        _repair_path "$path" -R go-w || rc=1
+        _repair_flat_dir "$path" || rc=1
     done
     for path in "${INSTALL_ROOT}/tmp/vpn-director.log" "${INSTALL_ROOT}/var/lock/vpn-director.lock" \
         "${INSTALL_ROOT}/jffs/scripts" "${INSTALL_ROOT}/jffs/scripts/firewall-start" \

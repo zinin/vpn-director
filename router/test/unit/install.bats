@@ -1327,6 +1327,63 @@ make_world_writable_install() {
     assert_equal "$(stat -c %a "$elsewhere/file")" 666
 }
 
+# Our directories in /tmp hold plain files only, and the repair never walks them: chmod -R goes
+# by name, and a subdirectory another process swaps for a symlink mid-walk would take root's chmod
+# anywhere. A subdirectory planted in one, and what it holds, keep their modes.
+@test "repair_modes: a subdirectory in one of our /tmp directories is not descended into" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dir="$INSTALL_ROOT/tmp/tunnel_director"
+    mkdir -p "$dir/planted"
+    printf '1 ovpnc4\n' > "$dir/tun_dir_tables"
+    printf 'x\n' > "$dir/planted/file"
+    chmod 777 "$dir" "$dir/planted"
+    chmod 666 "$dir/tun_dir_tables" "$dir/planted/file"
+
+    run repair_modes
+
+    assert_success
+    assert_equal "$(stat -c %a "$dir")" 755
+    assert_equal "$(stat -c %a "$dir/tun_dir_tables")" 644
+    assert_equal "$(stat -c %a "$dir/planted")" 777
+    assert_equal "$(stat -c %a "$dir/planted/file")" 666
+}
+
+@test "repair_modes: a file where one of our /tmp directories belongs is left as it is, with a warning" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    mkdir -p "$INSTALL_ROOT/tmp"
+    printf 'x\n' > "$INSTALL_ROOT/tmp/xray_tproxy"
+    chmod 666 "$INSTALL_ROOT/tmp/xray_tproxy"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: $INSTALL_ROOT/tmp/xray_tproxy is a symlink, no directory or another user's; left as it is"
+    assert_equal "$(stat -c %a "$INSTALL_ROOT/tmp/xray_tproxy")" 666
+}
+
+# Any process can create /tmp/xray_tproxy before we do: root leaves a directory another user owns
+# as it is, as ensure_owned_dir does. Only root can make a directory of another user's here.
+@test "repair_modes: one of our /tmp directories that another user owns is left as it is, with a warning" {
+    [[ $EUID -eq 0 ]] || skip "only root can make a directory of another user's"
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dir="$INSTALL_ROOT/tmp/xray_tproxy"
+    mkdir -p "$dir"
+    printf 'ok\n' > "$dir/ready"
+    chmod 777 "$dir"
+    chmod 666 "$dir/ready"
+    chown -R nobody "$dir"
+
+    run repair_modes
+
+    assert_failure
+    assert_output --partial "Warning: $dir is a symlink, no directory or another user's; left as it is"
+    assert_equal "$(stat -c %a "$dir")" 777
+    assert_equal "$(stat -c %a "$dir/ready")" 666
+}
+
 @test "repair_modes: a fresh install has nothing to repair and no warning" {
     load_installer
     INSTALL_ROOT="$BATS_TEST_TMPDIR/root"

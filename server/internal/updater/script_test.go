@@ -2274,11 +2274,13 @@ func TestGenerateScript_RepairsModesBeforeTheCopy(t *testing.T) {
 	}
 }
 
-// The template's repair_path and repair_modes, run under /bin/sh with their paths moved into a
-// scratch root - the twin of install.sh's, which install.bats runs. Beside /opt/vpn-director and
-// the runtime files, the repair has to reach every file the update installs outside the tree (the
-// init scripts, the Xray template: cp -f keeps the mode of a destination that is there),
-// /jffs/scripts and Asuswrt-Merlin's shared hooks in it, which root runs on every firewall start.
+// The template's repair_path, repair_flat_dir and repair_modes, run under /bin/sh with their paths
+// moved into a scratch root - the twin of install.sh's, which install.bats runs. Beside
+// /opt/vpn-director and the runtime files, the repair has to reach every file the update installs
+// outside the tree (the init scripts, the Xray template: cp -f keeps the mode of a destination
+// that is there), /jffs/scripts and Asuswrt-Merlin's shared hooks in it, which root runs on every
+// firewall start. Our directories in /tmp are never walked: a subdirectory planted in one, and
+// what it holds, keep their modes.
 func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	script := cleanupScript(t)
 	root := t.TempDir()
@@ -2311,6 +2313,8 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 		place("opt/vpn-director/telegram-bot.json", 0o666, false): 0o600,
 		place("tmp/tunnel_director", 0o777, true):                 0o755,
 		place("tmp/tunnel_director/tun_dir_tables", 0o666, false): 0o644,
+		place("tmp/tunnel_director/planted", 0o777, true):         0o777,
+		place("tmp/tunnel_director/planted/file", 0o666, false):   0o666,
 		place("tmp/xray_tproxy/ready", 0o666, false):              0o644,
 		place("tmp/vpn-director.log", 0o666, false):               0o644,
 		place("var/lock/vpn-director.lock", 0o666, false):         0o644,
@@ -2342,6 +2346,7 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	prog := "set -e\nPATH='" + bin + "':$PATH\nFILES='" + files + "'\n" +
 		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
 		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
+		"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
 		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
 		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -2419,6 +2424,7 @@ func TestGenerateScript_RepairModesRecursesIntoALinkedTreeUnderBusyBox(t *testin
 	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" +
 		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
 		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
+		"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
 		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
 		"repair_modes || true\n"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
