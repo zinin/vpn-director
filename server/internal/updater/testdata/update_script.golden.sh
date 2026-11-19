@@ -132,6 +132,25 @@ repair_flat_dir() {
     return $rf_rc
 }
 
+# has_go_write $1=dir - status 0 when the directory, or anything under it that
+# is no symlink, is writable by group or others. A plain find, and ls -ld for
+# the mode: Asuswrt-Merlin's BusyBox find knows no -type and no -perm, and this
+# script runs it wherever Entware's findutils is not installed. The twin of
+# install.sh's _has_go_write.
+has_go_write() {
+    while IFS= read -r gw_p; do
+        [ -n "$gw_p" ] || continue
+        [ -L "$gw_p" ] && continue
+        gw_mode=$(ls -ld "$gw_p" 2>/dev/null) || continue
+        case "$gw_mode" in
+            ?????w* | ????????w*) return 0 ;;
+        esac
+    done <<EOF
+$(find "$1/" 2>/dev/null)
+EOF
+    return 1
+}
+
 # repair_modes - Asuswrt-Merlin runs everything under umask 0, and earlier
 # releases created their directories and files without a mode: every process on
 # the router could write to them, and root runs the scripts and binaries there.
@@ -161,16 +180,19 @@ repair_modes() {
         # into the file that is there: its owner can still write to it, whatever
         # its mode. Name each such entry (the first ten, then a count); never
         # chown it. A here-document keeps the loop, and its count, in this shell.
+        # A plain find, the symlink left out here: Asuswrt-Merlin's BusyBox find
+        # knows no -type, and -O would follow the link.
         rm_foreign=0
         while IFS= read -r rm_p; do
             [ -n "$rm_p" ] || continue
+            [ -L "$rm_p" ] && continue
             [ -O "$rm_p" ] && continue
             rm_foreign=$((rm_foreign + 1))
             if [ "$rm_foreign" -le 10 ]; then
                 repair_warn "$rm_p is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy (reinstall, or run setup_telegram_bot.sh for telegram-bot.json)"
             fi
         done <<EOF
-$(find /opt/vpn-director/ ! -type l)
+$(find /opt/vpn-director/)
 EOF
         if [ "$rm_foreign" -gt 10 ]; then
             repair_warn "... and $((rm_foreign - 10)) more entries under /opt/vpn-director are another user's"
@@ -199,8 +221,7 @@ EOF
     case "$rm_dd" in
         /opt/vpn-director | /opt/vpn-director/*) ;;
         /*)
-            if [ -n "$(find "$rm_dd/" ! -type l -perm -002 2>/dev/null | head -n 1)" ] ||
-                [ -n "$(find "$rm_dd/" ! -type l -perm -020 2>/dev/null | head -n 1)" ]; then
+            if has_go_write "$rm_dd"; then
                 repair_warn "data_dir $rm_dd lies outside /opt/vpn-director, which the repair does not touch, and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w $rm_dd"
                 rm_rc=1
             fi

@@ -506,6 +506,25 @@ its version banner before it loads the config, so `xrayconf_validate` reads
 that exit code — not the output — to tell a timeout
 (`xray config test timed out after 15s`) from a rejection.
 
+### Asuswrt-Merlin's BusyBox `find` knows no `-type` and no `-perm`
+
+**Problem**: the `find` applet of BusyBox 1.25.1 on an RT-AX86U (Merlin 388) knows `-L`, `-H`,
+`-follow`, `!`, `-a`, `-o`, `-name`, `-iname`, `-mtime`, `-print`, `-print0` and `-exec … ;`, and
+nothing else. `-type`, `-perm`, `-user`, `-prune`, `-maxdepth`, `-path`, `-newer` and the rest end
+with `find: unrecognized: -type`, the applet's usage and exit 1. An ssh session there has
+`PATH=/bin:/sbin:/usr/bin:/usr/sbin:/opt/bin:…`, so `/usr/bin/find`, the applet, comes ahead of
+Entware's GNU `find` in `/opt/bin` even where findutils is installed, and `install.sh` runs with
+that PATH. The update script puts `/opt/bin` first, but findutils is no dependency of ours. In a
+command or process substitution the failure is silent: the loop over its output reads nothing, and
+a check built on it finds nothing. A workstation runs GNU `find`, where the tests pass.
+
+**Solution**: a plain `find <dir>/`, which every `find` walks, and the tests in the shell on each
+path it prints: `[ -L ]` for a symlink, `[ -O ]` for the owner (BusyBox ash and dash have it), the
+mode from `ls -ld` (`?????w*` or `????????w*` in a `case` is write for group or others). The
+repair's scans in `install.sh` and the update template are written that way, and `install.bats`
+(`merlin_find`) and `script_test.go` (`merlinFind`) run them under a `find` that refuses what the
+router's refuses.
+
 ### jq reads number literals that are not JSON
 
 **Problem**: jq 1.8.1 takes number literals Go's `encoding/json` refuses:
@@ -659,7 +678,9 @@ is named with a warning too: `chmod` never changes an owner, who keeps write acc
 mode, so such a file is to be replaced from a trusted copy. A `data_dir` outside `/opt/vpn-director`
 is not repaired, only named with a warning while group or others can write to something in it: the
 path comes from `vpn-director.json`, which earlier releases left writable by every process, so root
-reads it and changes no mode there.
+reads it and changes no mode there. Both scans, the tree's for another user's entries and
+`data_dir`'s for write by group or others, walk with a plain `find` and test each path in the
+shell ("Asuswrt-Merlin's BusyBox `find` knows no `-type` and no `-perm`" above).
 
 `/opt/vpn-director` itself is taken as given, and handed to `chmod -R` with a trailing slash.
 BusyBox's `chmod -R`, given a symlink to a directory, changes only that directory and exits 0; the

@@ -1646,3 +1646,65 @@ MANIFEST
     assert_equal "$(stat -c %a "$elsewhere/lib")" 755
     assert_equal "$(stat -c %a "$elsewhere/lib/common.sh")" 644
 }
+
+# merlin_find is find as Asuswrt-Merlin 388 has it: BusyBox v1.25.1, whose find --help on an
+# RT-AX86U lists -L, -H, -follow, !, -a, -o, -name, -iname, -mtime, -print, -print0 and -exec, the
+# last ended by ";" alone, and nothing else - no -type, no -perm - and which an ssh session there
+# finds ahead of Entware's. It refuses everything else the way that find does, and notes each
+# refused call in $BATS_TEST_TMPDIR/find.refused.
+merlin_find() {
+    local a skip=0 in_exec=0
+    for a in "$@"; do
+        if (( in_exec )); then
+            if [[ $a == ';' ]]; then
+                in_exec=0
+            fi
+            continue
+        fi
+        if (( skip )); then
+            skip=0
+            continue
+        fi
+        case $a in
+            -L | -H | -follow | '!' | -a | -o | -print | -print0) ;;
+            -name | -iname | -mtime) skip=1 ;;
+            -exec) in_exec=1 ;;
+            -* | '(' | ')')
+                echo "find: unrecognized: $a" >&2
+                echo "$*" >> "$BATS_TEST_TMPDIR/find.refused"
+                return 1
+                ;;
+        esac
+    done
+    command find "$@"
+}
+
+# The installer runs with the PATH of an ssh session, and on Asuswrt-Merlin that finds BusyBox's
+# find, which knows no -type and no -perm, ahead of Entware's: the repair has to make do with what
+# it knows. A symlink in the tree to a file of another user's - /etc/passwd, root's, for a test that
+# does not run as root - is no entry of another user's: chmod -R does not follow it, and it is not
+# ours to replace.
+@test "repair_modes: under Asuswrt-Merlin's BusyBox find, no find it runs is refused and a data_dir others can write to is still named" {
+    load_installer
+    INSTALL_ROOT="$BATS_TEST_TMPDIR/root"
+    local dd="$BATS_TEST_TMPDIR/elsewhere"
+    mkdir -p "$dd/ipsets"
+    printf 'x\n' > "$dd/ipsets/ru.dump"
+    chmod 755 "$dd" "$dd/ipsets"
+    chmod 666 "$dd/ipsets/ru.dump"
+    jq -n --arg dd "$dd" '{data_dir: $dd}' > "$VPD_DIR/vpn-director.json"
+    ln -s /etc/passwd "$VPD_DIR/lib/passwd"
+    find() { merlin_find "$@"; }
+
+    run repair_modes
+    unset -f find
+
+    if [[ -e $BATS_TEST_TMPDIR/find.refused ]]; then
+        fail "the repair ran a find Asuswrt-Merlin's BusyBox refuses: $(cat "$BATS_TEST_TMPDIR/find.refused")"
+    fi
+    assert_failure
+    assert_output --partial "Warning: data_dir $dd lies outside $VPD_DIR, which the repair does not touch, and group or others can write to something in it"
+    if (( EUID != 0 )); then
+        refute_output --partial "another user's"
+    fi
+}

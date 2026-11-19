@@ -2275,6 +2275,24 @@ func TestGenerateScript_RepairsModesBeforeTheCopy(t *testing.T) {
 	}
 }
 
+// repairFunctions defines the template's repair functions for /bin/sh, every router path in them
+// moved into a scratch root by move. A router path move leaves where it is fails the test: run as
+// it is, the repair would chmod the machine's own /opt/vpn-director, /jffs/scripts or /var/lock.
+func repairFunctions(t *testing.T, script string, move *strings.Replacer) string {
+	t.Helper()
+	var b strings.Builder
+	for _, name := range []string{"repair_warn", "repair_path", "repair_flat_dir", "has_go_write", "repair_modes"} {
+		b.WriteString(name + "() {\n" + move.Replace(functionBody(t, script, name)) + "\n}\n")
+	}
+	if m := unmovedRouterPath.FindString(b.String()); m != "" {
+		t.Fatalf("the repair functions keep a router path move does not cover: %q", m)
+	}
+	return b.String()
+}
+
+// unmovedRouterPath is a router path the repair touches with no scratch root in front of it.
+var unmovedRouterPath = regexp.MustCompile(`(?m)(^|[^A-Za-z0-9_.-])/(opt|jffs|var/lock|tmp/tunnel_director|tmp/xray_tproxy|tmp/vpn-director\.log)\b`)
+
 // The template's repair_path, repair_flat_dir and repair_modes, run under /bin/sh with their paths
 // moved into a scratch root - the twin of install.sh's, which install.bats runs. Beside
 // /opt/vpn-director and the runtime files, the repair has to reach every file the update installs
@@ -2344,11 +2362,7 @@ func TestGenerateScript_RepairModesTakesWriteFromEverythingOurs(t *testing.T) {
 	}
 
 	files := "a|" + root + "/opt/etc/init.d/S99vpn-director|x b|" + root + "/opt/etc/xray/config.json.template|-"
-	prog := "set -e\nPATH='" + bin + "':$PATH\nFILES='" + files + "'\n" +
-		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
-		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
-		"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
-		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+	prog := "set -e\nPATH='" + bin + "':$PATH\nFILES='" + files + "'\n" + repairFunctions(t, script, move) +
 		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2424,11 +2438,7 @@ func TestGenerateScript_RepairModesWarnsAboutAWritableDataDirOutsideTheTree(t *t
 				t.Fatal(err)
 			}
 		}
-		prog := "PATH='" + bin + "':$PATH\nFILES=''\n" +
-			"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
-			"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
-			"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
-			"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+		prog := "PATH='" + bin + "':$PATH\nFILES=''\n" + repairFunctions(t, script, move) +
 			"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -2558,11 +2568,7 @@ func TestGenerateScript_RepairNamesWhatAnotherUserOwns(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '"+logged+"'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" +
-		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
-		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
-		"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
-		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" + repairFunctions(t, script, move) +
 		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2640,13 +2646,9 @@ func TestGenerateScript_RepairModesRecursesIntoALinkedTreeUnderBusyBox(t *testin
 		"/opt/vpn-director", root+"/opt/vpn-director",
 		"/tmp/", root+"/tmp/",
 		"/var/lock/", root+"/var/lock/",
-		"/jffs/scripts/", root+"/jffs/scripts/",
+		"/jffs/scripts", root+"/jffs/scripts",
 	)
-	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" +
-		"repair_warn() {\n" + functionBody(t, script, "repair_warn") + "\n}\n" +
-		"repair_path() {\n" + move.Replace(functionBody(t, script, "repair_path")) + "\n}\n" +
-		"repair_flat_dir() {\n" + functionBody(t, script, "repair_flat_dir") + "\n}\n" +
-		"repair_modes() {\n" + move.Replace(functionBody(t, script, "repair_modes")) + "\n}\n" +
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\n" + repairFunctions(t, script, move) +
 		"repair_modes || true\n"
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -2661,5 +2663,109 @@ func TestGenerateScript_RepairModesRecursesIntoALinkedTreeUnderBusyBox(t *testin
 		if got := info.Mode().Perm(); got != want {
 			t.Errorf("%s is %o, want %o", strings.TrimPrefix(path, root), got, want)
 		}
+	}
+}
+
+// merlinFind is find as Asuswrt-Merlin 388 has it: BusyBox v1.25.1, whose find --help on an
+// RT-AX86U lists -L, -H, -follow, !, -a, -o, -name, -iname, -mtime, -print, -print0 and -exec, the
+// last ended by ";" alone, and nothing else - no -type, no -perm. A shell function to define ahead
+// of the repair functions: it refuses everything else the way that find does, and notes each
+// refused call in the file $MERLIN_FIND_REFUSED names.
+const merlinFind = `find() {
+    mf_skip=0
+    mf_exec=0
+    for mf_a in "$@"; do
+        if [ "$mf_exec" = 1 ]; then
+            [ "$mf_a" != ';' ] || mf_exec=0
+            continue
+        fi
+        if [ "$mf_skip" = 1 ]; then
+            mf_skip=0
+            continue
+        fi
+        case $mf_a in
+            -L | -H | -follow | '!' | -a | -o | -print | -print0) ;;
+            -name | -iname | -mtime) mf_skip=1 ;;
+            -exec) mf_exec=1 ;;
+            -* | '(' | ')')
+                echo "find: unrecognized: $mf_a" >&2
+                echo "$*" >> "$MERLIN_FIND_REFUSED"
+                return 1
+                ;;
+        esac
+    done
+    command find "$@"
+}
+`
+
+// Asuswrt-Merlin's BusyBox find knows no -type and no -perm, and the update script runs it wherever
+// Entware's findutils is not installed: the repair has to make do with what that find knows. Under
+// it every find the repair runs is one it knows, and a data_dir others can write to is still named.
+// A symlink in the tree to a file of another user's - /etc/passwd, root's, for a test that does not
+// run as root - is no entry of another user's: chmod -R does not follow it, and it is not ours to
+// replace.
+func TestGenerateScript_RepairModesUnderAsuswrtMerlinsFind(t *testing.T) {
+	if _, err := exec.LookPath("jq"); err != nil {
+		t.Skip("jq not installed")
+	}
+	script := cleanupScript(t)
+	root := t.TempDir()
+	move := strings.NewReplacer(
+		"/opt/vpn-director", root+"/opt/vpn-director",
+		"/tmp/", root+"/tmp/",
+		"/var/lock/", root+"/var/lock/",
+		"/jffs/scripts", root+"/jffs/scripts",
+	)
+	tree := filepath.Join(root, "opt/vpn-director")
+	if err := os.MkdirAll(filepath.Join(tree, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/etc/passwd", filepath.Join(tree, "lib", "passwd")); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := filepath.Join(root, "elsewhere")
+	dump := filepath.Join(dataDir, "ipsets", "ru.dump")
+	if err := os.MkdirAll(filepath.Dir(dump), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dump, []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dump, 0o666); err != nil {
+		t.Fatal(err)
+	}
+	config, err := json.Marshal(map[string]string{"data_dir": dataDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tree, "vpn-director.json"), config, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "logger"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	refused := filepath.Join(t.TempDir(), "find.refused")
+
+	prog := "PATH='" + bin + "':$PATH\nFILES=''\nMERLIN_FIND_REFUSED='" + refused + "'\n" + merlinFind +
+		repairFunctions(t, script, move) +
+		"if repair_modes; then echo rc=0; else echo rc=1; fi\n"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	b, err := exec.CommandContext(ctx, "/bin/sh", "-c", prog).CombinedOutput()
+	if err != nil {
+		t.Fatalf("repair_modes under /bin/sh: %v\n%s", err, b)
+	}
+	out := string(b)
+	if calls, err := os.ReadFile(refused); err == nil {
+		t.Errorf("the repair ran a find Asuswrt-Merlin's BusyBox refuses:\n%s\noutput:\n%s", calls, out)
+	}
+	want := "WARN: data_dir " + dataDir + " lies outside " + root + "/opt/vpn-director, which the repair does not touch, " +
+		"and group or others can write to something in it"
+	if !strings.Contains(out, want) || !strings.Contains(out, "rc=1") {
+		t.Errorf("want %q and status 1; got:\n%s", want, out)
+	}
+	if os.Geteuid() != 0 && strings.Contains(out, "another user's") {
+		t.Errorf("a symlink in the tree is named as another user's entry; got:\n%s", out)
 	}
 }

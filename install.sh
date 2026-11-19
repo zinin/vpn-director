@@ -459,6 +459,22 @@ _repair_flat_dir() {
     return "$rc"
 }
 
+# _has_go_write <dir>
+#   Status 0 when <dir>, or anything under it that is no symlink, is writable by group or others.
+#   A plain find, and ls -ld for the mode: Asuswrt-Merlin's BusyBox find knows no -type and no
+#   -perm, and an ssh session there finds it ahead of Entware's.
+_has_go_write() {
+    local p mode
+    while IFS= read -r p; do
+        [[ -L $p ]] && continue
+        mode=$(ls -ld "$p" 2>/dev/null) || continue
+        if [[ ${mode:5:1} == w || ${mode:8:1} == w ]]; then
+            return 0
+        fi
+    done < <(find "$1/" 2>/dev/null)
+    return 1
+}
+
 # repair_modes
 #   Asuswrt-Merlin runs everything under umask 0, and earlier releases created their directories
 #   and files without a mode: every process on the router could write to them, and root runs the
@@ -483,14 +499,15 @@ repair_modes() {
         # chmod never changes an owner. While the tree was 0777 any process could put a file of its
         # own in place of one of ours, and curl -o and cp -f write into the file that is there: its
         # owner can still write to it, whatever its mode. Name each such entry (the first ten, then
-        # a count); never chown it.
+        # a count); never chown it. A plain find, the symlink left out here: Asuswrt-Merlin's
+        # BusyBox find knows no -type, and -O would follow the link.
         while IFS= read -r p; do
-            [[ -O $p ]] && continue
+            [[ -L $p || -O $p ]] && continue
             foreign=$((foreign + 1))
             if (( foreign <= 10 )); then
                 print_info "Warning: $p is another user's: its owner can still write to it whatever its mode; replace it from a trusted copy (reinstall, or run setup_telegram_bot.sh for telegram-bot.json)"
             fi
-        done < <(find "$VPD_DIR/" ! -type l)
+        done < <(find "$VPD_DIR/")
         if (( foreign > 10 )); then
             print_info "Warning: ... and $((foreign - 10)) more entries under $VPD_DIR are another user's"
         fi
@@ -511,9 +528,7 @@ repair_modes() {
     # covers it. The trailing slash follows a data_dir that is a symlink, as the tree's repair does.
     local dd
     dd=$(jq -r '.data_dir // empty' "$VPD_DIR/vpn-director.json" 2>/dev/null) || dd=""
-    if [[ $dd == /* && $dd != "$VPD_DIR" && $dd != "$VPD_DIR"/* ]] &&
-        [[ -n $(find "$dd/" ! -type l -perm -002 2>/dev/null | head -n 1) ||
-            -n $(find "$dd/" ! -type l -perm -020 2>/dev/null | head -n 1) ]]; then
+    if [[ $dd == /* && $dd != "$VPD_DIR" && $dd != "$VPD_DIR"/* ]] && _has_go_write "$dd"; then
         print_info "Warning: data_dir $dd lies outside $VPD_DIR, which the repair does not touch, and group or others can write to something in it; if it holds VPN Director's data alone, run chmod -R go-w $dd"
         rc=1
     fi
