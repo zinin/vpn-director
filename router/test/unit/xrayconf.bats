@@ -249,12 +249,17 @@ stored_stream() {
     [ "$(printf '%s' "$output" | jq -c '[.outbounds[] | [.tag, .protocol]]')" = '[["proxy-out","shadowsocks"]]' ]
 }
 
-@test "xrayconf_validate: a config Xray accepts passes, with -format json" {
+# Xray 26.10.29 refuses a -c file whose extension is not a config's, -format
+# notwithstanding, and a mktemp name must not end in .json, or S24xray's
+# "xray run -confdir" would load it beside config.json: Xray reads it on stdin.
+@test "xrayconf_validate: a config Xray accepts passes, read on stdin with -format json" {
     export PATH="$TEST_ROOT/mocks:$PATH" XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log"
-    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    export XRAY_MOCK_STDIN="$BATS_TEST_TMPDIR/xray.stdin"
+    printf '{"outbounds":[]}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
     run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
     [ "$status" -eq 0 ]
-    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c stdin:" ]
+    [ "$(cat "$XRAY_MOCK_STDIN")" = '{"outbounds":[]}' ]
 }
 
 @test "xrayconf_validate: a config Xray rejects fails with Xray's last lines" {
@@ -309,10 +314,12 @@ MOCK
     chmod +x "$BATS_TEST_TMPDIR/bin/timeout"
     export PATH="$BATS_TEST_TMPDIR/bin:$TEST_ROOT/mocks:$PATH"
     export XRAY_MOCK_LOG="$BATS_TEST_TMPDIR/xray.log" TIMEOUT_MOCK_LOG="$BATS_TEST_TMPDIR/timeout.log"
-    printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
+    export XRAY_MOCK_STDIN="$BATS_TEST_TMPDIR/xray.stdin"
+    printf '{"outbounds":[]}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
     run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
     [ "$status" -eq 0 ]
-    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c stdin:" ]
+    [ "$(cat "$XRAY_MOCK_STDIN")" = '{"outbounds":[]}' ]
     [[ $(tail -1 "$TIMEOUT_MOCK_LOG") == *"xray run -test -format json"* ]]
 }
 
@@ -326,7 +333,7 @@ MOCK
     printf '{}' > "$BATS_TEST_TMPDIR/config.json.AbC123"
     run xrayconf_validate "$BATS_TEST_TMPDIR/config.json.AbC123"
     [ "$status" -eq 0 ]
-    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c $BATS_TEST_TMPDIR/config.json.AbC123" ]
+    [ "$(cat "$XRAY_MOCK_LOG")" = "run -test -format json -c stdin:" ]
 }
 
 @test "xrayconf_validate: without an xray the config passes, and says so" {

@@ -1,10 +1,35 @@
 #!/bin/bash
-# Mock xray for "xray run -test -format json -c FILE": prints XRAY_MOCK_OUTPUT
+# Mock xray for "xray run -test -format json -c stdin:": prints XRAY_MOCK_OUTPUT
 # (default "Configuration OK.", empty when it is set empty) and exits with
 # XRAY_MOCK_EXIT (default 0). The
 # arguments go to XRAY_MOCK_LOG when it is set.
+#
+# It loads its config as Xray 26.10.29 does: "run" refuses a -c file whose
+# extension is not a config's, -format notwithstanding, and exits 23
+# (main/confloader/external); "-c stdin:" reads the config from standard input,
+# which goes to XRAY_MOCK_STDIN when it is set.
 if [[ -n ${XRAY_MOCK_LOG:-} ]]; then
     printf '%s\n' "$*" >> "$XRAY_MOCK_LOG"
+fi
+if [[ ${1:-} == run ]]; then
+    prev="" file=""
+    for arg in "$@"; do
+        if [[ $prev == -c || $prev == -config ]]; then
+            file=$arg
+        fi
+        prev=$arg
+    done
+    if [[ $file == stdin: ]]; then
+        cat > "${XRAY_MOCK_STDIN:-/dev/null}"
+    elif [[ -n $file ]]; then
+        case ${file,,} in
+            *.json|*.jsonc|*.yml|*.yaml|*.toml|*.pb|*.protobuf) ;;
+            *)
+                printf 'Failed to start: main: failed to load config files: [%s] > main/confloader/external: unsupported config file extension: %s\n' "$file" "$file"
+                exit 23
+                ;;
+        esac
+    fi
 fi
 printf '%s\n' "${XRAY_MOCK_OUTPUT-Configuration OK.}"
 exit "${XRAY_MOCK_EXIT:-0}"
