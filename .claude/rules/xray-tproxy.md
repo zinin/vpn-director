@@ -139,12 +139,17 @@ The next import rewrites such records; nothing converts them. A link that names 
 stores `none` — how the share-link standard reads it, and every other client with it — where the
 legacy record dialed TLS; a server that wants TLS says so in its link.
 
-**Every config is tested before it replaces the live one:** `xray run -test -format json -c <temp>`
-(`xrayconf_validate` in shell, `xrayTest` in Go). An outbound from a subscription can name a protocol
-the installed Xray lacks, or a key it refuses — since 2026-06-01 Xray loads no config with
-`tlsSettings.allowInsecure: true` — and a config Xray rejects would take every Xray client, and the
-bot, offline at the next restart. The temp file (`config.json.XXXXXX`) does not end in `.json`, which
-keeps `xray -confdir` from loading it and is why `-format json` is needed. Without an `xray` binary
+**Every config is tested before it replaces the live one:** `xray run -test -format json -c stdin:`,
+the temp file on stdin (`xrayconf_validate` in shell, `xrayTest` in Go). An outbound from a
+subscription can name a protocol the installed Xray lacks, or a key it refuses — since 2026-06-01
+Xray loads no config with `tlsSettings.allowInsecure: true` — and a config Xray rejects would take
+every Xray client, and the bot, offline at the next restart. The temp file (`config.json.XXXXXX`)
+does not end in `.json`, which keeps `xray -confdir` from loading it beside `config.json`; and Xray
+26.10.29 refuses a `-c` file whose extension is not a config's (`.json`, `.jsonc`, `.yml`, `.yaml`,
+`.toml`, `.pb`, `.protobuf`; `main/confloader/external`), whatever `-format` says. `stdin:` has no
+extension to check, and `-format json` names the format. On the RT-AX86U, from the upgrade to
+26.10.29 (2026-11-11), every server switch — the Web UI, `/xray`, both wizards, the watch's walk and
+returns — failed with `unsupported config file extension`. Without an `xray` binary
 (dev mode, a workstation) the test is skipped. The test runs under the config lock and is bounded at
 15 s, half of the 30 s every other writer waits for that lock: a hung `xray` lets them take their
 turn instead of using up the whole wait, and the error says the test timed out rather than that Xray

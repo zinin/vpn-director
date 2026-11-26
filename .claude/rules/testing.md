@@ -49,7 +49,7 @@ router/test/
 │   ├── pgrep                # Mock process lookup
 │   ├── insmod               # Mock insmod (Keenetic modules)
 │   ├── cru                  # Mock cru (Merlin cron)
-│   ├── xray                 # Mock "xray run -test" (XRAY_MOCK_EXIT, XRAY_MOCK_OUTPUT, XRAY_MOCK_LOG)
+│   ├── xray                 # Mock "xray run -test" (XRAY_MOCK_EXIT, XRAY_MOCK_OUTPUT, XRAY_MOCK_LOG, XRAY_MOCK_STDIN); refuses a -c file whose extension is not a config's, as Xray 26.10.29 does
 │   ├── stateful/iptables    # Chains and rules kept per test (use_stateful_iptables)
 │   ├── stateful/iptables-restore # --noflush input into those chains, whole or nothing
 │   ├── stateful-ipset/ipset # XRAY_CLIENTS, TPROXY_BYPASS and their shadows kept per test (use_stateful_ipset)

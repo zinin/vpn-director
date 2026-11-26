@@ -427,6 +427,69 @@ func TestGenerateConfig_XrayRejectsTheConfig(t *testing.T) {
 	}
 }
 
+// writeExtensionCheckingXray puts on PATH an xray that loads its config as
+// Xray 26.10.29 does: "run" refuses a -c file whose extension is not a
+// config's, -format notwithstanding, and reads "-c stdin:" from its standard
+// input. Its arguments go to args, what it read on stdin to stdin.
+func writeExtensionCheckingXray(t *testing.T) (args, stdin string) {
+	t.Helper()
+	dir := t.TempDir()
+	args, stdin = filepath.Join(dir, "args"), filepath.Join(dir, "stdin")
+	script := `#!/bin/sh
+printf '%s\n' "$*" > "$XRAY_ARGS"
+for last; do :; done
+case "$last" in
+stdin:) /bin/cat > "$XRAY_STDIN" ;;
+*.json|*.jsonc|*.yml|*.yaml|*.toml|*.pb|*.protobuf) ;;
+*) printf 'main/confloader/external: unsupported config file extension: %s\n' "$last"; exit 23 ;;
+esac
+echo "Configuration OK."
+`
+	if err := os.WriteFile(filepath.Join(dir, "xray"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("XRAY_ARGS", args)
+	t.Setenv("XRAY_STDIN", stdin)
+	return args, stdin
+}
+
+// Xray 26.10.29 refuses a -c file whose extension is not a config's, -format
+// notwithstanding, and the staged config.json.* must not end in .json, or
+// S24xray's "xray run -confdir" would load it beside config.json: Xray reads
+// it on stdin. Every daemon tests it so - the Web UI and the bot through
+// NewXrayService, watchd through NewXrayServiceForContext - and what Xray read
+// is what replaces config.json.
+func TestGenerateConfig_XrayReadsTheStagedConfigOnStdin(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		service func(templatePath, outputPath string) *XrayService
+	}{
+		{"webui and bot", NewXrayService},
+		{"watchd", func(templatePath, outputPath string) *XrayService {
+			return NewXrayServiceForContext(context.Background(), templatePath, outputPath)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			args, stdin := writeExtensionCheckingXray(t)
+			tested, outputPath := testedService(t)
+			svc := tc.service(tested.templatePath, outputPath)
+			if err := svc.GenerateConfig(storedVLESS); err != nil {
+				t.Fatalf("generation: %v", err)
+			}
+			if got, _ := os.ReadFile(args); strings.TrimSpace(string(got)) != "run -test -format json -c stdin:" {
+				t.Errorf("xray %q, want the staged config on stdin", got)
+			}
+			read, _ := os.ReadFile(stdin)
+			published, _ := os.ReadFile(outputPath)
+			if len(read) == 0 || string(read) != string(published) {
+				t.Errorf("xray read %q on stdin; config.json holds %q", read, published)
+			}
+			assertNoXrayTemps(t, outputPath)
+		})
+	}
+}
+
 // storedXHTTP is a stored vless xhttp outbound whose extra carries the given
 // downloadSettings.
 func storedXHTTP(downloadSettings string) vpnconfig.Server {

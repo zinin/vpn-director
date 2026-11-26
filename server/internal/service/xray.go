@@ -59,9 +59,12 @@ var xrayTestTimeout = 15 * time.Second
 // installed Xray lacks or a key it refuses - allowInsecure stops Xray from
 // loading any config since 2026-06-01 - and a config Xray rejects takes every
 // Xray client, and the bot, offline until the next switch. S24xray runs
-// "xray run -confdir", which loads only *.json, so the temp config.json.*
-// names its format. Without an xray on PATH - the dev mode, a workstation -
-// there is nothing to test with.
+// "xray run -confdir", which loads every file of its directory named like a
+// config, *.json among them, so the staged config.json.* is not named so; and
+// Xray 26.10.29 refuses a -c file whose extension is not a config's, -format
+// notwithstanding. So Xray reads the staged file on stdin ("-c stdin:", no
+// extension to check), and -format json names its format. Without an xray on
+// PATH - the dev mode, a workstation - there is nothing to test with.
 func xrayTest(path string) error {
 	return testXrayConfig(context.Background(), path, true)
 }
@@ -77,7 +80,13 @@ func testXrayConfig(root context.Context, path string, details bool) error {
 		slog.Debug("xray not found, config not tested", "path", path)
 		return nil
 	}
-	cmd := exec.CommandContext(ctx, bin, "run", "-test", "-format", "json", "-c", path)
+	config, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open the staged config: %w", err)
+	}
+	defer config.Close()
+	cmd := exec.CommandContext(ctx, bin, "run", "-test", "-format", "json", "-c", "stdin:")
+	cmd.Stdin = config
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {

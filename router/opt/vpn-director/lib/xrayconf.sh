@@ -180,9 +180,13 @@ xrayconf_generate() {
 # verbatim from a subscription and name a protocol the installed Xray lacks or
 # a key it refuses - allowInsecure stops Xray from loading any config since
 # 2026-06-01 - and a config Xray rejects takes every Xray client offline at the
-# next restart. S24xray runs "xray run -confdir", which loads only *.json, so a
-# mktemp name needs -format json. Without an xray there is nothing to test
-# with: that is said on stderr, and the config passes.
+# next restart. S24xray runs "xray run -confdir", which loads every file of its
+# directory named like a config, *.json among them, so a mktemp name is not
+# named so; and Xray 26.10.29 refuses a -c file whose extension is not a
+# config's, -format notwithstanding. So Xray reads the file on stdin
+# ("-c stdin:", no extension to check), and -format json names its format.
+# Without an xray there is nothing to test with: that is said on stderr, and
+# the config passes.
 xrayconf_validate() {
     local file="$1" xray out rc=0
     xray=$(type -P xray 2>/dev/null) || xray=""
@@ -208,7 +212,7 @@ xrayconf_validate() {
     # ships 1.25 - only "timeout -t SECS PROG", and there the seconds would be
     # taken for the program, failing every config with exit 127. So the form is
     # probed, at the cost of one run of true.
-    local -a test_cmd=("$xray" run -test -format json -c "$file") bound=()
+    local -a test_cmd=("$xray" run -test -format json -c stdin:) bound=()
     if type -P timeout >/dev/null 2>&1; then
         if timeout 1 true >/dev/null 2>&1; then
             bound=(timeout 15)
@@ -217,7 +221,7 @@ xrayconf_validate() {
         fi
     fi
     test_cmd=("${bound[@]}" "${test_cmd[@]}")
-    out=$("${test_cmd[@]}" 2>&1) || rc=$?
+    out=$("${test_cmd[@]}" 2>&1 < "$file") || rc=$?
     if (( rc != 0 )); then
         if (( ${#bound[@]} > 0 )) && [[ $rc == 124 || $rc == 143 ]]; then
             printf 'xrayconf: xray config test timed out after 15s\n' >&2
